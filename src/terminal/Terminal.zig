@@ -15721,7 +15721,7 @@ test "Terminal: OSC133P after a padded partial line keeps the prompt on its own 
 
     // The padding spaces are gone, so narrowing does not reflow them into
     // extra blank rows above the prompt.
-    try t.resize(alloc, .{ .cols = 4, .rows = 5 });
+    try t.resize(alloc, .{ .cols = 5, .rows = 5 });
     try testing.expectEqual(@as(size.CellCountInt, 1), t.screens.active.cursor.y);
 }
 
