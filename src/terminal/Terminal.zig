@@ -2193,9 +2193,15 @@ pub fn semanticPrompt(
             // The k (kind) option specifies the type of prompt:
             // regular primary prompt (k=i or default),
             // right-side prompts (k=r), or prompts for continuation lines (k=c or k=s).
-            self.screens.active.cursorSetSemanticContent(.{
-                .prompt = cmd.readOption(.prompt_kind) orelse .initial,
-            });
+            const kind = cmd.readOption(.prompt_kind) orelse .initial;
+
+            // A primary prompt starts a new logical line, the same as 133;A.
+            // Shells that avoid 133;A's fresh-line (bash with ble.sh) still
+            // reach column 0 of a soft-wrapped row through padding.
+            const screen: *Screen = self.screens.active;
+            if (kind == .initial and screen.cursor.x == 0) screen.cursorBreakWrapIntoRow();
+
+            screen.cursorSetSemanticContent(.{ .prompt = kind });
         },
 
         .end_prompt_start_input => {
