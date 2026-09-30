@@ -2129,6 +2129,13 @@ pub fn semanticPrompt(
 
             const screen: *Screen = self.screens.active;
 
+            // A prompt that starts at column 0 of a soft-wrapped row reached
+            // it through padding, such as zsh PROMPT_SP overflowing spaces
+            // after a partial line. The shell draws and redraws this prompt
+            // as the start of a line, so reflow must not join it onto the
+            // padded row above.
+            if (screen.cursor.x == 0) screen.cursorBreakWrapIntoRow();
+
             // "Subsequent text (until a OSC "133;B" or OSC "133;I" command)
             // is a prompt string (as if followed by OSC 133;P;k=i\007)."
             screen.cursorSetSemanticContent(.{

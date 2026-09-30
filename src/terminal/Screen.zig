@@ -1651,6 +1651,25 @@ pub fn cursorResetWrap(self: *Screen) void {
     }
 }
 
+/// Make the cursor row start a new logical line by resetting the soft wrap
+/// from the row above into it. Reflow then never joins the two rows.
+pub fn cursorBreakWrapIntoRow(self: *Screen) void {
+    const page_row = self.cursor.page_row;
+    if (!page_row.wrap_continuation) return;
+    page_row.wrap_continuation = false;
+
+    const prev = self.cursor.page_pin.up(1) orelse return;
+    const prev_row = prev.rowAndCell().row;
+    prev_row.wrap = false;
+
+    // A spacer head only exists to carry a wide character over the wrap.
+    const cells = prev.cells(.all);
+    const last = prev.node.cols() - 1;
+    if (cells[last].wide == .spacer_head) {
+        self.clearCells(prev.node.page(), prev_row, cells[last..][0..1]);
+    }
+}
+
 /// Options for scrolling the viewport of the terminal grid. The reason
 /// we have this in addition to PageList.Scroll is because we have additional
 /// scroll behaviors that are not part of the PageList.Scroll enum.
