@@ -15718,6 +15718,11 @@ test "Terminal: OSC133P after a padded partial line keeps the prompt on its own 
     try testing.expectEqual(@as(size.CellCountInt, 1), t.screens.active.cursor.y);
     const prompt_start = t.screens.active.pages.getCell(.{ .active = .{ .x = 0, .y = 1 } }).?;
     try testing.expect(prompt_start.cell.codepoint() == '$' or prompt_start.cell.codepoint() == 0);
+
+    // The padding spaces are gone, so narrowing does not reflow them into
+    // extra blank rows above the prompt.
+    try t.resize(alloc, .{ .cols = 4, .rows = 5 });
+    try testing.expectEqual(@as(size.CellCountInt, 1), t.screens.active.cursor.y);
 }
 
 test "Terminal: OSC133P continuation prompt keeps a soft wrap" {
