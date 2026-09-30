@@ -15687,6 +15687,50 @@ test "Terminal: OSC133A cl option sets click to cl value" {
     try testing.expectEqual(Screen.SemanticPrompt.SemanticClick{ .cl = .multiple }, t.screens.active.semantic_prompt.click);
 }
 
+test "Terminal: OSC133P after a padded partial line keeps the prompt on its own line across resize" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+
+    // ble.sh pads a partial output line past the right edge like zsh
+    // PROMPT_SP, and Ghostty's bash integration marks its prompt with
+    // 133;P (no fresh-line) because ble.sh tracks the cursor itself.
+    try t.printString("ab%");
+    try t.printString("        ");
+    t.carriageReturn();
+    try t.semanticPrompt(.{
+        .action = .prompt_start,
+        .options_unvalidated = "k=i",
+    });
+    try t.printString("$ ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try t.printString("ls");
+    try testing.expectEqual(@as(size.CellCountInt, 1), t.screens.active.cursor.y);
+
+    try t.resize(alloc, .{ .cols = 20, .rows = 5 });
+    try testing.expectEqual(@as(size.CellCountInt, 1), t.screens.active.cursor.y);
+    const prompt_start = t.screens.active.pages.getCell(.{ .active = .{ .x = 0, .y = 1 } }).?;
+    try testing.expect(prompt_start.cell.codepoint() == '$' or prompt_start.cell.codepoint() == 0);
+}
+
+test "Terminal: OSC133P continuation prompt keeps a soft wrap" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+
+    // Only a primary prompt starts a new logical line. A continuation
+    // prompt (k=c or k=s) belongs to the input it continues.
+    try t.printString("0123456789ab");
+    t.carriageReturn();
+    try t.semanticPrompt(.{
+        .action = .prompt_start,
+        .options_unvalidated = "k=c",
+    });
+    try testing.expect(t.screens.active.cursor.page_row.wrap_continuation);
+}
+
 test "Terminal: OSC133A after a padded partial line keeps the prompt on its own line across resize" {
     const alloc = testing.allocator;
     const io_impl = testing.io;
