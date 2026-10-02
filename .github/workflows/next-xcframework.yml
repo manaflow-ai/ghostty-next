@@ -45,6 +45,27 @@ jobs:
           key: zig-pkg-${{ hashFiles('build.zig.zon', 'build.zig.zon.json', 'next/toolchain.env') }}
           restore-keys: zig-pkg-
 
+      # Unit tests for the ghostty-next patches. They run before the
+      # GhosttyKit build so a red patch fails fast. Add a filter when a
+      # patch adds tests.
+      - name: Patch unit tests
+        run: |
+          set -euo pipefail
+          source next/toolchain.env
+          export DEVELOPER_DIR="$XCODE_APP/Contents/Developer"
+          zig="$(next/install-zig.sh | tail -n 1)"
+          export PATH="$(dirname "$zig"):$PATH"
+          zig build test \
+            -Dapp-runtime=none \
+            -Demit-macos-app=false \
+            -Dsentry=false \
+            -Dtest-filter="manual: " \
+            -Dtest-filter="terminal responses: " \
+            -Dtest-filter="ghostty.h SurfaceIoMode" \
+            -Dtest-filter="ghostty.h surface config IO fields" \
+            -Dtest-filter="encode committed text" \
+            --summary all
+
       - name: Build and package
         id: pkg
         run: |
