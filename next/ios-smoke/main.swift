@@ -50,7 +50,7 @@ func finish(_ pass: Bool, _ detail: String) -> Never {
 }
 
 /// Fraction of sampled pixels in the layer's IOSurface that are not black,
-/// and how many are red-dominant (the SGR 41 fill).
+/// and how many are pure red (the 24-bit background fill).
 @MainActor
 func inspect(_ view: TerminalView) -> String? {
     guard let host = view.layer.sublayers?.first(where: { String(describing: type(of: $0)) == "IOSurfaceLayer" })
@@ -71,7 +71,7 @@ func inspect(_ view: TerminalView) -> String? {
             let bl = Int(p[0]), g = Int(p[1]), r = Int(p[2])
             sampled += 1
             if r + g + bl > 30 { nonBlack += 1 }
-            if r > 120 && g < 80 && bl < 80 { red += 1 }
+            if r > 200 && g < 60 && bl < 60 { red += 1 }
         }
     }
     return "layer=\(Int(b.width))x\(Int(b.height))pt surface=\(w)x\(h)px nonblack=\(nonBlack)/\(sampled) red=\(red)"
@@ -120,9 +120,10 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         Task { @MainActor in
             view.layoutIfNeeded()
             guard let surface = view.surface else { finish(false, "no surface") }
-            // Red background fill (SGR 41 + ED 2 uses the background color),
+            // Pure red 24-bit background fill (ED 2 uses the background color; a
+            // 24-bit color does not depend on the palette),
             // then white text.
-            let payload = Array("\u{1b}[41m\u{1b}[2J\u{1b}[H\u{1b}[97mghostty-next render smoke\r\n".utf8)
+            let payload = Array("\u{1b}[48;2;255;0;0m\u{1b}[2J\u{1b}[H\u{1b}[97mghostty-next render smoke\r\n".utf8)
             payload.withUnsafeBufferPointer { buf in
                 buf.baseAddress!.withMemoryRebound(to: CChar.self, capacity: buf.count) {
                     ghostty_surface_process_output(surface, $0, UInt(buf.count))
