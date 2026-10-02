@@ -36,6 +36,7 @@ local clone, keep the upstream remote fetch-only:
 | embedded: expose manual and manual-mirror surface IO | Remote IO C API, same names and values as manaflow-ai/ghostty: `ghostty_surface_io_mode_e`, `ghostty_surface_config_s.io_mode`/`io_write_cb`/`io_write_userdata`, `ghostty_io_write_cb`, `ghostty_surface_process_output`. Threading and resize semantics are documented in `ghostty.h`. |
 | embedded: add committed text input | `ghostty_surface_text_input`: typed text and IME commits without paste semantics (no bracketed paste, LF to CR), as the iOS app sends them. Ported from manaflow-ai/ghostty 22fa801f88. |
 | ci: run the remote IO unit tests | `next-xcframework.yml` runs `zig build test` with filters for the patch tests before the GhosttyKit build. |
+| termio: manual backends load only in-band Kitty graphics | Remote output names files, temporary files and shared memory on another machine. Loading them would read or unlink local files and leak which paths exist, so a manual backend uses the direct-only limits at init and on config change. |
 
 Next in the stack (tracked in the design): iOS renderer fixes and snapshot
 restore from the session host.

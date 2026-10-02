@@ -276,7 +276,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
                 .palette = .default,
             },
             .kitty_image_storage_limit = opts.config.image_storage_limit,
-            .kitty_image_loading_limits = .allWithTempDir(global.tmpDirPath()),
+            .kitty_image_loading_limits = kittyLoadingLimits(opts.backend),
         };
     });
     errdefer term.deinit(alloc);
@@ -576,7 +576,22 @@ pub fn changeConfig(self: *Termio, td: *ThreadData, config: *DerivedConfig) !voi
 
     // Set the image limits
     self.terminal.setKittyGraphicsSizeLimit(self.alloc, config.image_storage_limit);
-    self.terminal.setKittyGraphicsLoadingLimits(.allWithTempDir(global.tmpDirPath()));
+    self.terminal.setKittyGraphicsLoadingLimits(kittyLoadingLimits(self.backend));
+}
+
+/// The Kitty graphics transmission mediums the terminal may load from.
+/// The output of a manual backend comes from a terminal on another
+/// machine, so a file name, temporary file or shared memory object in it
+/// does not name anything on this machine. Loading it would read local
+/// files, unlink temporary files and leak which paths exist. A manual
+/// backend loads only in-band (direct) image data.
+fn kittyLoadingLimits(
+    backend: termio.backend.Kind,
+) terminalpkg.kitty.graphics.LoadingImage.Limits {
+    return switch (backend) {
+        .exec => .allWithTempDir(global.tmpDirPath()),
+        .manual => .direct,
+    };
 }
 
 /// Resize the terminal.
