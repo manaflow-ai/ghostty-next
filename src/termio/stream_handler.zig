@@ -51,16 +51,42 @@ fn isReply(msg: termio.Message) bool {
 }
 
 /// True if the surface handles this message only by writing a reply:
-/// the title report (CSI 21 t), clipboard reads (OSC 52) and the Kitty
-/// clipboard protocol (OSC 5522), which answers every request.
+/// the title report (CSI 21 t) and clipboard reads (OSC 52 and the Kitty
+/// clipboard protocol, OSC 5522). A Kitty clipboard write is not one: it
+/// sets the clipboard like OSC 52 and carries its own `reply` flag for
+/// the status packet. The switch is exhaustive so a new message kind
+/// needs a decision here.
 fn isReplyRequest(msg: apprt.surface.Message) bool {
     return switch (msg) {
         .report_title,
         .clipboard_read,
         .kitty_clipboard_read,
-        .kitty_clipboard_write,
         => true,
-        else => false,
+
+        .set_title,
+        .resize_window,
+        .set_mouse_shape,
+        .kitty_clipboard_write,
+        .clipboard_write,
+        .change_config,
+        .close,
+        .child_exited,
+        .desktop_notification,
+        .renderer_health,
+        .present_surface,
+        .password_input,
+        .color_change,
+        .selection_scroll_tick,
+        .pwd_change,
+        .ring_bell,
+        .progress_report,
+        .start_command,
+        .stop_command,
+        .scrollbar,
+        .search_total,
+        .search_selected,
+        .redraw,
+        => false,
     };
 }
 
@@ -68,7 +94,6 @@ fn isReplyRequest(msg: apprt.surface.Message) bool {
 fn discardReplyRequest(msg: apprt.surface.Message) void {
     switch (msg) {
         .kitty_clipboard_read => |req| req.destroy(),
-        .kitty_clipboard_write => |req| req.destroy(),
         else => {},
     }
 }
@@ -1451,6 +1476,7 @@ pub const StreamHandler = struct {
             .name = name_owned,
             .granted = granted,
             .terminator = terminator,
+            .reply = !self.suppress_terminal_responses,
         };
 
         self.surfaceMessageWriter(.{ .kitty_clipboard_write = req });
