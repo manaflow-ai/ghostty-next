@@ -74,6 +74,10 @@ pub fn build(b: *std.Build) !void {
         ) } },
         .target = target,
         .optimize = optimize,
+        // Apple SDK headers declare block types (CoreGraphics in the iOS
+        // 26.5 SDK, for example). The translator enables blocks by default
+        // only for some Darwin targets, so enable them for all of them.
+        .extra_args = if (target.result.os.tag.isDarwin()) &.{"-fblocks"} else &.{},
     });
 
     const lib = b.addLibrary(.{
