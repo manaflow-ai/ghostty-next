@@ -505,6 +505,55 @@ typedef enum {
   GHOSTTY_SURFACE_CONTEXT_SPLIT = 2,
 } ghostty_surface_context_e;
 
+// Who owns the terminal byte stream of a surface.
+//
+// EXEC: Ghostty starts the command in a pty it owns (the default).
+//
+// MANUAL: the embedder owns the byte stream, for example a session host
+// that owns the pty on another machine. Ghostty starts no subprocess,
+// opens no pty and runs no read thread; command, working_directory and
+// env_vars are ignored. Output arrives through
+// ghostty_surface_process_output. Everything Ghostty would write to a
+// pty goes to io_write_cb: encoded user input and the replies the parser
+// generates (device attributes, status reports, ...).
+//
+// MANUAL_MIRROR: like MANUAL, for a surface that mirrors the output of
+// another terminal core that owns the terminal protocol. That core
+// answers queries, so Ghostty drops every reply it would generate in
+// answer to the output (DA, DSR, CPR, XTVERSION, DECRQM mode reports,
+// Kitty keyboard and graphics replies, OSC 4/10/11/12 color replies,
+// ENQ, XTGETTCAP, CSI 21 t title reports, OSC 52 clipboard reads, the
+// Kitty clipboard protocol), and the size (mode 2048, CSI 14/16/18 t),
+// color scheme (mode 2031) and visibility (mode 2033) reports. Only user
+// input reaches io_write_cb: keys, text, IME commits, paste (bracketed
+// when the mirrored output enabled mode 2004), mouse reports (per the
+// mirrored mouse modes) and focus reports (when the mirrored output
+// enabled mode 1004). Clipboard writes (OSC 52) still reach the
+// runtime's clipboard callback because they are not replies.
+typedef enum {
+  GHOSTTY_SURFACE_IO_EXEC = 0,
+  GHOSTTY_SURFACE_IO_MANUAL = 1,
+  GHOSTTY_SURFACE_IO_MANUAL_MIRROR = 2,
+} ghostty_surface_io_mode_e;
+
+// Receives bytes for the pty in the MANUAL and MANUAL_MIRROR modes:
+// (io_write_userdata, bytes, length). The bytes are valid only during
+// the call; copy them.
+//
+// Threading: user input is delivered synchronously, before the input
+// call returns, on the thread that called it (ghostty_surface_key,
+// including IME commits sent as key text, ghostty_surface_text,
+// ghostty_surface_mouse_*, ghostty_surface_set_focus, and
+// ghostty_surface_set_size for MANUAL size reports). Normally that is
+// the main thread. Bytes Ghostty writes on its own (initial_input, the
+// form feed of the clear_screen action at a prompt and, in MANUAL mode
+// only, parser replies and reports) are delivered on the surface's IO
+// thread. Calls for one surface never overlap. The callback may run
+// while Ghostty holds the surface's terminal lock, so it must not call
+// back into the surface. It can be called until ghostty_surface_free
+// returns.
+typedef void (*ghostty_io_write_cb)(void*, const char*, uintptr_t);
+
 typedef struct {
   ghostty_platform_e platform_tag;
   ghostty_platform_u platform;
@@ -518,6 +567,12 @@ typedef struct {
   const char* initial_input;
   bool wait_after_command;
   ghostty_surface_context_e context;
+  // See ghostty_surface_io_mode_e. Surfaces that Ghostty asks the
+  // embedder to create (new tab or split actions) do not inherit these
+  // fields; they start in EXEC mode.
+  ghostty_surface_io_mode_e io_mode;
+  ghostty_io_write_cb io_write_cb;
+  void* io_write_userdata;
 } ghostty_surface_config_s;
 
 typedef struct {
@@ -1203,6 +1258,29 @@ GHOSTTY_API bool ghostty_surface_key_is_binding(ghostty_surface_t,
                                                    ghostty_binding_flags_e*);
 GHOSTTY_API void ghostty_surface_text(ghostty_surface_t, const char*, uintptr_t);
 GHOSTTY_API void ghostty_surface_preedit(ghostty_surface_t, const char*, uintptr_t);
+// Parse terminal output as if it was read from the pty and render it.
+// This is how a MANUAL or MANUAL_MIRROR surface receives output. Order
+// matters: call it for one surface from one serial queue. It takes the
+// surface's terminal lock, so it can block briefly while the renderer
+// reads the terminal; call it off the main thread.
+//
+// ghostty_surface_set_size (and a font size change) in the MANUAL modes
+// resizes the local grid before it returns, on the calling thread. Bytes passed to
+// ghostty_surface_process_output before the call are parsed at the old
+// size and bytes after it at the new size. The resize does what the
+// terminal does for any resize: the primary screen reflows soft-wrapped
+// lines when wraparound (DECAWM) is on, the alternate screen is clipped
+// or padded without reflow, and synchronized output (mode 2026) ends.
+// No pty is resized and nothing is written, except the mode 2048 size
+// report in MANUAL mode. The terminal core that owns the pty resizes and
+// reflows its own grid. Both grids stay identical only when the embedder
+// resizes at the same point in the byte stream as the owner, for example
+// on the queue that feeds ghostty_surface_process_output, when the owner
+// confirms the new size and before the output it produced at that size.
+// Otherwise resync the mirror from the owner.
+GHOSTTY_API void ghostty_surface_process_output(ghostty_surface_t,
+                                                const char*,
+                                                uintptr_t);
 GHOSTTY_API bool ghostty_surface_mouse_captured(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_mouse_button(ghostty_surface_t,
                                                  ghostty_input_mouse_state_e,
