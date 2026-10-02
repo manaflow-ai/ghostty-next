@@ -1,0 +1,132 @@
+name: GhosttyKit (ghostty-next)
+
+# Builds GhosttyKit.xcframework for the cmux iOS app on a remote macOS
+# runner, never on a developer Mac. A push to main publishes the release
+# `xcframework-<sha>-<flavor>` with a deterministic zip, SHA256SUMS,
+# manifest.json and a build provenance attestation. Pull requests build
+# and upload a workflow artifact only.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish the release for this commit (main only)"
+        type: boolean
+        default: false
+      verify_reproducible:
+        description: "Build a second time on another runner and compare slice hashes"
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ${{ vars.GHOSTTY_NEXT_MACOS_RUNNER || 'blacksmith-6vcpu-macos-26' }}
+    timeout-minutes: 90
+    outputs:
+      archive_sha256: ${{ steps.pkg.outputs.archive_sha256 }}
+      release_tag: ${{ steps.pkg.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Cache Zig packages
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/.cache/zig
+          key: zig-pkg-${{ hashFiles('build.zig.zon', 'build.zig.zon.json', 'next/toolchain.env') }}
+          restore-keys: zig-pkg-
+
+      - name: Build and package
+        id: pkg
+        run: |
+          set -euo pipefail
+          next/build-xcframework.sh "$RUNNER_TEMP/out" | tee "$RUNNER_TEMP/pkg.log"
+          result="$(tail -n 1 "$RUNNER_TEMP/pkg.log")"
+          python3 -c 'import json,sys; r=json.loads(sys.argv[1]); print("archive_sha256=" + r["archive_sha256"]); print("release_tag=" + r["release_tag"])' "$result" >> "$GITHUB_OUTPUT"
+          cat "$RUNNER_TEMP/out/SHA256SUMS"
+          cat "$RUNNER_TEMP/out/manifest.json"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ghosttykit-${{ github.sha }}
+          path: ${{ runner.temp }}/out/
+          if-no-files-found: error
+          retention-days: 14
+
+  reproduce:
+    if: github.event_name == 'workflow_dispatch' && inputs.verify_reproducible
+    needs: build
+    runs-on: ${{ vars.GHOSTTY_NEXT_MACOS_RUNNER || 'blacksmith-6vcpu-macos-26' }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: ghosttykit-${{ github.sha }}
+          path: ${{ runner.temp }}/first
+      - name: Rebuild without caches and compare
+        run: |
+          set -euo pipefail
+          rm -rf ~/.cache/zig .zig-cache
+          next/build-xcframework.sh "$RUNNER_TEMP/second"
+          slices() { python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); [print(s["identifier"], s["sha256"]) for s in m["slices"]]' "$1"; }
+          archive() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["archive"]["sha256"])' "$1"; }
+          diff -u <(slices "$RUNNER_TEMP/first/manifest.json") <(slices "$RUNNER_TEMP/second/manifest.json")
+          a="$(archive "$RUNNER_TEMP/first/manifest.json")"
+          b="$(archive "$RUNNER_TEMP/second/manifest.json")"
+          echo "archive first=$a second=$b"
+          [ "$a" = "$b" ]
+
+  publish:
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish))
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: ghosttykit-${{ github.sha }}
+          path: out
+      - name: Verify checksums
+        run: |
+          set -euo pipefail
+          cd out && sha256sum -c SHA256SUMS
+          test "$(sha256sum GhosttyKit.xcframework.zip | cut -d' ' -f1)" = "${{ needs.build.outputs.archive_sha256 }}"
+      - uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: out/GhosttyKit.xcframework.zip
+      - name: Create release (never replaces an existing one)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.build.outputs.release_tag }}
+          SUM: ${{ needs.build.outputs.archive_sha256 }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $TAG exists; checking its archive"
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern GhosttyKit.xcframework.zip --dir existing
+            existing="$(sha256sum existing/GhosttyKit.xcframework.zip | cut -d' ' -f1)"
+            echo "published=$existing rebuilt=$SUM"
+            exit 0
+          fi
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "GhosttyKit $GITHUB_SHA ($(jq -r .flavor out/manifest.json))" \
+            --notes "GhosttyKit.xcframework for ghostty-next $GITHUB_SHA. sha256 (also the SwiftPM checksum): $SUM. Toolchain and slice hashes: manifest.json." \
+            out/GhosttyKit.xcframework.zip out/SHA256SUMS out/manifest.json
