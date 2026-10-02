@@ -92,6 +92,24 @@ pub fn init(
                 .headers = headers,
                 .dsym = macos_native.dsym,
             }},
+
+            .ios => &.{
+                .{
+                    .library = ios.output,
+                    .headers = headers,
+                    .dsym = ios.dsym,
+                },
+                .{
+                    .library = ios_sim.output,
+                    .headers = headers,
+                    .dsym = ios_sim.dsym,
+                },
+                .{
+                    .library = macos_native.output,
+                    .headers = headers,
+                    .dsym = macos_native.dsym,
+                },
+            },
         },
     });
 

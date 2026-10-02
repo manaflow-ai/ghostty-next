@@ -40,8 +40,9 @@ pub fn init(
         .universal => null,
 
         // Native we need to override the architecture in the Xcode
-        // project with the -arch flag.
-        .native => switch (builtin.cpu.arch) {
+        // project with the -arch flag. The ios target carries only a
+        // native macOS slice, so it needs the same override.
+        .native, .ios => switch (builtin.cpu.arch) {
             .aarch64 => "arm64",
             .x86_64 => "x86_64",
             else => @panic("unsupported macOS arch"),
