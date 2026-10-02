@@ -16,6 +16,63 @@ const posix = std.posix;
 
 const log = std.log.scoped(.io_handler);
 
+/// True if the parser sends this termio message only to answer the
+/// terminal output: a write (every parser write is a reply) or a report.
+/// Messages that change terminal or termio state are not replies. The
+/// switch is exhaustive so a new message kind needs a decision here.
+fn isReply(msg: termio.Message) bool {
+    return switch (msg) {
+        .write_small,
+        .write_stable,
+        .write_alloc,
+        .size_report,
+        .color_scheme_report,
+        .visibility_report,
+        // Sent when the program enables focus events (mode 1004), to
+        // report the current focus. User focus changes do not use the
+        // parser.
+        .focused,
+        => true,
+
+        .crash,
+        .change_config,
+        .inspector,
+        .resize,
+        .clear_screen,
+        .scroll_viewport,
+        .selection_scroll,
+        .jump_to_prompt,
+        .start_synchronized_output,
+        .linefeed_mode,
+        .kitty_clipboard_grant_read,
+        .kitty_clipboard_grant_write,
+        => false,
+    };
+}
+
+/// True if the surface handles this message only by writing a reply:
+/// the title report (CSI 21 t), clipboard reads (OSC 52) and the Kitty
+/// clipboard protocol (OSC 5522), which answers every request.
+fn isReplyRequest(msg: apprt.surface.Message) bool {
+    return switch (msg) {
+        .report_title,
+        .clipboard_read,
+        .kitty_clipboard_read,
+        .kitty_clipboard_write,
+        => true,
+        else => false,
+    };
+}
+
+/// Free a dropped reply request. The receiver normally owns it.
+fn discardReplyRequest(msg: apprt.surface.Message) void {
+    switch (msg) {
+        .kitty_clipboard_read => |req| req.destroy(),
+        .kitty_clipboard_write => |req| req.destroy(),
+        else => {},
+    }
+}
+
 /// This is used as the handler for the terminal.Stream type. This is
 /// stateful and is expected to live for the entire lifetime of the terminal.
 /// It is NOT VALID to stop a stream handler, create a new one, and use that
@@ -54,6 +111,10 @@ pub const StreamHandler = struct {
     /// Maximum total decoded bytes per Kitty clipboard protocol
     /// (OSC 5522) write transaction; exceeding it aborts with EFBIG.
     clipboard_write_limit: usize,
+
+    /// Drop replies to the terminal output. See
+    /// termio.Options.suppress_terminal_responses.
+    suppress_terminal_responses: bool = false,
 
     //---------------------------------------------------------------
     // Internal state
@@ -131,6 +192,11 @@ pub const StreamHandler = struct {
         self: *StreamHandler,
         msg: apprt.surface.Message,
     ) void {
+        if (self.suppress_terminal_responses and isReplyRequest(msg)) {
+            discardReplyRequest(msg);
+            return;
+        }
+
         // See messageWriter which has similar logic and explains why
         // we may have to do this.
         if (self.surface_mailbox.push(msg, .{ .instant = {} }) == 0) {
@@ -141,6 +207,11 @@ pub const StreamHandler = struct {
     }
 
     inline fn messageWriter(self: *StreamHandler, msg: termio.Message) void {
+        if (self.suppress_terminal_responses and isReply(msg)) {
+            msg.deinit();
+            return;
+        }
+
         self.termio_mailbox.send(msg, self.renderer_state.mutex);
         self.termio_messaged = true;
     }
@@ -1972,4 +2043,153 @@ test "kitty clipboard write: oversized text replies EFBIG" {
     // Teardown leaves no transaction that could be committed and
     // forwarded to the macOS clipboard path.
     try testing.expect(mailbox.spsc.queue.pop(global.io()) == null);
+}
+
+/// A stream handler for reply tests. Termio messages go to `mailbox`.
+/// The surface and renderer mailboxes are not set up: the "none" test
+/// runtime cannot deliver surface messages, so these tests call the
+/// handler's reply functions directly instead of running a Stream.
+fn testHandler(
+    t: *terminal.Terminal,
+    mailbox: *termio.Mailbox,
+    renderer_state: *renderer.State,
+    size: *renderer.Size,
+    suppress_terminal_responses: bool,
+) StreamHandler {
+    return .{
+        .alloc = std.testing.allocator,
+        .size = size,
+        .terminal = t,
+        .termio_mailbox = mailbox,
+        .surface_mailbox = undefined,
+        .renderer_state = renderer_state,
+        .renderer_mailbox = undefined,
+        .renderer_wakeup = undefined,
+        .enquiry_response = "ok",
+        .osc_color_report_format = .@"16-bit",
+        .clipboard_write = .deny,
+        .clipboard_write_limit = 0,
+        .suppress_terminal_responses = suppress_terminal_responses,
+    };
+}
+
+/// Answer one query of each parser reply class. Returns how many
+/// replies an unsuppressed handler sends.
+fn testQueries(h: *StreamHandler) !usize {
+    try h.deviceAttributes(.primary); // CSI c
+    try h.deviceAttributes(.secondary); // CSI > c
+    try h.deviceStatusReport(.operating_status); // CSI 5 n
+    try h.deviceStatusReport(.cursor_position); // CSI 6 n (CPR)
+    try h.deviceStatusReport(.color_scheme); // CSI ? 996 n
+    try h.deviceStatusReport(.visibility); // CSI ? 998 n
+    try h.reportXtversion(); // CSI > q
+    try h.requestMode(.bracketed_paste); // DECRQM
+    try h.queryKittyKeyboard(); // CSI ? u
+    try h.enquiry(); // ENQ
+
+    // Kitty graphics query: ESC _ G a=q ... ESC \
+    h.apc.start();
+    h.apc.feedSlice(std.testing.allocator, "Ga=q,i=31,s=1,v=1,f=24;AAAA");
+    try h.apcEnd();
+
+    // Reports the parser requests when a program enables focus events
+    // (mode 1004) or in-band size reports (mode 2048), or asks for the
+    // text area size (CSI 18 t).
+    h.messageWriter(.{ .focused = true });
+    h.messageWriter(.{ .size_report = .mode_2048 });
+    h.messageWriter(.{ .size_report = .csi_18_t });
+
+    return 14;
+}
+
+/// Pop and free every queued message. Returns how many there were.
+fn testDrain(mailbox: *termio.Mailbox) usize {
+    var n: usize = 0;
+    while (mailbox.spsc.queue.pop(global.io())) |msg| {
+        msg.deinit();
+        n += 1;
+    }
+    return n;
+}
+
+test "terminal responses: replies are sent by default" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(global.io(), alloc, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(alloc);
+    var mailbox = try termio.Mailbox.initSPSC(alloc);
+    defer mailbox.deinit(alloc);
+    var mutex: std.Io.Mutex = .init;
+    mutex.lockUncancelable(global.io());
+    defer mutex.unlock(global.io());
+    var renderer_state: renderer.State = .{ .mutex = &mutex, .terminal = &t };
+    var size: renderer.Size = .{
+        .screen = .{ .width = 800, .height = 480 },
+        .cell = .{ .width = 10, .height = 20 },
+        .padding = .{},
+    };
+
+    // Guards the suppression test: every query must produce a reply, or
+    // that test would pass without suppressing anything.
+    var h = testHandler(&t, &mailbox, &renderer_state, &size, false);
+    defer h.deinit();
+    const expected = try testQueries(&h);
+    try testing.expectEqual(expected, testDrain(&mailbox));
+}
+
+test "terminal responses: suppression drops every reply" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(global.io(), alloc, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(alloc);
+    var mailbox = try termio.Mailbox.initSPSC(alloc);
+    defer mailbox.deinit(alloc);
+    var mutex: std.Io.Mutex = .init;
+    mutex.lockUncancelable(global.io());
+    defer mutex.unlock(global.io());
+    var renderer_state: renderer.State = .{ .mutex = &mutex, .terminal = &t };
+    var size: renderer.Size = .{
+        .screen = .{ .width = 800, .height = 480 },
+        .cell = .{ .width = 10, .height = 20 },
+        .padding = .{},
+    };
+
+    var h = testHandler(&t, &mailbox, &renderer_state, &size, true);
+    defer h.deinit();
+    _ = try testQueries(&h);
+
+    // A dropped allocated reply is freed (the testing allocator checks).
+    const long_reply: []const u8 = "\x1b]11;rgb:0000/0000/0000\x1b\\" ** 4;
+    h.messageWriter(try termio.Message.writeReq(alloc, long_reply));
+
+    try testing.expectEqual(@as(usize, 0), testDrain(&mailbox));
+
+    // State changes are not replies and still reach the termio thread.
+    h.messageWriter(.{ .linefeed_mode = true });
+    h.messageWriter(.{ .start_synchronized_output = {} });
+
+    const first = mailbox.spsc.queue.pop(global.io()).?;
+    defer first.deinit();
+    try testing.expect(first == .linefeed_mode);
+    try testing.expect(first.linefeed_mode);
+
+    const second = mailbox.spsc.queue.pop(global.io()).?;
+    defer second.deinit();
+    try testing.expect(second == .start_synchronized_output);
+
+    try testing.expectEqual(@as(usize, 0), testDrain(&mailbox));
+}
+
+test "terminal responses: surface reply requests" {
+    const testing = std.testing;
+
+    // Requests the surface answers by writing to the pty.
+    try testing.expect(isReplyRequest(.{ .report_title = .csi_21_t }));
+    try testing.expect(isReplyRequest(.{ .clipboard_read = .standard }));
+
+    // Requests with effects other than a reply.
+    try testing.expect(!isReplyRequest(.ring_bell));
+    try testing.expect(!isReplyRequest(.{ .set_mouse_shape = .default }));
 }

@@ -20,6 +20,15 @@ config: termio.Termio.DerivedConfig,
 /// The backend for termio that implements where reads/writes are sourced.
 backend: termio.Backend,
 
+/// Drop every reply the terminal would send in answer to its output
+/// (device attributes, status and mode reports, color and title queries,
+/// clipboard reads, Kitty graphics and clipboard responses) and the size,
+/// color scheme and visibility reports. Set this when another terminal
+/// core owns the PTY protocol and this terminal only mirrors its output,
+/// so the owner is the only one that answers. User input (keys, text,
+/// paste, mouse and focus reports) is still written.
+suppress_terminal_responses: bool = false,
+
 /// The mailbox for the terminal. This is how messages are delivered.
 /// If you're using termio.Thread this MUST be "mailbox".
 mailbox: termio.Mailbox,
