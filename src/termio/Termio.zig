@@ -65,6 +65,9 @@ mailbox: termio.Mailbox,
 /// from the child process and calls callbacks in the stream handler.
 terminal_stream: StreamHandler.Stream,
 
+/// See termio.Options.suppress_terminal_responses.
+suppress_terminal_responses: bool,
+
 /// Last time the cursor was reset. This is used to prevent message
 /// flooding with cursor resets.
 last_cursor_reset: ?std.Io.Timestamp = null,
@@ -305,6 +308,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .clipboard_write = opts.config.clipboard_write,
         .clipboard_write_limit = opts.config.clipboard_write_limit,
         .enquiry_response = opts.config.enquiry_response,
+        .suppress_terminal_responses = opts.suppress_terminal_responses,
     };
 
     const thread_enter_state = try ThreadEnterState.create(
@@ -327,6 +331,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
             .allocator = alloc,
             .handler = handler,
         }),
+        .suppress_terminal_responses = opts.suppress_terminal_responses,
         .thread_enter_state = thread_enter_state,
     };
 }
@@ -626,6 +631,7 @@ pub fn sizeReport(self: *Termio, td: *ThreadData, style: termio.Message.SizeRepo
 }
 
 fn sizeReportLocked(self: *Termio, td: *ThreadData, style: termio.Message.SizeReport) !void {
+    if (self.suppress_terminal_responses) return;
     const grid_size = self.size.grid();
     const report_size: terminalpkg.size_report.Size = .{
         .rows = grid_size.rows,
@@ -838,6 +844,7 @@ pub fn colorSchemeReport(self: *Termio, td: *ThreadData, force: bool) !void {
 }
 
 pub fn colorSchemeReportLocked(self: *Termio, td: *ThreadData, force: bool) !void {
+    if (self.suppress_terminal_responses) return;
     if (!force and !self.renderer_state.terminal.modes.get(.report_color_scheme)) {
         return;
     }
@@ -860,6 +867,8 @@ pub fn visibilityReport(
     visible: bool,
     force: bool,
 ) !void {
+    if (self.suppress_terminal_responses) return;
+
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
 
