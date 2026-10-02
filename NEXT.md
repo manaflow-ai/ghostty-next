@@ -41,6 +41,7 @@ local clone, keep the upstream remote fetch-only:
 | termio: deliver Kitty clipboard writes to mirrors without the reply | OSC 5522 writes now behave like OSC 52 in MANUAL_MIRROR: the surface applies the write, and a `reply` flag on the request suppresses the status packet. `isReplyRequest` is exhaustive. |
 | embedded: tighten manual surface input and output | `process_output` is a no-op for exec surfaces and parses in 64 KiB slices with one terminal lock hold each. New surfaces do not inherit a manual surface working directory. A mirror sends only an explicit `initial_input`, not the global `input` config. `text_input` turns CRLF into one CR. |
 | ghostty.h: manual IO threading contract | Every surface call except `process_output` on the main thread, `process_output` on one serial queue, no synchronous wait on that queue from main or `io_write_cb`, `process_output` stopped before `ghostty_surface_free`. Lists which thread calls `io_write_cb` for each kind of write. |
+| test: manual IO byte corpus and queueMessage tests | Feeds every query class through `Stream.nextSlice` with suppression on and off, and drives `Termio.queueMessage` on a manual backend (locked and unlocked writes, `write_alloc` free, LNM, focus with mode 1004, resize, `processOutput`, Kitty limits). The none runtime gets a no-op `wakeup` so the tests can use a real app mailbox. |
 
 Differences from manaflow-ai/ghostty in the remote IO mode: MANUAL_MIRROR
 sends user focus reports (mode 1004) to `io_write_cb`; the desktop fork
