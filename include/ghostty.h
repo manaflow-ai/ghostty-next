@@ -542,7 +542,7 @@ typedef enum {
 //
 // Threading: user input is delivered synchronously, before the input
 // call returns, on the thread that called it (ghostty_surface_key,
-// including IME commits sent as key text, ghostty_surface_text,
+// ghostty_surface_text, ghostty_surface_text_input,
 // ghostty_surface_mouse_*, ghostty_surface_set_focus, and
 // ghostty_surface_set_size for MANUAL size reports). Normally that is
 // the main thread. Bytes Ghostty writes on its own (initial_input, the
@@ -1257,6 +1257,12 @@ GHOSTTY_API bool ghostty_surface_key_is_binding(ghostty_surface_t,
                                                    ghostty_input_key_s,
                                                    ghostty_binding_flags_e*);
 GHOSTTY_API void ghostty_surface_text(ghostty_surface_t, const char*, uintptr_t);
+// Send committed text, such as typed text or an IME commit, as if typed.
+// Unlike ghostty_surface_text (a paste), there is no bracketed paste and
+// no paste protection, and LF becomes CR like the Enter key.
+GHOSTTY_API void ghostty_surface_text_input(ghostty_surface_t,
+                                            const char*,
+                                            uintptr_t);
 GHOSTTY_API void ghostty_surface_preedit(ghostty_surface_t, const char*, uintptr_t);
 // Parse terminal output as if it was read from the pty and render it.
 // This is how a MANUAL or MANUAL_MIRROR surface receives output. Order

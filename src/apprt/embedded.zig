@@ -1159,6 +1159,13 @@ pub const Surface = struct {
         };
     }
 
+    pub fn textInputCallback(self: *Surface, text: []const u8) void {
+        self.core_surface.textInputCallback(text) catch |err| {
+            log.err("error in text input callback err={}", .{err});
+            return;
+        };
+    }
+
     pub fn focusCallback(self: *Surface, focused: bool) void {
         self.core_surface.focusCallback(focused) catch |err| {
             log.err("error in focus callback err={}", .{err});
@@ -2137,6 +2144,17 @@ pub const CAPI = struct {
         len: usize,
     ) void {
         surface.preeditCallback(if (len == 0) null else ptr[0..len]);
+    }
+
+    /// Send committed text (typed text, an IME commit) to the terminal.
+    /// Unlike ghostty_surface_text this is not a paste: newlines become
+    /// carriage returns and bracketed paste is never used.
+    export fn ghostty_surface_text_input(
+        surface: *Surface,
+        ptr: [*]const u8,
+        len: usize,
+    ) void {
+        surface.textInputCallback(ptr[0..len]);
     }
 
     /// Parse terminal output as if it was read from the pty. This is how
