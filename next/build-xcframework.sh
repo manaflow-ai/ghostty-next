@@ -41,6 +41,8 @@ flags=(
   -Dsentry=false
   -Di18n=false
 )
+# Archive members carry no timestamps, so equal inputs give equal archives.
+export ZERO_AR_DATE=1
 cd "$repo"
 rm -rf macos/GhosttyKit.xcframework
 zig build "${flags[@]}" --summary failures

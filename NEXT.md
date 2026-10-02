@@ -29,6 +29,8 @@ local clone, keep the upstream remote fetch-only:
 | build: restore iOS slices in GhosttyKit.xcframework | Upstream stopped building the full library for iOS (7a171895dd); this repo needs it. |
 | build: add the ios xcframework target | `-Dxcframework-target=ios`: iOS device, iOS simulator and a native macOS slice for host tests. |
 | ci: ghostty-next GhosttyKit pipeline | Replaces the upstream workflows with `next-xcframework.yml`. |
+| build: enable blocks when translating Apple SDK headers | iOS 26.5 SDK CoreGraphics headers use blocks. |
+| ci: zero archive dates and add a link smoke | `ZERO_AR_DATE=1`; `next/smoke.sh` links every slice and runs macOS (and the simulator when one is given). |
 
 Next in the stack (tracked in the design): the remote IO mode (renderer and
 input encoder over an embedder-owned byte stream, no local PTY, no parser
@@ -51,7 +53,13 @@ from `next/toolchain.env`, builds with fixed flags and packages with
 A build provenance attestation covers the zip:
 `gh attestation verify GhosttyKit.xcframework.zip --repo manaflow-ai/ghostty-next`.
 A release is never replaced. A dispatch with `verify_reproducible` rebuilds
-on a second runner without caches and compares slice hashes.
+on a second runner without caches and compares slice hashes. Known
+difference before this check can pass: C objects compiled from Zig packages
+embed the per-build global cache path (`~/.cache/zig/b/<hash>`).
+
+Push and pull request events did not start runs when this repository was
+created; run the workflow with `gh workflow run next-xcframework.yml --ref
+<branch> [-f publish=true]` until they do.
 
 Builds never run on a developer Mac.
 
