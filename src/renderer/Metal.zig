@@ -145,6 +145,37 @@ pub fn deinit(self: *Metal) void {
     self.layer.release();
 }
 
+/// iOS only: size and place the IOSurfaceLayer inside the embedder's view.
+///
+/// On iOS the IOSurfaceLayer is a sublayer of the view's own layer (the
+/// view's `layer` is read-only), so unlike macOS it does not follow the
+/// view's bounds. Without this its bounds stay zero, `surfaceSize` reports
+/// 0x0, `drawFrame` returns early, and nothing is ever drawn. The embedded
+/// runtime calls this on the main thread from `ghostty_surface_set_size`
+/// and `ghostty_surface_set_content_scale`, before the renderer learns the
+/// new size, so the next frame matches the layer. The layer is pinned to
+/// the view's top-left corner; its implicit animations are already off.
+pub fn setHostedLayerSize(
+    self: *Metal,
+    width_px: u32,
+    height_px: u32,
+    scale: f64,
+) void {
+    if (comptime builtin.os.tag != .ios) return;
+    if (!(scale > 0)) return;
+    const layer = self.layer.layer;
+    layer.setProperty("contentsScale", scale);
+    layer.setProperty("anchorPoint", graphics.Point{ .x = 0, .y = 0 });
+    layer.setProperty("position", graphics.Point{ .x = 0, .y = 0 });
+    layer.setProperty("bounds", graphics.Rect{
+        .origin = .{ .x = 0, .y = 0 },
+        .size = .{
+            .width = @as(f64, @floatFromInt(width_px)) / scale,
+            .height = @as(f64, @floatFromInt(height_px)) / scale,
+        },
+    });
+}
+
 pub fn loopEnter(self: *Metal) void {
     const renderer: *align(1) Renderer = @fieldParentPtr("api", self);
     self.layer.setDisplayCallback(

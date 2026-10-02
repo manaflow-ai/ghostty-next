@@ -48,6 +48,8 @@ sends user focus reports (mode 1004) to `io_write_cb`; the desktop fork
 drops them. `io_write_cb` gets user input synchronously on the caller
 thread. New tab and split surfaces do not inherit the IO fields.
 | build: name the ios xcframework and module GhosttyNextKit | Avoids a module collision with the desktop GhosttyKit in shared workspaces; flavor `ios-v2`; the smoke test also compiles `import GhosttyNextKit` in Swift. |
+| test: iOS simulator render smoke that requires non-black pixels | `next/ios-render-smoke.sh` (build host, `nx-remote --sim`): one MANUAL_MIRROR surface, red fill through `process_output`; requires the renderer layer at the view's size, red pixels in its IOSurface, and a screenshot at least 20% red. |
+| renderer: size the iOS layer from ghostty_surface_set_size | On iOS the IOSurfaceLayer is a sublayer of the embedder's view and kept zero bounds, so every frame was skipped (black screen). `set_size` and `set_content_scale` now size it (top-left, points = pixels / scale) on the main thread. |
 
 Next in the stack (tracked in the design): iOS renderer fixes and snapshot
 restore from the session host.
