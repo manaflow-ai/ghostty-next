@@ -944,3 +944,261 @@ pub const ThreadData = struct {
 pub fn getProcessInfo(self: *Termio, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
     return self.backend.getProcessInfo(info);
 }
+
+/// Collects io_write_cb bytes for the manual backend tests.
+const TestSink = struct {
+    out: std.ArrayList(u8) = .empty,
+
+    fn cb(ud: ?*anyopaque, ptr: [*]const u8, len: usize) callconv(.c) void {
+        const self: *TestSink = @ptrCast(@alignCast(ud.?));
+        self.out.appendSlice(std.testing.allocator, ptr[0..len]) catch
+            @panic("OOM");
+    }
+
+    /// Check the bytes written since the last check, then forget them.
+    /// (Clearing the list invalidates its old contents, so the check
+    /// happens first.)
+    fn expect(self: *TestSink, expected: []const u8) !void {
+        defer self.out.clearRetainingCapacity();
+        try std.testing.expectEqualStrings(expected, self.out.items);
+    }
+};
+
+/// Pop and free every message queued for the termio thread.
+fn testDrainMailbox(mailbox: *termio.Mailbox) usize {
+    var n: usize = 0;
+    while (mailbox.spsc.queue.pop(global.io())) |msg| {
+        msg.deinit();
+        n += 1;
+    }
+    return n;
+}
+
+/// Run `body` against a Termio with a manual backend. The surface
+/// mailbox is not set up: nothing in these tests sends to it.
+fn testManualTermio(
+    mirror: bool,
+    comptime body: anytype,
+) !void {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var config: configpkg.Config = try .default(alloc);
+    defer config.deinit();
+
+    var sink: TestSink = .{};
+    defer sink.out.deinit(alloc);
+
+    var mutex: std.Io.Mutex = .init;
+    var renderer_state: renderer.State = .{ .mutex = &mutex, .terminal = undefined };
+    const renderer_mailbox = try renderer.Thread.Mailbox.create(alloc);
+    defer renderer_mailbox.destroy(alloc);
+    var renderer_wakeup = try xev.Async.init();
+    defer renderer_wakeup.deinit();
+
+    var io: Termio = undefined;
+    try Termio.init(&io, alloc, .{
+        .size = .{
+            .screen = .{ .width = 800, .height = 480 },
+            .cell = .{ .width = 10, .height = 20 },
+            .padding = .{},
+        },
+        .full_config = &config,
+        .config = try .init(alloc, &config),
+        .backend = .{ .manual = try termio.Manual.init(alloc, .{
+            .write_cb = TestSink.cb,
+            .write_userdata = &sink,
+            .mirror = mirror,
+        }) },
+        .suppress_terminal_responses = mirror,
+        .mailbox = try termio.Mailbox.initSPSC(alloc),
+        .renderer_state = &renderer_state,
+        .renderer_wakeup = renderer_wakeup,
+        .renderer_mailbox = renderer_mailbox,
+        .surface_mailbox = undefined,
+    });
+    defer io.deinit();
+    renderer_state.terminal = &io.terminal;
+
+    try body(&io, &sink, mirror);
+    while (renderer_mailbox.pop(global.io())) |_| {}
+}
+
+test "manual: queueMessage delivers input on the calling thread" {
+    const body = struct {
+        fn run(io: *Termio, sink: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            const alloc = testing.allocator;
+
+            io.queueMessage(.{ .write_stable = "a" }, .unlocked);
+            try sink.expect("a");
+
+            // A caller that holds the renderer state lock.
+            {
+                io.renderer_state.mutex.lockUncancelable(global.io());
+                defer io.renderer_state.mutex.unlock(global.io());
+                io.queueMessage(try termio.Message.writeReq(alloc, @as([]const u8, "b")), .locked);
+            }
+            try sink.expect("b");
+
+            // An allocated write is delivered and freed (the testing
+            // allocator checks for leaks).
+            const long: []const u8 = "0123456789" ** 8;
+            io.queueMessage(try termio.Message.writeReq(alloc, long), .unlocked);
+            try sink.expect(long);
+
+            // Linefeed mode (LNM) from the output applies to input.
+            io.terminal.modes.set(.linefeed, true);
+            io.queueMessage(.{ .write_stable = "\r" }, .unlocked);
+            try sink.expect("\r\n");
+            io.terminal.modes.set(.linefeed, false);
+
+            // Nothing went through the termio thread.
+            try testing.expectEqual(@as(usize, 0), testDrainMailbox(&io.mailbox));
+        }
+    }.run;
+
+    try testManualTermio(false, body);
+    try testManualTermio(true, body);
+}
+
+test "manual: focus reports follow mode 1004" {
+    const body = struct {
+        fn run(io: *Termio, sink: *TestSink, _: bool) !void {
+            const testing = std.testing;
+
+            io.queueMessage(.{ .focused = true }, .unlocked);
+            try sink.expect("");
+
+            io.terminal.modes.set(.focus_event, true);
+            io.queueMessage(.{ .focused = true }, .unlocked);
+            try sink.expect("\x1b[I");
+            io.queueMessage(.{ .focused = false }, .unlocked);
+            try sink.expect("\x1b[O");
+
+            // With the lock held the focus report takes the mailbox.
+            {
+                io.renderer_state.mutex.lockUncancelable(global.io());
+                defer io.renderer_state.mutex.unlock(global.io());
+                io.queueMessage(.{ .focused = true }, .locked);
+            }
+            try sink.expect("");
+            try testing.expectEqual(@as(usize, 1), testDrainMailbox(&io.mailbox));
+        }
+    }.run;
+
+    // User focus reports are input, so a mirror sends them too.
+    try testManualTermio(false, body);
+    try testManualTermio(true, body);
+}
+
+test "manual: resize applies before queueMessage returns" {
+    const body = struct {
+        fn run(io: *Termio, sink: *TestSink, mirror: bool) !void {
+            const testing = std.testing;
+
+            try testing.expectEqual(@as(usize, 80), io.terminal.cols);
+            io.terminal.modes.set(.in_band_size_reports, true);
+            io.queueMessage(.{ .resize = .{
+                .screen = .{ .width = 400, .height = 480 },
+                .cell = .{ .width = 10, .height = 20 },
+                .padding = .{},
+            } }, .unlocked);
+            try testing.expectEqual(@as(usize, 40), io.terminal.cols);
+
+            // The mode 2048 size report is a report: only MANUAL sends it.
+            if (mirror) {
+                try sink.expect("");
+            } else {
+                try sink.expect("\x1b[48;24;40;480;400t");
+            }
+            try testing.expectEqual(@as(usize, 0), testDrainMailbox(&io.mailbox));
+        }
+    }.run;
+
+    try testManualTermio(false, body);
+    try testManualTermio(true, body);
+}
+
+test "manual: processOutput parses output and routes replies by mode" {
+    const body = struct {
+        fn run(io: *Termio, sink: *TestSink, mirror: bool) !void {
+            const testing = std.testing;
+            const alloc = testing.allocator;
+
+            io.processOutput("hello\x1b[c");
+            const str = try io.terminal.plainString(alloc);
+            defer alloc.free(str);
+            try testing.expectEqualStrings("hello", str);
+
+            // Parser replies never run on the calling thread. MANUAL
+            // queues the DA reply for the termio thread; a mirror drops it.
+            try sink.expect("");
+            try testing.expectEqual(
+                @as(usize, if (mirror) 0 else 1),
+                testDrainMailbox(&io.mailbox),
+            );
+        }
+    }.run;
+
+    try testManualTermio(false, body);
+    try testManualTermio(true, body);
+}
+
+test "manual: Kitty graphics load in-band data only" {
+    const body = struct {
+        fn run(io: *Termio, _: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            const alloc = testing.allocator;
+
+            // A file that a t=t load would read and then unlink.
+            var tmp_dir = testing.tmpDir(.{});
+            defer tmp_dir.cleanup();
+            const name = "tty-graphics-protocol-image.data";
+            try tmp_dir.dir.writeFile(testing.io, .{ .sub_path = name, .data = "\x00\x00\x00" });
+            var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const path = path_buf[0..try tmp_dir.dir.realPathFile(testing.io, name, &path_buf)];
+
+            try expectRejected(io, path);
+
+            // A config change keeps the manual limits.
+            var td = io.manualThreadData();
+            var config: configpkg.Config = try .default(alloc);
+            defer config.deinit();
+            var derived: DerivedConfig = try .init(alloc, &config);
+            try io.changeConfig(&td, &derived);
+            try expectRejected(io, path);
+
+            // The file was neither read away nor unlinked.
+            try tmp_dir.dir.access(testing.io, path, .{});
+        }
+
+        fn expectRejected(io: *Termio, path: []const u8) !void {
+            const testing = std.testing;
+            const alloc = testing.allocator;
+
+            var b64: [std.fs.max_path_bytes * 2]u8 = undefined;
+            const shm_name = "/ghostty-next-manual-test";
+            const inputs = [_]struct { medium: []const u8, data: []const u8 }{
+                .{ .medium = "t", .data = path },
+                .{ .medium = "f", .data = path },
+                .{ .medium = "s", .data = shm_name },
+            };
+            for (inputs) |input| {
+                const cmd_str = try std.fmt.allocPrint(
+                    alloc,
+                    "a=t,t={s},f=24,s=1,v=1,i=5;{s}",
+                    .{ input.medium, std.base64.standard.Encoder.encode(&b64, input.data) },
+                );
+                defer alloc.free(cmd_str);
+                var cmd = try terminalpkg.kitty.graphics.CommandParser.parseString(alloc, cmd_str);
+                defer cmd.deinit(alloc);
+                const resp = io.terminal.kittyGraphics(global.io(), alloc, &cmd) orelse
+                    return error.TestExpectedResponse;
+                try testing.expect(!resp.ok());
+            }
+        }
+    }.run;
+
+    try testManualTermio(false, body);
+}

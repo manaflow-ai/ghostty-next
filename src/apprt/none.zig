@@ -6,6 +6,10 @@ const apprt = @import("../apprt.zig");
 pub const resourcesDir = internal_os.resourcesDir;
 
 pub const App = struct {
+    /// There is no app thread or event loop to wake. Messages sent to
+    /// the core app mailbox stay queued until something drains it.
+    pub fn wakeup(_: *App) void {}
+
     /// Always return false as there is no apprt to communicate with.
     pub fn performIpc(
         _: Allocator,
