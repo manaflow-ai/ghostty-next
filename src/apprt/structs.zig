@@ -243,3 +243,45 @@ pub const Selection = struct {
     offset_start: u32,
     offset_len: u32,
 };
+
+/// Who owns the terminal byte stream of an embedded surface.
+///
+/// If this is changed, you must also update ghostty.h
+/// (ghostty_surface_io_mode_e).
+pub const SurfaceIoMode = enum(c_int) {
+    /// Ghostty starts the command in a pty it owns.
+    exec = 0,
+
+    /// The embedder owns the byte stream. Output arrives through
+    /// ghostty_surface_process_output, input and parser replies go to
+    /// the surface's io_write_cb.
+    manual = 1,
+
+    /// Like manual, but another terminal core owns the terminal protocol
+    /// and answers queries. Parser replies and reports are dropped; only
+    /// user input goes to io_write_cb.
+    manual_mirror = 2,
+};
+
+test "ghostty.h SurfaceIoMode" {
+    try @import("../lib/enum.zig").checkGhosttyHEnum(
+        SurfaceIoMode,
+        "GHOSTTY_SURFACE_IO_",
+    );
+}
+
+test "ghostty.h surface config IO fields" {
+    // The fields are appended after `context` in both ghostty.h and
+    // embedded.Surface.Options. The offsets below are the 64-bit layout,
+    // which embedded.zig checks at comptime on the Zig side.
+    if (@sizeOf(usize) != 8) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const c = @import("ghostty.h");
+    const T = c.ghostty_surface_config_s;
+    try testing.expectEqual(@as(usize, 84), @offsetOf(T, "context"));
+    try testing.expectEqual(@as(usize, 88), @offsetOf(T, "io_mode"));
+    try testing.expectEqual(@as(usize, 96), @offsetOf(T, "io_write_cb"));
+    try testing.expectEqual(@as(usize, 104), @offsetOf(T, "io_write_userdata"));
+    try testing.expectEqual(@as(usize, 112), @sizeOf(T));
+}

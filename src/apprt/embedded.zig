@@ -16,6 +16,7 @@ const input = @import("../input.zig");
 const internal_os = @import("../os/main.zig");
 const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
+const termio = @import("../termio.zig");
 const CoreApp = @import("../App.zig");
 const CoreInspector = @import("../inspector/main.zig").Inspector;
 const CoreSurface = @import("../Surface.zig");
@@ -454,6 +455,11 @@ pub const Surface = struct {
     cursor_pos: apprt.CursorPos,
     inspector: ?*Inspector = null,
 
+    /// Who owns the terminal byte stream. See Options.io_mode.
+    io_mode: apprt.SurfaceIoMode = .exec,
+    io_write_cb: ?termio.Manual.WriteCallback = null,
+    io_write_userdata: ?*anyopaque = null,
+
     /// The current title of the surface. The embedded apprt saves this so
     /// that getTitle works without the implementer needing to save it.
     title: ?[:0]const u8 = null,
@@ -499,6 +505,20 @@ pub const Surface = struct {
 
         /// Context for the new surface
         context: apprt.surface.NewSurfaceContext = .window,
+
+        /// Who owns the terminal byte stream, an apprt.SurfaceIoMode.
+        /// Stored as a c_int so an invalid value from C is an error, not
+        /// undefined behavior. In the manual modes there is no subprocess
+        /// and command, working_directory and env_vars are ignored.
+        io_mode: c_int = @intFromEnum(apprt.SurfaceIoMode.exec),
+
+        /// Receives the bytes Ghostty would write to a pty in the manual
+        /// modes. See ghostty_io_write_cb in ghostty.h for the threading
+        /// contract.
+        io_write_cb: ?termio.Manual.WriteCallback = null,
+
+        /// Passed as the first argument of io_write_cb.
+        io_write_userdata: ?*anyopaque = null,
     };
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
@@ -513,6 +533,12 @@ pub const Surface = struct {
             },
             .size = .{ .width = 800, .height = 600 },
             .cursor_pos = .{ .x = -1, .y = -1 },
+            .io_mode = std.enums.fromInt(
+                apprt.SurfaceIoMode,
+                opts.io_mode,
+            ) orelse return error.InvalidIoMode,
+            .io_write_cb = opts.io_write_cb,
+            .io_write_userdata = opts.io_write_userdata,
         };
 
         // Add ourselves to the list of surfaces on the app.
@@ -1178,6 +1204,19 @@ pub const Surface = struct {
         };
     }
 
+    /// The manual backend configuration, or null to run a subprocess.
+    /// The core surface calls this once during init.
+    pub fn manualIo(self: *const Surface) ?termio.Manual.Config {
+        return switch (self.io_mode) {
+            .exec => null,
+            .manual, .manual_mirror => .{
+                .write_cb = self.io_write_cb,
+                .write_userdata = self.io_write_userdata,
+                .mirror = self.io_mode == .manual_mirror,
+            },
+        };
+    }
+
     pub fn defaultTermioEnv(self: *const Surface) !std.process.Environ.Map {
         _ = self;
         var env = try global.environMap();
@@ -1216,6 +1255,21 @@ pub const Surface = struct {
         return .{ .x = pos.x * scale.x, .y = pos.y * scale.y };
     }
 };
+
+// The IO fields extend ghostty_surface_config_s. ghostty.h must match;
+// the "ghostty.h surface config IO fields" test in apprt/structs.zig
+// checks the header side of the same layout.
+comptime {
+    if (@sizeOf(usize) == 8) {
+        const O = Surface.Options;
+        if (@offsetOf(O, "context") != 84 or
+            @offsetOf(O, "io_mode") != 88 or
+            @offsetOf(O, "io_write_cb") != 96 or
+            @offsetOf(O, "io_write_userdata") != 104 or
+            @sizeOf(O) != 112)
+            @compileError("Surface.Options IO fields must match ghostty_surface_config_s");
+    }
+}
 
 /// Inspector is the state required for the terminal inspector. A terminal
 /// inspector is 1:1 with a Surface.
@@ -2083,6 +2137,17 @@ pub const CAPI = struct {
         len: usize,
     ) void {
         surface.preeditCallback(if (len == 0) null else ptr[0..len]);
+    }
+
+    /// Parse terminal output as if it was read from the pty. This is how
+    /// a surface in a manual IO mode receives output. See ghostty.h.
+    export fn ghostty_surface_process_output(
+        surface: *Surface,
+        ptr: [*]const u8,
+        len: usize,
+    ) void {
+        if (len == 0) return;
+        surface.core_surface.io.processOutput(ptr[0..len]);
     }
 
     /// Returns true if the surface currently has mouse capturing
