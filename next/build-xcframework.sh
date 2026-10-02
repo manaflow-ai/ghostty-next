@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Reproducible GhosttyKit build for ghostty-next.
+# Reproducible GhosttyNextKit build for ghostty-next.
 #
 # Usage: next/build-xcframework.sh <out-dir>
 # Needs: macOS arm64, the Xcode in next/toolchain.env with the iOS SDK and the
 # Metal toolchain. Runs in CI (Blacksmith macOS) or on a fleet Mac, never on a
-# developer Mac. Output: <out-dir>/GhosttyKit.xcframework.zip, SHA256SUMS and
+# developer Mac. Output: <out-dir>/GhosttyNextKit.xcframework.zip, SHA256SUMS and
 # manifest.json (see next/package_xcframework.py).
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -44,12 +44,12 @@ flags=(
 # Archive members carry no timestamps, so equal inputs give equal archives.
 export ZERO_AR_DATE=1
 cd "$repo"
-rm -rf macos/GhosttyKit.xcframework
+rm -rf macos/GhosttyNextKit.xcframework
 zig build "${flags[@]}" --summary failures
 
 mkdir -p "$out"
 python3 "$here/package_xcframework.py" \
-  --xcframework macos/GhosttyKit.xcframework \
+  --xcframework macos/GhosttyNextKit.xcframework \
   --out "$out" \
   --flavor "$GHOSTTYKIT_FLAVOR" \
   --zig-version "$ZIG_VERSION" \

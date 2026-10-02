@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Install the pinned Zig into $1 (default: $RUNNER_TEMP or /tmp) and verify
 # its SHA-256. Prints the zig path on the last line. macOS arm64 only: the
-# GhosttyKit build needs Xcode, so it never runs on Linux.
+# GhosttyNextKit build needs Xcode, so it never runs on Linux.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=toolchain.env

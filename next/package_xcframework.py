@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Package GhosttyKit.xcframework for a ghostty-next release.
+"""Package GhosttyNextKit.xcframework for a ghostty-next release.
 
 Writes three files into --out:
 
-  GhosttyKit.xcframework.zip  deterministic zip (sorted entries, fixed
+  GhosttyNextKit.xcframework.zip  deterministic zip (sorted entries, fixed
                               timestamps and modes), usable as a SwiftPM
                               binaryTarget(url:checksum:)
   SHA256SUMS                  sha256 of the zip and of the manifest
@@ -27,7 +27,7 @@ import sys
 import zipfile
 from pathlib import Path
 
-ROOT = "GhosttyKit.xcframework"
+ROOT = "GhosttyNextKit.xcframework"
 FIXED_DATE = (1980, 1, 1, 0, 0, 0)
 # Slices the ios target must produce (Info.plist LibraryIdentifier).
 REQUIRED_SLICES = {"ios-arm64", "ios-arm64-simulator", "macos-arm64"}
@@ -91,6 +91,8 @@ def slices(xcframework: Path) -> list[dict]:
         for required in ("ghostty.h", "module.modulemap"):
             if not (headers / required).is_file():
                 raise SystemExit(f"{ident}: missing {required}")
+        if "module GhosttyNextKit" not in (headers / "module.modulemap").read_text():
+            raise SystemExit(f"{ident}: module map does not declare GhosttyNextKit")
         result.append({
             "identifier": ident,
             "platform": lib.get("SupportedPlatform"),
@@ -129,7 +131,7 @@ def main() -> int:
     commit = run("git", "-C", str(repo), "rev-parse", "HEAD")
     manifest = {
         "schema": 1,
-        "name": "GhosttyKit",
+        "name": "GhosttyNextKit",
         "repository": "manaflow-ai/ghostty-next",
         "commit": commit,
         "upstream_base": (repo / "next" / "UPSTREAM_BASE").read_text().strip(),

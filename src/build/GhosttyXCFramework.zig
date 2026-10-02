@@ -60,14 +60,30 @@ pub fn init(
     // module system.
     const wf = b.addWriteFiles();
     _ = wf.addCopyFile(b.path("include/ghostty.h"), "ghostty.h");
-    _ = wf.addCopyFile(b.path("include/module.modulemap"), "module.modulemap");
+    // ghostty-next: the ios target publishes the module GhosttyNextKit so
+    // it can sit next to the desktop GhosttyKit in one Xcode workspace.
+    if (target == .ios) {
+        _ = wf.add("module.modulemap",
+            \\// ghostty-next: the iOS remote-terminal build of libghostty.
+            \\module GhosttyNextKit {
+            \\    umbrella header "ghostty.h"
+            \\    export *
+            \\}
+            \\
+        );
+    } else {
+        _ = wf.addCopyFile(b.path("include/module.modulemap"), "module.modulemap");
+    }
     const headers = wf.getDirectory();
 
     // The xcframework wraps our ghostty library so that we can link
     // it to the final app built with Swift.
     const xcframework = XCFrameworkStep.create(b, .{
-        .name = "GhosttyKit",
-        .out_path = "macos/GhosttyKit.xcframework",
+        .name = if (target == .ios) "GhosttyNextKit" else "GhosttyKit",
+        .out_path = if (target == .ios)
+            "macos/GhosttyNextKit.xcframework"
+        else
+            "macos/GhosttyKit.xcframework",
         .libraries = switch (target) {
             .universal => &.{
                 .{
