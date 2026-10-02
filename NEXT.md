@@ -35,10 +35,10 @@ local clone, keep the upstream remote fetch-only:
 | termio: suppress replies for mirror renderers | Remote IO: the session host answers terminal queries, so a mirror drops parser replies (DA, DSR, CPR, XTVERSION, mode reports, OSC color queries, Kitty graphics and clipboard replies, title and clipboard reads) and size, color scheme and visibility reports. Ported from manaflow-ai/ghostty 581dbf264f. |
 | embedded: expose manual and manual-mirror surface IO | Remote IO C API, same names and values as manaflow-ai/ghostty: `ghostty_surface_io_mode_e`, `ghostty_surface_config_s.io_mode`/`io_write_cb`/`io_write_userdata`, `ghostty_io_write_cb`, `ghostty_surface_process_output`. Threading and resize semantics are documented in `ghostty.h`. |
 | embedded: add committed text input | `ghostty_surface_text_input`: typed text and IME commits without paste semantics (no bracketed paste, LF to CR), as the iOS app sends them. Ported from manaflow-ai/ghostty 22fa801f88. |
+| ci: run the remote IO unit tests | `next-xcframework.yml` runs `zig build test` with filters for the patch tests before the GhosttyKit build. |
 
-Next in the stack (tracked in the design): the remote IO mode (renderer and
-input encoder over an embedder-owned byte stream, no local PTY, no parser
-replies), iOS renderer fixes, and snapshot restore from the session host.
+Next in the stack (tracked in the design): iOS renderer fixes and snapshot
+restore from the session host.
 
 ## GhosttyKit releases
 
