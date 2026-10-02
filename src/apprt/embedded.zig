@@ -633,6 +633,13 @@ pub const Surface = struct {
             );
         }
 
+        // The `input` config is for a command that Ghostty starts. A
+        // mirror starts nothing, so it sends only an explicit
+        // initial_input.
+        if (opts.initial_input == null and self.io_mode == .manual_mirror) {
+            config.input.list.clearRetainingCapacity();
+        }
+
         // Wait after command
         if (opts.wait_after_command) {
             config.@"wait-after-command" = true;
@@ -1199,6 +1206,10 @@ pub const Surface = struct {
 
         const working_directory: ?[*:0]const u8 = wd: {
             if (!apprt.surface.shouldInheritWorkingDirectory(context, &self.app.config)) break :wd null;
+
+            // The pwd of a manual surface is reported by a terminal on
+            // another machine and names nothing here.
+            if (self.io_mode != .exec) break :wd null;
             const cwd = self.core_surface.pwd(self.app.core_app.alloc) catch null orelse break :wd null;
             defer self.app.core_app.alloc.free(cwd);
             break :wd self.app.core_app.alloc.dupeZ(u8, cwd) catch null;
@@ -2164,8 +2175,21 @@ pub const CAPI = struct {
         ptr: [*]const u8,
         len: usize,
     ) void {
-        if (len == 0) return;
-        surface.core_surface.io.processOutput(ptr[0..len]);
+        const io = &surface.core_surface.io;
+
+        // Output of an exec surface comes from its own pty.
+        if (io.backend != .manual) return;
+
+        // Parse in slices with one terminal lock hold each, like the
+        // exec read thread, so a large buffer does not hold off the
+        // renderer and input for its whole length.
+        const slice_len = 64 * 1024;
+        var rest = ptr[0..len];
+        while (rest.len > 0) {
+            const n = @min(rest.len, slice_len);
+            io.processOutput(rest[0..n]);
+            rest = rest[n..];
+        }
     }
 
     /// Returns true if the surface currently has mouse capturing
