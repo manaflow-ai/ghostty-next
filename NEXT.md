@@ -40,6 +40,12 @@ local clone, keep the upstream remote fetch-only:
 | remote IO: leave clear_screen and reset of a mirror to its owner | In MANUAL_MIRROR the clear_screen and reset binding actions return false (not performed) and leave the grid to the owning terminal core. In MANUAL, clear_screen runs on the caller thread so its form feed stays in order with user input. |
 | termio: deliver Kitty clipboard writes to mirrors without the reply | OSC 5522 writes now behave like OSC 52 in MANUAL_MIRROR: the surface applies the write, and a `reply` flag on the request suppresses the status packet. `isReplyRequest` is exhaustive. |
 | embedded: tighten manual surface input and output | `process_output` is a no-op for exec surfaces and parses in 64 KiB slices with one terminal lock hold each. New surfaces do not inherit a manual surface working directory. A mirror sends only an explicit `initial_input`, not the global `input` config. `text_input` turns CRLF into one CR. |
+| ghostty.h: manual IO threading contract | Every surface call except `process_output` on the main thread, `process_output` on one serial queue, no synchronous wait on that queue from main or `io_write_cb`, `process_output` stopped before `ghostty_surface_free`. Lists which thread calls `io_write_cb` for each kind of write. |
+
+Differences from manaflow-ai/ghostty in the remote IO mode: MANUAL_MIRROR
+sends user focus reports (mode 1004) to `io_write_cb`; the desktop fork
+drops them. `io_write_cb` gets user input synchronously on the caller
+thread. New tab and split surfaces do not inherit the IO fields.
 
 Next in the stack (tracked in the design): iOS renderer fixes and snapshot
 restore from the session host.
