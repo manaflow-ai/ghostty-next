@@ -204,6 +204,12 @@ pub const ClipboardRequest = union(ClipboardRequestType) {
         /// The response terminator, matching the request's.
         terminator: terminal.osc.Terminator,
 
+        /// False when another terminal core owns the protocol and sends
+        /// the status packets: the surface applies the write but writes
+        /// no status to the pty. See
+        /// termio.Options.suppress_terminal_responses.
+        reply: bool = true,
+
         pub fn destroy(self: *KittyWrite) void {
             // The struct itself lives in the arena, so move the arena
             // out before tearing it down.

@@ -6152,21 +6152,11 @@ pub fn completeClipboardRequest(
                 false,
             ) catch |err| {
                 log.err("error setting clipboard err={}", .{err});
-                try self.kittyClipboardStatus(
-                    .write,
-                    kitty.id,
-                    kitty.terminator,
-                    .EIO,
-                );
+                try self.kittyClipboardWriteStatus(kitty, .EIO);
                 return;
             };
 
-            try self.kittyClipboardStatus(
-                .write,
-                kitty.id,
-                kitty.terminator,
-                .DONE,
-            );
+            try self.kittyClipboardWriteStatus(kitty, .DONE);
         },
     }
 }
@@ -6215,12 +6205,7 @@ pub fn denyClipboardRequest(self: *Surface, req: apprt.ClipboardRequest) void {
 
         .kitty_write => |kitty| {
             defer kitty.destroy();
-            self.kittyClipboardStatus(
-                .write,
-                kitty.id,
-                kitty.terminator,
-                .EPERM,
-            ) catch |err| {
+            self.kittyClipboardWriteStatus(kitty, .EPERM) catch |err| {
                 log.warn("error replying to kitty clipboard write err={}", .{err});
             };
         },
@@ -6520,7 +6505,7 @@ fn kittyClipboardWrite(
     if (self.config.clipboard_write == .deny) {
         defer req.destroy();
         log.info("application attempted to write clipboard, but 'clipboard-write' is set to deny", .{});
-        try self.kittyClipboardStatus(.write, req.id, req.terminator, .EPERM);
+        try self.kittyClipboardWriteStatus(req, .EPERM);
         return;
     }
 
@@ -6529,7 +6514,7 @@ fn kittyClipboardWrite(
         .{ .kitty_write = req },
     ) catch |err| {
         defer req.destroy();
-        self.kittyClipboardStatus(.write, req.id, req.terminator, .EIO) catch {};
+        self.kittyClipboardWriteStatus(req, .EIO) catch {};
         return err;
     };
 
@@ -6543,9 +6528,20 @@ fn kittyClipboardWrite(
         // it the same.
         .unavailable, .unsupported => {
             defer req.destroy();
-            try self.kittyClipboardStatus(.write, req.id, req.terminator, .ENOSYS);
+            try self.kittyClipboardWriteStatus(req, .ENOSYS);
         },
     }
+}
+
+/// Reply to a Kitty clipboard write with a status packet, unless the
+/// request says another terminal core owns the replies.
+fn kittyClipboardWriteStatus(
+    self: *Surface,
+    req: *const apprt.ClipboardRequest.KittyWrite,
+    status: terminal.kitty.clipboard.Status,
+) error{ OutOfMemory, WriteFailed }!void {
+    if (!req.reply) return;
+    try self.kittyClipboardStatus(.write, req.id, req.terminator, status);
 }
 
 /// Reply to a Kitty clipboard request with a single status packet.
