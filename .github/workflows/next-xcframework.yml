@@ -55,6 +55,14 @@ jobs:
           cat "$RUNNER_TEMP/out/SHA256SUMS"
           cat "$RUNNER_TEMP/out/manifest.json"
 
+      - name: Link and run smoke
+        run: |
+          set -euo pipefail
+          # shellcheck source=/dev/null
+          . next/toolchain.env
+          export DEVELOPER_DIR="$XCODE_APP/Contents/Developer"
+          next/smoke.sh --xcframework macos/GhosttyKit.xcframework
+
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ghosttykit-${{ github.sha }}
