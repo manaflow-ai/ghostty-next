@@ -4,7 +4,7 @@
 #   1. the app reports RENDER-SMOKE PASS (the renderer layer has the view's
 #      size and its IOSurface has non-black, red-filled pixels), and
 #   2. a simulator screenshot taken while the app is on screen has at least
-#      20% red pixels (the SGR 41 fill the app feeds through process_output).
+#      20% red pixels (the 24-bit red fill the app feeds through process_output).
 #
 #   next/ios-render-smoke.sh --xcframework <dir>
 #   next/ios-render-smoke.sh --release <tag> <sha256>
@@ -69,7 +69,7 @@ for y in range(0, h, 8):
         i = off + y * row + x * bpp_bytes
         b, g, r = d[i], d[i + 1], d[i + 2]
         total += 1
-        if r > 120 and g < 80 and b < 80:
+        if r > 200 and g < 60 and b < 60:
             red += 1
 print(round(100 * red / max(total, 1)))
 PY
