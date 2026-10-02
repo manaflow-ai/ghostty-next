@@ -1047,11 +1047,25 @@ pub const Surface = struct {
             .x = @floatCast(x_scaled),
             .y = @floatCast(y_scaled),
         };
+        self.syncHostedLayer();
 
         self.core_surface.contentScaleCallback(self.content_scale) catch |err| {
             log.err("error in content scale callback err={}", .{err});
             return;
         };
+    }
+
+    /// iOS: the renderer's layer is a sublayer of the embedder's view and
+    /// does not follow its bounds, so the surface keeps it at the size the
+    /// embedder reported. See `Metal.setHostedLayerSize`.
+    fn syncHostedLayer(self: *Surface) void {
+        if (comptime builtin.os.tag == .ios) {
+            self.core_surface.renderer.api.setHostedLayerSize(
+                self.size.width,
+                self.size.height,
+                self.content_scale.x,
+            );
+        }
     }
 
     pub fn updateSize(self: *Surface, width: u32, height: u32) void {
@@ -1065,6 +1079,7 @@ pub const Surface = struct {
             .width = width,
             .height = height,
         };
+        self.syncHostedLayer();
 
         // Call the primary callback.
         self.core_surface.sizeCallback(self.size) catch |err| {
