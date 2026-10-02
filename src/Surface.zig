@@ -5061,6 +5061,11 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         },
 
         .reset => {
+            // A mirror's grid belongs to the terminal core that owns the
+            // protocol. Resetting it here would make the mirror differ
+            // from the owner, so the action is left to the embedder.
+            if (self.io.suppress_terminal_responses) return false;
+
             self.renderer_state.mutex.lockUncancelable(global.io());
             defer self.renderer_state.mutex.unlock(global.io());
             self.renderer_state.terminal.fullReset();
@@ -5362,6 +5367,10 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             // we send the message. If the currently active screen is on the
             // alternate screen then clear screen does nothing so we want to
             // return false so the keybind can be unconsumed.
+            //
+            // A mirror leaves it to the embedder for the same reason
+            // as reset: the grid belongs to the owning terminal core.
+            if (self.io.suppress_terminal_responses) return false;
             {
                 self.renderer_state.mutex.lockUncancelable(global.io());
                 defer self.renderer_state.mutex.unlock(global.io());

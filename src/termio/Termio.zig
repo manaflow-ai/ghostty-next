@@ -440,14 +440,14 @@ pub fn queueMessage(
 /// false if the message must go through the mailbox instead.
 ///
 /// A manual backend has no PTY to service, so the termio thread adds
-/// nothing for input: the embedder gets encoded writes and focus reports
-/// synchronously, in call order, on the thread that produced them. A
+/// nothing for input: the embedder gets encoded writes, focus reports and
+/// the clear screen form feed synchronously, in call order, on the thread that produced them. A
 /// resize applies to the terminal before the call returns, so an embedder
 /// that orders resizes and processOutput calls on one thread knows which
 /// bytes were parsed at which grid size.
 ///
-/// Handlers that take the renderer state lock themselves (focus, resize)
-/// only run inline when the caller does not hold it; otherwise the
+/// Handlers that take the renderer state lock themselves (focus, resize,
+/// clear screen) only run inline when the caller does not hold it; otherwise the
 /// message takes the normal mailbox path.
 fn queueMessageManual(
     self: *Termio,
@@ -472,6 +472,14 @@ fn queueMessageManual(
             if (mutex == .locked) return false;
             self.resize(&td, v) catch |err| {
                 log.warn("manual resize failed err={}", .{err});
+            };
+        },
+        // At a prompt this writes a form feed, which must stay in order
+        // with the user input around it.
+        .clear_screen => |v| {
+            if (mutex == .locked) return false;
+            self.clearScreen(&td, v.history) catch |err| {
+                log.warn("manual clear screen failed err={}", .{err});
             };
         },
         else => return false,

@@ -37,6 +37,7 @@ local clone, keep the upstream remote fetch-only:
 | embedded: add committed text input | `ghostty_surface_text_input`: typed text and IME commits without paste semantics (no bracketed paste, LF to CR), as the iOS app sends them. Ported from manaflow-ai/ghostty 22fa801f88. |
 | ci: run the remote IO unit tests | `next-xcframework.yml` runs `zig build test` with filters for the patch tests before the GhosttyKit build. |
 | termio: manual backends load only in-band Kitty graphics | Remote output names files, temporary files and shared memory on another machine. Loading them would read or unlink local files and leak which paths exist, so a manual backend uses the direct-only limits at init and on config change. |
+| remote IO: leave clear_screen and reset of a mirror to its owner | In MANUAL_MIRROR the clear_screen and reset binding actions return false (not performed) and leave the grid to the owning terminal core. In MANUAL, clear_screen runs on the caller thread so its form feed stays in order with user input. |
 
 Next in the stack (tracked in the design): iOS renderer fixes and snapshot
 restore from the session host.
