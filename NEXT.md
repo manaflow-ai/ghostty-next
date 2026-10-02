@@ -15,7 +15,7 @@ share branches.
 `next/UPSTREAM_BASE`, plus the patch stack below. Every patch is one
 self-describing commit. To move the base, rebase the stack onto a newer
 upstream commit, update `next/UPSTREAM_BASE` in the same push, and let CI
-publish a new GhosttyKit. Never merge `manaflow-ai/ghostty` into this repo;
+publish a new GhosttyNextKit. Never merge `manaflow-ai/ghostty` into this repo;
 port a patch from it as a new commit that names the source commit.
 
 Never push to, or open a pull request against, `ghostty-org/ghostty`. In a
@@ -47,34 +47,37 @@ Differences from manaflow-ai/ghostty in the remote IO mode: MANUAL_MIRROR
 sends user focus reports (mode 1004) to `io_write_cb`; the desktop fork
 drops them. `io_write_cb` gets user input synchronously on the caller
 thread. New tab and split surfaces do not inherit the IO fields.
+| build: name the ios xcframework and module GhosttyNextKit | Avoids a module collision with the desktop GhosttyKit in shared workspaces; flavor `ios-v2`; the smoke test also compiles `import GhosttyNextKit` in Swift. |
 
 Next in the stack (tracked in the design): iOS renderer fixes and snapshot
 restore from the session host.
 
-## GhosttyKit releases
+## GhosttyNextKit releases
 
 A push to `main` runs `.github/workflows/next-xcframework.yml` on a remote
 macOS runner. It runs `next/build-xcframework.sh`, which pins Zig and Xcode
 from `next/toolchain.env`, builds with fixed flags and packages with
 `next/package_xcframework.py`. The release tag is
-`xcframework-<commit>-<flavor>` and holds:
+`xcframework-<commit>-<flavor>` (flavor `ios-v2` and later) and holds:
 
-- `GhosttyKit.xcframework.zip`: deterministic zip. Its sha256 is also the
+- `GhosttyNextKit.xcframework.zip`: deterministic zip. Its sha256 is also the
   SwiftPM checksum.
 - `SHA256SUMS`: sha256 of the zip and of the manifest.
 - `manifest.json`: commit, upstream base, toolchain versions, flags, and the
   sha256 of each slice library.
 
 A build provenance attestation covers the zip:
-`gh attestation verify GhosttyKit.xcframework.zip --repo manaflow-ai/ghostty-next`.
+`gh attestation verify GhosttyNextKit.xcframework.zip --repo manaflow-ai/ghostty-next`.
 A release is never replaced. A dispatch with `verify_reproducible` rebuilds
 on a second runner without caches and compares slice hashes. Known
 difference before this check can pass: C objects compiled from Zig packages
 embed the per-build global cache path (`~/.cache/zig/b/<hash>`).
 
-Push and pull request events did not start runs when this repository was
-created; run the workflow with `gh workflow run next-xcframework.yml --ref
-<branch> [-f publish=true]` until they do.
+The xcframework and its Swift module are named `GhosttyNextKit` (only
+for `-Dxcframework-target=ios`; the other targets keep upstream's
+`GhosttyKit`), so the iOS app and the desktop app can share one Xcode
+workspace without a module collision. Releases with flavor `ios-v1` use the
+old name `GhosttyKit`; do not pin them.
 
 Builds never run on a developer Mac.
 
@@ -84,12 +87,13 @@ The app pins one release in its package manifest:
 
 ```swift
 .binaryTarget(
-    name: "GhosttyKit",
-    url: "https://github.com/manaflow-ai/ghostty-next/releases/download/xcframework-<commit>-<flavor>/GhosttyKit.xcframework.zip",
+    name: "GhosttyNextKit",
+    url: "https://github.com/manaflow-ai/ghostty-next/releases/download/xcframework-<commit>-<flavor>/GhosttyNextKit.xcframework.zip",
     checksum: "<sha256 from SHA256SUMS>"
 )
 ```
 
 SwiftPM downloads the public asset without credentials and refuses a
 checksum mismatch. A pin change is one reviewed commit in the app that
-changes both values.
+changes both values. Swift code imports the module with
+`import GhosttyNextKit`; the C API names (`ghostty_*`) are unchanged.
