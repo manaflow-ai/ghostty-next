@@ -3406,6 +3406,46 @@ pub fn textCallback(self: *Surface, text: []const u8) !void {
     try self.completeClipboardPaste(text, true);
 }
 
+/// Send committed text, such as typed text or an IME commit, to the pty.
+/// Unlike textCallback this is not a paste: no bracketed paste, no paste
+/// protection, and newlines become carriage returns like the Enter key.
+pub fn textInputCallback(self: *Surface, text: []const u8) !void {
+    // Crash metadata in case we crash in here
+    crash.sentry.thread_state = self.crashThreadState();
+    defer crash.sentry.thread_state = null;
+
+    if (text.len == 0) return;
+
+    var data_duped: ?[]u8 = null;
+    const encoded = input.text.encode(text) catch |err| switch (err) {
+        error.MutableRequired => encoded: {
+            const buf: []u8 = try self.alloc.dupe(u8, text);
+            errdefer self.alloc.free(buf);
+            data_duped = buf;
+            break :encoded input.text.encode(buf);
+        },
+    };
+    defer if (data_duped) |v| self.alloc.free(v);
+
+    // Same as a key press that encodes text after the process exited.
+    if (self.child_exited) {
+        self.close();
+        return;
+    }
+
+    self.queueIo(try termio.Message.writeReq(
+        self.alloc,
+        encoded,
+    ), .unlocked);
+
+    // Same side effects as typing a key.
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    if (self.config.selection_clear_on_typing) try self.setSelection(null);
+    if (self.config.scroll_to_bottom.keystroke) self.io.terminal.scrollViewport(.bottom);
+    try self.queueRender();
+}
+
 /// Callback for when the surface is fully visible or not, regardless
 /// of focus state. This is used to pause rendering when the surface
 /// is not visible, and also re-render when it becomes visible again.
