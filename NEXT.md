@@ -31,6 +31,7 @@ local clone, keep the upstream remote fetch-only:
 | ci: ghostty-next GhosttyKit pipeline | Replaces the upstream workflows with `next-xcframework.yml`. |
 | build: enable blocks when translating Apple SDK headers | iOS 26.5 SDK CoreGraphics headers use blocks. |
 | ci: zero archive dates and add a link smoke | `ZERO_AR_DATE=1`; `next/smoke.sh` links every slice and runs macOS (and the simulator when one is given). |
+| termio: add the manual backend | Remote IO: no PTY, no subprocess, no read thread. Output comes in through `Termio.processOutput`; writes, focus reports and resizes run on the caller thread. Ported from manaflow-ai/ghostty d631f36cea and 22fa801f88. |
 
 Next in the stack (tracked in the design): the remote IO mode (renderer and
 input encoder over an embedder-owned byte stream, no local PTY, no parser

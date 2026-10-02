@@ -1351,9 +1351,11 @@ fn childExitedAbnormally(
     const alloc = arena.allocator();
 
     // Build up our command for the error message
-    const command = try std.mem.join(alloc, " ", switch (self.io.backend) {
-        .exec => |*exec| exec.subprocess.args,
-    });
+    const command = switch (self.io.backend) {
+        .exec => |*exec| try std.mem.join(alloc, " ", exec.subprocess.args),
+        // A manual backend never starts a process, so it never exits.
+        .manual => "",
+    };
     const runtime_str = try std.fmt.allocPrint(alloc, "{d} ms", .{info.runtime_ms});
 
     self.renderer_state.mutex.lockUncancelable(global.io());

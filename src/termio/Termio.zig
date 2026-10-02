@@ -419,11 +419,93 @@ pub fn queueMessage(
     msg: termio.Message,
     mutex: MutexState,
 ) void {
+    switch (self.backend) {
+        .manual => if (self.queueMessageManual(msg, mutex)) return,
+        .exec => {},
+    }
+
     self.mailbox.send(msg, switch (mutex) {
         .locked => self.renderer_state.mutex,
         .unlocked => null,
     });
     self.mailbox.notify();
+}
+
+/// Handle a message for a manual backend on the calling thread. Returns
+/// false if the message must go through the mailbox instead.
+///
+/// A manual backend has no PTY to service, so the termio thread adds
+/// nothing for input: the embedder gets encoded writes and focus reports
+/// synchronously, in call order, on the thread that produced them. A
+/// resize applies to the terminal before the call returns, so an embedder
+/// that orders resizes and processOutput calls on one thread knows which
+/// bytes were parsed at which grid size.
+///
+/// Handlers that take the renderer state lock themselves (focus, resize)
+/// only run inline when the caller does not hold it; otherwise the
+/// message takes the normal mailbox path.
+fn queueMessageManual(
+    self: *Termio,
+    msg: termio.Message,
+    mutex: MutexState,
+) bool {
+    var td = self.manualThreadData();
+    switch (msg) {
+        .write_small => |v| self.queueWriteManual(&td, v.data[0..v.len], mutex),
+        .write_stable => |v| self.queueWriteManual(&td, v, mutex),
+        .write_alloc => |v| {
+            defer v.alloc.free(v.data);
+            self.queueWriteManual(&td, v.data, mutex);
+        },
+        .focused => |v| {
+            if (mutex == .locked) return false;
+            self.focusGained(&td, v) catch |err| {
+                log.warn("manual focus report failed err={}", .{err});
+            };
+        },
+        .resize => |v| {
+            if (mutex == .locked) return false;
+            self.resize(&td, v) catch |err| {
+                log.warn("manual resize failed err={}", .{err});
+            };
+        },
+        else => return false,
+    }
+
+    return true;
+}
+
+/// Thread data for work a manual backend does outside the termio thread.
+/// The manual backend never reads the event loop.
+fn manualThreadData(self: *Termio) ThreadData {
+    return .{
+        .alloc = self.alloc,
+        .loop = undefined,
+        .renderer_state = self.renderer_state,
+        .surface_mailbox = self.surface_mailbox,
+        .backend = .{ .manual = .{} },
+        .mailbox = &self.mailbox,
+    };
+}
+
+fn queueWriteManual(
+    self: *Termio,
+    td: *ThreadData,
+    data: []const u8,
+    mutex: MutexState,
+) void {
+    // The termio thread tracks linefeed mode (LNM) from mailbox messages.
+    // Inline writes read it from the terminal, which the parser updates
+    // under the renderer state lock.
+    const linefeed = linefeed: {
+        if (mutex == .unlocked) self.renderer_state.mutex.lockUncancelable(global.io());
+        defer if (mutex == .unlocked) self.renderer_state.mutex.unlock(global.io());
+        break :linefeed self.terminal.modes.get(.linefeed);
+    };
+
+    self.queueWrite(td, data, linefeed) catch |err| {
+        log.warn("manual write failed err={}", .{err});
+    };
 }
 
 /// Queue a write directly to the pty.
@@ -498,7 +580,6 @@ pub fn resize(
     td: *ThreadData,
     size: renderer.Size,
 ) !void {
-    self.size = size;
     const grid_size = size.grid();
 
     // Update the size of our pty.
@@ -508,6 +589,10 @@ pub fn resize(
     {
         self.renderer_state.mutex.lockUncancelable(global.io());
         defer self.renderer_state.mutex.unlock(global.io());
+
+        // The stream handler and size reports read this under the lock,
+        // and a manual backend resizes from the caller's thread.
+        self.size = size;
 
         // Update the size of our terminal state
         try self.terminal.resize(
