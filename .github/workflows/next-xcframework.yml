@@ -66,6 +66,30 @@ jobs:
             -Dtest-filter="ghostty.h surface config IO fields" \
             -Dtest-filter="encode committed text" \
             --summary all
+          # libghostty-vt patches (VT replay formatter, terminal and Kitty
+          # graphics C API). These live in the lib-vt test modules.
+          zig build test-lib-vt \
+            -Dtest-filter="Terminal vt restores cursor" \
+            -Dtest-filter="Terminal vt clamps an outside origin cursor" \
+            -Dtest-filter="Terminal vt cursor is absolute when origin mode is omitted" \
+            -Dtest-filter="Terminal vt cursor uses default margins" \
+            -Dtest-filter="Terminal vt trailing blank rows" \
+            -Dtest-filter="Page vt preserved trailing blank rows" \
+            -Dtest-filter="Page VT preserves a fully styled blank row" \
+            -Dtest-filter="Page VT unstyled blank cells" \
+            -Dtest-filter="render: OSC dynamic color resets" \
+            -Dtest-filter="get cursor visual" \
+            -Dtest-filter="cursor activity" \
+            -Dtest-filter="count limit" \
+            -Dtest-filter="kitty graphics dirty state" \
+            -Dtest-filter="placement iterator exposes internal" \
+            -Dtest-filter="image_get_handle_by_number" \
+            -Dtest-filter="image_set_number" \
+            -Dtest-filter="image iterator visits" \
+            -Dtest-filter="image ID cursor" \
+            -Dtest-filter="Kitty automatic image ID cursors" \
+            -Dtest-filter="RIS preserves configured byte and count limits" \
+            --summary all
 
       - name: Build and package
         id: pkg
