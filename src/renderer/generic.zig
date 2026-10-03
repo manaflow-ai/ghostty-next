@@ -28,6 +28,7 @@ const ArenaAllocator = std.heap.ArenaAllocator;
 const Terminal = terminal.Terminal;
 const Health = renderer.Health;
 const compat_file = @import("../lib/compat/file.zig");
+const compat_thread = @import("../lib/compat/thread.zig");
 
 const getConstraint = @import("../font/nerd_font_attributes.zig").getConstraint;
 
@@ -320,6 +321,32 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 for (0..buf_count) |_| self.frame_sema.waitUncancelable(
                     global.io(),
                 );
+                for (&self.frames) |*frame| frame.deinit();
+            }
+
+            /// Wait at most `timeout_ns` for every in-flight frame to
+            /// complete. True: no frame is in flight and the caller owns
+            /// every frame, so it may call `deinitIdle`. False: the wait
+            /// timed out and nothing changed.
+            pub fn waitIdle(self: *SwapChain, timeout_ns: u64) bool {
+                const io = global.io();
+                const sema = &self.frame_sema;
+                sema.mutex.lockUncancelable(io);
+                defer sema.mutex.unlock(io);
+                while (sema.permits < buf_count) {
+                    compat_thread.waitTimeout(&sema.cond, io, &sema.mutex, .{
+                        .duration = .{
+                            .raw = .fromNanoseconds(timeout_ns),
+                            .clock = .awake,
+                        },
+                    }) catch return false;
+                }
+                sema.permits = 0;
+                return true;
+            }
+
+            /// Free the frames after `waitIdle` returned true.
+            pub fn deinitIdle(self: *SwapChain) void {
                 for (&self.frames) |*frame| frame.deinit();
             }
 
@@ -1188,11 +1215,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.visible = visible;
             self.syncDisplayLink(null, null);
 
-            // When we're hidden, release our GPU resources.
+            // When we're hidden, release our GPU resources, but never
+            // wait long for frames in flight (see hidden_release_wait_ns).
             if (!visible) {
                 self.draw_mutex.lockUncancelable(global.io());
                 defer self.draw_mutex.unlock(global.io());
-                self.releaseGpuResources();
+                self.releaseGpuResourcesWait(hidden_release_wait_ns);
             }
         }
 
@@ -1209,10 +1237,35 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Caller must lock the draw mutex before calling this function.
         /// Resources that are already released are skipped.
         pub fn releaseGpuResources(self: *Self) void {
+            self.releaseGpuResourcesWait(null);
+        }
+
+        /// How long hiding a surface waits for its frames in flight before
+        /// it keeps the swap chain instead of freeing it. The system can
+        /// hold back GPU completions (iOS does while the app moves to the
+        /// background), and an unbounded wait there stalls the render
+        /// thread and everything that waits for its draw lock.
+        const hidden_release_wait_ns = 100 * std.time.ns_per_ms;
+
+        /// `releaseGpuResources` with a bounded wait for frames in flight:
+        /// null waits until they complete. When a bounded wait times out,
+        /// the swap chain is kept; it is released at the next hide or at
+        /// teardown, and a visible surface keeps drawing with it.
+        ///
+        /// Caller must lock the draw mutex before calling this function.
+        fn releaseGpuResourcesWait(self: *Self, timeout_ns: ?u64) void {
             if (self.swap_chain) |*sc| {
-                // Waits for any in-flight frames to complete, then
-                // frees all GPU resources.
-                sc.deinit();
+                if (timeout_ns) |ns| {
+                    if (!sc.waitIdle(ns)) {
+                        log.info("frames still in flight, keeping the swap chain", .{});
+                        return;
+                    }
+                    sc.deinitIdle();
+                } else {
+                    // Waits for any in-flight frames to complete, then
+                    // frees all GPU resources.
+                    sc.deinit();
+                }
                 self.swap_chain = null;
             }
 
