@@ -70,6 +70,7 @@ thread. New tab and split surfaces do not inherit the IO fields.
 | build: flavor ios-v4 | First release with `ghostty_surface_set_grid`, `ghostty_surface_restore_snapshot`, `ghostty_surface_encode_snapshot`, the non-blocking renderer mailbox and the iOS renderer ports. |
 | termio: the surface's scrollback limits hold across snapshot restores | A restored terminal took the session host's scrollback limits from the snapshot, so a phone that restores READY only had to re-encode its own state to trim history, dropping scrollback and on-screen Kitty images. A manual backend now applies its config's `scrollback-limit-bytes` and `scrollback-limit-lines` to every restored terminal (HISTORY pages beyond them are dropped from the oldest end) and, through `ghostty_surface_update_config`, to the live terminal (oldest complete pages freed, never the screen or its images). No new C API: the existing config key holds across restores because the restore reads it from the surface config. Exec surfaces keep upstream behavior (limits apply to new surfaces only). |
 | test: render smoke restores under a surface scrollback limit | The `snapshot` check sets `scrollback-limit-bytes = 65536` on the surface with `ghostty_surface_update_config` before it restores READY and HISTORY (about 380 KB of history); the restore succeeds and the red fill is back. |
+| build: flavor ios-v5 | First release where restored terminals keep the surface's scrollback limits. |
 
 Next in the stack (tracked in the design): presentation callbacks for
 frame-exact acknowledgment, Kitty image replay after a snapshot, and a
@@ -81,7 +82,7 @@ A push to `main` runs `.github/workflows/next-xcframework.yml` on a remote
 macOS runner. It runs `next/build-xcframework.sh`, which pins Zig and Xcode
 from `next/toolchain.env`, builds with fixed flags and packages with
 `next/package_xcframework.py`. The release tag is
-`xcframework-<commit>-<flavor>` (flavor `ios-v2` and later; `ios-v3` is the first with a drawing iOS renderer; `ios-v4` adds `set_grid`, snapshot restore and encode, and non-blocking surface calls) and holds:
+`xcframework-<commit>-<flavor>` (flavor `ios-v2` and later; `ios-v3` is the first with a drawing iOS renderer; `ios-v4` adds `set_grid`, snapshot restore and encode, and non-blocking surface calls; `ios-v5` keeps the surface's scrollback limits across restores) and holds:
 
 - `GhosttyNextKit.xcframework.zip`: deterministic zip. Its sha256 is also the
   SwiftPM checksum.
