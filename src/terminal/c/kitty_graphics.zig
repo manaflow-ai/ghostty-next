@@ -1530,6 +1530,63 @@ test "placement_pixel_size with transmit and display" {
     try testing.expectEqual(20, h);
 }
 
+test "placement_pixel_size keeps the c/r size with cell offsets" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var t: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer terminal_c.free(t);
+    try testing.expectEqual(Result.success, terminal_c.resize(t, 80, 24, 10, 20));
+
+    // X=3,Y=4 offsets with c=2,r=3: libghostty-vt moves the image by the
+    // offset and keeps the full 2x3 cell size (20x60 px). Offsets do not
+    // shrink the placement.
+    const cmd = "\x1b_Ga=T,t=d,f=24,i=1,p=1,s=1,v=2,X=3,Y=4,c=2,r=3;////////\x1b\\";
+    terminal_c.vt_write(t, cmd.ptr, cmd.len);
+
+    var graphics: KittyGraphics = undefined;
+    try testing.expectEqual(Result.success, terminal_c.get(
+        t,
+        .kitty_graphics,
+        @ptrCast(&graphics),
+    ));
+    const img = image_get_handle(graphics, 1);
+    try testing.expect(img != null);
+
+    var iter: PlacementIterator = null;
+    try testing.expectEqual(Result.success, placement_iterator_new(
+        &lib.alloc.test_allocator,
+        &iter,
+    ));
+    defer placement_iterator_free(iter);
+    try testing.expectEqual(Result.success, get(graphics, .placement_iterator, @ptrCast(&iter)));
+    try testing.expect(placement_iterator_next(iter));
+
+    var x_offset: u32 = undefined;
+    var y_offset: u32 = undefined;
+    try testing.expectEqual(Result.success, placement_get(iter, .x_offset, @ptrCast(&x_offset)));
+    try testing.expectEqual(Result.success, placement_get(iter, .y_offset, @ptrCast(&y_offset)));
+    try testing.expectEqual(3, x_offset);
+    try testing.expectEqual(4, y_offset);
+
+    var w: u32 = undefined;
+    var h: u32 = undefined;
+    try testing.expectEqual(Result.success, placement_pixel_size(iter, img, t, &w, &h));
+    try testing.expectEqual(20, w);
+    try testing.expectEqual(60, h);
+
+    var cols: u32 = undefined;
+    var rows: u32 = undefined;
+    try testing.expectEqual(Result.success, placement_grid_size(iter, img, t, &cols, &rows));
+    try testing.expectEqual(2, cols);
+    try testing.expectEqual(3, rows);
+}
+
 test "placement_pixel_size null args return invalid_value" {
     if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
 

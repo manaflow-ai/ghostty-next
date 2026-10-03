@@ -18,6 +18,14 @@ const Command = command.Command;
 
 const log = std.log.scoped(.kitty_gfx);
 
+/// Whether X/Y cell offsets shrink a placement sized by columns or rows.
+/// The Ghostty app follows the protocol text: offsets move the near edge
+/// inward and never enlarge the c/r rectangle. libghostty-vt keeps the
+/// image at the full c/r size and moves it by the offset, so embedders
+/// that render placements themselves (the cmux-tui session host) see the
+/// sizes they had before upstream c5a3c7e2e.
+const offsets_shrink_cell_size = @import("terminal_options").artifact != .lib;
+
 /// Default maximum number of stored images per storage.
 pub const default_image_count_limit: usize = 4096;
 
@@ -2054,7 +2062,10 @@ pub const ImageStorage = struct {
             // count and the height by the row count, because it should be.
             const cell_width: u32 = t.width_px / t.cols;
             const cell_height: u32 = t.height_px / t.rows;
-            const cell_offset = self.cellOffset(t);
+            const cell_offset = if (comptime offsets_shrink_cell_size)
+                self.cellOffset(t)
+            else
+                @TypeOf(self.cellOffset(t)){ .x = 0, .y = 0 };
 
             // If we have a specified cols AND rows then we calculate
             // the width and height from them directly, we don't need
@@ -3229,8 +3240,14 @@ test "storage: cell offsets stay within explicit destination rectangle" {
         .rows = 1,
     };
     const actual = placement.pixelSize(.{ .width = 4, .height = 3 }, &t);
-    try testing.expectEqual(@as(u32, 17), actual.width);
-    try testing.expectEqual(@as(u32, 16), actual.height);
+    if (comptime offsets_shrink_cell_size) {
+        try testing.expectEqual(@as(u32, 17), actual.width);
+        try testing.expectEqual(@as(u32, 16), actual.height);
+    } else {
+        // libghostty-vt: offsets move the image but keep the c/r size.
+        try testing.expectEqual(@as(u32, 20), actual.width);
+        try testing.expectEqual(@as(u32, 20), actual.height);
+    }
     try testing.expectEqual(@as(u32, 2), placement.gridSize(.{ .width = 4, .height = 3 }, &t).cols);
     try testing.expectEqual(@as(u32, 1), placement.gridSize(.{ .width = 4, .height = 3 }, &t).rows);
 }
@@ -3256,10 +3273,12 @@ test "storage: cell offsets clamp to cell bounds" {
     try testing.expectEqual(@as(u32, 9), offset.x);
     try testing.expectEqual(@as(u32, 19), offset.y);
 
-    // Even hostile offsets leave one pixel inside the requested cell.
+    // Even hostile offsets leave one pixel inside the requested cell. In
+    // libghostty-vt offsets do not shrink the requested cell at all.
     const actual = placement.pixelSize(.{ .width = 1, .height = 1 }, &t);
-    try testing.expectEqual(@as(u32, 1), actual.width);
-    try testing.expectEqual(@as(u32, 1), actual.height);
+    const expected: [2]u32 = if (comptime offsets_shrink_cell_size) .{ 1, 1 } else .{ 10, 20 };
+    try testing.expectEqual(expected[0], actual.width);
+    try testing.expectEqual(expected[1], actual.height);
 }
 
 test "storage: aspect ratio calculation when only columns or rows specified" {
