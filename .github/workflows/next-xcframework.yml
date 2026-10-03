@@ -94,6 +94,8 @@ jobs:
             -Dtest-filter="ghostty.h SurfaceIoMode" \
             -Dtest-filter="ghostty.h surface config IO fields" \
             -Dtest-filter="encode committed text" \
+            -Dtest-filter="OSC 7: manual surfaces keep the raw URL" \
+            -Dtest-filter="osc7Path decodes" \
             -Dtest-filter="cell offsets" \
             -Dtest-filter="kittygfx display clamps cell offsets" \
             -Dtest-filter="report associated text produced by consumed alt" \
