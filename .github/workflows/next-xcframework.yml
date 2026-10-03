@@ -94,6 +94,9 @@ jobs:
             -Dtest-filter="ghostty.h SurfaceIoMode" \
             -Dtest-filter="ghostty.h surface config IO fields" \
             -Dtest-filter="encode committed text" \
+            -Dtest-filter="cell offsets" \
+            -Dtest-filter="kittygfx display clamps cell offsets" \
+            -Dtest-filter="report associated text produced by consumed alt" \
             -Dtest-filter="ghostty.h surface grid" \
             -Dtest-filter="ghostty.h SurfaceSnapshotPhase" \
             -Dtest-filter="renderer mailbox: " \
@@ -121,6 +124,13 @@ jobs:
             -Dtest-filter="image ID cursor" \
             -Dtest-filter="Kitty automatic image ID cursors" \
             -Dtest-filter="RIS preserves configured byte and count limits" \
+            -Dtest-filter="cell offsets" \
+            -Dtest-filter="kittygfx display clamps cell offsets" \
+            -Dtest-filter="placement_pixel_size keeps the c/r size with cell offsets" \
+            -Dtest-filter="report associated text produced by consumed alt" \
+            -Dtest-filter="select word on a wrapped" \
+            -Dtest-filter="select word ending in a wide glyph" \
+            -Dtest-filter="Terminal vt restores pending wrap with origin mode" \
             --summary all
 
       - name: Build and package

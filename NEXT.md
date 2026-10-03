@@ -76,6 +76,7 @@ thread. New tab and split surfaces do not inherit the IO fields.
 | lib-vt: report associated text produced by a consumed Alt | libghostty-vt Kitty key encoding keeps the associated text when Alt was consumed to produce it (an Option-generated character), as manaflow-ai/ghostty does. The Ghostty app keeps upstream behavior. Ported from manaflow-ai/ghostty 14d4d041b8 and 7e091b0efb. |
 | lib-vt: word selection endpoints stay on wide glyph leads | `ghostty_terminal_select_word` moves an endpoint off a wide-character spacer onto its glyph lead: a word that begins with a wrapped wide glyph starts on the next row, and a word that ends with a wide glyph ends on its lead, as manaflow-ai/ghostty reports them. `Screen.selectWord` (upstream a3e80a685, used by the app) is unchanged. |
 | test: VT replay restores pending wrap under origin mode | Regression test: with DECOM and margins, the formatter alone restores the cursor cell and the pending wrap. A consumer must not reprint the cursor cell again. |
+| ci: run the round-2 libghostty-vt patch tests | Filters for the cell-offset sizing, consumed-Alt text, word-selection and pending-wrap tests, in both the app (`zig build test`) and libghostty-vt (`zig build test-lib-vt`) runs, so both artifacts are proven. |
 
 Next in the stack (tracked in the design): presentation callbacks for
 frame-exact acknowledgment, Kitty image replay after a snapshot, and a
