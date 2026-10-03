@@ -54,6 +54,7 @@ thread. New tab and split surfaces do not inherit the IO fields.
 | formatter: keep trailing and styled blank rows in VT replay | libghostty-vt VT replay: when the cursor is replayed, trailing blank rows are kept (all row breaks but the final one, which is carried to the next page) so the replay target does not scroll; fully styled blank rows are content for styled output; blank cells after a styled cell close the style first. Ported from manaflow-ai/ghostty a3e9304c5d, 3429f20e9f, 9961d09be3, 9d8d40319, 2439e8e7c and 51c8da0ced. |
 | test: OSC dynamic color resets follow later C API defaults | Regression test from manaflow-ai/ghostty d6f611a30: after OSC 110/111/112 resets, the terminal and the render state follow C API default changes. The fix itself is upstream (7cd2f65f5); only the test is ported. |
 | lib-vt: expose the effective cursor visual state | `GHOSTTY_TERMINAL_DATA_CURSOR_VISUAL_STYLE` (43, `GhosttyTerminalCursorStyle`) and `GHOSTTY_TERMINAL_DATA_CURSOR_BLINKING` (44, `bool`) on the terminal, appended after upstream values. Ported from manaflow-ai/ghostty 9a614e570. |
+| lib-vt: expose cursor semantic activity | `GHOSTTY_TERMINAL_DATA_CURSOR_ACTIVITY` (45, `uint64_t`): an opaque token that advances on DECSCUSR, DEC mode 12, alternate screen dispatches, full reset and configured cursor-default changes, so a replay producer sees cursor changes that leave the visual unchanged. Ported from manaflow-ai/ghostty 71ed4f8f6. |
 
 Next in the stack (tracked in the design): iOS renderer fixes and snapshot
 restore from the session host.
