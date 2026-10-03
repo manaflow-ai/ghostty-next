@@ -76,6 +76,23 @@ Next in the stack (tracked in the design): presentation callbacks for
 frame-exact acknowledgment, Kitty image replay after a snapshot, and a
 local scrollback window limit for restored snapshots.
 
+## Behavior that differs from upstream
+
+The next upstream sync must keep these behaviors, or change them in a
+reviewed commit that says why. Each one is covered by a test in the patch
+stack.
+
+- Scrollback limits in the MANUAL modes: when the embedder calls
+  `ghostty_surface_update_config` on a MANUAL or MANUAL_MIRROR surface,
+  `scrollback-limit-bytes` and `scrollback-limit-lines` apply to the live
+  terminal at once. Only the oldest complete history pages are freed, never
+  on-screen rows or the Kitty images on them. Upstream applies these keys to
+  new surfaces only, and EXEC surfaces here keep the upstream behavior. Every
+  `ghostty_surface_restore_snapshot` (READY and HISTORY) also uses the
+  surface config's limits, not the limits in the host's snapshot. Why: the
+  iOS app restores host snapshots and must keep its own memory budget.
+  Source: PR 8 (`74e97632d40a`), release ios-v4 to ios-v5.
+
 ## GhosttyNextKit releases
 
 A push to `main` runs `.github/workflows/next-xcframework.yml` on a remote
