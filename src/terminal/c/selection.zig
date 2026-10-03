@@ -6,6 +6,7 @@ const formatterpkg = @import("../formatter.zig");
 const grid_ref = @import("grid_ref.zig");
 const point = @import("../point.zig");
 const selection_codepoints = @import("../selection_codepoints.zig");
+const PageList = @import("../PageList.zig");
 const Selection = @import("../Selection.zig");
 const Result = @import("result.zig").Result;
 const terminal_c = @import("terminal.zig");
@@ -102,12 +103,36 @@ pub fn word(
 
     const screen = t.screens.active;
     const pin = opts.ref.toPin() orelse return .invalid_value;
-    out.* = .fromZig(screen.selectWord(
+    const sel = screen.selectWord(
         pin,
         boundary_codepoints orelse &selection_codepoints.default_word_boundaries,
-    ) orelse
-        return .no_value);
+    ) orelse return .no_value;
+    out.* = .fromZig(Selection.init(
+        wideGlyphOwner(sel.start()),
+        wideGlyphOwner(sel.end()),
+        sel.rectangle,
+    ));
     return .success;
+}
+
+/// Move a word selection endpoint off a wide-character spacer onto the
+/// glyph that owns it. Screen.selectWord (upstream a3e80a685) resolves
+/// spacers to their glyph, so a word can start on the spacer head that
+/// pads a wrapped wide glyph or end on a spacer tail. C API embedders
+/// expect word endpoints on the glyph lead cells, as manaflow-ai/ghostty
+/// reports them: a word that begins with a wrapped wide glyph starts on
+/// the next row, and a word that ends with a wide glyph ends on its lead.
+fn wideGlyphOwner(pin: PageList.Pin) PageList.Pin {
+    switch (pin.rowAndCell().cell.wide) {
+        .narrow, .wide => {},
+        .spacer_tail => if (pin.x > 0) return pin.left(1),
+        .spacer_head => if (pin.down(1)) |below| {
+            var lead = below;
+            lead.x = 0;
+            if (lead.rowAndCell().cell.wide == .wide) return lead;
+        },
+    }
+    return pin;
 }
 
 pub fn word_between(
@@ -575,4 +600,63 @@ test "selection_format_alloc returns no_value without active selection" {
     ));
     try testing.expect(out_ptr == null);
     try testing.expectEqual(@as(usize, 0), out_len);
+}
+
+test "select word on a wrapped wide head starts on the glyph lead" {
+    var t: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(
+        &lib.alloc.test_allocator,
+        &t,
+        4,
+        3,
+    ));
+    defer terminal_c.free(t);
+
+    // "AB " fills columns 0-2. The wide glyph does not fit in column 3, so
+    // column 3 becomes a spacer head and the glyph wraps to row 1.
+    const text = "AB \u{6A4B}";
+    terminal_c.vt_write(t, text.ptr, text.len);
+
+    const zt = terminal_c.zigTerminal(t).?;
+    const lead_pin = zt.screens.active.pages.pin(.{ .active = .{ .x = 0, .y = 1 } }).?;
+    const head_pin = zt.screens.active.pages.pin(.{ .active = .{ .x = 3, .y = 0 } }).?;
+    try testing.expectEqual(.spacer_head, head_pin.rowAndCell().cell.wide);
+
+    for ([_]PageList.Pin{ lead_pin, head_pin }) |clicked| {
+        const opts: SelectWordOptions = .{ .ref = .fromPin(clicked) };
+        var sel: CSelection = undefined;
+        try testing.expectEqual(Result.success, word(t, &opts, &sel));
+        const start = sel.start.toPin().?;
+        const end = sel.end.toPin().?;
+        const start_pt = zt.screens.active.pages.pointFromPin(.active, start).?.active;
+        const end_pt = zt.screens.active.pages.pointFromPin(.active, end).?.active;
+        try testing.expectEqual(@as(u16, 0), start_pt.x);
+        try testing.expectEqual(@as(u32, 1), start_pt.y);
+        try testing.expectEqual(@as(u16, 0), end_pt.x);
+        try testing.expectEqual(@as(u32, 1), end_pt.y);
+    }
+}
+
+test "select word ending in a wide glyph ends on its lead" {
+    var t: terminal_c.Terminal = null;
+    try testing.expectEqual(Result.success, terminal_c.new(
+        &lib.alloc.test_allocator,
+        &t,
+        10,
+        3,
+    ));
+    defer terminal_c.free(t);
+
+    const text = "ab\u{65E5}\u{672C} c";
+    terminal_c.vt_write(t, text.ptr, text.len);
+
+    const zt = terminal_c.zigTerminal(t).?;
+    const pin = zt.screens.active.pages.pin(.{ .active = .{ .x = 0, .y = 0 } }).?;
+    const opts: SelectWordOptions = .{ .ref = .fromPin(pin) };
+    var sel: CSelection = undefined;
+    try testing.expectEqual(Result.success, word(t, &opts, &sel));
+    const end_pt = zt.screens.active.pages.pointFromPin(.active, sel.end.toPin().?).?.active;
+    // a b 日 日' 本 本': the word ends on the lead of 本 (column 4).
+    try testing.expectEqual(@as(u16, 4), end_pt.x);
+    try testing.expectEqual(@as(u32, 0), end_pt.y);
 }
