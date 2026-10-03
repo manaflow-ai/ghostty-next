@@ -3601,3 +3601,31 @@ test "kittygfx animation: control negative gap makes frame gapless" {
     const anim = storage.imagePtrByIdOrNumber(1, 0).?.animation.?;
     try testing.expectEqual(@as(u32, 0), anim.frames.items[0].gap_ms);
 }
+
+test "kittygfx RIS preserves configured byte and count limits" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{
+        .rows = 5,
+        .cols = 5,
+        .kitty_image_storage_limit = 37,
+        .kitty_image_count_limit = 3,
+        .kitty_placement_count_limit = 5,
+    });
+    defer t.deinit(alloc);
+
+    t.fullReset();
+
+    const storage = &t.screens.active.kitty_images;
+    try testing.expectEqual(@as(usize, 37), storage.total_limit);
+    try testing.expectEqual(@as(usize, 3), storage.image_count_limit);
+    try testing.expectEqual(@as(usize, 5), storage.placement_count_limit);
+
+    // The alternate screen inherits the configured limits.
+    _ = try t.switchScreen(.alternate);
+    const alternate = &t.screens.get(.alternate).?.kitty_images;
+    try testing.expectEqual(@as(usize, 3), alternate.image_count_limit);
+    try testing.expectEqual(@as(usize, 5), alternate.placement_count_limit);
+}

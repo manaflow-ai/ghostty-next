@@ -2145,6 +2145,37 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Input type: GhosttyTerminalResetFn
    */
   GHOSTTY_TERMINAL_OPT_RESET = 43,
+
+  /*
+   * manaflow-ai additions. They follow upstream's values so upstream option
+   * numbers stay identical; new values are appended here.
+   */
+
+  /**
+   * Set the maximum number of stored Kitty graphics images per screen.
+   *
+   * Adding a new image at the limit evicts images, unused ones first and
+   * then the oldest. Replacing an existing image ID remains allowed.
+   * Lowering the limit evicts images immediately. Zero allows no stored
+   * images but does not disable Kitty graphics protocol parsing. A NULL
+   * value pointer is equivalent to zero.
+   *
+   * Input type: uint64_t*
+   */
+  GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_COUNT_LIMIT = 44,
+
+  /**
+   * Set the maximum number of Kitty graphics placements per screen.
+   *
+   * Adding a new placement at the limit is rejected, while replacing an
+   * existing external placement remains allowed. Lowering the limit below
+   * any screen's current placement count returns GHOSTTY_INVALID_VALUE and
+   * leaves every screen unchanged. Zero allows no placements. A NULL value
+   * pointer is equivalent to zero.
+   *
+   * Input type: uint64_t*
+   */
+  GHOSTTY_TERMINAL_OPT_KITTY_PLACEMENT_COUNT_LIMIT = 45,
   GHOSTTY_TERMINAL_OPT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalOption;
 
@@ -2614,6 +2645,24 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Output type: uint64_t *
    */
   GHOSTTY_TERMINAL_DATA_CURSOR_ACTIVITY = 45,
+
+  /**
+   * The stored Kitty graphics image count limit for the active screen.
+   *
+   * Returns GHOSTTY_NO_VALUE when Kitty graphics are disabled at build time.
+   *
+   * Output type: uint64_t *
+   */
+  GHOSTTY_TERMINAL_DATA_KITTY_IMAGE_COUNT_LIMIT = 46,
+
+  /**
+   * The Kitty graphics placement count limit for the active screen.
+   *
+   * Returns GHOSTTY_NO_VALUE when Kitty graphics are disabled at build time.
+   *
+   * Output type: uint64_t *
+   */
+  GHOSTTY_TERMINAL_DATA_KITTY_PLACEMENT_COUNT_LIMIT = 47,
   GHOSTTY_TERMINAL_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalData;
 

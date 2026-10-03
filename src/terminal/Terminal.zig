@@ -304,6 +304,20 @@ pub const Options = struct {
         .lib => 10 * 1000 * 1000, // 10MB
     },
 
+    /// The maximum number of stored Kitty images per screen. Has no effect
+    /// if kitty images are disabled at build-time.
+    kitty_image_count_limit: usize = if (build_options.kitty_graphics)
+        kitty.graphics.default_image_count_limit
+    else
+        0,
+
+    /// The maximum number of Kitty placements per screen. Has no effect if
+    /// kitty images are disabled at build-time.
+    kitty_placement_count_limit: usize = if (build_options.kitty_graphics)
+        kitty.graphics.default_placement_count_limit
+    else
+        0,
+
     /// The limits for what medium types are allowed for Kitty image loading.
     /// Has no effect if kitty images are disabled otherwise. For example,
     // if no `sys.decode_png` hook is specified, png formats are disabled
@@ -330,6 +344,8 @@ pub fn init(
         .max_scrollback_lines = opts.max_scrollback_lines,
         .kitty_image_storage_limit = opts.kitty_image_storage_limit,
         .kitty_image_loading_limits = opts.kitty_image_loading_limits,
+        .kitty_image_count_limit = opts.kitty_image_count_limit,
+        .kitty_placement_count_limit = opts.kitty_placement_count_limit,
     });
     errdefer screen_set.deinit(alloc);
 
@@ -3839,6 +3855,39 @@ pub fn setKittyGraphicsSizeLimit(
     }
 }
 
+/// Set the maximum number of stored Kitty images across all screens.
+/// Lowering the limit evicts images (unused first, then oldest). Eviction
+/// does not allocate, so every screen is updated or none is.
+pub fn setKittyGraphicsImageCountLimit(
+    self: *Terminal,
+    alloc: Allocator,
+    limit: usize,
+) void {
+    if (comptime !build_options.kitty_graphics) return;
+    var it = self.screens.all.iterator();
+    while (it.next()) |entry| {
+        const screen: *Screen = entry.value.*;
+        screen.kitty_images.setImageCountLimit(self.io(), alloc, screen, limit);
+    }
+}
+
+/// Set the maximum number of Kitty placements across all screens.
+/// Returns false and changes nothing if any screen holds more placements
+/// than `limit`.
+pub fn setKittyGraphicsPlacementCountLimit(self: *Terminal, limit: usize) bool {
+    if (comptime !build_options.kitty_graphics) return true;
+    var check = self.screens.all.iterator();
+    while (check.next()) |entry| {
+        if (!entry.value.*.kitty_images.canSetPlacementCountLimit(limit)) return false;
+    }
+    var it = self.screens.all.iterator();
+    while (it.next()) |entry| {
+        const ok = entry.value.*.kitty_images.setPlacementCountLimit(limit);
+        assert(ok);
+    }
+    return true;
+}
+
 /// Set the allowed medium types for Kitty graphics image loading
 /// across all screens.
 pub fn setKittyGraphicsLoadingLimits(
@@ -4166,6 +4215,14 @@ pub fn resize(
                 .kitty_image_loading_limits = if (comptime build_options.kitty_graphics)
                     primary.kitty_images.image_limits
                 else {},
+                .kitty_image_count_limit = if (comptime build_options.kitty_graphics)
+                    primary.kitty_images.image_count_limit
+                else
+                    0,
+                .kitty_placement_count_limit = if (comptime build_options.kitty_graphics)
+                    primary.kitty_images.placement_count_limit
+                else
+                    0,
             },
         ) catch |init_err| {
             log.warn(
@@ -4780,6 +4837,14 @@ pub fn switchScreen(self: *Terminal, key: ScreenSet.Key) !?*Screen {
                 .kitty_image_loading_limits = if (comptime build_options.kitty_graphics)
                     primary.kitty_images.image_limits
                 else {},
+                .kitty_image_count_limit = if (comptime build_options.kitty_graphics)
+                    primary.kitty_images.image_count_limit
+                else
+                    0,
+                .kitty_placement_count_limit = if (comptime build_options.kitty_graphics)
+                    primary.kitty_images.placement_count_limit
+                else
+                    0,
             },
         );
     };
@@ -16751,4 +16816,64 @@ test "Terminal: eraseDisplay complete ignores stale prompt on recycled row" {
     t.eraseDisplay(.complete, false);
 
     try testing.expectEqual(t.screens.active.pages.rows, t.screens.active.pages.total_rows);
+}
+
+test "Terminal: Kitty image count limit applies to every screen without allocating" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 3, .rows = 3 });
+    defer t.deinit(alloc);
+
+    const primary = t.screens.get(.primary).?;
+    try primary.kitty_images.addImage(testing.io, alloc, primary, .{ .id = 1 });
+    try primary.kitty_images.addImage(testing.io, alloc, primary, .{ .id = 2 });
+
+    _ = try t.switchScreen(.alternate);
+    const alternate = t.screens.get(.alternate).?;
+    try alternate.kitty_images.addImage(testing.io, alloc, alternate, .{ .id = 3 });
+    try alternate.kitty_images.addImage(testing.io, alloc, alternate, .{ .id = 4 });
+
+    // Lowering the limit must not need any allocation, so it can never
+    // leave one screen updated and the other not.
+    var failing = testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    t.setKittyGraphicsImageCountLimit(failing.allocator(), 1);
+    try testing.expect(!failing.has_induced_failure);
+
+    for ([_]*Screen{ primary, alternate }) |screen| {
+        try testing.expectEqual(@as(usize, 1), screen.kitty_images.image_count_limit);
+        try testing.expectEqual(@as(usize, 1), screen.kitty_images.images.count());
+    }
+}
+
+test "Terminal: Kitty placement count limit is all or nothing across screens" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 3, .rows = 3 });
+    defer t.deinit(alloc);
+
+    _ = try t.switchScreen(.alternate);
+    const alternate = t.screens.get(.alternate).?;
+    try alternate.kitty_images.addImage(testing.io, alloc, alternate, .{ .id = 1 });
+    try alternate.kitty_images.addPlacement(testing.io, alloc, alternate, 1, 1, .{
+        .location = .{ .virtual = {} },
+    });
+    try alternate.kitty_images.addPlacement(testing.io, alloc, alternate, 1, 2, .{
+        .location = .{ .virtual = {} },
+    });
+
+    try testing.expect(!t.setKittyGraphicsPlacementCountLimit(1));
+    const primary = t.screens.get(.primary).?;
+    for ([_]*Screen{ primary, alternate }) |screen| {
+        try testing.expectEqual(
+            kitty.graphics.default_placement_count_limit,
+            screen.kitty_images.placement_count_limit,
+        );
+    }
+
+    try testing.expect(t.setKittyGraphicsPlacementCountLimit(2));
+    for ([_]*Screen{ primary, alternate }) |screen| {
+        try testing.expectEqual(@as(usize, 2), screen.kitty_images.placement_count_limit);
+    }
 }
