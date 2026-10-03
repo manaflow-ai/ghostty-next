@@ -50,6 +50,7 @@ thread. New tab and split surfaces do not inherit the IO fields.
 | build: name the ios xcframework and module GhosttyNextKit | Avoids a module collision with the desktop GhosttyKit in shared workspaces; flavor `ios-v2`; the smoke test also compiles `import GhosttyNextKit` in Swift. |
 | test: iOS simulator render smoke that requires non-black pixels | `next/ios-render-smoke.sh` (build host, `nx-remote --sim`): one MANUAL_MIRROR surface, 24-bit red fill through `process_output`; requires the renderer layer at the view's size, red pixels in its IOSurface, and a screenshot at least 20% red. |
 | renderer: size the iOS layer from ghostty_surface_set_size | On iOS the IOSurfaceLayer is a sublayer of the embedder's view and kept zero bounds, so every frame was skipped (black screen). `set_size` and `set_content_scale` now size it (top-left, points = pixels / scale) on the main thread. |
+| formatter: replay the cursor relative to origin margins | libghostty-vt VT replay (cmux-tui session host): the screen cursor CUP is emitted relative to the emitted origin margins and saturates at them instead of using DECSC/DECRC, so replay never overwrites the saved cursor. Upstream already emits the cursor after terminal state (997a2aff2a). Ported from manaflow-ai/ghostty 5543a00ff..533c27ae1c (9e49174be, d6fdb42e1, 6fd6762a9, b1d0adddd, 28b6fc6f4, 2bba4149b, e57ffa985, 9ddb1ab57). |
 
 Next in the stack (tracked in the design): iOS renderer fixes and snapshot
 restore from the session host.
