@@ -78,6 +78,7 @@ thread. New tab and split surfaces do not inherit the IO fields.
 | test: VT replay restores pending wrap under origin mode | Regression test: with DECOM and margins, the formatter alone restores the cursor cell and the pending wrap. A consumer must not reprint the cursor cell again. |
 | ci: run the round-2 libghostty-vt patch tests | Filters for the cell-offset sizing, consumed-Alt text, word-selection and pending-wrap tests, in both the app (`zig build test`) and libghostty-vt (`zig build test-lib-vt`) runs, so both artifacts are proven. |
 | formatter: lib-vt returns from tabstops with a carriage return | Tabstop serialization moves only the column (CHA), so libghostty-vt ends it with CR instead of CUP home. A consumer that writes a selection after its own earlier rows (the cmux-tui segmented replay) no longer has the following rows moved to the top of the screen. The Ghostty app keeps upstream e523cf810. |
+| termio: manual surfaces do not assume the shell redraws the prompt | MANUAL and MANUAL_MIRROR terminals start with `shell_redraws_prompt = false`, matching libghostty-vt embedder terminals (see "Behavior that differs from upstream"). EXEC surfaces are unchanged. |
 
 Next in the stack (tracked in the design): presentation callbacks for
 frame-exact acknowledgment, Kitty image replay after a snapshot, and a
@@ -88,6 +89,15 @@ local scrollback window limit for restored snapshots.
 The next upstream sync must keep these behaviors, or change them in a
 reviewed commit that says why.
 
+- Prompt redraw in the MANUAL modes: MANUAL and MANUAL_MIRROR surfaces
+  create their terminal with `shell_redraws_prompt = false`, the value
+  that libghostty-vt's C API (`ghostty_terminal_new`) gives every embedder
+  terminal. Upstream surfaces assume the shell redraws its prompt on
+  resize, and EXEC surfaces here keep that. Why: the phone mirrors a
+  session host's libghostty-vt terminal. With the same value, both
+  terminals reflow alike and their GHOSTSNP TERMINAL records match byte
+  for byte. A shell can still opt in with OSC 133;A;redraw=1, which both
+  parse. Test: `manual: the shell is not assumed to redraw the prompt`.
 - Scrollback limits in the MANUAL modes: when the embedder calls
   `ghostty_surface_update_config` on a MANUAL or MANUAL_MIRROR surface,
   `scrollback-limit-bytes` and `scrollback-limit-lines` apply to the live

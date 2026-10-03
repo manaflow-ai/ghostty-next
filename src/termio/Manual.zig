@@ -59,7 +59,14 @@ pub fn deinit(self: *Manual) void {
     self.* = undefined;
 }
 
-pub fn initTerminal(_: *Manual, _: *terminal.Terminal) void {}
+pub fn initTerminal(_: *Manual, t: *terminal.Terminal) void {
+    // The terminal is a copy of a session host's libghostty-vt terminal,
+    // which never assumes that the shell redraws its prompt on resize
+    // (c/terminal.zig `new`). Use the same value so the two terminals
+    // reflow alike and their GHOSTSNP TERMINAL records match. A shell can
+    // still opt in with OSC 133;A;redraw=1, which both parse.
+    t.flags.shell_redraws_prompt = .false;
+}
 
 pub fn threadEnter(
     _: *Manual,

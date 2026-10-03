@@ -1664,6 +1664,30 @@ test "manual: a mirror never reflows" {
     try testManualTermio(true, body);
 }
 
+test "manual: the shell is not assumed to redraw the prompt" {
+    const body = struct {
+        fn run(io: *Termio, _: *TestSink, _: bool) !void {
+            const testing = std.testing;
+
+            // Both MANUAL and MANUAL_MIRROR match libghostty-vt's C API
+            // default. EXEC surfaces keep Terminal's default of true.
+            try testing.expectEqual(.false, io.terminal.flags.shell_redraws_prompt);
+
+            // A shell can still opt in, as it can with libghostty-vt.
+            io.processOutput("\x1b]133;A;redraw=1\x1b\\");
+            try testing.expectEqual(.true, io.terminal.flags.shell_redraws_prompt);
+        }
+    }.run;
+
+    try testManualTermio(false, body);
+    try testManualTermio(true, body);
+
+    // EXEC keeps upstream behavior: a new Terminal assumes the shell
+    // redraws its prompt.
+    const flags: @FieldType(terminalpkg.Terminal, "flags") = .{};
+    try std.testing.expectEqual(.true, flags.shell_redraws_prompt);
+}
+
 test "manual: snapshot restore and encode round trip" {
     const S = struct {
         var complete: std.ArrayListUnmanaged(u8) = .empty;
