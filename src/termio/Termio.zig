@@ -77,6 +77,7 @@ grid_lock: ?GridLock = null,
 /// was restored (see `restoreSnapshot`). Only the output queue uses it.
 snapshot_restore: ?SnapshotRestore = null,
 
+
 /// Last time the cursor was reset. This is used to prevent message
 /// flooding with cursor resets.
 last_cursor_reset: ?std.Io.Timestamp = null,
@@ -206,6 +207,8 @@ pub const DerivedConfig = struct {
 
     palette: terminalpkg.color.Palette,
     image_storage_limit: usize,
+    scrollback_limit_bytes: ?usize,
+    scrollback_limit_lines: ?usize,
     cursor_style: terminalpkg.CursorStyle,
     cursor_blink: ?bool,
     cursor_color: ?configpkg.Config.TerminalColor,
@@ -243,6 +246,8 @@ pub const DerivedConfig = struct {
         return .{
             .palette = palette,
             .image_storage_limit = config.@"image-storage-limit",
+            .scrollback_limit_bytes = config.@"scrollback-limit-bytes".optional(),
+            .scrollback_limit_lines = config.@"scrollback-limit-lines".optional(),
             .cursor_style = config.@"cursor-style",
             .cursor_blink = config.@"cursor-style-blink",
             .cursor_color = config.@"cursor-color",
@@ -626,6 +631,16 @@ pub fn changeConfig(self: *Termio, td: *ThreadData, config: *DerivedConfig) !voi
     // Set the image limits
     self.terminal.setKittyGraphicsSizeLimit(self.alloc, config.image_storage_limit);
     self.terminal.setKittyGraphicsLoadingLimits(kittyLoadingLimits(self.backend));
+
+    // A manual backend applies the scrollback limits at runtime too: its
+    // terminal is replaced by every snapshot restore, which takes these
+    // limits rather than the owner's, so a new limit must hold for the
+    // live terminal as well. (Exec surfaces keep upstream behavior: the
+    // limits apply to new surfaces only.)
+    if (self.backend == .manual) {
+        self.terminal.setScrollbackMaxBytes(config.scrollback_limit_bytes);
+        self.terminal.setScrollbackMaxLines(config.scrollback_limit_lines);
+    }
 }
 
 /// The Kitty graphics transmission mediums the terminal may load from.
@@ -803,10 +818,12 @@ pub fn gridState(self: *Termio) GridState {
 /// no replies, and the unfinished sequence it carries (its continuation)
 /// is replayed into the parser, which produces no actions for it.
 ///
-/// The restored terminal keeps the snapshot's grid, colors, modes and
-/// scrollback limits; a locked grid takes the snapshot's size and keeps
-/// its generation. Local policy is applied again: the Kitty image storage
-/// limit and in-band (direct) image loading only.
+/// The restored terminal keeps the snapshot's grid, colors and modes; a
+/// locked grid takes the snapshot's size and keeps its generation. Local
+/// policy from this surface's config replaces the owner's: the scrollback
+/// limits (`scrollback-limit-bytes`, `scrollback-limit-lines`), so history
+/// beyond them is dropped from the oldest end, the Kitty image storage
+/// limit, and in-band (direct) image loading only.
 pub fn restoreSnapshot(
     self: *Termio,
     bytes: []const u8,
@@ -844,15 +861,19 @@ fn replaceTerminal(
 ) void {
     var new = decoded.toOwned();
 
-    // Local policy the snapshot does not carry. An alternate screen made
-    // later copies these from the primary screen.
-    new.setKittyGraphicsSizeLimit(self.alloc, self.config.image_storage_limit);
-    new.setKittyGraphicsLoadingLimits(kittyLoadingLimits(self.backend));
 
     var old: terminalpkg.Terminal = undefined;
     {
         self.renderer_state.mutex.lockUncancelable(global.io());
         defer self.renderer_state.mutex.unlock(global.io());
+
+        // Local policy, from this surface's config (which the lock
+        // guards): Kitty image limits, and the scrollback limits instead
+        // of the owner's, so history that arrives later stops at the
+        // local limit (the decoder drops a page that does not fit and
+        // every older page after it). An alternate screen made later
+        // copies these from the primary screen.
+        self.applyLocalLimitsLocked(&new);
 
         // Every screen is new storage. Advance each generation past the
         // old terminal's, as a screen removal does, so references into
@@ -912,6 +933,18 @@ fn replaceTerminal(
 
     // The old terminal is unreachable now; free it off the lock.
     old.deinit(self.alloc);
+}
+
+/// Apply the surface's config limits to a terminal of a manual backend:
+/// Kitty image storage and in-band loading, and the scrollback byte and
+/// line limits. Lowering a scrollback limit frees the oldest complete
+/// history pages, never a page of the active area. Caller must hold
+/// `renderer_state.mutex` when `t` is the live terminal.
+fn applyLocalLimitsLocked(self: *Termio, t: *terminalpkg.Terminal) void {
+    t.setKittyGraphicsSizeLimit(self.alloc, self.config.image_storage_limit);
+    t.setKittyGraphicsLoadingLimits(kittyLoadingLimits(self.backend));
+    t.setScrollbackMaxBytes(self.config.scrollback_limit_bytes);
+    t.setScrollbackMaxLines(self.config.scrollback_limit_lines);
 }
 
 /// Return the parser to ground and drop unfinished sequence state.
@@ -1718,6 +1751,163 @@ test "manual: snapshot restore and encode round trip" {
     defer alloc.free(joined);
     try std.testing.expectEqualSlices(u8, S.complete.items, joined);
     try testManualTermio(true, S.restore);
+}
+
+/// Change the surface config's scrollback byte limit the way
+/// ghostty_surface_update_config does (null: unlimited).
+fn testSetScrollbackLimit(io: *Termio, bytes: ?usize) !void {
+    const alloc = std.testing.allocator;
+    var config: configpkg.Config = try .default(alloc);
+    defer config.deinit();
+    config.@"scrollback-limit-bytes" = .{ .value = bytes orelse std.math.maxInt(usize) };
+    var derived: DerivedConfig = try .init(alloc, &config);
+    var td = io.manualThreadData();
+    try io.changeConfig(&td, &derived);
+}
+
+/// The active screen as VT (contents, styles, cursor, modes), for tests
+/// that compare what is on screen.
+fn testActiveVt(io: *Termio) ![]u8 {
+    const alloc = std.testing.allocator;
+    const t = &io.terminal;
+    const pages = &t.screens.active.pages;
+    const top = pages.pin(.{ .active = .{} }).?;
+    const bottom = pages.pin(.{ .active = .{ .x = t.cols - 1, .y = t.rows - 1 } }).?;
+    var formatter: terminalpkg.formatter.TerminalFormatter = .init(t, .vt);
+    formatter.content = .{ .selection = terminalpkg.Selection.init(top, bottom, false) };
+    formatter.extra = .all;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try formatter.format(&out.writer);
+    return try out.toOwnedSlice();
+}
+
+test "manual: the config scrollback limit holds across snapshot restores" {
+    const S = struct {
+        var ready: std.ArrayListUnmanaged(u8) = .empty;
+        var history: std.ArrayListUnmanaged(u8) = .empty;
+        var screen: []u8 = &.{};
+        var host_pages: usize = 0;
+
+        /// The phone's limit: a third of the host's history bytes, so
+        /// some history stays and the oldest pages go.
+        var cap: usize = 0;
+
+        fn encode(io: *Termio, phase: apprt.SurfaceSnapshotPhase, out: *std.ArrayListUnmanaged(u8)) !void {
+            const alloc = std.testing.allocator;
+            var w: std.Io.Writer.Allocating = .init(alloc);
+            defer w.deinit();
+            try io.encodeSnapshot(&w.writer, phase);
+            try out.appendSlice(alloc, w.written());
+        }
+
+        /// The host: unlimited scrollback, many pages of history.
+        fn host(io: *Termio, _: *TestSink, _: bool) !void {
+            io.terminal.setScrollbackMaxBytes(null);
+            var buf: [64]u8 = undefined;
+            for (0..6000) |i| {
+                io.processOutput(try std.fmt.bufPrint(&buf, "\x1b[3{d}mline {d}\x1b[m\r\n", .{ i % 8, i }));
+            }
+            io.processOutput("\x1b[41mbottom\x1b[m");
+            const pages = &io.terminal.screens.get(.primary).?.pages;
+            host_pages = pages.totalPages();
+            cap = pages.page_size / 3;
+            screen = try testActiveVt(io);
+            try encode(io, .ready, &ready);
+            try encode(io, .history, &history);
+        }
+
+        fn phone(io: *Termio, sink: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            const alloc = testing.allocator;
+            try testSetScrollbackLimit(io, cap);
+
+            try io.restoreSnapshot(ready.items, .ready);
+            try io.restoreSnapshot(history.items, .history);
+            try testing.expect(io.snapshot_restore == null);
+
+            // The restored terminal has the surface config's limit, not
+            // the host's (unlimited), and history stopped at it: the
+            // oldest pages were dropped.
+            const pages = &io.terminal.screens.get(.primary).?.pages;
+            try testing.expectEqual(cap, pages.limits.bytes.explicit);
+            try testing.expect(pages.totalPages() < host_pages);
+            try testing.expect(pages.totalPages() > 1);
+            try testing.expect(pages.page_size <= pages.limits.max(.bytes));
+
+            // What is on screen equals the host's screen.
+            {
+                const vt = try testActiveVt(io);
+                defer alloc.free(vt);
+                try testing.expectEqualStrings(screen, vt);
+            }
+
+            // A later READY restore keeps the local limit too.
+            try io.restoreSnapshot(ready.items, .ready);
+            try testing.expectEqual(cap, io.terminal.screens.get(.primary).?.pages.limits.bytes.explicit);
+            {
+                const vt = try testActiveVt(io);
+                defer alloc.free(vt);
+                try testing.expectEqualStrings(screen, vt);
+            }
+
+            // A config change applies to the live terminal and to the
+            // next restore.
+            try testSetScrollbackLimit(io, 2 * cap);
+            try testing.expectEqual(2 * cap, io.terminal.screens.get(.primary).?.pages.limits.bytes.explicit);
+            try io.restoreSnapshot(ready.items, .ready);
+            try testing.expectEqual(2 * cap, io.terminal.screens.get(.primary).?.pages.limits.bytes.explicit);
+
+            try sink.expect("");
+        }
+    };
+    const alloc = std.testing.allocator;
+    defer S.ready.deinit(alloc);
+    defer S.history.deinit(alloc);
+    defer alloc.free(S.screen);
+
+    try testManualTermio(true, S.host);
+    try testManualTermio(true, S.phone);
+}
+
+test "manual: a config scrollback limit change trims the live terminal" {
+    const body = struct {
+        fn run(io: *Termio, _: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            io.terminal.setScrollbackMaxBytes(null);
+            var buf: [64]u8 = undefined;
+            for (0..6000) |i| {
+                io.processOutput(try std.fmt.bufPrint(&buf, "line {d}\r\n", .{i}));
+            }
+            // A Kitty image placed on screen (in-band, 1x1 RGB).
+            io.processOutput("\x1b_Ga=T,f=24,s=1,v=1,i=7;AAAA\x1b\\");
+            const kitty = terminalpkg.options.kitty_graphics;
+            const images = &io.terminal.screens.active.kitty_images;
+            if (comptime kitty) {
+                try testing.expectEqual(@as(usize, 1), images.images.count());
+                try testing.expectEqual(@as(usize, 1), images.placements.count());
+            }
+
+            const pages = &io.terminal.screens.get(.primary).?.pages;
+            const before = pages.totalPages();
+            try testSetScrollbackLimit(io, pages.page_size / 3);
+            try testing.expect(pages.totalPages() < before);
+
+            // The on-screen image and its placement stay.
+            if (comptime kitty) {
+                try testing.expectEqual(@as(usize, 1), images.images.count());
+                try testing.expectEqual(@as(usize, 1), images.placements.count());
+            }
+
+            // The active area is intact.
+            const alloc = testing.allocator;
+            const str = try io.terminal.plainString(alloc);
+            defer alloc.free(str);
+            try testing.expect(std.mem.indexOf(u8, str, "line 5999") != null);
+        }
+    }.run;
+
+    try testManualTermio(true, body);
 }
 
 test "manual: snapshot history refuses malformed and oversized records" {
