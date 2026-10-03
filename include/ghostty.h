@@ -552,9 +552,10 @@ typedef enum {
 // Threading contract for a surface in a manual mode:
 //
 // - Call every surface function on the main (app) thread, including
-//   ghostty_surface_set_size, except ghostty_surface_process_output.
-// - Call ghostty_surface_process_output from one serial queue that is
-//   not the main thread.
+//   ghostty_surface_set_size, except the output functions:
+//   ghostty_surface_process_output and ghostty_surface_set_grid.
+// - Call the output functions from one serial queue that is not the
+//   main thread, in the order of the owner's byte stream.
 // - Never wait synchronously for that queue from the main thread or from
 //   io_write_cb. Output parsing can wait for the main thread to drain
 //   the app mailbox (ghostty_app_tick), so such a wait can deadlock.
@@ -610,6 +611,17 @@ typedef struct {
   uint32_t cell_width_px;
   uint32_t cell_height_px;
 } ghostty_surface_size_s;
+
+// The terminal grid of a surface, see ghostty_surface_grid.
+typedef struct {
+  // True after ghostty_surface_set_grid locked the grid.
+  bool locked;
+  uint16_t columns;
+  uint16_t rows;
+  // The generation of the last accepted ghostty_surface_set_grid, 0
+  // while the grid is not locked.
+  uint64_t generation;
+} ghostty_surface_grid_s;
 
 // Config types
 
@@ -1273,6 +1285,36 @@ GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t);
 GHOSTTY_API ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
+// Lock the terminal grid of a MANUAL or MANUAL_MIRROR surface to
+// cols x rows, the grid of the terminal core that owns the byte stream,
+// independent of the view's pixel size. Call it from the output queue
+// (see ghostty_io_write_cb), in order with ghostty_surface_process_output.
+//
+// After the lock, ghostty_surface_set_size and font size changes set
+// only the pixel size; ghostty_surface_size still reports how many cells
+// would fit the view (the embedder's viewport proposal to the owner).
+// The grid is drawn from the top-left corner of the view, after the
+// configured window padding. In a larger view the rest is padding in
+// the background color. In a smaller view the grid is cropped: the
+// columns and rows beyond the right and bottom edges are not drawn.
+//
+// A MANUAL_MIRROR surface never reflows on its own: a grid change, and
+// any resize, clips or pads the lines, and the owner follows its own
+// reflow with a snapshot (ghostty_surface_restore_snapshot). A MANUAL
+// surface reflows like any resize and sends the mode 2048 size report
+// when the output enabled it.
+//
+// generation is the owner's grid generation. A call with a generation
+// older than the current lock is refused. Returns false, and changes
+// nothing, for an EXEC surface, a zero dimension, an older generation or
+// a failed allocation.
+GHOSTTY_API bool ghostty_surface_set_grid(ghostty_surface_t,
+                                          uint16_t cols,
+                                          uint16_t rows,
+                                          uint64_t generation);
+// The terminal's current grid and its lock. Any thread may call it,
+// except from io_write_cb (it takes the terminal lock).
+GHOSTTY_API ghostty_surface_grid_s ghostty_surface_grid(ghostty_surface_t);
 GHOSTTY_API uint64_t ghostty_surface_foreground_pid(ghostty_surface_t);
 GHOSTTY_API ghostty_string_s ghostty_surface_tty_name(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_set_color_scheme(ghostty_surface_t,
@@ -1298,13 +1340,14 @@ GHOSTTY_API void ghostty_surface_preedit(ghostty_surface_t, const char*, uintptr
 // the surface's terminal lock, so a call blocks while the renderer or
 // the main thread holds that lock.
 //
+// Until ghostty_surface_set_grid locks the grid,
 // ghostty_surface_set_size (and a font size change) in the MANUAL modes
 // resizes the local grid before it returns. It takes the terminal lock,
 // so the resize lands between two slices of output. The resize does what
-// the terminal does for any resize: the primary screen reflows
-// soft-wrapped lines when wraparound (DECAWM) is on, the alternate
-// screen is clipped or padded without reflow, and synchronized output
-// (mode 2026) ends. No pty is resized and nothing is written, except the
+// the terminal does for any resize: in MANUAL mode the primary screen
+// reflows soft-wrapped lines when wraparound (DECAWM) is on (a
+// MANUAL_MIRROR surface never reflows), the alternate screen is clipped
+// or padded without reflow, and synchronized output (mode 2026) ends. No pty is resized and nothing is written, except the
 // mode 2048 size report in MANUAL mode. The terminal core that owns the
 // pty resizes and reflows its own grid. Both grids stay identical only
 // when the local resize lands at the same point in the byte stream as
