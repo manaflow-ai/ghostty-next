@@ -828,6 +828,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // and does not free GPU resources like the swap chain and
             // shaders. Those are freed with `releaseGpuResources`.
 
+            // Let the graphics API unhook anything that still points at
+            // this renderer (the iOS layer) before its memory goes.
+            if (@hasDecl(GraphicsAPI, "prepareDeinit")) {
+                self.api.prepareDeinit();
+            }
+
             if (self.overlay) |*overlay| overlay.deinit(self.alloc);
             self.terminal_state.deinit(self.alloc);
             if (self.search_selected_match) |*m| m.arena.deinit();

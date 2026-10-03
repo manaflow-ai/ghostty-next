@@ -176,6 +176,26 @@ pub fn setHostedLayerSize(
     });
 }
 
+/// iOS only: detach the IOSurfaceLayer from the embedder's view before
+/// the renderer's memory is freed.
+///
+/// The layer keeps raw pointers to this renderer (display callback and
+/// context) in its instance variables. On iOS it is a sublayer of the
+/// embedder's view, which outlives the surface, so a Core Animation pass
+/// on the main thread after the free would call into freed memory.
+/// Clearing the pointers, the contents and the sublayer link on the main
+/// queue, while they still name this renderer, closes that window. A
+/// layer whose callback was rebound to another renderer is left alone.
+/// Ported from manaflow-ai/ghostty adee7043fc and dd726a9a60.
+pub fn prepareDeinit(self: *Metal) void {
+    if (comptime builtin.os.tag != .ios) return;
+    const renderer: *align(1) Renderer = @fieldParentPtr("api", self);
+    self.layer.detachFromHostIfDisplayCallbackOwned(
+        @ptrCast(&displayCallback),
+        @ptrCast(renderer),
+    );
+}
+
 pub fn loopEnter(self: *Metal) void {
     const renderer: *align(1) Renderer = @fieldParentPtr("api", self);
     self.layer.setDisplayCallback(
