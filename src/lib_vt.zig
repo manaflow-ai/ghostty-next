@@ -387,6 +387,12 @@ comptime {
         }
         if (features.kitty_graphics) {
             @export(&c.kitty_graphics_get, .{ .name = "ghostty_kitty_graphics_get" });
+            @export(&c.kitty_graphics_set, .{ .name = "ghostty_kitty_graphics_set" });
+            @export(&c.kitty_graphics_image_by_number, .{ .name = "ghostty_kitty_graphics_image_by_number" });
+            @export(&c.kitty_graphics_image_set_number, .{ .name = "ghostty_kitty_graphics_image_set_number" });
+            @export(&c.kitty_graphics_image_iterator_new, .{ .name = "ghostty_kitty_graphics_image_iterator_new" });
+            @export(&c.kitty_graphics_image_iterator_free, .{ .name = "ghostty_kitty_graphics_image_iterator_free" });
+            @export(&c.kitty_graphics_image_next, .{ .name = "ghostty_kitty_graphics_image_next" });
             @export(&c.kitty_graphics_image, .{ .name = "ghostty_kitty_graphics_image" });
             @export(&c.kitty_graphics_image_get, .{ .name = "ghostty_kitty_graphics_image_get" });
             @export(&c.kitty_graphics_image_get_multi, .{ .name = "ghostty_kitty_graphics_image_get_multi" });

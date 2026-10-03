@@ -277,6 +277,18 @@ pub const Options = struct {
         .lib => 10 * 1000 * 1000, // 10MB
     },
 
+    /// The maximum number of stored Kitty images for this screen.
+    kitty_image_count_limit: usize = if (build_options.kitty_graphics)
+        kitty.graphics.default_image_count_limit
+    else
+        0,
+
+    /// The maximum number of Kitty placements for this screen.
+    kitty_placement_count_limit: usize = if (build_options.kitty_graphics)
+        kitty.graphics.default_placement_count_limit
+    else
+        0,
+
     /// The limits for what medium types are allowed for Kitty image loading.
     kitty_image_loading_limits: if (build_options.kitty_graphics)
         kitty.graphics.LoadingImage.Limits
@@ -341,6 +353,8 @@ pub fn init(
             opts.kitty_image_storage_limit,
         );
         result.kitty_images.image_limits = opts.kitty_image_loading_limits;
+        result.kitty_images.image_count_limit = opts.kitty_image_count_limit;
+        result.kitty_images.placement_count_limit = opts.kitty_placement_count_limit;
     }
 
     return result;
@@ -453,11 +467,15 @@ pub fn reset(self: *Screen) void {
         // Reset kitty graphics storage
         const image_limits = self.kitty_images.image_limits;
         const total_limit = self.kitty_images.total_limit;
+        const image_count_limit = self.kitty_images.image_count_limit;
+        const placement_count_limit = self.kitty_images.placement_count_limit;
         self.kitty_images.deinit(self.alloc, self);
         self.kitty_images = .{
             .dirty = true,
             .image_limits = image_limits,
             .total_limit = total_limit,
+            .image_count_limit = image_count_limit,
+            .placement_count_limit = placement_count_limit,
         };
     }
 

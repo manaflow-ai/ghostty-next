@@ -28,6 +28,9 @@ pub const ImageStorage = storage.ImageStorage;
 pub const RenderPlacement = render.Placement;
 pub const Response = command.Response;
 pub const nextGeneration = storage.nextGeneration;
+pub const default_image_count_limit = storage.default_image_count_limit;
+pub const default_placement_count_limit = storage.default_placement_count_limit;
+pub const default_image_id = storage.default_image_id;
 
 pub const execute = exec.execute;
 
