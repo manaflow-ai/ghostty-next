@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
-# ghostty-next iOS render smoke: builds next/ios-smoke into a simulator app,
-# runs it in the booted simulator $NX_SIM_UDID, and passes only when
-#   1. the app reports RENDER-SMOKE PASS (the renderer layer has the view's
-#      size and its IOSurface has non-black, red-filled pixels), and
-#   2. a simulator screenshot taken while the app is on screen has at least
-#      20% red pixels (the 24-bit red fill the app feeds through process_output).
+# ghostty-next iOS render smoke: builds next/ios-smoke into a simulator app
+# and runs it in the booted simulator $NX_SIM_UDID once per check (fill,
+# grid, snapshot; see next/ios-smoke/main.swift). Each check passes only
+# when
+#   1. the app reports RENDER-SMOKE PASS (its checks of the pixels in the
+#      renderer's IOSurface), and
+#   2. a simulator screenshot taken while the app is on screen has the
+#      expected share of red pixels: at least 20% for fill and snapshot,
+#      1 to 10% for grid (a 10x5 grid smaller than the view).
 #
 #   next/ios-render-smoke.sh --xcframework <dir>
 #   next/ios-render-smoke.sh --release <tag> <sha256>
@@ -41,20 +44,9 @@ bundle=dev.manaflow.ghosttynext.rendersmoke
 xcrun simctl uninstall "$NX_SIM_UDID" "$bundle" >/dev/null 2>&1 || true
 xcrun simctl install "$NX_SIM_UDID" "$app"
 
-log="$work/console.log"
-xcrun simctl launch --console-pty --terminate-running-process "$NX_SIM_UDID" "$bundle" >"$log" 2>&1 &
-launcher=$!
-for _ in $(seq 1 120); do
-  grep -q 'RENDER-SMOKE-READY\|RENDER-SMOKE FAIL' "$log" && break
-  sleep 0.25
-done
-xcrun simctl io "$NX_SIM_UDID" screenshot "$work/shot.png" >/dev/null 2>&1 || true
-wait "$launcher" || true
-grep -a 'RENDER-SMOKE' "$log" || { echo "no RENDER-SMOKE line"; cat "$log"; exit 1; }
-if [ -n "${NX_ARTIFACTS:-}" ] && [ -f "$work/shot.png" ]; then cp "$work/shot.png" "$NX_ARTIFACTS/render-smoke.png"; fi
-
-sips -s format bmp "$work/shot.png" --out "$work/shot.bmp" >/dev/null
-red_pct="$(python3 - "$work/shot.bmp" <<'PY'
+red_pct() { # png -> percent of sampled pixels that are pure red
+  sips -s format bmp "$1" --out "$1.bmp" >/dev/null
+  python3 - "$1.bmp" <<'PY2'
 import struct, sys
 d = open(sys.argv[1], "rb").read()
 off = struct.unpack_from("<I", d, 10)[0]
@@ -72,9 +64,34 @@ for y in range(0, h, 8):
         if r > 200 and g < 60 and b < 60:
             red += 1
 print(round(100 * red / max(total, 1)))
-PY
-)"
-echo "screenshot red pixels: ${red_pct}%"
-grep -aq 'RENDER-SMOKE PASS' "$log" || { echo IOS-RENDER-SMOKE-FAIL; exit 1; }
-[ "$red_pct" -ge 20 ] || { echo IOS-RENDER-SMOKE-FAIL; exit 1; }
+PY2
+}
+
+# One launch per check. The screenshot bounds: fill and snapshot cover
+# the screen with red; grid ends with a 10x5 grid in a corner.
+failed=0
+for mode in fill grid snapshot; do
+  log="$work/console-$mode.log"
+  shot="$work/shot-$mode.png"
+  xcrun simctl launch --console-pty --terminate-running-process "$NX_SIM_UDID" "$bundle" "$mode" >"$log" 2>&1 &
+  launcher=$!
+  for _ in $(seq 1 240); do
+    grep -q 'RENDER-SMOKE-READY\|RENDER-SMOKE FAIL' "$log" && break
+    sleep 0.25
+  done
+  xcrun simctl io "$NX_SIM_UDID" screenshot "$shot" >/dev/null 2>&1 || true
+  wait "$launcher" || true
+  line="$(grep -a 'RENDER-SMOKE ' "$log" || true)"
+  if [ -z "$line" ]; then echo "mode=$mode: no RENDER-SMOKE line"; cat "$log"; failed=1; continue; fi
+  echo "$line"
+  if [ -n "${NX_ARTIFACTS:-}" ] && [ -f "$shot" ]; then cp "$shot" "$NX_ARTIFACTS/render-smoke-$mode.png"; fi
+  pct=0; [ -f "$shot" ] && pct="$(red_pct "$shot")"
+  echo "mode=$mode screenshot red pixels: ${pct}%"
+  case "$mode" in
+    grid) [ "$pct" -ge 1 ] && [ "$pct" -le 10 ] || { echo "mode=$mode: screenshot red outside 1..10%"; failed=1; } ;;
+    *) [ "$pct" -ge 20 ] || { echo "mode=$mode: screenshot red under 20%"; failed=1; } ;;
+  esac
+  echo "$line" | grep -q 'RENDER-SMOKE PASS' || failed=1
+done
+[ "$failed" = 0 ] || { echo IOS-RENDER-SMOKE-FAIL; exit 1; }
 echo IOS-RENDER-SMOKE-PASS
