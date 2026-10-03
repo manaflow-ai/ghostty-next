@@ -2575,6 +2575,29 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Output type: GhosttyTerminalMemoryUsage *
    */
   GHOSTTY_TERMINAL_DATA_MEMORY_USAGE = 42,
+
+  /*
+   * manaflow-ai additions. They follow upstream's values so upstream data
+   * numbers stay identical; new values are appended here.
+   */
+
+  /**
+   * The active screen's effective cursor visual style.
+   *
+   * This is the visual shape selected by DECSCUSR or the configured terminal
+   * default. It is distinct from GHOSTTY_TERMINAL_DATA_CURSOR_STYLE, which is
+   * the SGR style applied to newly printed cells.
+   *
+   * Output type: GhosttyTerminalCursorStyle *
+   */
+  GHOSTTY_TERMINAL_DATA_CURSOR_VISUAL_STYLE = 43,
+
+  /**
+   * Whether the effective cursor visual is blinking (DEC mode 12).
+   *
+   * Output type: bool *
+   */
+  GHOSTTY_TERMINAL_DATA_CURSOR_BLINKING = 44,
   GHOSTTY_TERMINAL_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalData;
 
