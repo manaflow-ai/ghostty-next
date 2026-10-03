@@ -71,6 +71,7 @@ thread. New tab and split surfaces do not inherit the IO fields.
 | termio: the surface's scrollback limits hold across snapshot restores | A restored terminal took the session host's scrollback limits from the snapshot, so a phone that restores READY only had to re-encode its own state to trim history, dropping scrollback and on-screen Kitty images. A manual backend now applies its config's `scrollback-limit-bytes` and `scrollback-limit-lines` to every restored terminal (HISTORY pages beyond them are dropped from the oldest end) and, through `ghostty_surface_update_config`, to the live terminal (oldest complete pages freed, never the screen or its images). No new C API: the existing config key holds across restores because the restore reads it from the surface config. Exec surfaces keep upstream behavior (limits apply to new surfaces only). |
 | test: render smoke restores under a surface scrollback limit | The `snapshot` check sets `scrollback-limit-bytes = 65536` on the surface with `ghostty_surface_update_config` before it restores READY and HISTORY (about 380 KB of history); the restore succeeds and the red fill is back. |
 | build: flavor ios-v5 | First release where restored terminals keep the surface's scrollback limits. |
+| ci: release labels are never reused and docs-only pushes do not publish | `next/release_plan.py` + tests; plan job gates build and publish (coordinator decision 2026-10-03). |
 
 Next in the stack (tracked in the design): presentation callbacks for
 frame-exact acknowledgment, Kitty image replay after a snapshot, and a
@@ -119,7 +120,7 @@ from `next/toolchain.env`, builds with fixed flags and packages with
 
 A build provenance attestation covers the zip:
 `gh attestation verify GhosttyNextKit.xcframework.zip --repo manaflow-ai/ghostty-next`.
-A release is never replaced. A dispatch with `verify_reproducible` rebuilds
+A release is never replaced, and a label is never reused: each release is labeled `<flavor>+<12-char sha>` (for example `ios-v5+74e97632d40a`) and tagged `xcframework-<sha>-<flavor>`; the publish job refuses when that tag exists. A push that changes no build input since the newest ancestor release (only `*.md`, `docs/`, issue and discussion templates, LICENSE, CODEOWNERS, VOUCHED) publishes nothing. `next/release_plan.py` decides both; `next/test_release_plan.py` tests them. Pin by URL and sha256, never by label alone. A dispatch with `verify_reproducible` rebuilds
 on a second runner without caches and compares slice hashes. Known
 difference before this check can pass: C objects compiled from Zig packages
 embed the per-build global cache path (`~/.cache/zig/b/<hash>`).
