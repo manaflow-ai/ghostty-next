@@ -29,7 +29,36 @@ permissions:
   contents: read
 
 jobs:
+  # Release rules (next/release_plan.py): skip when no build input changed
+  # since the newest ancestor release; a label (<flavor>+<sha12>) and tag are
+  # never reused, and an existing tag refuses the publish.
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      publish: ${{ steps.plan.outputs.publish }}
+      label: ${{ steps.plan.outputs.label }}
+      tag: ${{ steps.plan.outputs.tag }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Release rule tests
+        run: python3 -m unittest next/test_release_plan.py
+      - name: Release plan
+        id: plan
+        run: |
+          set -euo pipefail
+          # shellcheck source=/dev/null
+          . next/toolchain.env
+          python3 next/release_plan.py --repo . --head "$GITHUB_SHA" \
+            --flavor "$GHOSTTYKIT_FLAVOR" --github-output "$GITHUB_OUTPUT"
+
   build:
+    needs: plan
+    if: >-
+      github.event_name != 'push' || needs.plan.outputs.publish == 'true'
     runs-on: ${{ vars.GHOSTTY_NEXT_MACOS_RUNNER || 'blacksmith-6vcpu-macos-26' }}
     timeout-minutes: 90
     outputs:
@@ -147,7 +176,7 @@ jobs:
     if: >-
       github.ref == 'refs/heads/main' &&
       (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish))
-    needs: build
+    needs: [plan, build]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -167,23 +196,23 @@ jobs:
       - uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
         with:
           subject-path: out/GhosttyNextKit.xcframework.zip
-      - name: Create release (never replaces an existing one)
+      - name: Create release (a tag and label are never reused)
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.build.outputs.release_tag }}
+          PLAN_TAG: ${{ needs.plan.outputs.tag }}
+          LABEL: ${{ needs.plan.outputs.label }}
           SUM: ${{ needs.build.outputs.archive_sha256 }}
         run: |
           set -euo pipefail
+          test "$TAG" = "$PLAN_TAG"
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "release $TAG exists; checking its archive"
-            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern GhosttyNextKit.xcframework.zip --dir existing
-            existing="$(sha256sum existing/GhosttyNextKit.xcframework.zip | cut -d' ' -f1)"
-            echo "published=$existing rebuilt=$SUM"
-            exit 0
+            echo "::error::release $TAG already exists; a label is never reused, refusing to publish"
+            exit 1
           fi
           gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
-            --title "GhosttyNextKit $GITHUB_SHA ($(jq -r .flavor out/manifest.json))" \
-            --notes "GhosttyNextKit.xcframework for ghostty-next $GITHUB_SHA. sha256 (also the SwiftPM checksum): $SUM. Toolchain and slice hashes: manifest.json." \
+            --title "GhosttyNextKit $LABEL" \
+            --notes "GhosttyNextKit.xcframework, label $LABEL, for ghostty-next $GITHUB_SHA. sha256 (also the SwiftPM checksum): $SUM. Pin by URL and sha256. Toolchain and slice hashes: manifest.json." \
             out/GhosttyNextKit.xcframework.zip out/SHA256SUMS out/manifest.json
