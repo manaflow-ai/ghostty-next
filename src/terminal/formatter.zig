@@ -7513,3 +7513,51 @@ test "Page HTML hyperlink point map maps closing to previous cell" {
         try testing.expectEqual(expected_coord, point_map.items[i]);
     }
 }
+
+test "Terminal vt restores pending wrap with origin mode and margins" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var t = try Terminal.init(io, alloc, .{ .cols = 5, .rows = 5 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+
+    // Fill the second row of a 2-4 scrolling region in origin mode, which
+    // leaves the cursor in the last column with a pending wrap.
+    s.nextSlice("\x1b[2;4r\x1b[?6h\x1b[2;1Habcde");
+    try testing.expect(t.screens.active.cursor.pending_wrap);
+
+    var formatter: TerminalFormatter = .init(&t, .vt);
+    formatter.extra = .all;
+    try formatter.format(&builder.writer);
+    const output = builder.writer.buffered();
+
+    var t2 = try Terminal.init(io, alloc, .{ .cols = 5, .rows = 5 });
+    defer t2.deinit(alloc);
+    var s2 = t2.vtStream();
+    defer s2.deinit();
+    s2.nextSlice(output);
+
+    // The replay alone restores the cursor cell and the pending wrap. A
+    // consumer must not reprint the cursor cell again: with the wrap
+    // pending, that print would wrap to the next row.
+    try testing.expectEqual(t.screens.active.cursor.x, t2.screens.active.cursor.x);
+    try testing.expectEqual(t.screens.active.cursor.y, t2.screens.active.cursor.y);
+    try testing.expect(t2.screens.active.cursor.pending_wrap);
+
+    s.nextSlice("X");
+    s2.nextSlice("X");
+    try testing.expectEqual(t.screens.active.cursor.x, t2.screens.active.cursor.x);
+    try testing.expectEqual(t.screens.active.cursor.y, t2.screens.active.cursor.y);
+
+    const before = try t.plainString(alloc);
+    defer alloc.free(before);
+    const after = try t2.plainString(alloc);
+    defer alloc.free(after);
+    try testing.expectEqualStrings(before, after);
+}
