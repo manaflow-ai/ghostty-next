@@ -465,8 +465,14 @@ pub const TerminalFormatter = struct {
                 }
             }
 
-            // Screen contents are formatted relative to the top-left.
-            try writer.writeAll("\x1b[H");
+            // Screen contents are formatted from the first column. Setting
+            // tabstops uses CHA, which only moves the cursor within its row,
+            // so a carriage return is enough to undo it. libghostty-vt uses
+            // that instead of CUP home: a consumer may write a selection's
+            // VT output after earlier output (the rows above the selection),
+            // and homing there would move the following rows to the top of
+            // the screen. The Ghostty app keeps upstream's CUP home.
+            try writer.writeAll(if (comptime tabstops_home_with_cup) "\x1b[H" else "\r");
 
             // If we have a pin_map, add the bytes we wrote to map.
             if (self.pin_map) |*m| {
@@ -578,6 +584,11 @@ pub const TerminalFormatter = struct {
         };
     }
 };
+
+/// Whether tabstop serialization returns the cursor with CUP home (the
+/// Ghostty app) or with a carriage return (libghostty-vt). See the tabstop
+/// emission in TerminalFormatter.format.
+const tabstops_home_with_cup = @import("terminal_options").artifact != .lib;
 
 /// Screen formatter formats a single terminal screen (e.g. primary vs alt).
 pub const ScreenFormatter = struct {
@@ -7560,4 +7571,56 @@ test "Terminal vt restores pending wrap with origin mode and margins" {
     const after = try t2.plainString(alloc);
     defer alloc.free(after);
     try testing.expectEqualStrings(before, after);
+}
+
+test "Terminal vt selection after earlier rows keeps its rows with tabstops" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    // A consumer replays a terminal in row segments: it writes the row
+    // breaks for the leading blank rows itself, then the formatted last
+    // segment with tabstops and the cursor. Tabstop serialization must not
+    // move the cursor to another row in the middle of that stream.
+    var t = try Terminal.init(io, alloc, .{ .cols = 12, .rows = 4 });
+    defer t.deinit(alloc);
+    var s = t.vtStream();
+    defer s.deinit();
+    for (0..9) |_| s.nextSlice("\r\n");
+    s.nextSlice("tail");
+    const pages = &t.screens.active.pages;
+    try testing.expectEqual(@as(usize, 10), pages.total_rows);
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+    var formatter: TerminalFormatter = .init(&t, .vt);
+    formatter.extra = .none;
+    formatter.extra.tabstops = true;
+    formatter.extra.screen.cursor = true;
+    formatter.content = .{ .selection = .init(
+        pages.pin(.{ .screen = .{ .x = 0, .y = 7 } }).?,
+        pages.pin(.{ .screen = .{ .x = 11, .y = 9 } }).?,
+        false,
+    ) };
+    try formatter.format(&builder.writer);
+
+    var t2 = try Terminal.init(io, alloc, .{ .cols = 12, .rows = 4 });
+    defer t2.deinit(alloc);
+    var s2 = t2.vtStream();
+    defer s2.deinit();
+    // Rows 0-6 come from the consumer, then the break into row 7.
+    for (0..7) |_| s2.nextSlice("\r\n");
+    s2.nextSlice(builder.writer.buffered());
+
+    if (comptime !tabstops_home_with_cup) {
+        try testing.expectEqual(pages.total_rows, t2.screens.active.pages.total_rows);
+        try testing.expectEqual(t.screens.active.cursor.x, t2.screens.active.cursor.x);
+        try testing.expectEqual(t.screens.active.cursor.y, t2.screens.active.cursor.y);
+        const before = try t.plainString(alloc);
+        defer alloc.free(before);
+        const after = try t2.plainString(alloc);
+        defer alloc.free(after);
+        try testing.expectEqualStrings(before, after);
+    }
+    try testing.expect(t2.tabstops.get(8));
 }

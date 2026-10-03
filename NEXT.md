@@ -77,6 +77,7 @@ thread. New tab and split surfaces do not inherit the IO fields.
 | lib-vt: word selection endpoints stay on wide glyph leads | `ghostty_terminal_select_word` moves an endpoint off a wide-character spacer onto its glyph lead: a word that begins with a wrapped wide glyph starts on the next row, and a word that ends with a wide glyph ends on its lead, as manaflow-ai/ghostty reports them. `Screen.selectWord` (upstream a3e80a685, used by the app) is unchanged. |
 | test: VT replay restores pending wrap under origin mode | Regression test: with DECOM and margins, the formatter alone restores the cursor cell and the pending wrap. A consumer must not reprint the cursor cell again. |
 | ci: run the round-2 libghostty-vt patch tests | Filters for the cell-offset sizing, consumed-Alt text, word-selection and pending-wrap tests, in both the app (`zig build test`) and libghostty-vt (`zig build test-lib-vt`) runs, so both artifacts are proven. |
+| formatter: lib-vt returns from tabstops with a carriage return | Tabstop serialization moves only the column (CHA), so libghostty-vt ends it with CR instead of CUP home. A consumer that writes a selection after its own earlier rows (the cmux-tui segmented replay) no longer has the following rows moved to the top of the screen. The Ghostty app keeps upstream e523cf810. |
 
 Next in the stack (tracked in the design): presentation callbacks for
 frame-exact acknowledgment, Kitty image replay after a snapshot, and a
