@@ -1433,9 +1433,14 @@ typedef void (*ghostty_surface_snapshot_write_cb)(void*,
 // image loading stay local. Snapshot format version 1 carries no Kitty
 // images: the owner replays the images on screen after the snapshot.
 //
+// A restored synchronized update (mode 2026) gets the same safety
+// timeout as one the output starts.
+//
 // Returns false for an EXEC surface, an unknown phase, a malformed or
-// unsupported snapshot (the terminal is unchanged when the READY prefix
-// fails), or HISTORY with no snapshot in progress.
+// unsupported snapshot, a record longer than 64 MiB, or HISTORY with no
+// snapshot in progress. A failed READY leaves the terminal unchanged (it
+// still abandons the history of an earlier snapshot); a failed HISTORY
+// keeps the pages applied so far and ends the restore.
 GHOSTTY_API bool ghostty_surface_restore_snapshot(
     ghostty_surface_t,
     const uint8_t*,

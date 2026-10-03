@@ -893,6 +893,14 @@ fn replaceTerminal(
             lock.rows = self.terminal.rows;
         }
 
+        // A snapshot cut inside a synchronized update (mode 2026) holds
+        // frames until the owner's output ends it. The parser starts the
+        // safety timer when it sees the mode set; a restored mode needs
+        // the same timer, or a lost end would stop drawing for good.
+        if (self.terminal.modes.get(.synchronized_output)) {
+            self.queueMessage(.{ .start_synchronized_output = {} }, .locked);
+        }
+
         // Redraw everything, images included.
         self.terminal.flags.dirty.clear = true;
         if (comptime terminalpkg.options.kitty_graphics) {
@@ -942,12 +950,26 @@ fn applySnapshotHistory(self: *Termio, bytes: []const u8) !void {
         const saved = restore.decoder;
         const start = reader.seek;
 
+        // The bytes come from another machine: refuse a record that
+        // claims more than any history record holds, and tell a record
+        // that is still arriving from one that is malformed (below).
+        const complete_records = try completeSnapshotRecords(
+            restore.pending.items[start..],
+        );
+
         const progress = progress: {
             self.renderer_state.mutex.lockUncancelable(global.io());
             defer self.renderer_state.mutex.unlock(global.io());
             break :progress restore.decoder.next(self.alloc, &self.terminal);
         } catch |err| switch (err) {
             error.EndOfStream => {
+                // One step reads at most two HISTORY manifests and a
+                // PAGE or FINISH record. With that many complete records
+                // buffered, running out of bytes means a record's
+                // payload is shorter than its contents: malformed.
+                if (complete_records >= max_records_per_history_step) {
+                    return error.MalformedSnapshot;
+                }
                 restore.decoder = saved;
                 reader.seek = start;
                 break;
@@ -971,6 +993,34 @@ fn applySnapshotHistory(self: *Termio, bytes: []const u8) !void {
         restore.pending.items[consumed..],
     );
     restore.pending.shrinkRetainingCapacity(rest);
+}
+
+/// The most records one `Decoder.next` call reads: the HISTORY manifests
+/// of both screens (when the first has no pages) and one PAGE or FINISH.
+const max_records_per_history_step = 3;
+
+/// The largest snapshot record payload a restore accepts. PAGE records
+/// are the largest (one terminal page); this bounds the bytes a restore
+/// buffers for an incomplete record.
+const max_snapshot_record_payload = 64 * 1024 * 1024;
+
+/// Count the complete records at the start of `bytes`, up to
+/// `max_records_per_history_step`, from their headers (u16 tag, u32
+/// payload length, u32 CRC32C, little-endian). Fails for a payload length
+/// over `max_snapshot_record_payload`.
+fn completeSnapshotRecords(bytes: []const u8) error{SnapshotRecordTooLarge}!usize {
+    const header_len = 10;
+    var rest = bytes;
+    var count: usize = 0;
+    while (count < max_records_per_history_step and rest.len >= header_len) {
+        const payload_len = std.mem.readInt(u32, rest[2..6], .little);
+        if (payload_len > max_snapshot_record_payload) return error.SnapshotRecordTooLarge;
+        const record_len = header_len + @as(usize, payload_len);
+        if (rest.len < record_len) break;
+        rest = rest[record_len..];
+        count += 1;
+    }
+    return count;
 }
 
 /// Forget a snapshot whose history is still arriving.
@@ -1668,6 +1718,41 @@ test "manual: snapshot restore and encode round trip" {
     defer alloc.free(joined);
     try std.testing.expectEqualSlices(u8, S.complete.items, joined);
     try testManualTermio(true, S.restore);
+}
+
+test "manual: snapshot history refuses malformed and oversized records" {
+    const body = struct {
+        fn run(io: *Termio, _: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            const alloc = testing.allocator;
+
+            var out: std.Io.Writer.Allocating = .init(alloc);
+            defer out.deinit();
+            try io.encodeSnapshot(&out.writer, .ready);
+
+            // A record header that claims a 4 GiB payload is refused at
+            // once instead of buffering toward it.
+            try io.restoreSnapshot(out.written(), .ready);
+            try testing.expect(io.snapshot_restore != null);
+            const huge = [_]u8{ 4, 0, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0 };
+            try testing.expectError(
+                error.SnapshotRecordTooLarge,
+                io.restoreSnapshot(&huge, .history),
+            );
+            try testing.expect(io.snapshot_restore == null);
+
+            // Complete records whose payloads are too short for their
+            // contents: malformed, not "still arriving".
+            try io.restoreSnapshot(out.written(), .ready);
+            const short = [_]u8{ 4, 0, 0, 0, 0, 0, 0, 0, 0, 0 } ** 3;
+            if (io.restoreSnapshot(&short, .history)) |_| {
+                return error.TestExpectedError;
+            } else |_| {}
+            try testing.expect(io.snapshot_restore == null);
+        }
+    }.run;
+
+    try testManualTermio(true, body);
 }
 
 test "manual: processOutput parses output and routes replies by mode" {
