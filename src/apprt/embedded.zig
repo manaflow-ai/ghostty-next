@@ -2044,6 +2044,28 @@ pub const CAPI = struct {
         surface.updateSize(w, h);
     }
 
+    /// Lock the terminal grid of a manual surface to the grid of the
+    /// terminal core that owns its byte stream. See ghostty.h.
+    export fn ghostty_surface_set_grid(
+        surface: *Surface,
+        cols: u16,
+        rows: u16,
+        generation: u64,
+    ) bool {
+        return surface.core_surface.io.setGrid(cols, rows, generation);
+    }
+
+    /// Return the terminal grid and its lock. See ghostty.h.
+    export fn ghostty_surface_grid(surface: *Surface) apprt.SurfaceGrid {
+        const state = surface.core_surface.io.gridState();
+        return .{
+            .locked = state.locked,
+            .columns = state.cols,
+            .rows = state.rows,
+            .generation = state.generation,
+        };
+    }
+
     /// Return the size information a surface has.
     export fn ghostty_surface_size(surface: *Surface) SurfaceSize {
         const grid_size = surface.core_surface.size.grid();

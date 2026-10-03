@@ -68,6 +68,11 @@ terminal_stream: StreamHandler.Stream,
 /// See termio.Options.suppress_terminal_responses.
 suppress_terminal_responses: bool,
 
+/// The grid the embedder locked with `setGrid`, or null while the grid
+/// follows the view (`size.grid()`). Only a manual backend locks it.
+/// Read and written under `renderer_state.mutex`.
+grid_lock: ?GridLock = null,
+
 /// Last time the cursor was reset. This is used to prevent message
 /// flooding with cursor resets.
 last_cursor_reset: ?std.Io.Timestamp = null,
@@ -75,6 +80,16 @@ last_cursor_reset: ?std.Io.Timestamp = null,
 /// State we have for thread enter. This may be null if we don't need
 /// to keep track of any state or if its already been freed.
 thread_enter_state: ?*ThreadEnterState = null,
+
+/// A terminal grid set by the terminal core that owns the byte stream.
+pub const GridLock = struct {
+    cols: terminalpkg.size.CellCountInt,
+    rows: terminalpkg.size.CellCountInt,
+
+    /// The owner's grid generation. A lock with an older generation is
+    /// refused, so a late grid change cannot undo a newer one.
+    generation: u64,
+};
 
 /// The state we need to keep around only until we enter the IO
 /// thread. Then we can throw it all away.
@@ -603,15 +618,16 @@ fn kittyLoadingLimits(
 }
 
 /// Resize the terminal.
+///
+/// With a grid lock (see `setGrid`) only the pixel size changes: the
+/// terminal keeps the locked grid and the renderer pads or crops it.
 pub fn resize(
     self: *Termio,
     td: *ThreadData,
     size: renderer.Size,
 ) !void {
-    const grid_size = size.grid();
-
-    // Update the size of our pty.
-    try self.backend.resize(grid_size, size.terminal());
+    // Update the size of our pty. A manual backend has none.
+    try self.backend.resize(size.grid(), size.terminal());
 
     // Enter the critical area that we want to keep small
     {
@@ -623,6 +639,7 @@ pub fn resize(
         self.size = size;
 
         // Update the size of our terminal state
+        const grid_size = self.gridSizeLocked();
         try self.terminal.resize(
             self.alloc,
             .{
@@ -632,6 +649,7 @@ pub fn resize(
                     .width = self.size.cell.width,
                     .height = self.size.cell.height,
                 },
+                .reflow = !self.suppress_terminal_responses,
             },
         );
 
@@ -646,6 +664,99 @@ pub fn resize(
     self.renderer_wakeup.notify() catch {};
 }
 
+/// The grid the terminal has: the locked grid, or what fits the view.
+/// Caller must hold `renderer_state.mutex`.
+fn gridSizeLocked(self: *const Termio) renderer.GridSize {
+    if (self.grid_lock) |lock| return .{
+        .columns = lock.cols,
+        .rows = lock.rows,
+    };
+    return self.size.grid();
+}
+
+/// Lock the terminal grid to `cols` x `rows`, the grid of the terminal
+/// core that owns the byte stream, independent of the view's pixel size.
+/// Later resizes change only the pixel size. A mirror
+/// (`suppress_terminal_responses`) never reflows: its owner reflows and
+/// sends a snapshot. A manual (not mirror) terminal reflows like any
+/// resize and sends the mode 2048 size report when it is enabled.
+///
+/// Returns false and changes nothing for an exec backend, a zero
+/// dimension, a generation older than the current lock, or a failed
+/// resize. The same grid with a newer generation only stores the
+/// generation.
+pub fn setGrid(
+    self: *Termio,
+    cols: terminalpkg.size.CellCountInt,
+    rows: terminalpkg.size.CellCountInt,
+    generation: u64,
+) bool {
+    if (self.backend != .manual) return false;
+    if (cols == 0 or rows == 0) return false;
+
+    {
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+
+        if (self.grid_lock) |current| {
+            if (generation < current.generation) return false;
+        }
+
+        if (self.terminal.cols != cols or self.terminal.rows != rows) {
+            self.terminal.resize(self.alloc, .{
+                .cols = cols,
+                .rows = rows,
+                .cell_size_px = .{
+                    .width = self.size.cell.width,
+                    .height = self.size.cell.height,
+                },
+                .reflow = !self.suppress_terminal_responses,
+            }) catch |err| {
+                log.warn("set grid failed err={}", .{err});
+                return false;
+            };
+        }
+
+        self.grid_lock = .{
+            .cols = cols,
+            .rows = rows,
+            .generation = generation,
+        };
+
+        if (self.terminal.modes.get(.in_band_size_reports)) {
+            var td = self.manualThreadData();
+            self.sizeReportLocked(&td, .mode_2048) catch |err| {
+                log.warn("set grid size report failed err={}", .{err});
+            };
+        }
+    }
+
+    self.renderer_wakeup.notify() catch {};
+    return true;
+}
+
+/// The terminal's grid and its lock, read under the terminal lock.
+pub const GridState = struct {
+    /// True after a successful `setGrid`.
+    locked: bool,
+    cols: terminalpkg.size.CellCountInt,
+    rows: terminalpkg.size.CellCountInt,
+
+    /// The generation of the last accepted `setGrid`, 0 when unlocked.
+    generation: u64,
+};
+
+pub fn gridState(self: *Termio) GridState {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    return .{
+        .locked = self.grid_lock != null,
+        .cols = self.terminal.cols,
+        .rows = self.terminal.rows,
+        .generation = if (self.grid_lock) |lock| lock.generation else 0,
+    };
+}
+
 /// Make a size report.
 pub fn sizeReport(self: *Termio, td: *ThreadData, style: termio.Message.SizeReport) !void {
     self.renderer_state.mutex.lockUncancelable(global.io());
@@ -655,7 +766,7 @@ pub fn sizeReport(self: *Termio, td: *ThreadData, style: termio.Message.SizeRepo
 
 fn sizeReportLocked(self: *Termio, td: *ThreadData, style: termio.Message.SizeReport) !void {
     if (self.suppress_terminal_responses) return;
-    const grid_size = self.size.grid();
+    const grid_size = self.gridSizeLocked();
     const report_size: terminalpkg.size_report.Size = .{
         .rows = grid_size.rows,
         .columns = grid_size.columns,
@@ -1113,6 +1224,79 @@ test "manual: resize applies before queueMessage returns" {
                 try sink.expect("\x1b[48;24;40;480;400t");
             }
             try testing.expectEqual(@as(usize, 0), testDrainMailbox(&io.mailbox));
+        }
+    }.run;
+
+    try testManualTermio(false, body);
+    try testManualTermio(true, body);
+}
+
+test "manual: set_grid locks the grid and resizes change only pixels" {
+    const body = struct {
+        fn run(io: *Termio, sink: *TestSink, mirror: bool) !void {
+            const testing = std.testing;
+
+            try testing.expect(!io.gridState().locked);
+            try testing.expect(io.setGrid(20, 5, 7));
+            try testing.expectEqual(GridState{
+                .locked = true,
+                .cols = 20,
+                .rows = 5,
+                .generation = 7,
+            }, io.gridState());
+
+            // A view resize keeps the locked grid and stores the pixels.
+            io.queueMessage(.{ .resize = .{
+                .screen = .{ .width = 400, .height = 480 },
+                .cell = .{ .width = 10, .height = 20 },
+                .padding = .{},
+            } }, .unlocked);
+            try testing.expectEqual(@as(usize, 20), io.terminal.cols);
+            try testing.expectEqual(@as(usize, 5), io.terminal.rows);
+            try testing.expectEqual(@as(u32, 400), io.size.screen.width);
+
+            // Older generations and zero sizes are refused.
+            try testing.expect(!io.setGrid(30, 6, 6));
+            try testing.expect(!io.setGrid(0, 6, 8));
+            try testing.expectEqual(@as(usize, 20), io.terminal.cols);
+            try testing.expectEqual(@as(u64, 7), io.gridState().generation);
+
+            // A newer generation with the same grid stores the generation.
+            try testing.expect(io.setGrid(20, 5, 8));
+            try testing.expectEqual(@as(u64, 8), io.gridState().generation);
+
+            // The mode 2048 size report follows the grid: MANUAL only.
+            io.terminal.modes.set(.in_band_size_reports, true);
+            try testing.expect(io.setGrid(30, 6, 9));
+            if (mirror) {
+                try sink.expect("");
+            } else {
+                try sink.expect("\x1b[48;6;30;120;300t");
+            }
+            try testing.expectEqual(@as(usize, 0), testDrainMailbox(&io.mailbox));
+        }
+    }.run;
+
+    try testManualTermio(false, body);
+    try testManualTermio(true, body);
+}
+
+test "manual: a mirror never reflows" {
+    const body = struct {
+        fn run(io: *Termio, _: *TestSink, mirror: bool) !void {
+            const testing = std.testing;
+            const alloc = testing.allocator;
+
+            try testing.expect(io.setGrid(10, 3, 1));
+            io.processOutput("0123456789AB");
+            try testing.expect(io.setGrid(5, 3, 2));
+
+            const str = try io.terminal.plainString(alloc);
+            defer alloc.free(str);
+            // MANUAL reflows the soft-wrapped line; a mirror clips it and
+            // waits for the owner's snapshot.
+            try testing.expectEqual(!mirror, std.mem.indexOf(u8, str, "56789") != null);
+            try testing.expect(std.mem.startsWith(u8, str, "01234"));
         }
     }.run;
 

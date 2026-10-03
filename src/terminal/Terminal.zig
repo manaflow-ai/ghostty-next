@@ -4056,6 +4056,11 @@ pub const Resize = struct {
         width: u32,
         height: u32,
     } = null,
+
+    /// Reflow soft-wrapped lines of the primary screen when wraparound
+    /// (DECAWM) is on. False clips or pads every screen, for a terminal
+    /// that mirrors another terminal which reflows its own grid.
+    reflow: bool = true,
 };
 
 pub const ResizeError = error{
@@ -4155,7 +4160,7 @@ pub fn resize(
     try primary.resize(.{
         .cols = opts.cols,
         .rows = opts.rows,
-        .reflow = self.modes.get(.wraparound),
+        .reflow = opts.reflow and self.modes.get(.wraparound),
         .prompt_redraw = self.flags.shell_redraws_prompt,
         .pull_scrollback = self.flags.resize_pull_scrollback,
     });

@@ -269,6 +269,31 @@ pub const SurfaceIoMode = enum(c_int) {
     manual_mirror = 2,
 };
 
+/// The terminal grid of an embedded surface and its lock, as returned by
+/// ghostty_surface_grid.
+///
+/// If this is changed, you must also update ghostty.h
+/// (ghostty_surface_grid_s).
+pub const SurfaceGrid = extern struct {
+    /// True after ghostty_surface_set_grid locked the grid.
+    locked: bool,
+    columns: u16,
+    rows: u16,
+    /// The generation of the last accepted lock, 0 when unlocked.
+    generation: u64,
+};
+
+test "ghostty.h surface grid" {
+    const testing = std.testing;
+    const c = @import("ghostty.h");
+    const T = c.ghostty_surface_grid_s;
+    try testing.expectEqual(@offsetOf(SurfaceGrid, "locked"), @offsetOf(T, "locked"));
+    try testing.expectEqual(@offsetOf(SurfaceGrid, "columns"), @offsetOf(T, "columns"));
+    try testing.expectEqual(@offsetOf(SurfaceGrid, "rows"), @offsetOf(T, "rows"));
+    try testing.expectEqual(@offsetOf(SurfaceGrid, "generation"), @offsetOf(T, "generation"));
+    try testing.expectEqual(@sizeOf(SurfaceGrid), @sizeOf(T));
+}
+
 test "ghostty.h SurfaceIoMode" {
     try @import("../lib/enum.zig").checkGhosttyHEnum(
         SurfaceIoMode,
