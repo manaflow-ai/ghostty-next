@@ -131,6 +131,8 @@ jobs:
             -Dtest-filter="select word on a wrapped" \
             -Dtest-filter="select word ending in a wide glyph" \
             -Dtest-filter="Terminal vt restores pending wrap with origin mode" \
+            -Dtest-filter="Terminal vt selection after earlier rows keeps its rows with tabstops" \
+            -Dtest-filter="Terminal vt with tabstops" \
             --summary all
 
       - name: Build and package
