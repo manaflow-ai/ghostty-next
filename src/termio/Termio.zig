@@ -73,6 +73,10 @@ suppress_terminal_responses: bool,
 /// Read and written under `renderer_state.mutex`.
 grid_lock: ?GridLock = null,
 
+/// A snapshot whose history is still arriving after its READY prefix
+/// was restored (see `restoreSnapshot`). Only the output queue uses it.
+snapshot_restore: ?SnapshotRestore = null,
+
 /// Last time the cursor was reset. This is used to prevent message
 /// flooding with cursor resets.
 last_cursor_reset: ?std.Io.Timestamp = null,
@@ -89,6 +93,20 @@ pub const GridLock = struct {
     /// The owner's grid generation. A lock with an older generation is
     /// refused, so a late grid change cannot undo a newer one.
     generation: u64,
+};
+
+/// The largest unfinished escape sequence a snapshot carries, both when a
+/// manual backend encodes one and when it restores one.
+pub const snapshot_continuation_max_bytes = 1024 * 1024;
+
+/// The history of a restored snapshot that is still arriving.
+const SnapshotRestore = struct {
+    /// Positioned after the last complete record that was applied. Its
+    /// source is set again for every call.
+    decoder: terminalpkg.snapshot.Decoder,
+
+    /// Bytes received after that record: the start of an incomplete one.
+    pending: std.ArrayListUnmanaged(u8) = .empty,
 };
 
 /// The state we need to keep around only until we enter the IO
@@ -345,6 +363,12 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .terminal_stream = .init(.{
             .allocator = alloc,
             .handler = handler,
+            // A manual backend encodes snapshots, which carry the bytes
+            // of an unfinished escape sequence.
+            .continuation_max_bytes = if (opts.backend == .manual)
+                snapshot_continuation_max_bytes
+            else
+                null,
         }),
         .suppress_terminal_responses = opts.suppress_terminal_responses,
         .thread_enter_state = thread_enter_state,
@@ -359,6 +383,8 @@ pub fn deinit(self: *Termio) void {
 
     // Clear any StreamHandler state
     self.terminal_stream.deinit();
+
+    self.abandonSnapshotRestore();
 
     // Clear any initial state if we have it
     if (self.thread_enter_state) |v| v.destroy();
@@ -755,6 +781,257 @@ pub fn gridState(self: *Termio) GridState {
         .rows = self.terminal.rows,
         .generation = if (self.grid_lock) |lock| lock.generation else 0,
     };
+}
+
+/// Replace the terminal state from a GHOSTSNP snapshot (upstream
+/// libghostty-vt `snapshot`) that the terminal core owning the byte
+/// stream encoded. Only a manual backend restores snapshots, on the
+/// thread that calls `processOutput`.
+///
+/// `.ready` (and `.complete`): `bytes` start at the snapshot envelope and
+/// hold at least the READY prefix. The prefix is decoded off the terminal
+/// lock, then swapped in under it in one step: the renderer sees the old
+/// terminal or the new one, never a mix. History bytes that follow READY
+/// in the same buffer are applied like `.history`. A restore abandons the
+/// history of an earlier snapshot that is still arriving.
+///
+/// `.history`: `bytes` continue the stream after READY, cut anywhere.
+/// Complete history pages are prepended to their screens; an incomplete
+/// record waits for the next call. FINISH ends the snapshot.
+///
+/// The restore writes nothing to the pty callback: the snapshot carries
+/// no replies, and the unfinished sequence it carries (its continuation)
+/// is replayed into the parser, which produces no actions for it.
+///
+/// The restored terminal keeps the snapshot's grid, colors, modes and
+/// scrollback limits; a locked grid takes the snapshot's size and keeps
+/// its generation. Local policy is applied again: the Kitty image storage
+/// limit and in-band (direct) image loading only.
+pub fn restoreSnapshot(
+    self: *Termio,
+    bytes: []const u8,
+    phase: apprt.SurfaceSnapshotPhase,
+) !void {
+    if (self.backend != .manual) return error.NotManual;
+    switch (phase) {
+        .ready, .complete => {
+            self.abandonSnapshotRestore();
+
+            var reader: std.Io.Reader = .fixed(bytes);
+            var decoder: terminalpkg.snapshot.Decoder = .init(&reader);
+            var decoded = try decoder.ready(self.alloc, global.io(), .{
+                .max_continuation_bytes = snapshot_continuation_max_bytes,
+            });
+            defer decoded.deinit(self.alloc);
+
+            self.replaceTerminal(&decoded, &decoder);
+            self.snapshot_restore = .{ .decoder = decoder };
+            try self.applySnapshotHistory(bytes[reader.seek..]);
+        },
+
+        .history => {
+            if (self.snapshot_restore == null) return error.NoSnapshotInProgress;
+            try self.applySnapshotHistory(bytes);
+        },
+    }
+}
+
+/// Swap in a decoded terminal under the terminal lock.
+fn replaceTerminal(
+    self: *Termio,
+    decoded: *terminalpkg.snapshot.Decoded,
+    decoder: *terminalpkg.snapshot.Decoder,
+) void {
+    var new = decoded.toOwned();
+
+    // Local policy the snapshot does not carry. An alternate screen made
+    // later copies these from the primary screen.
+    new.setKittyGraphicsSizeLimit(self.alloc, self.config.image_storage_limit);
+    new.setKittyGraphicsLoadingLimits(kittyLoadingLimits(self.backend));
+
+    var old: terminalpkg.Terminal = undefined;
+    {
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+
+        // Every screen is new storage. Advance each generation past the
+        // old terminal's, as a screen removal does, so references into
+        // the old pages (selection gesture pins, search) are seen as
+        // stale. The decoder applies history only to the generations it
+        // saw at READY, so it follows the new values.
+        const ScreenKey = @TypeOf(new.screens.active_key);
+        for (std.enums.values(ScreenKey)) |key| {
+            new.screens.generations.put(
+                key,
+                self.terminal.screens.generation(key) +% 1,
+            );
+        }
+        switch (decoder.state) {
+            .history => |*history| {
+                var it = history.generations.iterator();
+                while (it.next()) |entry| {
+                    entry.value.* = new.screens.generation(entry.key);
+                }
+            },
+            else => {},
+        }
+
+        old = self.terminal;
+        self.terminal = new;
+
+        // The parser state belonged to the old byte stream. The
+        // snapshot's continuation is the unfinished sequence of the new
+        // one; replaying it also restarts continuation tracking.
+        self.resetStreamLocked();
+        switch (decoded.continuation) {
+            .ground => {},
+            .bytes => |continuation| self.terminal_stream.nextSlice(continuation),
+        }
+
+        if (self.grid_lock) |*lock| {
+            lock.cols = self.terminal.cols;
+            lock.rows = self.terminal.rows;
+        }
+
+        // Redraw everything, images included.
+        self.terminal.flags.dirty.clear = true;
+        if (comptime terminalpkg.options.kitty_graphics) {
+            var it = self.terminal.screens.all.iterator();
+            while (it.next()) |entry| entry.value.*.kitty_images.dirty = true;
+        }
+        self.terminal_stream.handler.queueRender() catch {};
+    }
+
+    // The old terminal is unreachable now; free it off the lock.
+    old.deinit(self.alloc);
+}
+
+/// Return the parser to ground and drop unfinished sequence state.
+/// Caller must hold `renderer_state.mutex`.
+fn resetStreamLocked(self: *Termio) void {
+    const stream = &self.terminal_stream;
+    const osc_alloc = stream.parser.osc_parser.alloc;
+    const osc_unknown_max_bytes = stream.parser.osc_parser.unknown_max_bytes;
+    stream.parser.deinit();
+    stream.parser = .init();
+    stream.parser.osc_parser.alloc = osc_alloc;
+    stream.parser.osc_parser.unknown_max_bytes = osc_unknown_max_bytes;
+    stream.utf8decoder = .{};
+    if (stream.continuation) |*tracker| tracker.reset();
+    stream.handler.resetSequenceState();
+}
+
+/// Apply the complete history records in `bytes` (after any pending
+/// bytes) and keep the start of an incomplete record for the next call.
+fn applySnapshotHistory(self: *Termio, bytes: []const u8) !void {
+    const restore: *SnapshotRestore = if (self.snapshot_restore) |*v| v else return;
+    errdefer self.abandonSnapshotRestore();
+
+    try restore.pending.appendSlice(self.alloc, bytes);
+    var reader: std.Io.Reader = .fixed(restore.pending.items);
+    restore.decoder.source = &reader;
+
+    var applied = false;
+    defer if (applied) self.renderer_wakeup.notify() catch {};
+
+    while (true) {
+        // A truncated record fails with EndOfStream before it changes
+        // the terminal (a page is decoded into its own allocation and
+        // joined only when complete), so rewinding the decoder and the
+        // reader to this point is exact.
+        const saved = restore.decoder;
+        const start = reader.seek;
+
+        const progress = progress: {
+            self.renderer_state.mutex.lockUncancelable(global.io());
+            defer self.renderer_state.mutex.unlock(global.io());
+            break :progress restore.decoder.next(self.alloc, &self.terminal);
+        } catch |err| switch (err) {
+            error.EndOfStream => {
+                restore.decoder = saved;
+                reader.seek = start;
+                break;
+            },
+            else => return err,
+        };
+
+        // FINISH: the snapshot is complete.
+        const page = progress orelse {
+            self.abandonSnapshotRestore();
+            return;
+        };
+        if (page.rows > 0) applied = true;
+    }
+
+    // Keep only the incomplete record.
+    const consumed = reader.seek;
+    const rest = restore.pending.items.len - consumed;
+    @memmove(
+        restore.pending.items[0..rest],
+        restore.pending.items[consumed..],
+    );
+    restore.pending.shrinkRetainingCapacity(rest);
+}
+
+/// Forget a snapshot whose history is still arriving.
+fn abandonSnapshotRestore(self: *Termio) void {
+    var restore = self.snapshot_restore orelse return;
+    restore.pending.deinit(self.alloc);
+    self.snapshot_restore = null;
+}
+
+/// Encode the terminal as a GHOSTSNP snapshot (upstream libghostty-vt
+/// `snapshot`) into `writer`: the READY prefix, the history after it, or
+/// both (`.complete`, the same bytes as `snapshot.encode`). Only a manual
+/// backend encodes snapshots, on the thread that calls `processOutput`,
+/// so the encoding matches the bytes parsed so far. Holds the terminal
+/// lock for the whole encoding.
+pub fn encodeSnapshot(
+    self: *Termio,
+    writer: *std.Io.Writer,
+    phase: apprt.SurfaceSnapshotPhase,
+) !void {
+    if (self.backend != .manual) return error.NotManual;
+    const snapshot = terminalpkg.snapshot;
+
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+
+    // The unfinished escape sequence at the end of the parsed output.
+    var continuation_bytes: std.Io.Writer.Allocating = .init(self.alloc);
+    defer continuation_bytes.deinit();
+    self.terminal_stream.writeContinuation(&continuation_bytes.writer) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+        else => |e| return e,
+    };
+    const continuation: snapshot.Continuation = if (continuation_bytes.written().len == 0)
+        .ground
+    else
+        .{ .bytes = continuation_bytes.written() };
+
+    const t = &self.terminal;
+    var stream: snapshot.record.Writer = .init(self.alloc, writer);
+    defer stream.deinit();
+
+    if (phase != .history) {
+        try snapshot.continuation.validate(continuation);
+        try snapshot.envelope.encode(stream.writer());
+        try snapshot.terminal.encode(t, &stream);
+        try snapshot.screen.encode(t.screens.get(.primary).?, .primary, &stream);
+        if (t.screens.get(.alternate)) |alternate| {
+            try snapshot.screen.encode(alternate, .alternate, &stream);
+        }
+        try snapshot.continuation.encode(continuation, &stream);
+        try snapshot.checkpoint.encode(.ready, &stream);
+    }
+
+    if (phase != .ready) {
+        try snapshot.history.encode(t.screens.get(.primary).?, .primary, &stream);
+        if (t.screens.get(.alternate)) |alternate| {
+            try snapshot.history.encode(alternate, .alternate, &stream);
+        }
+        try snapshot.checkpoint.encode(.finish, &stream);
+    }
 }
 
 /// Make a size report.
@@ -1302,6 +1579,95 @@ test "manual: a mirror never reflows" {
 
     try testManualTermio(false, body);
     try testManualTermio(true, body);
+}
+
+test "manual: snapshot restore and encode round trip" {
+    const S = struct {
+        var complete: std.ArrayListUnmanaged(u8) = .empty;
+        var ready: std.ArrayListUnmanaged(u8) = .empty;
+        var history: std.ArrayListUnmanaged(u8) = .empty;
+
+        fn encode(io: *Termio, phase: apprt.SurfaceSnapshotPhase) ![]u8 {
+            const alloc = std.testing.allocator;
+            var out: std.Io.Writer.Allocating = .init(alloc);
+            errdefer out.deinit();
+            try io.encodeSnapshot(&out.writer, phase);
+            return try out.toOwnedSlice();
+        }
+
+        /// A terminal with styled text, scrollback over several pages,
+        /// and an unfinished escape sequence at the cut.
+        fn source(io: *Termio, _: *TestSink, _: bool) !void {
+            const alloc = std.testing.allocator;
+            io.processOutput("\x1b[1;38;2;255;0;0mbold red\x1b[0m plain " ++
+                "\x1b[4;48;5;33munderlined\x1b[m\r\n");
+            var buf: [64]u8 = undefined;
+            for (0..3000) |i| {
+                io.processOutput(try std.fmt.bufPrint(&buf, "\x1b[3{d}mline {d}\x1b[m\r\n", .{ i % 8, i }));
+            }
+            // Output that messages the surface (title, bell) is left out:
+            // these tests have no surface mailbox.
+            io.processOutput("tail \x1b[");
+            try std.testing.expect(io.terminal.screens.get(.primary).?.pages.totalPages() > 2);
+
+            const c = try encode(io, .complete);
+            defer alloc.free(c);
+            const r = try encode(io, .ready);
+            defer alloc.free(r);
+            const h = try encode(io, .history);
+            defer alloc.free(h);
+            try complete.appendSlice(alloc, c);
+            try ready.appendSlice(alloc, r);
+            try history.appendSlice(alloc, h);
+        }
+
+        /// Restore READY, then the history in uneven slices, into a
+        /// mirror that has other content, and encode it again.
+        fn restore(io: *Termio, sink: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            const alloc = testing.allocator;
+
+            io.processOutput("\x1b[2Jother content\x1b[5");
+            try io.restoreSnapshot(ready.items, .ready);
+            var rest = history.items;
+            while (rest.len > 0) {
+                const n = @min(rest.len, 997);
+                try io.restoreSnapshot(rest[0..n], .history);
+                rest = rest[n..];
+            }
+            try testing.expect(io.snapshot_restore == null);
+
+            const again = try encode(io, .complete);
+            defer alloc.free(again);
+            try testing.expectEqualSlices(u8, complete.items, again);
+
+            // The continuation was replayed: the cut SGR sequence
+            // completes with the next output.
+            io.processOutput("1mX");
+            try testing.expect(io.terminal.screens.active.cursor.style.flags.bold);
+
+            // A restore writes nothing to the pty callback.
+            try sink.expect("");
+
+            // A complete snapshot restores in one call too.
+            try io.restoreSnapshot(complete.items, .complete);
+            try testing.expect(io.snapshot_restore == null);
+            const third = try encode(io, .complete);
+            defer alloc.free(third);
+            try testing.expectEqualSlices(u8, complete.items, third);
+            try testing.expectEqual(@as(usize, 0), testDrainMailbox(&io.mailbox));
+        }
+    };
+    const alloc = std.testing.allocator;
+    defer S.complete.deinit(alloc);
+    defer S.ready.deinit(alloc);
+    defer S.history.deinit(alloc);
+
+    try testManualTermio(true, S.source);
+    const joined = try std.mem.concat(alloc, u8, &.{ S.ready.items, S.history.items });
+    defer alloc.free(joined);
+    try std.testing.expectEqualSlices(u8, S.complete.items, joined);
+    try testManualTermio(true, S.restore);
 }
 
 test "manual: processOutput parses output and routes replies by mode" {

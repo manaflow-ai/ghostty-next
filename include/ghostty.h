@@ -553,7 +553,8 @@ typedef enum {
 //
 // - Call every surface function on the main (app) thread, including
 //   ghostty_surface_set_size, except the output functions:
-//   ghostty_surface_process_output and ghostty_surface_set_grid.
+//   ghostty_surface_process_output, ghostty_surface_set_grid,
+//   ghostty_surface_restore_snapshot and ghostty_surface_encode_snapshot.
 // - Call the output functions from one serial queue that is not the
 //   main thread, in the order of the owner's byte stream.
 // - Never wait synchronously for that queue from the main thread or from
@@ -1359,6 +1360,80 @@ GHOSTTY_API void ghostty_surface_process_output(ghostty_surface_t,
                                                 const char*,
                                                 uintptr_t);
 GHOSTTY_API bool ghostty_surface_mouse_captured(ghostty_surface_t);
+
+// Which part of a GHOSTSNP terminal snapshot (the libghostty-vt snapshot
+// format, see ghostty/vt/snapshot.h) a surface restores or encodes.
+//
+// READY: the renderable prefix, from the envelope through the READY
+// marker: terminal state, both screens, and the unfinished escape
+// sequence at the cut (the continuation).
+// HISTORY: the records after READY: scrollback pages, through FINISH.
+// COMPLETE: READY followed by HISTORY, one complete snapshot.
+typedef enum {
+  GHOSTTY_SURFACE_SNAPSHOT_READY = 0,
+  GHOSTTY_SURFACE_SNAPSHOT_HISTORY = 1,
+  GHOSTTY_SURFACE_SNAPSHOT_COMPLETE = 2,
+} ghostty_surface_snapshot_phase_e;
+
+// Receives an encoded snapshot: (userdata, bytes, length). The bytes are
+// valid only during the call; copy them.
+typedef void (*ghostty_surface_snapshot_write_cb)(void*,
+                                                  const uint8_t*,
+                                                  size_t);
+
+// Replace the terminal state of a MANUAL or MANUAL_MIRROR surface from a
+// snapshot that the terminal core owning the byte stream encoded. Call
+// it from the output queue (see ghostty_io_write_cb), in order with
+// ghostty_surface_process_output: output that follows the snapshot cut
+// is fed after it.
+//
+// READY (or COMPLETE): bytes start at the snapshot envelope and hold at
+// least the READY prefix. The prefix is decoded without the terminal
+// lock, then swapped in atomically: the renderer draws the old terminal
+// or the new one, never a mix. History bytes after READY in the same
+// buffer are applied as with HISTORY. A READY restore abandons the
+// history of an earlier snapshot that is still arriving.
+//
+// HISTORY: bytes continue the same snapshot after READY and may be cut
+// anywhere. Complete scrollback pages are prepended above the restored
+// screens (newest first, as the snapshot orders them); an incomplete
+// record waits for the next call; FINISH ends the snapshot. Pages are
+// dropped, not applied, when output since READY changed the width or
+// replaced the screen.
+//
+// The restore emits nothing to io_write_cb. The restored terminal takes
+// the snapshot's grid, colors, modes and scrollback limits; a grid
+// locked with ghostty_surface_set_grid takes the snapshot's size and
+// keeps its generation. Kitty image storage limits and in-band only
+// image loading stay local. Snapshot format version 1 carries no Kitty
+// images: the owner replays the images on screen after the snapshot.
+//
+// Returns false for an EXEC surface, an unknown phase, a malformed or
+// unsupported snapshot (the terminal is unchanged when the READY prefix
+// fails), or HISTORY with no snapshot in progress.
+GHOSTTY_API bool ghostty_surface_restore_snapshot(
+    ghostty_surface_t,
+    const uint8_t*,
+    size_t,
+    ghostty_surface_snapshot_phase_e);
+
+// Encode the terminal of a MANUAL or MANUAL_MIRROR surface as a snapshot
+// (READY prefix, HISTORY records, or COMPLETE) and pass the bytes to
+// write_cb, once, before returning. Call it from the output queue so the
+// snapshot matches the output parsed so far. The terminal lock is held
+// while encoding, not while write_cb runs. COMPLETE equals the READY
+// bytes followed by the HISTORY bytes. Returns false for an EXEC
+// surface, an unknown phase, or when the unfinished escape sequence is
+// longer than 1 MiB.
+GHOSTTY_API bool ghostty_surface_encode_snapshot(
+    ghostty_surface_t,
+    ghostty_surface_snapshot_write_cb,
+    void*,
+    ghostty_surface_snapshot_phase_e);
+
+// The GHOSTSNP format version that ghostty_surface_restore_snapshot
+// accepts and ghostty_surface_encode_snapshot writes.
+GHOSTTY_API uint16_t ghostty_surface_snapshot_version(void);
 GHOSTTY_API bool ghostty_surface_mouse_button(ghostty_surface_t,
                                                  ghostty_input_mouse_state_e,
                                                  ghostty_input_mouse_button_e,

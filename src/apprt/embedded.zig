@@ -2229,6 +2229,61 @@ pub const CAPI = struct {
         }
     }
 
+    /// Receives an encoded snapshot: (userdata, bytes, length).
+    const SnapshotWriteCb = *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void;
+
+    /// Restore the terminal of a manual surface from a snapshot that the
+    /// owning terminal core encoded. See ghostty.h.
+    export fn ghostty_surface_restore_snapshot(
+        surface: *Surface,
+        ptr: ?[*]const u8,
+        len: usize,
+        phase_raw: c_int,
+    ) bool {
+        const phase = std.enums.fromInt(
+            apprt.SurfaceSnapshotPhase,
+            phase_raw,
+        ) orelse return false;
+        const bytes: []const u8 = if (len == 0) &.{} else (ptr orelse return false)[0..len];
+        surface.core_surface.io.restoreSnapshot(bytes, phase) catch |err| {
+            log.warn("error restoring snapshot err={}", .{err});
+            return false;
+        };
+        return true;
+    }
+
+    /// Encode the terminal of a manual surface as a snapshot and pass
+    /// the bytes to `write_cb` before returning. See ghostty.h.
+    export fn ghostty_surface_encode_snapshot(
+        surface: *Surface,
+        write_cb: ?SnapshotWriteCb,
+        userdata: ?*anyopaque,
+        phase_raw: c_int,
+    ) bool {
+        const cb = write_cb orelse return false;
+        const phase = std.enums.fromInt(
+            apprt.SurfaceSnapshotPhase,
+            phase_raw,
+        ) orelse return false;
+
+        // Encode under the terminal lock, call back without it.
+        var out: std.Io.Writer.Allocating = .init(surface.app.core_app.alloc);
+        defer out.deinit();
+        surface.core_surface.io.encodeSnapshot(&out.writer, phase) catch |err| {
+            log.warn("error encoding snapshot err={}", .{err});
+            return false;
+        };
+        const bytes = out.written();
+        cb(userdata, bytes.ptr, bytes.len);
+        return true;
+    }
+
+    /// The GHOSTSNP format version that restore accepts and encode
+    /// writes.
+    export fn ghostty_surface_snapshot_version() u16 {
+        return terminal.snapshot.envelope.version;
+    }
+
     /// Returns true if the surface currently has mouse capturing
     /// enabled.
     export fn ghostty_surface_mouse_captured(surface: *Surface) bool {
