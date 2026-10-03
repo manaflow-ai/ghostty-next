@@ -66,6 +66,7 @@ jobs:
             -Dtest-filter="ghostty.h surface config IO fields" \
             -Dtest-filter="encode committed text" \
             -Dtest-filter="ghostty.h surface grid" \
+            -Dtest-filter="ghostty.h SurfaceSnapshotPhase" \
             --summary all
           # libghostty-vt patches (VT replay formatter, terminal and Kitty
           # graphics C API). These live in the lib-vt test modules.

@@ -194,6 +194,17 @@ pub const StreamHandler = struct {
         }
     }
 
+    /// Drop the state of unfinished APC, DCS and Kitty clipboard
+    /// sequences. Termio calls this with the terminal lock held when it
+    /// replaces the terminal from a snapshot and resets the parser.
+    pub fn resetSequenceState(self: *StreamHandler) void {
+        // Keep the handlers' limits; only their sequence state goes.
+        self.apc.deinit();
+        self.apc.state = .inactive;
+        self.dcs.deinit();
+        self.kittyClipboardWriteAbort();
+    }
+
     /// This queues a render operation with the renderer thread. The render
     /// isn't guaranteed to happen immediately but it will happen as soon as
     /// practical.

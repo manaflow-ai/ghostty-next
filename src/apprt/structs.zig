@@ -283,6 +283,29 @@ pub const SurfaceGrid = extern struct {
     generation: u64,
 };
 
+/// Which part of a terminal snapshot an embedded surface encodes or
+/// restores.
+///
+/// If this is changed, you must also update ghostty.h
+/// (ghostty_surface_snapshot_phase_e).
+pub const SurfaceSnapshotPhase = enum(c_int) {
+    /// The renderable prefix: envelope through the READY marker.
+    ready = 0,
+
+    /// The bytes after READY: history pages through the FINISH marker.
+    history = 1,
+
+    /// READY followed by HISTORY: one complete snapshot.
+    complete = 2,
+};
+
+test "ghostty.h SurfaceSnapshotPhase" {
+    try @import("../lib/enum.zig").checkGhosttyHEnum(
+        SurfaceSnapshotPhase,
+        "GHOSTTY_SURFACE_SNAPSHOT_",
+    );
+}
+
 test "ghostty.h surface grid" {
     const testing = std.testing;
     const c = @import("ghostty.h");
