@@ -47,6 +47,34 @@ pub fn release(self: *IOSurfaceLayer) void {
     self.layer.release();
 }
 
+/// Detach this layer from its host (the embedder's view layer) if its
+/// display callback still belongs to `display_cb`/`display_ctx`: clear
+/// the callback, the contents, and remove it from its superlayer. Runs
+/// synchronously on the main queue, because Core Animation calls the
+/// display callback from main thread transactions while the renderer is
+/// being destroyed.
+pub fn detachFromHostIfDisplayCallbackOwned(
+    self: *IOSurfaceLayer,
+    display_cb: DisplayCallback,
+    display_ctx: ?*anyopaque,
+) void {
+    var block = DetachFromHostBlock.init(.{
+        .layer = self.layer.value,
+        .display_cb = @ptrCast(@constCast(display_cb)),
+        .display_ctx = display_ctx,
+    }, &detachFromHostCallback);
+
+    const NSThread = objc.getClass("NSThread").?;
+    if (NSThread.msgSend(bool, "isMainThread", .{})) {
+        detachFromHostCallback(&block);
+    } else {
+        macos.dispatch.dispatch_sync(
+            @ptrCast(macos.dispatch.queue.getMain()),
+            @ptrCast(&block),
+        );
+    }
+}
+
 /// Sets the layer's `contents` to the provided IOSurface.
 ///
 /// Makes sure to do so on the main thread to avoid visual artifacts.
@@ -92,6 +120,28 @@ const SetSurfaceBlock = objc.Block(struct {
     layer: objc.c.id,
     surface: *IOSurface,
 }, .{}, void);
+
+const DetachFromHostBlock = objc.Block(struct {
+    layer: objc.c.id,
+    display_cb: ?*anyopaque,
+    display_ctx: ?*anyopaque,
+}, .{}, void);
+
+fn detachFromHostCallback(
+    block: *const DetachFromHostBlock.Context,
+) callconv(.c) void {
+    const layer = objc.Object.fromId(block.layer);
+
+    // Ownership guard: a layer rebound to another renderer stays as it is.
+    const cur_cb: ?*anyopaque = @ptrCast(layer.getInstanceVariable("display_cb").value);
+    const cur_ctx: ?*anyopaque = @ptrCast(layer.getInstanceVariable("display_ctx").value);
+    if (cur_cb != block.display_cb or cur_ctx != block.display_ctx) return;
+
+    layer.setInstanceVariable("display_cb", .{ .value = null });
+    layer.setInstanceVariable("display_ctx", .{ .value = null });
+    layer.setProperty("contents", @as(?*anyopaque, null));
+    layer.msgSend(void, objc.sel("removeFromSuperlayer"), .{});
+}
 
 fn setSurfaceCallback(
     block: *const SetSurfaceBlock.Context,
