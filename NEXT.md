@@ -73,6 +73,7 @@ thread. New tab and split surfaces do not inherit the IO fields.
 | build: flavor ios-v5 | First release where restored terminals keep the surface's scrollback limits. |
 | ci: release labels are never reused and docs-only pushes do not publish | `next/release_plan.py` + tests; plan job gates build and publish (coordinator decision 2026-10-03). |
 | lib-vt: Kitty cell offsets do not shrink c/r placements | In libghostty-vt a placement sized by columns/rows keeps its full cell size; X/Y offsets only move it (the size the cmux-tui session host renders, as manaflow-ai/ghostty does). The Ghostty app keeps upstream c5a3c7e2e, where offsets move the near edge inward. |
+| lib-vt: report associated text produced by a consumed Alt | libghostty-vt Kitty key encoding keeps the associated text when Alt was consumed to produce it (an Option-generated character), as manaflow-ai/ghostty does. The Ghostty app keeps upstream behavior. Ported from manaflow-ai/ghostty 14d4d041b8 and 7e091b0efb. |
 
 Next in the stack (tracked in the design): presentation callbacks for
 frame-exact acknowledgment, Kitty image replay after a snapshot, and a

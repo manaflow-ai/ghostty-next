@@ -9,6 +9,11 @@ const key = @import("key.zig");
 const KittyEntry = @import("kitty.zig").Entry;
 const kitty_entries = @import("kitty.zig").entries;
 
+/// libghostty-vt reports associated text produced by a consumed Alt
+/// (manaflow-ai/ghostty 14d4d041b8). The Ghostty app keeps upstream
+/// behavior.
+const consumed_alt_keeps_text = @import("terminal_options").artifact == .lib;
+
 /// Options that affect key encoding behavior. This is a mix of behavior
 /// from terminal state as well as application configuration.
 pub const Options = struct {
@@ -297,7 +302,15 @@ fn kitty(
             // Determine if the Alt modifier should be treated as an actual
             // modifier (in which case it prevents associated text) or as
             // the macOS Option key, which does not prevent associated text.
-            const alt_prevents_text = if (comptime builtin.os.tag == .macos)
+            //
+            // libghostty-vt only: Alt that was consumed to produce this
+            // event's text (an Option-generated character) is not an
+            // effective text-preventing modifier, so the text is still
+            // reported. The Ghostty app keeps its platform behavior.
+            const alt_prevents_text = if (consumed_alt_keeps_text and
+                event.consumed_mods.alt)
+                false
+            else if (comptime builtin.os.tag == .macos)
                 switch (opts.macos_option_as_alt) {
                     .left => all_mods.sides.alt == .left,
                     .right => all_mods.sides.alt == .right,
@@ -1806,6 +1819,32 @@ test "kitty: report associated with alt text on macOS with option" {
         .macos_option_as_alt = .false,
     });
     try testing.expectEqualStrings("\x1b[119;3;8721u", writer.buffered());
+}
+
+test "kitty: report associated text produced by consumed alt" {
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try kitty(&writer, .{
+        .key = .key_w,
+        .mods = .{ .alt = true },
+        .consumed_mods = .{ .alt = true },
+        .utf8 = "∑",
+        .unshifted_codepoint = 119,
+    }, .{
+        .kitty_flags = .{
+            .disambiguate = true,
+            .report_all = true,
+            .report_alternates = true,
+            .report_associated = true,
+        },
+        .macos_option_as_alt = .true,
+    });
+    if (comptime consumed_alt_keeps_text) {
+        try testing.expectEqualStrings("\x1b[119;3;8721u", writer.buffered());
+    } else {
+        // The Ghostty app: Alt as a real modifier drops the text.
+        try testing.expectEqualStrings("\x1b[119;3u", writer.buffered());
+    }
 }
 
 test "kitty: report associated with alt text on macOS with alt" {
