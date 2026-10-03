@@ -14,8 +14,9 @@
 //             a 10x5 grid smaller than the view is red inside the grid
 //             area only, and ghostty_surface_size still reports the
 //             cells that fit.
-//   snapshot  encode the red fill (READY and HISTORY), clear it, then
-//             restore the snapshot: the red fill is back.
+//   snapshot  encode the red fill (READY and HISTORY), clear it, set a
+//             64 KiB scrollback-limit-bytes on the surface, then restore
+//             the snapshot: the red fill is back.
 import GhosttyNextKit
 import IOSurface
 import UIKit
@@ -256,6 +257,15 @@ func runSnapshot(_ app: ghostty_app_t, _ view: TerminalView, _ surface: ghostty_
     guard let cleared = capture(view) else { return (false, "no IOSurface (cleared)") }
     let clearedRed = cleared.redFraction()
 
+    // A surface scrollback limit far below the snapshot's history (the
+    // existing scrollback-limit-bytes config key): the restore takes it
+    // instead of the host's and still draws the screen.
+    let limitPath = NSTemporaryDirectory() + "scrollback-limit.conf"
+    try? "scrollback-limit-bytes = 65536\n".write(toFile: limitPath, atomically: true, encoding: .utf8)
+    guard let limitConfig = ghostty_config_new() else { return (false, "ghostty_config_new") }
+    ghostty_config_load_file(limitConfig, limitPath)
+    ghostty_config_finalize(limitConfig)
+    ghostty_surface_update_config(surface, limitConfig)
     let restored = await onOutput(ref) { s in
         restore(s, ready, GHOSTTY_SURFACE_SNAPSHOT_READY) && restore(s, history, GHOSTTY_SURFACE_SNAPSHOT_HISTORY)
     }
