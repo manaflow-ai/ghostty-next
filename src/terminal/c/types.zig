@@ -221,6 +221,8 @@ const type_decls = [_]TypeDecl{
     .initUnion("GhosttyStyleColorValue", style.ColorValue, null),
     .initStruct("GhosttySysImage", sys.Image),
     .initStruct("GhosttyTerminalDesktopNotification", terminal.DesktopNotification),
+    .initStruct("GhosttyTerminalKittyImageIdCursorState", terminal.KittyImageIdCursorState),
+    .initStruct("GhosttyTerminalKittyImageIdCursors", terminal.KittyImageIdCursors),
     .initStruct("GhosttyTerminalMemoryUsage", terminal.TerminalMemoryUsage),
     .initStruct("GhosttyTerminalModeConfig", terminal.ModeConfig),
     .initStruct("GhosttyTerminalProgressReport", terminal.ProgressReport),
