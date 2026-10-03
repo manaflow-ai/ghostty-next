@@ -56,6 +56,12 @@ pub const Handler = struct {
     /// do not flag this.
     semantic_failure: bool = false,
 
+    /// Opaque epoch for operations that can affect cursor replay semantics:
+    /// DECSCUSR, DEC mode 12, alternate screen mode dispatches, full reset
+    /// and configured cursor-default changes. Consumers compare it only for
+    /// inequality.
+    cursor_activity: u64 = 0,
+
     /// Callbacks for certain effects that handlers may have. These
     /// may or may not fully replace internal handling of certain effects,
     /// but they allow for the handler to trigger or query external
@@ -448,6 +454,17 @@ pub const Handler = struct {
         };
     }
 
+    /// Return the opaque cursor-semantic activity token. Consumers must only
+    /// compare this value for inequality.
+    pub fn cursorActivity(self: *const Handler) u64 {
+        return self.cursor_activity;
+    }
+
+    /// Record an operation that can affect cursor replay semantics.
+    pub fn recordCursorActivity(self: *Handler) void {
+        self.cursor_activity +%= 1;
+    }
+
     pub fn deinit(self: *Handler) void {
         self.kittyClipboardAbort();
         self.kitty_clipboard_grants.deinit(self.terminal.gpa());
@@ -596,7 +613,10 @@ pub const Handler = struct {
                 self.terminal.screens.active.cursor.y + 1 +| value.value,
                 self.terminal.screens.active.cursor.x + 1,
             ),
-            .cursor_style => self.terminal.setCursorStyle(value),
+            .cursor_style => {
+                self.recordCursorActivity();
+                self.terminal.setCursorStyle(value);
+            },
             .erase_display_below => self.terminal.eraseDisplay(.below, value),
             .erase_display_above => self.terminal.eraseDisplay(.above, value),
             .erase_display_complete => self.terminal.eraseDisplay(.complete, value),
@@ -671,6 +691,8 @@ pub const Handler = struct {
             .active_status_display => self.terminal.status_display = value,
             .decaln => try self.terminal.decaln(),
             .full_reset => {
+                self.recordCursorActivity();
+
                 // A reset turns off synchronized output, ending its hold.
                 const sync = self.terminal.modes.get(.synchronized_output);
                 self.terminal.fullReset();
@@ -1852,6 +1874,15 @@ pub const Handler = struct {
     }
 
     fn setMode(self: *Handler, mode: modes.Mode, enabled: bool) !void {
+        switch (mode) {
+            .cursor_blinking,
+            .alt_screen_legacy,
+            .alt_screen,
+            .alt_screen_save_cursor_clear_enter,
+            => self.recordCursorActivity(),
+            else => {},
+        }
+
         // Synchronized output is reported as a render hold. We only report
         // real changes. Reporting a set during a hold would be harmful
         // because the screen is half-drawn at that point and the callback
