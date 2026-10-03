@@ -66,9 +66,11 @@ thread. New tab and split surfaces do not inherit the IO fields.
 | renderer: detach the iOS IOSurfaceLayer before freeing the renderer | On iOS the IOSurfaceLayer is a sublayer of the embedder's view and keeps raw pointers to the renderer in its ivars. Renderer deinit now first clears the callback, the contents and the sublayer link on the main queue, only while they still name this renderer, so a later Core Animation pass cannot call freed memory. Ported from manaflow-ai/ghostty adee7043fc and dd726a9a60. |
 | renderer: bounded wait when hiding releases the swap chain | `setVisible(false)` released the swap chain on every platform and waited without bound for frames in flight. iOS holds back GPU completions while the app moves to the background, so the render thread (and every waiter on its draw lock) could hang. Hiding now waits at most 100 ms; on timeout the swap chain is kept and released at the next hide or at teardown. |
 | test: simulator smoke for set_grid, snapshot restore, 72 DPI and occlusion | `next/ios-render-smoke.sh` runs the app once per check, with output calls on a serial queue: `fill` (red fill, cells at 72 DPI, red again after an occlusion cycle), `grid` (a grid larger than the view crops; a 10x5 grid is red inside its area only; a stale generation is refused), `snapshot` (encode READY and HISTORY, clear, restore: red again). |
+| build: flavor ios-v4 | First release with `ghostty_surface_set_grid`, `ghostty_surface_restore_snapshot`, `ghostty_surface_encode_snapshot`, the non-blocking renderer mailbox and the iOS renderer ports. |
 
-Next in the stack (tracked in the design): iOS renderer fixes and snapshot
-restore from the session host.
+Next in the stack (tracked in the design): presentation callbacks for
+frame-exact acknowledgment, Kitty image replay after a snapshot, and a
+local scrollback window limit for restored snapshots.
 
 ## GhosttyNextKit releases
 
@@ -76,7 +78,7 @@ A push to `main` runs `.github/workflows/next-xcframework.yml` on a remote
 macOS runner. It runs `next/build-xcframework.sh`, which pins Zig and Xcode
 from `next/toolchain.env`, builds with fixed flags and packages with
 `next/package_xcframework.py`. The release tag is
-`xcframework-<commit>-<flavor>` (flavor `ios-v2` and later; `ios-v3` is the first with a drawing iOS renderer) and holds:
+`xcframework-<commit>-<flavor>` (flavor `ios-v2` and later; `ios-v3` is the first with a drawing iOS renderer; `ios-v4` adds `set_grid`, snapshot restore and encode, and non-blocking surface calls) and holds:
 
 - `GhosttyNextKit.xcframework.zip`: deterministic zip. Its sha256 is also the
   SwiftPM checksum.
