@@ -79,19 +79,29 @@ local scrollback window limit for restored snapshots.
 ## Behavior that differs from upstream
 
 The next upstream sync must keep these behaviors, or change them in a
-reviewed commit that says why. Each one is covered by a test in the patch
-stack.
+reviewed commit that says why.
 
 - Scrollback limits in the MANUAL modes: when the embedder calls
   `ghostty_surface_update_config` on a MANUAL or MANUAL_MIRROR surface,
   `scrollback-limit-bytes` and `scrollback-limit-lines` apply to the live
-  terminal at once. Only the oldest complete history pages are freed, never
-  on-screen rows or the Kitty images on them. Upstream applies these keys to
-  new surfaces only, and EXEC surfaces here keep the upstream behavior. Every
+  terminal at once. Upstream applies these keys to new surfaces only, and
+  EXEC surfaces here keep the upstream behavior. Every
   `ghostty_surface_restore_snapshot` (READY and HISTORY) also uses the
   surface config's limits, not the limits in the host's snapshot. Why: the
   iOS app restores host snapshots and must keep its own memory budget.
-  Source: PR 8 (`74e97632d40a`), release ios-v4 to ios-v5.
+  Source: PR 8 (`74e97632d40a`), release ios-v5.
+  - Trimming frees the oldest complete history pages and keeps the active
+    rows and the Kitty images placed on them. So a configured limit can stay
+    unmet when the history boundary shares a page with active rows, and the
+    line limit always permits at least one standard history page.
+    Exception: `scrollback-limit-bytes = 0` erases all history
+    (`Terminal.setScrollbackMaxBytes` calls `eraseHistory`), which can remove
+    only the history part of a page that it shares with active rows.
+  - Test coverage: the Zig restore test covers `scrollback-limit-bytes`
+    through a READY restore, a second restore and a live config change; a
+    second test covers a live trim that keeps an on-screen Kitty image. No
+    test covers `scrollback-limit-lines` on restore yet. The iOS simulator
+    smoke checks only that a restore under a byte limit succeeds and draws.
 
 ## GhosttyNextKit releases
 
