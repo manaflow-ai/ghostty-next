@@ -2014,13 +2014,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // If our health value hasn't changed, then we do nothing. We don't
             // do a cmpxchg here because strict atomicity isn't important.
             if (self.health.load(.seq_cst) != health) {
-                self.health.store(health, .seq_cst);
-
                 // Our health value changed, so we notify the surface so that it
-                // can do something about it.
-                _ = self.surface_mailbox.push(.{
+                // can do something about it. Never wait: this runs on the GPU
+                // completion thread before the frame is released below, and
+                // the app mailbox drains on the main thread, which may be in
+                // a synchronous draw waiting for that frame. The value is
+                // stored only once the notification is queued, so a dropped
+                // one is sent again with the next completed frame.
+                if (self.surface_mailbox.push(.{
                     .renderer_health = health,
-                }, .{ .forever = {} });
+                }, .{ .instant = {} }) > 0) {
+                    self.health.store(health, .seq_cst);
+                }
             }
 
             // Always release our semaphore. The swap chain is
