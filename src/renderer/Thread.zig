@@ -12,7 +12,6 @@ const rendererpkg = @import("../renderer.zig");
 const apprt = @import("../apprt.zig");
 const configpkg = @import("../config.zig");
 const terminalpkg = @import("../terminal/main.zig");
-const BlockingQueue = @import("../datastruct/main.zig").BlockingQueue;
 
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.renderer_thread);
@@ -24,7 +23,8 @@ const CURSOR_BLINK_INTERVAL = 600;
 /// The type used for sending messages to the IO thread. For now this is
 /// hardcoded with a capacity. We can make this a comptime parameter in
 /// the future if we want it configurable.
-pub const Mailbox = BlockingQueue(rendererpkg.Message, 64);
+/// Producers never block on it; see mailbox.zig.
+pub const Mailbox = @import("mailbox.zig");
 
 /// Allocator used for some state
 alloc: std.mem.Allocator,

@@ -563,6 +563,31 @@ typedef enum {
 // - Stop calling ghostty_surface_process_output, and let every call
 //   return, before ghostty_surface_free.
 //
+// Blocking: no surface function waits for the renderer thread or for a
+// GPU completion, except ghostty_surface_draw (a synchronous draw that
+// waits for a free frame) and ghostty_surface_free (it joins the
+// renderer thread). ghostty_surface_process_output, set_grid, set_size,
+// set_content_scale, set_focus, set_occlusion, update_config and font
+// size changes post their renderer work and return: when the renderer is
+// behind, its mailbox grows instead of blocking, and a newer size, focus
+// or visibility replaces an older pending one. The remaining waits are
+// short lock holds and one queue:
+// - The terminal lock. The renderer thread holds it while it copies the
+//   terminal state for a frame (CPU work), and the output queue holds it
+//   for one 64 KiB slice of output, one snapshot restore swap or history
+//   page, or one snapshot encode. Main thread input and resize calls
+//   take it. One exception reaches the GPU: when Kitty image placements
+//   changed (or a snapshot was restored), the frame copy also takes the
+//   draw lock, which a synchronous draw (ghostty_surface_draw, or the
+//   layer's display pass on the main thread) holds while it waits for a
+//   free frame.
+// - The termio mailbox. Configuration changes and replies that a
+//   manual surface does not handle on the caller's thread go to the
+//   surface's IO thread, which never waits for the renderer.
+// - The app mailbox. Output parsing that messages the app (title, bell,
+//   clipboard, ...) waits while that mailbox is full, until the main
+//   thread drains it in ghostty_app_tick (see the deadlock rule above).
+//
 // io_write_cb is called:
 //
 // - Synchronously, before the input call returns, on the thread that
