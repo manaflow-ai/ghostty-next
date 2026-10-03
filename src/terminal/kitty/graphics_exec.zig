@@ -1840,8 +1840,14 @@ test "kittygfx display clamps cell offsets" {
     try testing.expectEqual(@as(u32, 19), placement.y_offset);
 
     const actual = placement.pixelSize(storage.imageById(1).?, &t);
-    try testing.expectEqual(@as(u32, 11), actual.width);
-    try testing.expectEqual(@as(u32, 1), actual.height);
+    if (comptime @import("terminal_options").artifact != .lib) {
+        try testing.expectEqual(@as(u32, 11), actual.width);
+        try testing.expectEqual(@as(u32, 1), actual.height);
+    } else {
+        // libghostty-vt keeps the c/r size; offsets only move the image.
+        try testing.expectEqual(@as(u32, 20), actual.width);
+        try testing.expectEqual(@as(u32, 20), actual.height);
+    }
 }
 
 test "kittygfx placement bounds cursor movement for untrusted dimensions" {
