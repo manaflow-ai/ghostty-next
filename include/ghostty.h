@@ -1427,10 +1427,15 @@ typedef void (*ghostty_surface_snapshot_write_cb)(void*,
 // replaced the screen.
 //
 // The restore emits nothing to io_write_cb. The restored terminal takes
-// the snapshot's grid, colors, modes and scrollback limits; a grid
-// locked with ghostty_surface_set_grid takes the snapshot's size and
-// keeps its generation. Kitty image storage limits and in-band only
-// image loading stay local. Snapshot format version 1 carries no Kitty
+// the snapshot's grid, colors and modes; a grid locked with
+// ghostty_surface_set_grid takes the snapshot's size and keeps its
+// generation. The surface's own config replaces the owner's limits: the
+// scrollback limits (scrollback-limit-bytes, scrollback-limit-lines),
+// so HISTORY pages beyond them are dropped from the oldest end, the
+// Kitty image storage limit, and in-band only image loading. In the
+// MANUAL modes, ghostty_surface_update_config applies new scrollback
+// limits to the live terminal too: the oldest complete history pages
+// are freed, never the screen or the Kitty images on it. Snapshot format version 1 carries no Kitty
 // images: the owner replays the images on screen after the snapshot.
 //
 // A restored synchronized update (mode 2026) gets the same safety
