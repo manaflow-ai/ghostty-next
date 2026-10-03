@@ -142,6 +142,14 @@ pub const StreamHandler = struct {
     /// termio.Options.suppress_terminal_responses.
     suppress_terminal_responses: bool = false,
 
+    /// Store the OSC 7 working directory as the raw URL, as libghostty-vt
+    /// does, without the local-host check. Set for MANUAL and
+    /// MANUAL_MIRROR surfaces, whose PTY belongs to a remote host: the
+    /// viewer's own host name means nothing there, and the stored form
+    /// must match the session host's terminal so snapshots round trip.
+    /// Readers that need a path decode it with `osc7Path`.
+    pwd_raw_url: bool = false,
+
     //---------------------------------------------------------------
     // Internal state
 
@@ -1075,7 +1083,14 @@ pub const StreamHandler = struct {
         if (title.len == 0) {
             // If we have a pwd then we set the title as the pwd else
             // we just set it to blank.
-            if (self.terminal.getPwd()) |pwd| pwd: {
+            var pwd_buf: [1024]u8 = undefined;
+            var pwd_fba: std.heap.FixedBufferAllocator = .init(&pwd_buf);
+            const stored_pwd = self.terminal.getPwd();
+            const title_pwd = if (self.pwd_raw_url)
+                if (stored_pwd) |raw| osc7Path(pwd_fba.allocator(), raw) catch null else null
+            else
+                stored_pwd;
+            if (title_pwd) |pwd| pwd: {
                 if (pwd.len >= buf.len) break :pwd;
                 @memcpy(buf[0..pwd.len], pwd);
                 buf[pwd.len] = 0;
@@ -1574,6 +1589,8 @@ pub const StreamHandler = struct {
     }
 
     fn reportPwd(self: *StreamHandler, url: []const u8) !void {
+        if (self.pwd_raw_url and url.len > 0) return try self.reportPwdRaw(url);
+
         // Special handling for the empty URL. We treat the empty URL
         // as resetting the pwd as if we never saw a pwd. I can't find any
         // other terminal that does this but it seems like a reasonable
@@ -1662,6 +1679,31 @@ pub const StreamHandler = struct {
         }
 
         // If we haven't seen a title, use our pwd as the title.
+        if (!self.seen_title) {
+            try self.windowTitle(path);
+            self.seen_title = false;
+        }
+    }
+
+    /// MANUAL modes: keep the raw OSC 7 URL in the terminal, exactly as
+    /// libghostty-vt's stream handler does, and report the decoded path
+    /// (when there is one) to the surface.
+    fn reportPwdRaw(self: *StreamHandler, url: []const u8) !void {
+        try self.terminal.setPwd(url);
+
+        var arena_alloc: std.heap.ArenaAllocator = .init(self.alloc);
+        defer arena_alloc.deinit();
+        const path = (osc7Path(arena_alloc.allocator(), url) catch null) orelse {
+            log.debug("OSC 7 url has no decodable path: {s}", .{url});
+            return;
+        };
+
+        if (apprt.surface.Message.WriteReq.init(self.alloc, path)) |req| {
+            self.surfaceMessageWriter(.{ .pwd_change = req });
+        } else |err| {
+            log.warn("error notifying surface of pwd change err={}", .{err});
+        }
+
         if (!self.seen_title) {
             try self.windowTitle(path);
             self.seen_title = false;
@@ -2326,4 +2368,79 @@ test "terminal responses: dropped allocated replies are freed" {
     const long_reply: []const u8 = "\x1b]11;rgb:0000/0000/0000\x1b\\" ** 4;
     ts.stream.handler.messageWriter(try termio.Message.writeReq(alloc, long_reply));
     try testing.expectEqual(@as(usize, 0), ts.drain().termio);
+}
+
+/// Decode the path of an OSC 7 working-directory URL (file:// or
+/// kitty-shell-cwd://) without checking its host. Returns null when the
+/// value is not such a URL. Used where the terminal stores the raw URL
+/// (see StreamHandler.pwd_raw_url).
+pub fn osc7Path(alloc: std.mem.Allocator, url: []const u8) !?[]const u8 {
+    if (builtin.os.tag == .windows) return null;
+    const uri: std.Uri = internal_os.uri.parse(url, .{
+        .mac_address = comptime builtin.os.tag != .macos,
+        .raw_path = std.mem.startsWith(u8, url, "kitty-shell-cwd://"),
+    }) catch return null;
+    if (!std.mem.eql(u8, "file", uri.scheme) and
+        !std.mem.eql(u8, "kitty-shell-cwd", uri.scheme)) return null;
+    return try uri.path.toRawMaybeAlloc(alloc);
+}
+
+test "OSC 7: manual surfaces keep the raw URL and skip the host check" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const testing = std.testing;
+
+    const remote = "file://cmux-remote-host-that-is-not-local/Users/dev/project0";
+    const local = "file://localhost/Users/dev/project0";
+
+    // MANUAL and MANUAL_MIRROR: the terminal keeps the raw URL, as
+    // libghostty-vt does, whatever the host is.
+    {
+        var ts: TestStream = undefined;
+        try ts.init(false);
+        defer ts.deinit();
+        ts.stream.handler.pwd_raw_url = true;
+
+        ts.parse("\x1b]7;" ++ local ++ "\x1b\\");
+        try testing.expectEqualStrings(local, ts.t.getPwd().?);
+        ts.parse("\x1b]7;" ++ remote ++ "\x1b\\");
+        try testing.expectEqualStrings(remote, ts.t.getPwd().?);
+        _ = ts.drain();
+    }
+
+    // EXEC keeps upstream behavior: the decoded path for a local host and
+    // nothing for a remote host.
+    {
+        var ts: TestStream = undefined;
+        try ts.init(false);
+        defer ts.deinit();
+
+        ts.parse("\x1b]7;" ++ local ++ "\x1b\\");
+        try testing.expectEqualStrings("/Users/dev/project0", ts.t.getPwd().?);
+        ts.parse("\x1b]7;" ++ remote ++ "\x1b\\");
+        try testing.expectEqualStrings("/Users/dev/project0", ts.t.getPwd().?);
+        _ = ts.drain();
+    }
+}
+
+test "osc7Path decodes file and kitty-shell-cwd URLs without a host check" {
+    const testing = std.testing;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    try testing.expectEqualStrings(
+        "/Users/dev/project 0",
+        (try osc7Path(alloc, "file://remote-host/Users/dev/project%200")).?,
+    );
+    try testing.expectEqualStrings(
+        "/Users/dev/project0",
+        (try osc7Path(alloc, "file://localhost/Users/dev/project0")).?,
+    );
+    try testing.expectEqualStrings(
+        "/tmp/a b",
+        (try osc7Path(alloc, "kitty-shell-cwd://remote-host/tmp/a b")).?,
+    );
+    try testing.expect((try osc7Path(alloc, "https://example.com/x")) == null);
+    try testing.expect((try osc7Path(alloc, "not a url")) == null);
 }

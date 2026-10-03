@@ -2165,6 +2165,15 @@ pub fn pwd(
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
     const terminal_pwd = self.io.terminal.getPwd() orelse return null;
+    // MANUAL modes store the raw OSC 7 URL (see
+    // StreamHandler.pwd_raw_url); callers get the decoded path.
+    if (self.io.backend == .manual) {
+        var arena: std.heap.ArenaAllocator = .init(alloc);
+        defer arena.deinit();
+        const path = (termio.osc7Path(arena.allocator(), terminal_pwd) catch null) orelse
+            return null;
+        return try alloc.dupe(u8, path);
+    }
     return try alloc.dupe(u8, terminal_pwd);
 }
 
@@ -2174,9 +2183,16 @@ fn resolvePathForOpening(
     path: []const u8,
 ) Allocator.Error!?[]const u8 {
     if (!std.fs.path.isAbsolute(path)) {
-        const terminal_pwd = self.io.terminal.getPwd() orelse {
+        const stored_pwd = self.io.terminal.getPwd() orelse {
             return null;
         };
+        var pwd_arena: std.heap.ArenaAllocator = .init(self.alloc);
+        defer pwd_arena.deinit();
+        const terminal_pwd = if (self.io.backend == .manual)
+            (termio.osc7Path(pwd_arena.allocator(), stored_pwd) catch null) orelse
+                return null
+        else
+            stored_pwd;
 
         const resolved = try std.fs.path.resolve(self.alloc, &.{ terminal_pwd, path });
 

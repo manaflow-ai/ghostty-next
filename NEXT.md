@@ -79,6 +79,7 @@ thread. New tab and split surfaces do not inherit the IO fields.
 | ci: run the round-2 libghostty-vt patch tests | Filters for the cell-offset sizing, consumed-Alt text, word-selection and pending-wrap tests, in both the app (`zig build test`) and libghostty-vt (`zig build test-lib-vt`) runs, so both artifacts are proven. |
 | formatter: lib-vt returns from tabstops with a carriage return | Tabstop serialization moves only the column (CHA), so libghostty-vt ends it with CR instead of CUP home. A consumer that writes a selection after its own earlier rows (the cmux-tui segmented replay) no longer has the following rows moved to the top of the screen. The Ghostty app keeps upstream e523cf810. |
 | termio: manual surfaces do not assume the shell redraws the prompt | MANUAL and MANUAL_MIRROR terminals start with `shell_redraws_prompt = false`, matching libghostty-vt embedder terminals (see "Behavior that differs from upstream"). EXEC surfaces are unchanged. |
+| termio: manual surfaces keep the raw OSC 7 URL | MANUAL and MANUAL_MIRROR store the OSC 7 URL as libghostty-vt does, with no local-host check, and decode the path on read (see "Behavior that differs from upstream"). EXEC is unchanged. |
 
 Next in the stack (tracked in the design): presentation callbacks for
 frame-exact acknowledgment, Kitty image replay after a snapshot, and a
@@ -89,6 +90,19 @@ local scrollback window limit for restored snapshots.
 The next upstream sync must keep these behaviors, or change them in a
 reviewed commit that says why.
 
+- OSC 7 working directory in the MANUAL modes: MANUAL and MANUAL_MIRROR
+  surfaces store the raw OSC 7 URL (for example
+  `file://localhost/Users/dev/project0`), the same form libghostty-vt
+  stores. They also skip the local-host check. Upstream keeps only the
+  decoded path and drops URLs whose host is not local, and EXEC surfaces
+  here keep that. Why: the PTY belongs to a remote session host, so the
+  viewer's own host name means nothing there, and the stored form must
+  match the host terminal so the pwd keeps its form across snapshot
+  restores. Readers that need a path decode it on read (`termio.osc7Path`):
+  the pwd action, `Surface.pwd`, relative path opening and the pwd window
+  title. Tests: `OSC 7: manual surfaces keep the raw URL and skip the host
+  check`, `osc7Path decodes file and kitty-shell-cwd URLs without a host
+  check`.
 - Prompt redraw in the MANUAL modes: MANUAL and MANUAL_MIRROR surfaces
   create their terminal with `shell_redraws_prompt = false`, the value
   that libghostty-vt's C API (`ghostty_terminal_new`) gives every embedder
