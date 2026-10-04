@@ -102,6 +102,8 @@ jobs:
             -Dtest-filter="ghostty.h surface grid" \
             -Dtest-filter="ghostty.h SurfaceSnapshotPhase" \
             -Dtest-filter="renderer mailbox: " \
+            -Dtest-filter="loadString " \
+            -Dtest-filter="c_get: window-padding" \
             --summary all
           # libghostty-vt patches (VT replay formatter, terminal and Kitty
           # graphics C API). These live in the lib-vt test modules.

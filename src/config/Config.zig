@@ -4089,6 +4089,36 @@ fn loadReader(self: *Config, alloc: Allocator, reader: *std.Io.Reader, path: []c
     try self.expandPaths(std.fs.path.dirname(path).?);
 }
 
+test "loadString loads in-memory contents with a synthetic path" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+    try cfg.loadString(
+        alloc,
+        "\xef\xbb\xbfabnormal-command-exit-runtime = 2500\nfont-size = 15\n",
+        "/home/ghostty/.config/ghostty/cmux.json",
+    );
+    try cfg.finalize();
+
+    try testing.expect(cfg._diagnostics.empty());
+    try testing.expectEqual(2500, cfg.@"abnormal-command-exit-runtime");
+    try testing.expectEqual(15, cfg.@"font-size");
+}
+
+test "loadString reports diagnostics against the synthetic path" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+    try cfg.loadString(alloc, "not-a-real-key = 1\n", "/cmux/cmux-next");
+    try cfg.finalize();
+
+    try testing.expect(!cfg._diagnostics.empty());
+}
+
 test "handle bom in config files" {
     const testing = std.testing;
     const alloc = testing.allocator;
