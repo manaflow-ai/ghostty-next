@@ -133,6 +133,7 @@ jobs:
             -Dtest-filter="image_set_number" \
             -Dtest-filter="image iterator visits" \
             -Dtest-filter="image ID cursor" \
+            -Dtest-filter="deferred clipboard" \
             -Dtest-filter="Kitty automatic image ID cursors" \
             -Dtest-filter="RIS preserves configured byte and count limits" \
             -Dtest-filter="cell offsets" \

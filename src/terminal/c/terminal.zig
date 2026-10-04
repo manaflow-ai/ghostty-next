@@ -5883,6 +5883,69 @@ test "set clipboard write max bytes" {
     try testing.expectEqual(@as(usize, kitty_clipboard.max_write_size), max);
 }
 
+test "deferred clipboard_read via the C API" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &t, 80, 24));
+    defer free(t);
+
+    const S = struct {
+        var last_data: ?[]u8 = null;
+        var token: u64 = 0;
+
+        fn deinit() void {
+            if (last_data) |d| testing.allocator.free(d);
+            last_data = null;
+        }
+
+        fn writePty(_: Terminal, _: ?*anyopaque, ptr: [*]const u8, len: usize) callconv(lib.calling_conv) void {
+            if (last_data) |d| testing.allocator.free(d);
+            last_data = testing.allocator.dupe(u8, ptr[0..len]) catch @panic("OOM");
+        }
+
+        fn clipboardRead(_: Terminal, _: ?*anyopaque, request: *const ClipboardRead) callconv(lib.calling_conv) void {
+            token = request.token;
+            request.reply(request, &.{
+                .size = @sizeOf(ClipboardReadReply),
+                .result = .deferred,
+                .contents = null,
+                .contents_len = 0,
+                .available = null,
+                .available_len = 0,
+                .remember = false,
+            });
+        }
+    };
+    defer S.deinit();
+
+    try testing.expectEqual(Result.success, set(t, .write_pty, @ptrCast(&S.writePty)));
+    try testing.expectEqual(Result.success, set(t, .clipboard_read, @ptrCast(&S.clipboardRead)));
+
+    const read_bel = "\x1B]52;c;?\x07";
+    vt_write(t, read_bel, read_bel.len);
+    try testing.expect(S.token != 0);
+    try testing.expect(S.last_data == null);
+
+    const contents = [_]ClipboardContent{.{ .mime = .init("text/plain"), .data = .init("hello") }};
+    const reply: ClipboardReadReply = .{
+        .size = @sizeOf(ClipboardReadReply),
+        .result = .success,
+        .contents = &contents,
+        .contents_len = contents.len,
+        .available = null,
+        .available_len = 0,
+        .remember = false,
+    };
+    try testing.expectEqual(Result.success, clipboard_read_complete(t, S.token, &reply));
+    try testing.expectEqualStrings("\x1B]52;c;aGVsbG8=\x07", S.last_data.?);
+    // Completed tokens and unknown ones are refused without a write.
+    S.deinit();
+    try testing.expectEqual(Result.invalid_value, clipboard_read_complete(t, S.token, &reply));
+    try testing.expect(S.last_data == null);
+
+    // A pending read is freed with the terminal (test allocator checks).
+    vt_write(t, read_bel, read_bel.len);
+}
+
 test "set clipboard_read callback" {
     var t: Terminal = null;
     try testing.expectEqual(Result.success, new(
