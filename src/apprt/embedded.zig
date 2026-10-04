@@ -2886,3 +2886,37 @@ test "grid metrics resolve a spacer-head cursor to its wrapped glyph" {
     try testing.expectEqual(@as(u16, 2), snapshot.cursor_width_cells);
 }
 
+
+test "grid metrics follow a host-locked grid that differs from the view" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var term = try terminal.Terminal.init(std.testing.io, alloc, .{
+        .cols = 10,
+        .rows = 2,
+    });
+    defer term.deinit(alloc);
+    const screen = term.screens.active;
+
+    // The view fits 20x4 cells, but the session host locked the grid to
+    // 10x2 (ghostty_surface_set_grid). Metrics describe the locked grid.
+    const size: renderer.Size = .{
+        .screen = .{ .width = 160, .height = 64 },
+        .cell = .{ .width = 8, .height = 16 },
+        .padding = .{ .left = 0, .top = 0 },
+    };
+    try testing.expect(CAPI.surfaceGridMetricsSnapshot(
+        size,
+        .{ .x = 1, .y = 1 },
+        screen,
+    ) == null);
+    const locked = CAPI.gridMetrics(
+        size,
+        .{ .x = 1, .y = 1 },
+        screen,
+        .{ .grid_locked = true },
+    ).?;
+    try testing.expectEqual(@as(u16, 10), locked.columns);
+    try testing.expectEqual(@as(u16, 2), locked.rows);
+    try testing.expect(locked.cursor_in_viewport);
+    try testing.expectEqual(@as(f64, 8), locked.cell_width);
+}
