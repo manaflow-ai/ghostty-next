@@ -119,7 +119,7 @@ reviewed commit that says why.
   check`, `osc7Path decodes file and kitty-shell-cwd URLs without a host
   check`.
 - OSC 133 prompt placement (all modes, and libghostty-vt): a primary
-  prompt (133;A, or 133;P without k=c/s) after a partial line padded to the
+  prompt (133;A, or 133;P with k=i or no k) after a partial line padded to the
   margin starts its own logical line, and the padding that forced the wrap
   is dropped. Upstream leaves the prompt soft-wrapped onto the padded line,
   so a resize reflows it away from column 0. Tests: `Terminal: OSC133...`.
