@@ -2129,6 +2129,13 @@ pub fn semanticPrompt(
 
             const screen: *Screen = self.screens.active;
 
+            // A prompt that starts at column 0 of a soft-wrapped row reached
+            // it through padding, such as zsh PROMPT_SP overflowing spaces
+            // after a partial line. The shell draws and redraws this prompt
+            // as the start of a line, so reflow must not join it onto the
+            // padded row above.
+            if (screen.cursor.x == 0) screen.cursorBreakWrapIntoRow();
+
             // "Subsequent text (until a OSC "133;B" or OSC "133;I" command)
             // is a prompt string (as if followed by OSC 133;P;k=i\007)."
             screen.cursorSetSemanticContent(.{
@@ -2186,9 +2193,15 @@ pub fn semanticPrompt(
             // The k (kind) option specifies the type of prompt:
             // regular primary prompt (k=i or default),
             // right-side prompts (k=r), or prompts for continuation lines (k=c or k=s).
-            self.screens.active.cursorSetSemanticContent(.{
-                .prompt = cmd.readOption(.prompt_kind) orelse .initial,
-            });
+            const kind = cmd.readOption(.prompt_kind) orelse .initial;
+
+            // A primary prompt starts a new logical line, the same as 133;A.
+            // Shells that avoid 133;A's fresh-line (bash with ble.sh) still
+            // reach column 0 of a soft-wrapped row through padding.
+            const screen: *Screen = self.screens.active;
+            if (kind == .initial and screen.cursor.x == 0) screen.cursorBreakWrapIntoRow();
+
+            screen.cursorSetSemanticContent(.{ .prompt = kind });
         },
 
         .end_prompt_start_input => {
@@ -15678,6 +15691,95 @@ test "Terminal: OSC133A cl option sets click to cl value" {
     });
 
     try testing.expectEqual(Screen.SemanticPrompt.SemanticClick{ .cl = .multiple }, t.screens.active.semantic_prompt.click);
+}
+
+test "Terminal: OSC133P after a padded partial line keeps the prompt on its own line across resize" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+
+    // ble.sh pads a partial output line past the right edge like zsh
+    // PROMPT_SP, and Ghostty's bash integration marks its prompt with
+    // 133;P (no fresh-line) because ble.sh tracks the cursor itself.
+    try t.printString("ab%");
+    try t.printString("        ");
+    t.carriageReturn();
+    try t.semanticPrompt(.{
+        .action = .prompt_start,
+        .options_unvalidated = "k=i",
+    });
+    try t.printString("$ ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try t.printString("ls");
+    try testing.expectEqual(@as(size.CellCountInt, 1), t.screens.active.cursor.y);
+
+    try t.resize(alloc, .{ .cols = 20, .rows = 5 });
+    try testing.expectEqual(@as(size.CellCountInt, 1), t.screens.active.cursor.y);
+    const prompt_start = t.screens.active.pages.getCell(.{ .active = .{ .x = 0, .y = 1 } }).?;
+    try testing.expect(prompt_start.cell.codepoint() == '$' or prompt_start.cell.codepoint() == 0);
+
+    // The padding spaces are gone, so narrowing does not reflow them into
+    // extra blank rows above the prompt.
+    try t.resize(alloc, .{ .cols = 5, .rows = 5 });
+    try testing.expectEqual(@as(size.CellCountInt, 1), t.screens.active.cursor.y);
+}
+
+test "Terminal: OSC133P continuation prompt keeps a soft wrap" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+
+    // Only a primary prompt starts a new logical line. A continuation
+    // prompt (k=c or k=s) belongs to the input it continues.
+    try t.printString("0123456789ab");
+    t.carriageReturn();
+    try t.semanticPrompt(.{
+        .action = .prompt_start,
+        .options_unvalidated = "k=c",
+    });
+    try testing.expect(t.screens.active.cursor.page_row.wrap_continuation);
+}
+
+test "Terminal: OSC133A after a padded partial line keeps the prompt on its own line across resize" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+
+    // zsh PROMPT_SP: after output with no trailing newline, the shell prints
+    // a mark and pads with spaces past the right edge so the terminal wraps
+    // to a new row, then returns to column 0 and starts the prompt there.
+    try t.printString("ab%");
+    try t.printString("        ");
+    t.carriageReturn();
+    try t.printString(" ");
+    t.carriageReturn();
+    try t.semanticPrompt(.{
+        .action = .fresh_line_new_prompt,
+        .options_unvalidated = "redraw=0",
+    });
+    try t.printString("$ ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try t.printString("ls");
+    try testing.expectEqual(@as(size.CellCountInt, 1), t.screens.active.cursor.y);
+
+    // The shell redraws its prompt from column 0 after a resize, so reflow
+    // must not join the prompt onto the padded row above it.
+    try t.resize(alloc, .{ .cols = 20, .rows = 5 });
+    try testing.expectEqual(@as(size.CellCountInt, 1), t.screens.active.cursor.y);
+    try testing.expectEqual(@as(size.CellCountInt, 4), t.screens.active.cursor.x);
+    const prompt_start = t.screens.active.pages.getCell(.{ .active = .{ .x = 0, .y = 1 } }).?;
+    try testing.expectEqual(@as(u21, '$'), prompt_start.cell.codepoint());
+
+    try t.resize(alloc, .{ .cols = 6, .rows = 5 });
+    const narrowed_start = t.screens.active.pages.getCell(.{ .active = .{
+        .x = 0,
+        .y = t.screens.active.cursor.y,
+    } }).?;
+    try testing.expectEqual(@as(u21, '$'), narrowed_start.cell.codepoint());
+    try testing.expectEqual(@as(size.CellCountInt, 4), t.screens.active.cursor.x);
 }
 
 test "Terminal: OSC133A cl=line sets click to line" {
