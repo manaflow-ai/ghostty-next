@@ -329,11 +329,15 @@ test "ghostty.h SurfaceLocalHistoryResult" {
     );
 }
 
-test "ghostty.h history digest length" {
+test "ghostty.h history digest length and version" {
     const c = @import("ghostty.h");
     try std.testing.expectEqual(
         @as(usize, terminal.history_digest.len),
         @as(usize, c.GHOSTTY_SURFACE_HISTORY_DIGEST_LEN),
+    );
+    try std.testing.expectEqual(
+        @as(u32, terminal.history_digest.version),
+        @as(u32, c.GHOSTTY_SURFACE_HISTORY_DIGEST_VERSION),
     );
 }
 

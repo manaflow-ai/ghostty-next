@@ -2387,6 +2387,7 @@ pub const CAPI = struct {
         const bytes: []const u8 = if (len == 0) &.{} else (ptr orelse return .@"error")[0..len];
         var expected: terminal.history_digest.Digest = .{
             .history_rows = expected_history_rows,
+            .seam_rows = 0, // taken from the READY
             .bytes = undefined,
         };
         @memcpy(&expected.bytes, digest_ptr[0..terminal.history_digest.len]);

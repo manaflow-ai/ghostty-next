@@ -972,19 +972,31 @@ pub const LocalHistoryResult = enum {
 
 /// Restore the READY prefix that the owner encoded directly after it
 /// resized, and keep this surface's own primary history instead of
-/// receiving the owner's: resize the old terminal to the snapshot's grid
-/// the way the owner resized (Terminal.resize, which reflows the primary
-/// screen), compare its history digest with the owner's
-/// (`terminalpkg.history_digest.matches`: equal digests, and equal row
-/// counts or a local history that its own smaller scrollback limit cut),
-/// and on a match put the old primary history above the new primary
-/// screen. The caller contract is in ghostty.h
+/// receiving the owner's. The caller contract is in ghostty.h
 /// (ghostty_surface_restore_snapshot_local_history).
 ///
+/// The terminal lock is held only for two swaps, never for O(history)
+/// work:
+/// 1. Under the lock, swap in the READY terminal (as a READY restore
+///    does). The old terminal is private to this call from then on:
+///    output arrives on this thread only.
+/// 2. Without the lock, resize the old terminal to the snapshot's grid the
+///    way the owner resized (Terminal.resize with the READY's prompt
+///    redraw and wraparound, which reflows the primary screen) and compare
+///    its history digest at the READY's seam with the owner's
+///    (`terminalpkg.history_digest.matches`). `expected.seam_rows` is
+///    ignored: the seam is the READY's own history row count.
+/// 3. On a match, still without the lock, decode the READY again and copy
+///    the old primary history above its own history rows
+///    (`PageList.prependHistoryFrom`).
+/// 4. Under the lock, swap that terminal in, unless a main-thread action
+///    (clear, reset, selection) changed the live READY terminal since
+///    step 1; then the live terminal stays and the result is a mismatch.
+///
 /// `bytes` hold exactly the READY prefix; bytes after READY are an error.
-/// Errors leave the terminal unchanged (an earlier snapshot whose history
-/// is still arriving is abandoned). After a result the snapshot is
-/// complete: a later `.history` restore fails with NoSnapshotInProgress.
+/// Errors leave the terminal unchanged (an in-progress HISTORY restore is
+/// abandoned). After a result the snapshot is complete: a later
+/// `.history` restore fails with NoSnapshotInProgress.
 pub fn restoreSnapshotLocalHistory(
     self: *Termio,
     bytes: []const u8,
@@ -993,81 +1005,122 @@ pub fn restoreSnapshotLocalHistory(
     if (self.backend != .manual) return error.NotManual;
     self.abandonSnapshotRestore();
 
+    var decoded = try self.decodeReadyExact(bytes);
+    defer decoded.deinit(self.alloc);
+    var new = decoded.toOwned();
+
+    // What the old terminal's reflow and the comparison need from the
+    // READY, read before the READY terminal becomes the live one: the
+    // owner's resize settings (a resize does not change them; the owner
+    // may use other defaults than this surface), the grid and the seam.
+    const owner_redraw = new.flags.shell_redraws_prompt;
+    const owner_wraparound = new.modes.get(.wraparound);
+    const cols = new.cols;
+    const rows = new.rows;
+    const seam: u64 = seam: {
+        const pages = &new.screens.get(.primary).?.pages;
+        break :seam pages.total_rows - pages.rows;
+    };
+    var want = expected;
+    want.seam_rows = seam;
+
+    // 1. Swap in the READY terminal, under the lock.
+    var old: terminalpkg.Terminal = undefined;
+    const live: LiveTerminalState = live: {
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+        self.prepareRestoredTerminalLocked(&new);
+        old = self.swapTerminalLocked(new, decoded.continuation);
+        break :live self.liveStateLocked();
+    };
+    defer old.deinit(self.alloc);
+    defer self.renderer_wakeup.notify() catch {};
+
+    // 2. Reflow and compare, without the lock.
+    old.flags.shell_redraws_prompt = owner_redraw;
+    old.modes.set(.wraparound, owner_wraparound);
+    old.resize(self.alloc, .{ .cols = cols, .rows = rows, .reflow = true }) catch |err| {
+        log.warn("local history resize failed err={}", .{err});
+        return .mismatch;
+    };
+    const old_pages = &old.screens.get(.primary).?.pages;
+    if (!terminalpkg.history_digest.matches(
+        terminalpkg.history_digest.pagesAtSeam(old_pages, seam),
+        old_pages.history_truncated and old_pages.historyAtLimit(),
+        want,
+    )) return .mismatch;
+
+    // 3. A second READY terminal with the old history, without the lock.
+    var again = self.decodeReadyExact(bytes) catch |err| {
+        log.warn("local history decode failed err={}", .{err});
+        return .mismatch;
+    };
+    defer again.deinit(self.alloc);
+    var full = again.toOwned();
+    var full_owned = true;
+    defer if (full_owned) full.deinit(self.alloc);
+    {
+        const full_primary = full.screens.get(.primary).?;
+        const copied = full_primary.pages.prependHistoryFrom(
+            self.alloc,
+            old_pages,
+            seam,
+        ) catch |err| {
+            log.warn("local history copy failed err={}", .{err});
+            return .mismatch;
+        };
+        if (copied.semantic_prompt) full_primary.semantic_prompt.seen = true;
+    }
+
+    // 4. Swap it in, under the lock, if the live terminal is still the
+    // READY terminal of step 1.
+    var ready_terminal: terminalpkg.Terminal = undefined;
+    {
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+        if (!std.meta.eql(self.liveStateLocked(), live)) return .mismatch;
+        self.prepareRestoredTerminalLocked(&full);
+        ready_terminal = self.swapTerminalLocked(full, again.continuation);
+        full_owned = false;
+    }
+    ready_terminal.deinit(self.alloc);
+    return .restored;
+}
+
+/// Identity of the live terminal's primary screen, to see whether
+/// anything changed it between two lock holds. Caller must hold
+/// `renderer_state.mutex`.
+fn liveStateLocked(self: *Termio) LiveTerminalState {
+    const primary = self.terminal.screens.get(.primary).?;
+    return .{
+        .active_key = self.terminal.screens.active_key,
+        .primary = primary,
+        .first = primary.pages.pages.first,
+        .total_rows = primary.pages.total_rows,
+        .generation = self.terminal.screens.generation(.primary),
+        .has_selection = primary.selection != null,
+    };
+}
+
+const LiveTerminalState = struct {
+    active_key: terminalpkg.ScreenSet.Key,
+    primary: *terminalpkg.Screen,
+    first: ?*terminalpkg.PageList.List.Node,
+    total_rows: usize,
+    generation: usize,
+    has_selection: bool,
+};
+
+/// Decode exactly one READY prefix: bytes after READY are an error.
+fn decodeReadyExact(self: *Termio, bytes: []const u8) !terminalpkg.snapshot.Decoded {
     var reader: std.Io.Reader = .fixed(bytes);
     var decoder: terminalpkg.snapshot.Decoder = .init(&reader);
     var decoded = try decoder.ready(self.alloc, global.io(), .{
         .max_continuation_bytes = snapshot_continuation_max_bytes,
     });
-    defer decoded.deinit(self.alloc);
+    errdefer decoded.deinit(self.alloc);
     if (reader.seek != bytes.len) return error.TrailingSnapshotBytes;
-
-    var new = decoded.toOwned();
-    var result: LocalHistoryResult = .mismatch;
-    var old: terminalpkg.Terminal = undefined;
-    {
-        self.renderer_state.mutex.lockUncancelable(global.io());
-        defer self.renderer_state.mutex.unlock(global.io());
-
-        self.prepareRestoredTerminalLocked(&new);
-
-        // The owner's resize, on the old terminal, which the swap below
-        // discards. Both sides parsed the same bytes, so the reflowed
-        // primary history is the owner's when nothing diverged; the
-        // digest checks that. A failed resize discards the history.
-        // Reflow with the owner's resize settings, which the READY
-        // carries (a resize does not change them): the owner's terminal
-        // may use other defaults than this surface (libghostty-vt
-        // terminals vs surface config). resize_pull_scrollback is not in
-        // the snapshot; both sides keep the Terminal default (true).
-        self.terminal.flags.shell_redraws_prompt = new.flags.shell_redraws_prompt;
-        self.terminal.modes.set(.wraparound, new.modes.get(.wraparound));
-
-        const resized = resized: {
-            self.terminal.resize(self.alloc, .{
-                .cols = new.cols,
-                .rows = new.rows,
-                .cell_size_px = .{
-                    .width = self.size.cell.width,
-                    .height = self.size.cell.height,
-                },
-                .reflow = true,
-            }) catch |err| {
-                log.warn("local history resize failed err={}", .{err});
-                break :resized false;
-            };
-            break :resized true;
-        };
-
-        if (resized and terminalpkg.history_digest.matches(
-            terminalpkg.history_digest.terminal(&self.terminal),
-            self.terminal.screens.get(.primary).?.pages.history_truncated,
-            expected,
-        )) history: {
-            // The new primary screen holds the owner's newest history
-            // rows that share the active area's first page; take only the
-            // older rows from the old terminal.
-            const new_primary = new.screens.get(.primary).?;
-            const old_primary = self.terminal.screens.get(.primary).?;
-            const overlap = new_primary.pages.total_rows - new_primary.pages.rows;
-            const copied = new_primary.pages.prependHistoryFrom(
-                self.alloc,
-                &old_primary.pages,
-                overlap,
-            ) catch |err| {
-                log.warn("local history copy failed err={}", .{err});
-                break :history;
-            };
-            if (copied.semantic_prompt) new_primary.semantic_prompt.seen = true;
-            result = .restored;
-        }
-
-        old = self.swapTerminalLocked(new, decoded.continuation);
-    }
-
-    // The old terminal is unreachable now; free it off the lock.
-    old.deinit(self.alloc);
-    self.renderer_wakeup.notify() catch {};
-    return result;
+    return decoded;
 }
 
 /// The history digest of the live terminal's primary screen
@@ -2004,7 +2057,7 @@ const TestOwner = struct {
     stream: terminalpkg.TerminalStream,
 
     /// The owner starts at the viewer's view grid and then takes the
-    /// locked grid without reflow, as the viewer did (setGrid on a
+    /// locked grid the way the viewer's setGrid did (no reflow on a
     /// mirror), so both have the same pages from the start.
     fn init(self: *TestOwner, io: *Termio, cols: u16, rows: u16, max_lines: ?usize) !void {
         const alloc = std.testing.allocator;
@@ -2016,7 +2069,11 @@ const TestOwner = struct {
             .max_scrollback_lines = max_lines,
         });
         errdefer self.t.deinit(alloc);
-        try self.t.resize(alloc, .{ .cols = cols, .rows = rows, .reflow = false });
+        try self.t.resize(alloc, .{
+            .cols = cols,
+            .rows = rows,
+            .reflow = !io.suppress_terminal_responses,
+        });
         self.t.flags.shell_redraws_prompt = io.terminal.flags.shell_redraws_prompt;
         self.t.modes.set(.grapheme_cluster, io.terminal.modes.get(.grapheme_cluster));
         self.t.modes.set(.wraparound, io.terminal.modes.get(.wraparound));
@@ -2092,8 +2149,11 @@ fn testExpectSamePrimary(io: *Termio, owner: *TestOwner) !void {
     const got = try testPrimaryText(&io.terminal, 0);
     defer alloc.free(got);
     try std.testing.expectEqualStrings(want, got);
-    try std.testing.expect(terminalpkg.history_digest.terminal(&io.terminal)
-        .eql(terminalpkg.history_digest.terminal(&owner.t)));
+    // Page layouts differ after a splice, so compare at one seam (the
+    // owner's own seam depends on its layout).
+    const d = terminalpkg.history_digest;
+    try std.testing.expect(d.pagesAtSeam(&io.terminal.screens.get(.primary).?.pages, 0)
+        .eql(d.pagesAtSeam(&owner.t.screens.get(.primary).?.pages, 0)));
 }
 
 fn testHistoryRows(t: *terminalpkg.Terminal) usize {
@@ -2320,10 +2380,33 @@ test "manual: snapshot local history restore reflows with the owner's prompt red
             owner.t.flags.shell_redraws_prompt = .true;
             try testing.expectEqual(.false, io.terminal.flags.shell_redraws_prompt);
 
-            // No OSC 133 here: it messages the surface, which these
-            // tests do not have.
-            try testFeedLines(io, &owner, 0, 3000);
-            testFeedBoth(io, &owner, "~/src $ ");
+            // Shell integration output with OSC 133 prompt marks. The
+            // surface's stream handler sends OSC 133 to the surface
+            // mailbox, which these tests do not have, so the viewer's
+            // terminal parses through the libghostty-vt stream handler
+            // directly (the same terminal state changes). Prompt redraw
+            // clears only the prompt rows at the cursor, which are in the
+            // active area that READY replaces, so this guards the match
+            // and does not fail without the READY's value.
+            {
+                var viewer = io.terminal.vtStream();
+                defer viewer.deinit();
+                var buf: [200]u8 = undefined;
+                for (0..1500) |i| {
+                    const bytes = try std.fmt.bufPrint(
+                        &buf,
+                        "\x1b]133;A\x07~/src $ \x1b]133;B\x07make {d}\r\n\x1b]133;C\x07" ++
+                            ("output abcdefghij" ** 3) ++ "\r\n\x1b]133;D;0\x07",
+                        .{i},
+                    );
+                    viewer.nextSlice(bytes);
+                    owner.stream.nextSlice(bytes);
+                }
+                const prompt = "\x1b]133;A\x07~/src $ \x1b]133;B\x07";
+                viewer.nextSlice(prompt);
+                owner.stream.nextSlice(prompt);
+            }
+            try testing.expect(io.terminal.screens.get(.primary).?.semantic_prompt.seen);
 
             const ready, const digest = try owner.resizeAndEncode(25, 10);
             defer alloc.free(ready);
@@ -2525,6 +2608,31 @@ test "manual: snapshot local history restore after erased scrollback is not a cu
         }
     }.run;
     try testManualTermio(true, body);
+}
+
+test "manual: a MANUAL surface's history digest equals libghostty-vt's after the same resize" {
+    const body = struct {
+        fn run(io: *Termio, _: *TestSink, _: bool) !void {
+            const testing = std.testing;
+
+            // A MANUAL surface as the host: set_grid reflows with the same
+            // Terminal.resize as ghostty_terminal_resize.
+            try testing.expect(io.setGrid(40, 10, 1));
+            var owner: TestOwner = undefined;
+            try owner.init(io, 40, 10, null);
+            defer owner.deinit();
+            try testFeedLines(io, &owner, 0, 3000);
+            try testing.expect(io.setGrid(25, 10, 2));
+            try owner.t.resize(testing.allocator, .{ .cols = 25, .rows = 10 });
+
+            // historyDigest is ghostty_surface_history_digest.
+            const surface = try io.historyDigest();
+            const lib = terminalpkg.history_digest.terminal(&owner.t);
+            try testing.expect(surface.eql(lib));
+            try testing.expect(surface.history_rows > surface.seam_rows + 64);
+        }
+    }.run;
+    try testManualTermio(false, body);
 }
 
 test "manual: snapshot local history restore errors leave the terminal unchanged" {

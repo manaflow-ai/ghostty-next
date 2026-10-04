@@ -456,7 +456,8 @@ limits: Limits,
 /// (byte-limit recycling in `grow`, `Limits.enforce`, or a history page
 /// that `PageAllocation.finalize` or `prependHistoryFrom` refused). Then
 /// this list holds only the newest part of the history it received.
-/// `reset` clears it; a `clone` keeps it.
+/// `reset` and erasing all history (CSI 3 J) clear it; a `clone` keeps it.
+/// It does not say the list is still at its limit: see `historyAtLimit`.
 history_truncated: bool = false,
 
 /// The total number of rows represented by this PageList. This is used
@@ -4588,12 +4589,12 @@ pub fn prependHistoryFrom(
 ) PrependHistoryError!PrependHistory {
     if (src.cols != self.cols) return error.ColumnMismatch;
 
+    // History that the source already dropped is missing here too.
+    if (src.history_truncated) self.history_truncated = true;
+
     var result: PrependHistory = .{};
     const history_rows = src.total_rows - src.rows;
     if (skip_newest >= history_rows) return result;
-
-    // History that the source already dropped is missing here too.
-    if (src.history_truncated) self.history_truncated = true;
     const copy_rows = history_rows - skip_newest;
 
     var it = src.pageIterator(
@@ -4628,6 +4629,19 @@ pub fn prependHistoryFrom(
 
     self.assertIntegrity();
     return result;
+}
+
+/// Whether the history is at this list's effective scrollback limit: one
+/// more standard page of rows would exceed the line limit, or one more
+/// standard page would exceed the byte limit. Growing such a list drops
+/// its oldest page; a list well below its limits (after CSI 3 J or a
+/// raised limit) is not at its limit even when `history_truncated` is set.
+pub fn historyAtLimit(self: *const PageList) bool {
+    const history_rows = self.total_rows - self.rows;
+    const page_rows: usize = initialCapacity(self.cols).rows;
+    if (history_rows +| page_rows > self.limits.max(.lines)) return true;
+    if (self.page_size +| PagePool.item_size > self.limits.max(.bytes)) return true;
+    return false;
 }
 
 fn pageHasSemanticPrompt(page: *const Page) bool {
@@ -5742,6 +5756,9 @@ fn eraseRows(
 
     // Update our total row count
     self.total_rows -= erased;
+
+    // No history is left, so none of it is missing.
+    if (self.total_rows <= self.rows) self.history_truncated = false;
 
     // If we deleted active, we need to regrow because one of our invariants
     // is that we always have full active space.
@@ -8134,7 +8151,14 @@ test "PageList prependHistoryFrom copies older history newest first within limit
         try testing.expectEqual(@as(u32, @intCast(1000 - result.rows)), S.mark(&dst, 0));
         try testing.expectEqual(@as(u32, 999), S.mark(&dst, result.rows - 1));
         try testing.expect(dst.history_truncated);
+        try testing.expect(dst.historyAtLimit());
         try testing.expect(!src.history_truncated);
+        try testing.expect(!src.historyAtLimit());
+
+        // Erasing all history clears the flag.
+        dst.eraseHistory(null);
+        try testing.expect(!dst.history_truncated);
+        try testing.expect(!dst.historyAtLimit());
     }
 
     // Skipping all history copies nothing; another width is refused.

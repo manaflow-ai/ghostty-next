@@ -31,7 +31,7 @@
  *
  * @ingroup terminal
  */
-#define GHOSTTY_TERMINAL_HISTORY_DIGEST_VERSION 1
+#define GHOSTTY_TERMINAL_HISTORY_DIGEST_VERSION 2
 
 /**
  * Length in bytes of a history digest (SHA-256).
@@ -41,8 +41,8 @@
 #define GHOSTTY_TERMINAL_HISTORY_DIGEST_LEN 32
 
 /**
- * Most history rows a history digest covers: the newest rows directly
- * above the active area.
+ * Most history rows a history digest covers: the rows directly above the
+ * seam (the history rows that a READY snapshot prefix carries itself).
  *
  * @ingroup terminal
  */
@@ -3038,28 +3038,33 @@ GHOSTTY_API GhosttyResult ghostty_terminal_continuation_alloc(
 /**
  * Compute the history digest of the terminal's primary screen.
  *
- * The digest identifies the primary screen's history (the scrollback rows
- * above the active area) so that two terminals that parsed the same bytes
- * and resized the same way can check that they hold the same history
- * without sending it. A cmux host computes it directly after a resize and
- * sends it with the READY snapshot prefix; the mirror computes the same
- * value on its own reflowed terminal (ghostty_surface_restore_snapshot_local_history
- * in ghostty.h) before it keeps its local history.
+ * The digest identifies the history rows that a mirror splices in after a
+ * resize. A READY snapshot prefix carries the page that holds the first
+ * active row of the primary screen, so it already holds the newest S
+ * history rows: the seam, the rows above the active area in that page. A
+ * mirror keeps those and puts its own older, reflowed rows above them
+ * (ghostty_surface_restore_snapshot_local_history in ghostty.h). The
+ * digest covers the rows directly above the seam, where the mirror
+ * splices.
  *
- * out_history_rows receives the number of history rows of the primary
- * screen (physical rows: a soft-wrapped line counts once per row). This
- * is the active screen's history only when the primary screen is active;
- * the alternate screen is never used.
+ * A cmux host calls it at the cut: after ghostty_terminal_resize and the
+ * READY encode, with no change to the terminal in between, because the
+ * seam comes from the page layout that READY encodes.
  *
- * Algorithm, version GHOSTTY_TERMINAL_HISTORY_DIGEST_VERSION (1): SHA-256
+ * out_history_rows receives the number of history rows H of the primary
+ * screen (physical rows: a soft-wrapped line counts once per row). Only
+ * the primary screen is used, active or not.
+ *
+ * Algorithm, version GHOSTTY_TERMINAL_HISTORY_DIGEST_VERSION (2): SHA-256
  * over the following bytes, every integer unsigned little-endian, where
- * H is the history row count, N = min(H, 64) and C the column count:
+ * S is the seam, N = min(H - S, 64) (0 when H <= S) and C the column
+ * count:
  *
  *   - the 22 ASCII bytes "ghostty-history-digest" and the version (u32)
- *   - N (u32) and C (u16) (H itself is not hashed: it is returned in
- *     out_history_rows and compared separately)
- *   - for each of the N newest history rows, from the oldest of them to
- *     the row directly above the active area:
+ *   - S (u32), N (u32) and C (u16) (H itself is not hashed: it is returned
+ *     in out_history_rows and compared separately)
+ *   - for each of the N history rows directly above the seam (rows H - S - N
+ *     to H - S - 1 counted from the oldest), oldest first:
  *       - a flags byte (u8): bit 0 the row is soft-wrapped (it continues
  *         on the next row), bit 1 the row continues a soft-wrapped row
  *       - for each of the C cells, from the left:
@@ -3074,15 +3079,16 @@ GHOSTTY_API GhosttyResult ghostty_terminal_continuation_alloc(
  * Styles, colors, hyperlinks, protection and semantic prompt marks are not
  * hashed (a mirror's local color policy changes colors).
  *
- * Match rule (what ghostty_surface_restore_snapshot_local_history applies):
- * the digests are equal and either the history row counts are equal, or
- * the mirror has fewer rows, both have at least 64, and the mirror's own
- * scrollback limit dropped its oldest history rows. Anything else is a
- * mismatch.
+ * Match rule (what ghostty_surface_restore_snapshot_local_history applies,
+ * with the mirror's digest computed at the READY's seam): the digests are
+ * equal and either the history row counts are equal, or the mirror has
+ * fewer rows, both have at least 64 rows above the seam, and the mirror's
+ * own scrollback limit cut its oldest history rows. Anything else is a
+ * mismatch. Rows older than the window are checked by the row count only.
  *
  * The caller must serialize this operation with all other access to the
- * same terminal. It may decompress compressed scrollback pages that hold
- * the newest history rows.
+ * same terminal. It may decompress compressed scrollback pages in the
+ * window.
  *
  * @param terminal Terminal to read from (must not be NULL)
  * @param[out] out_history_rows History row count (must not be NULL)
