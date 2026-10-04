@@ -828,7 +828,9 @@ pub fn gridState(self: *Termio) GridState {
 /// loading only, the default palette (OSC 4 overrides stay), the default
 /// background, foreground and cursor colors (OSC 10/11/12 overrides stay),
 /// and the default cursor style and blink (a program's explicit DECSCUSR
-/// stays until it selects the default again).
+/// stays until it selects the default again). While the cursor follows its
+/// default, mode 12 (cursor blinking) follows the local default blink, and
+/// every screen takes the local cursor style.
 pub fn restoreSnapshot(
     self: *Termio,
     bytes: []const u8,
@@ -971,9 +973,20 @@ fn applyLocalPolicyLocked(self: *Termio, t: *terminalpkg.Terminal) void {
     };
 
     // Cursor defaults, as the stream handler's changeConfig applies them:
-    // a cursor that follows its default takes this surface's style.
+    // a cursor that follows its default takes this surface's style, and
+    // mode 12 (cursor blinking) takes this surface's default blink.
     t.setDefaultCursorStyle(self.config.cursor_style);
     t.setDefaultCursorBlink(self.config.cursor_blink);
+
+    // setCursorStyle changes only the active screen. A snapshot taken on
+    // the alternate screen keeps the owner's shape on the primary one,
+    // and leaving the alternate screen (DECRC) does not restore the
+    // shape, so a cursor that follows its default takes the local shape
+    // on every screen.
+    if (t.cursor.is_default) {
+        var it = t.screens.all.iterator();
+        while (it.next()) |entry| entry.value.*.cursor.cursor_style = t.cursor.default_style;
+    }
 }
 
 /// Return the parser to ground and drop unfinished sequence state.

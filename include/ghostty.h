@@ -1483,7 +1483,9 @@ typedef void (*ghostty_surface_snapshot_write_cb)(void*,
 // replaced the screen.
 //
 // The restore emits nothing to io_write_cb. The restored terminal takes
-// the snapshot's grid, modes and the program's color overrides; a grid
+// the snapshot's grid, modes (except mode 12, cursor blinking, while the
+// cursor follows its default: it takes the local cursor-style-blink) and
+// the program's color overrides; a grid
 // locked with ghostty_surface_set_grid takes the snapshot's size and
 // keeps its generation. The surface's own config replaces the owner's
 // local policy: the scrollback limits (scrollback-limit-bytes,
