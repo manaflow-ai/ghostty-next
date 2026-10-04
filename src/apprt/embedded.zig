@@ -1627,6 +1627,101 @@ pub const CAPI = struct {
         cell_height_px: u32,
     };
 
+    // ghostty_surface_grid_metrics_s
+    const SurfaceGridMetrics = extern struct {
+        columns: u16,
+        rows: u16,
+        cursor_column: u16,
+        cursor_row: u16,
+        cursor_width_cells: u16,
+        cursor_in_viewport: bool,
+        cell_width: f64,
+        cell_height: f64,
+        padding_left: f64,
+        padding_top: f64,
+    };
+
+    const GridMetricsOptions = struct {
+        /// The session host locked the grid (ghostty_surface_set_grid), so
+        /// the terminal grid need not match the view's pixel grid.
+        grid_locked: bool = false,
+    };
+
+    /// The glyph lead and width of the cell at `pin`; a wide tail or a
+    /// spacer head resolves to its wide glyph.
+    fn canonicalCursorCell(pin: terminal.Pin) ?struct {
+        pin: terminal.Pin,
+        width_cells: u16,
+    } {
+        return switch (pin.rowAndCell().cell.wide) {
+            .wide => .{ .pin = pin, .width_cells = 2 },
+            .spacer_tail => .{ .pin = pin.left(1), .width_cells = 2 },
+            .narrow => .{ .pin = pin, .width_cells = 1 },
+            .spacer_head => cell: {
+                var it = pin.cellIterator(.right_down, null);
+                _ = it.next();
+                const next = it.next() orelse return null;
+                if (next.rowAndCell().cell.wide != .wide) return null;
+                break :cell .{ .pin = next, .width_cells = 2 };
+            },
+        };
+    }
+
+    /// Grid metrics for an unlocked grid: the view's pixel grid must match
+    /// the terminal grid (a mismatch is a resize in flight).
+    fn surfaceGridMetricsSnapshot(
+        size: renderer.Size,
+        scale: apprt.ContentScale,
+        screen: *terminal.Screen,
+    ) ?SurfaceGridMetrics {
+        return gridMetrics(size, scale, screen, .{});
+    }
+
+    fn gridMetrics(
+        size: renderer.Size,
+        scale: apprt.ContentScale,
+        screen: *terminal.Screen,
+        options: GridMetricsOptions,
+    ) ?SurfaceGridMetrics {
+        const size_grid = size.grid();
+        if (screen.pages.cols == 0 or
+            screen.pages.rows == 0 or
+            size.cell.width == 0 or
+            size.cell.height == 0 or
+            !std.math.isFinite(scale.x) or
+            !std.math.isFinite(scale.y) or
+            scale.x <= 0 or
+            scale.y <= 0) return null;
+        if (!options.grid_locked and
+            (size_grid.columns != screen.pages.cols or
+                size_grid.rows != screen.pages.rows)) return null;
+
+        const cursor_cell = canonicalCursorCell(screen.cursor.page_pin.*);
+        const cursor = if (cursor_cell) |cell|
+            if (screen.pages.pointFromPin(.viewport, cell.pin)) |pt|
+                if (pt.viewport.x < screen.pages.cols and
+                    pt.viewport.y < screen.pages.rows)
+                    pt
+                else
+                    null
+            else
+                null
+        else
+            null;
+        return .{
+            .columns = @intCast(screen.pages.cols),
+            .rows = @intCast(screen.pages.rows),
+            .cursor_column = if (cursor) |pt| @intCast(pt.viewport.x) else 0,
+            .cursor_row = if (cursor) |pt| @intCast(pt.viewport.y) else 0,
+            .cursor_width_cells = if (cursor != null) cursor_cell.?.width_cells else 0,
+            .cursor_in_viewport = cursor != null,
+            .cell_width = @as(f64, @floatFromInt(size.cell.width)) / scale.x,
+            .cell_height = @as(f64, @floatFromInt(size.cell.height)) / scale.y,
+            .padding_left = @as(f64, @floatFromInt(size.padding.left)) / scale.x,
+            .padding_top = @as(f64, @floatFromInt(size.padding.top)) / scale.y,
+        };
+    }
+
     // ghostty_clipboard_content_s
     //
     // One representation of clipboard contents. The data is binary-safe
@@ -2110,6 +2205,25 @@ pub const CAPI = struct {
             .rows = state.rows,
             .generation = state.generation,
         };
+    }
+
+    /// Grid geometry in logical (point) coordinates: grid, canonical
+    /// cursor cell, cell size and padding. False while a resize of an
+    /// unlocked grid is in flight.
+    export fn ghostty_surface_grid_metrics(
+        surface: *Surface,
+        result: *SurfaceGridMetrics,
+    ) bool {
+        const locked = surface.core_surface.io.gridState().locked;
+        surface.core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer surface.core_surface.renderer_state.mutex.unlock(global.io());
+        result.* = gridMetrics(
+            surface.core_surface.size,
+            surface.content_scale,
+            surface.core_surface.renderer_state.terminal.screens.active,
+            .{ .grid_locked = locked },
+        ) orelse return false;
+        return true;
     }
 
     /// Return the size information a surface has.

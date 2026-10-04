@@ -655,6 +655,22 @@ typedef struct {
   uint32_t cell_height_px;
 } ghostty_surface_size_s;
 
+// Grid geometry in the embedder's logical (point) coordinates. The cursor
+// fields name the canonical cursor cell (a wide glyph's lead) and are zero
+// with cursor_in_viewport false when the cursor is scrolled out of view.
+typedef struct {
+  uint16_t columns;
+  uint16_t rows;
+  uint16_t cursor_column;
+  uint16_t cursor_row;
+  uint16_t cursor_width_cells;
+  bool cursor_in_viewport;
+  double cell_width;
+  double cell_height;
+  double padding_left;
+  double padding_top;
+} ghostty_surface_grid_metrics_s;
+
 // The terminal grid of a surface, see ghostty_surface_grid.
 typedef struct {
   // True after ghostty_surface_set_grid locked the grid.
@@ -1343,6 +1359,11 @@ GHOSTTY_API bool ghostty_surface_set_font_size_action_callback(
     void* userdata);
 GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t);
 GHOSTTY_API ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
+// Fills the grid metrics. Returns false while a resize of an unlocked grid
+// is in flight; with a host-locked grid (ghostty_surface_set_grid) the
+// metrics describe the locked grid. Takes the terminal lock briefly.
+GHOSTTY_API bool ghostty_surface_grid_metrics(ghostty_surface_t,
+                                              ghostty_surface_grid_metrics_s*);
 // Lock the terminal grid of a MANUAL or MANUAL_MIRROR surface to
 // cols x rows, the grid of the terminal core that owns the byte stream,
 // independent of the view's pixel size. Call it from the output queue
