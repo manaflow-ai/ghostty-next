@@ -206,6 +206,52 @@ pub const InputEffect = enum {
     closed,
 };
 
+test "font size action event preserves semantic mutation" {
+    const absolute = fontSizeActionEvent(
+        .{ .set_font_size = 400 },
+        12,
+        255,
+        false,
+        true,
+    ).?;
+    try std.testing.expectEqual(
+        FontSizeActionKind.set,
+        absolute.kind,
+    );
+    try std.testing.expectEqual(@as(f32, 12), absolute.previous_points);
+    try std.testing.expectEqual(@as(f32, 255), absolute.current_points);
+    try std.testing.expect(!absolute.previous_adjusted);
+    try std.testing.expect(absolute.current_adjusted);
+
+    const clamped_relative = fontSizeActionEvent(
+        .{ .increase_font_size = 1 },
+        255,
+        255,
+        false,
+        true,
+    ).?;
+    try std.testing.expectEqual(
+        FontSizeActionKind.increase,
+        clamped_relative.kind,
+    );
+    try std.testing.expectEqual(
+        clamped_relative.previous_points,
+        clamped_relative.current_points,
+    );
+    try std.testing.expect(clamped_relative.current_adjusted);
+
+    try std.testing.expect(
+        fontSizeActionEvent(
+            .copy_title_to_clipboard,
+            12,
+            12,
+            false,
+            false,
+        ) == null,
+    );
+}
+
+
 /// The search state for the surface.
 const Search = struct {
     state: terminal.search.Thread,

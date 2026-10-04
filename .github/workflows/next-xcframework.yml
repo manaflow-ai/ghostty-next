@@ -104,6 +104,7 @@ jobs:
             -Dtest-filter="renderer mailbox: " \
             -Dtest-filter="loadString " \
             -Dtest-filter="c_get: window-padding" \
+            -Dtest-filter="font size action event" \
             --summary all
           # libghostty-vt patches (VT replay formatter, terminal and Kitty
           # graphics C API). These live in the lib-vt test modules.
