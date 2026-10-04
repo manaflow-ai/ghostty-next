@@ -6905,3 +6905,134 @@ test "promptClickRelativeRow" {
         try testing.expectEqual(case.expected, promptClickRelativeRow(&pages, prompt, click));
     }
 }
+
+fn boundedClipboardTestOptions(t: *terminal.Terminal) terminal.formatter.Options {
+    return .{
+        .emit = .plain,
+        .unwrap = true,
+        .trim = true,
+        .background = t.colors.background.get(),
+        .foreground = t.colors.foreground.get(),
+        .palette = &t.colors.palette.current,
+    };
+}
+
+test "bounded clipboard: plain and html for a styled selection" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 8, .rows = 2 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\x1b[31mred");
+
+    const screen = t.screens.active;
+    const selection = terminal.Selection.init(
+        screen.pages.pin(.{ .viewport = .{ .x = 0, .y = 0 } }).?,
+        screen.pages.pin(.{ .viewport = .{ .x = 2, .y = 0 } }).?,
+        false,
+    );
+    var arena = ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const contents = try formatSelectionClipboardContentsBounded(
+        arena.allocator(),
+        screen,
+        selection,
+        boundedClipboardTestOptions(&t),
+        4096,
+    );
+
+    try testing.expectEqual(@as(usize, 2), contents.len);
+    try testing.expectEqualStrings("text/plain", contents[0].mime);
+    try testing.expectEqualStrings("red", contents[0].data);
+    try testing.expectEqualStrings("text/html", contents[1].mime);
+    try testing.expect(std.mem.indexOf(u8, contents[1].data, "color:") != null);
+}
+
+test "bounded clipboard: plain text is kept when only html is over the bound" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 40, .rows = 2 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    // 30 cells, each with its own color: tiny as plain text, large as HTML.
+    var i: usize = 0;
+    while (i < 30) : (i += 1) {
+        var buf: [32]u8 = undefined;
+        stream.nextSlice(std.fmt.bufPrint(&buf, "\x1b[38;5;{d}mx", .{i + 16}) catch unreachable);
+    }
+
+    const screen = t.screens.active;
+    const selection = terminal.Selection.init(
+        screen.pages.pin(.{ .viewport = .{ .x = 0, .y = 0 } }).?,
+        screen.pages.pin(.{ .viewport = .{ .x = 29, .y = 0 } }).?,
+        false,
+    );
+    var arena = ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const contents = try formatSelectionClipboardContentsBounded(
+        arena.allocator(),
+        screen,
+        selection,
+        boundedClipboardTestOptions(&t),
+        200,
+    );
+
+    try testing.expectEqual(@as(usize, 1), contents.len);
+    try testing.expectEqualStrings("text/plain", contents[0].mime);
+    try testing.expectEqual(@as(usize, 30), contents[0].data.len);
+}
+
+test "bounded clipboard: refuses a selection over the bound" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 40, .rows = 4 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("0123456789012345678901234567890123456789");
+
+    const screen = t.screens.active;
+    const selection = terminal.Selection.init(
+        screen.pages.pin(.{ .viewport = .{ .x = 0, .y = 0 } }).?,
+        screen.pages.pin(.{ .viewport = .{ .x = 39, .y = 0 } }).?,
+        false,
+    );
+    var arena = ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    try testing.expectError(
+        error.ClipboardTooLarge,
+        formatSelectionClipboardContentsBounded(
+            arena.allocator(),
+            screen,
+            selection,
+            boundedClipboardTestOptions(&t),
+            16,
+        ),
+    );
+}
+
+test "bounded clipboard: an empty selection gives empty plain text" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 4, .rows = 2 });
+    defer t.deinit(alloc);
+    const screen = t.screens.active;
+    const pin = screen.pages.pin(.{ .viewport = .{ .x = 0, .y = 0 } }).?;
+    const selection = terminal.Selection.init(pin, pin, false);
+    var arena = ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const contents = try formatSelectionClipboardContentsBounded(
+        arena.allocator(),
+        screen,
+        selection,
+        boundedClipboardTestOptions(&t),
+        4096,
+    );
+    try testing.expectEqualStrings("", contents[0].data);
+}
