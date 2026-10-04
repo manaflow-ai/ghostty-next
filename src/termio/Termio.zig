@@ -1927,12 +1927,15 @@ test "manual: snapshot restores take this surface's colors and cursor defaults" 
     const S = struct {
         const host_red: terminalpkg.color.RGB = .{ .r = 0xaa, .g = 0x01, .b = 0x01 };
         const host_bg: terminalpkg.color.RGB = .{ .r = 0x10, .g = 0x20, .b = 0x30 };
+        const host_fg: terminalpkg.color.RGB = .{ .r = 0x70, .g = 0x71, .b = 0x72 };
         const local_red: terminalpkg.color.RGB = .{ .r = 0xcc, .g = 0x02, .b = 0x02 };
         const local_bg: terminalpkg.color.RGB = .{ .r = 0x40, .g = 0x50, .b = 0x60 };
+        const local_fg: terminalpkg.color.RGB = .{ .r = 0xe0, .g = 0xe1, .b = 0xe2 };
         const osc_green: terminalpkg.color.RGB = .{ .r = 0x11, .g = 0x22, .b = 0x33 };
+        const osc_bg: terminalpkg.color.RGB = .{ .r = 0x05, .g = 0x06, .b = 0x07 };
 
-        /// READY with the program's cursor at its default, then READY
-        /// after an explicit DECSCUSR underline.
+        /// READY with the program's cursor at its default (taken on the
+        /// alternate screen), then READY after an explicit DECSCUSR bar.
         var follows_default: std.ArrayListUnmanaged(u8) = .empty;
         var explicit: std.ArrayListUnmanaged(u8) = .empty;
 
@@ -1944,8 +1947,10 @@ test "manual: snapshot restores take this surface's colors and cursor defaults" 
             try out.appendSlice(alloc, w.written());
         }
 
-        /// The owner: its own default palette, background and cursor
-        /// style, plus a program's override of palette index 2.
+        /// The owner: its own default palette, colors and cursor style
+        /// (block_hollow, blinking), plus a program's overrides of palette
+        /// index 2 and of the background (applied directly: these tests
+        /// have no surface mailbox for the color_change message).
         fn host(io: *Termio, _: *TestSink, _: bool) !void {
             const alloc = std.testing.allocator;
             const t = &io.terminal;
@@ -1953,20 +1958,21 @@ test "manual: snapshot restores take this surface's colors and cursor defaults" 
             palette[1] = host_red;
             try t.colors.palette.changeDefault(alloc, palette);
             t.colors.background.default = host_bg;
-            t.setDefaultCursorStyle(.bar);
-            // A program's OSC 4 set, applied directly: these tests have no
-            // surface mailbox for the color_change message.
+            t.colors.foreground.default = host_fg;
+            t.setDefaultCursorStyle(.block_hollow);
+            t.setDefaultCursorBlink(true);
             t.colors.palette.set(2, osc_green);
-            io.processOutput("prompt$ ");
+            t.colors.background.override = osc_bg;
+            io.processOutput("prompt$ \x1b[?1049h");
             try std.testing.expect(t.cursor.is_default);
             try encode(io, &follows_default);
-            io.processOutput("\x1b[4 q");
+            io.processOutput("\x1b[6 q");
             try std.testing.expect(!t.cursor.is_default);
             try encode(io, &explicit);
         }
 
-        /// This surface: palette 1, background and cursor style from its
-        /// own config.
+        /// This surface: palette 1, colors and a steady underline cursor
+        /// from its own config.
         fn viewer(io: *Termio, _: *TestSink, _: bool) !void {
             const testing = std.testing;
             const alloc = testing.allocator;
@@ -1975,7 +1981,9 @@ test "manual: snapshot restores take this surface's colors and cursor defaults" 
             config.palette.value[1] = local_red;
             config.palette.mask.set(1);
             config.background = .{ .r = local_bg.r, .g = local_bg.g, .b = local_bg.b };
-            config.@"cursor-style" = .block;
+            config.foreground = .{ .r = local_fg.r, .g = local_fg.g, .b = local_fg.b };
+            config.@"cursor-style" = .underline;
+            config.@"cursor-style-blink" = false;
             var derived: DerivedConfig = try .init(alloc, &config);
             var td = io.manualThreadData();
             try io.changeConfig(&td, &derived);
@@ -1984,21 +1992,30 @@ test "manual: snapshot restores take this surface's colors and cursor defaults" 
             const t = &io.terminal;
             try testing.expectEqual(local_red, t.colors.palette.original[1]);
             try testing.expectEqual(local_red, t.colors.palette.current[1]);
-            // The program's OSC 4 override survives the restore.
+            // The program's overrides survive the restore.
             try testing.expectEqual(osc_green, t.colors.palette.current[2]);
+            try testing.expectEqual(osc_bg, t.colors.background.override.?);
             try testing.expectEqual(local_bg, t.colors.background.default.?);
-            try testing.expectEqual(terminalpkg.CursorStyle.block, t.cursor.default_style);
-            try testing.expectEqual(terminalpkg.CursorStyle.block, t.screens.active.cursor.cursor_style);
+            try testing.expectEqual(local_fg, t.colors.foreground.default.?);
+            try testing.expectEqual(terminalpkg.CursorStyle.underline, t.cursor.default_style);
+            try testing.expectEqual(terminalpkg.CursorStyle.underline, t.screens.active.cursor.cursor_style);
+            try testing.expect(!t.modes.get(.cursor_blinking));
+
+            // Back on the primary screen the cursor still follows this
+            // surface's default (DECRC does not restore the shape).
+            io.processOutput("\x1b[?1049l");
+            try testing.expectEqual(terminalpkg.CursorStyle.underline, io.terminal.screens.active.cursor.cursor_style);
 
             // A program's explicit cursor shape stays; the default is ours.
             try io.restoreSnapshot(explicit.items, .ready);
-            try testing.expectEqual(terminalpkg.CursorStyle.underline, io.terminal.screens.active.cursor.cursor_style);
-            try testing.expectEqual(terminalpkg.CursorStyle.block, io.terminal.cursor.default_style);
+            try testing.expectEqual(terminalpkg.CursorStyle.bar, io.terminal.screens.active.cursor.cursor_style);
+            try testing.expectEqual(terminalpkg.CursorStyle.underline, io.terminal.cursor.default_style);
             try testing.expectEqual(local_bg, io.terminal.colors.background.default.?);
 
             // DECSCUSR 0 then selects this surface's default.
             io.processOutput("\x1b[0 q");
-            try testing.expectEqual(terminalpkg.CursorStyle.block, io.terminal.screens.active.cursor.cursor_style);
+            try testing.expectEqual(terminalpkg.CursorStyle.underline, io.terminal.screens.active.cursor.cursor_style);
+            try testing.expect(!io.terminal.modes.get(.cursor_blinking));
         }
     };
     const alloc = std.testing.allocator;
