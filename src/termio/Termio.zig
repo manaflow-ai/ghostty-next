@@ -2416,12 +2416,115 @@ test "manual: snapshot local history restore refuses a diverged history" {
             try testing.expectEqual(kept, testHistoryRows(&io.terminal));
             io.abandonSnapshotRestore();
 
-            // The caller then applies the owner's history.
+            // The caller then requests a new READY + HISTORY (or COMPLETE)
+            // snapshot; this snapshot is complete.
             try testing.expectError(error.NoSnapshotInProgress, io.restoreSnapshot(&.{}, .history));
         }
     };
     try testManualTermio(true, S.missedFrame);
     try testManualTermio(true, S.graphemeMode);
+}
+
+/// Feed `count` soft-wrapped 70-character lines to both sides.
+fn testFeedWrapped(io: *Termio, owner: *TestOwner, first: usize, count: usize) !void {
+    var buf: [160]u8 = undefined;
+    for (first..first + count) |i| {
+        testFeedBoth(io, owner, try std.fmt.bufPrint(
+            &buf,
+            "\x1b[3{d}mline {d:0>4}\x1b[m " ++ ("abcdefghij" ** 6) ++ "\r\n",
+            .{ i % 8, i },
+        ));
+    }
+}
+
+/// Feed `count` one-row lines to both sides.
+fn testFeedShort(io: *Termio, owner: *TestOwner, first: usize, count: usize) !void {
+    var buf: [64]u8 = undefined;
+    for (first..first + count) |i| {
+        testFeedBoth(io, owner, try std.fmt.bufPrint(&buf, "short {d:0>5}\r\n", .{i}));
+    }
+}
+
+/// The owner's history row (0: oldest) that starts with `needle`.
+fn testOwnerRowOf(owner: *TestOwner, needle: []const u8) !usize {
+    const alloc = std.testing.allocator;
+    const text = try testPrimaryText(&owner.t, 0);
+    defer alloc.free(text);
+    const at = std.mem.indexOf(u8, text, needle) orelse return error.TestUnexpectedResult;
+    return std.mem.count(u8, text[0..at], "\n");
+}
+
+test "manual: snapshot local history restore checks the rows above the READY's own history" {
+    const body = struct {
+        fn run(io: *Termio, _: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            const alloc = testing.allocator;
+
+            // A viewer with a smaller limit, whose history was cut, misses
+            // one frame that ends up older than the newest 64 history
+            // rows but inside or just above the rows the READY carries
+            // itself: the rows the viewer would splice at.
+            try testSetScrollbackLines(io, 4000);
+            try testing.expect(io.setGrid(40, 10, 1));
+            var owner: TestOwner = undefined;
+            try owner.init(io, 40, 10, null);
+            defer owner.deinit();
+
+            try testFeedWrapped(io, &owner, 0, 2000);
+            owner.stream.nextSlice("missed frame\r\n");
+            try testFeedShort(io, &owner, 0, 80);
+
+            const ready, const digest = try owner.resizeAndEncode(25, 10);
+            defer alloc.free(ready);
+
+            // Preconditions of this layout: the frame is more than 64 rows
+            // above the active area and at most 64 rows above the READY's
+            // own history rows.
+            const overlap = try testReadyHistoryRows(ready);
+            const distance = digest.history_rows - try testOwnerRowOf(&owner, "missed frame");
+            try testing.expect(distance > 64);
+            try testing.expect(distance <= overlap + 64);
+
+            try testing.expectEqual(
+                LocalHistoryResult.mismatch,
+                try io.restoreSnapshotLocalHistory(ready, digest),
+            );
+            try testing.expectEqual(overlap, testHistoryRows(&io.terminal));
+        }
+    }.run;
+    try testManualTermio(true, body);
+}
+
+test "manual: snapshot local history restore after erased scrollback is not a cut history" {
+    const body = struct {
+        fn run(io: *Termio, _: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            const alloc = testing.allocator;
+
+            // The viewer's limit cut its history, then both erase the
+            // scrollback (CSI 3 J). Later the viewer misses one old frame:
+            // fewer rows, far below the limit, is a divergence.
+            try testSetScrollbackLines(io, 4000);
+            try testing.expect(io.setGrid(40, 10, 1));
+            var owner: TestOwner = undefined;
+            try owner.init(io, 40, 10, null);
+            defer owner.deinit();
+
+            try testFeedWrapped(io, &owner, 0, 3000);
+            testFeedBoth(io, &owner, "\x1b[3J");
+            try testFeedShort(io, &owner, 0, 20);
+            owner.stream.nextSlice("missed frame\r\n");
+            try testFeedShort(io, &owner, 20, 400);
+
+            const ready, const digest = try owner.resizeAndEncode(25, 10);
+            defer alloc.free(ready);
+            try testing.expectEqual(
+                LocalHistoryResult.mismatch,
+                try io.restoreSnapshotLocalHistory(ready, digest),
+            );
+        }
+    }.run;
+    try testManualTermio(true, body);
 }
 
 test "manual: snapshot local history restore errors leave the terminal unchanged" {
