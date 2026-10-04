@@ -392,6 +392,9 @@ typedef struct {
   ghostty_input_action_e action;
   ghostty_input_mods_e mods;
   ghostty_input_mods_e consumed_mods;
+  // The platform's native keycode: a Mac virtual keycode on macOS, and on
+  // iOS the USB HID keyboard usage that UIKit reports as UIKey.keyCode
+  // (UIKeyboardHIDUsage, for example 0x04 for A).
   uint32_t keycode;
   const char* text;
   uint32_t unshifted_codepoint;

@@ -108,6 +108,7 @@ jobs:
             -Dtest-filter="grid metrics " \
             -Dtest-filter="bounded clipboard: " \
             -Dtest-filter="keyboard selection: " \
+            -Dtest-filter="keycodes: " \
             -Dtest-filter="Terminal: OSC133" \
             --summary all
           # libghostty-vt patches (VT replay formatter, terminal and Kitty
