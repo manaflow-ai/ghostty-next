@@ -103,6 +103,8 @@ jobs:
             -Dtest-filter="ghostty.h SurfaceSnapshotPhase" \
             -Dtest-filter="renderer mailbox: " \
             -Dtest-filter="loadString " \
+            -Dtest-filter="keySource: " \
+            -Dtest-filter="ghostty_config_key_" \
             -Dtest-filter="c_get: window-padding" \
             -Dtest-filter="font size action event" \
             -Dtest-filter="grid metrics " \
