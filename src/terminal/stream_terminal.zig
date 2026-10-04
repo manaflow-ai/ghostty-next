@@ -4144,6 +4144,93 @@ test "clipboard_write effect callback" {
     try testing.expect(S.result == .denied);
 }
 
+test "deferred clipboard read: the reply comes later with the request's terminator" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = struct {
+        var written: std.ArrayList(u8) = .empty;
+        var tokens: [4]u64 = undefined;
+        var count: usize = 0;
+
+        fn writePty(_: *Handler, data: []const u8) void {
+            written.appendSlice(testing.allocator, data) catch @panic("OOM");
+        }
+
+        fn clipboardRead(_: *Handler, read: clipboard.Read) void {
+            tokens[count] = read.token;
+            count += 1;
+            read.reply(.deferred);
+        }
+    };
+    defer S.written.deinit(testing.allocator);
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    handler.effects.clipboard_read = &S.clipboardRead;
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    // Deferred: nothing is written while the embedder asks the user.
+    s.nextSlice("\x1B]52;c;?\x1B\\");
+    s.nextSlice("\x1B]52;p;?\x07");
+    try testing.expectEqual(2, S.count);
+    try testing.expect(S.tokens[0] != S.tokens[1]);
+    try testing.expectEqual(0, S.written.items.len);
+
+    // The second request completes first, with its own selector and BEL.
+    try testing.expect(s.handler.completeClipboardRead(S.tokens[1], .{ .success = .{ .contents = &.{.{
+        .mime = "text/plain",
+        .data = "hi",
+    }} } }));
+    try testing.expectEqualStrings("\x1B]52;p;aGk=\x07", S.written.items);
+    S.written.clearRetainingCapacity();
+
+    // A denied (or timed-out) read answers with an empty clipboard.
+    try testing.expect(s.handler.completeClipboardRead(S.tokens[0], .denied));
+    try testing.expectEqualStrings("\x1B]52;c;\x1B\\", S.written.items);
+    S.written.clearRetainingCapacity();
+
+    // A token completes once.
+    try testing.expect(!s.handler.completeClipboardRead(S.tokens[0], .denied));
+    try testing.expect(!s.handler.completeClipboardRead(12345, .denied));
+    try testing.expectEqual(0, S.written.items.len);
+}
+
+test "deferred clipboard read: pending reads are bounded and freed with the terminal" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = struct {
+        var written: std.ArrayList(u8) = .empty;
+
+        fn writePty(_: *Handler, data: []const u8) void {
+            written.appendSlice(testing.allocator, data) catch @panic("OOM");
+        }
+
+        fn clipboardRead(_: *Handler, read: clipboard.Read) void {
+            read.reply(.deferred);
+        }
+    };
+    defer S.written.deinit(testing.allocator);
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    handler.effects.clipboard_read = &S.clipboardRead;
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    // The testing allocator fails the test if deinit leaks pending reads.
+    defer s.deinit();
+
+    for (0..Handler.max_deferred_clipboard_reads) |_| s.nextSlice("\x1B]52;c;?\x07");
+    try testing.expectEqual(0, S.written.items.len);
+    try testing.expectEqual(Handler.max_deferred_clipboard_reads, s.handler.deferred_clipboard_reads.items.len);
+
+    // Past the bound a deferral answers at once with an empty clipboard.
+    s.nextSlice("\x1B]52;c;?\x07");
+    try testing.expectEqualStrings("\x1B]52;c;\x07", S.written.items);
+    try testing.expectEqual(Handler.max_deferred_clipboard_reads, s.handler.deferred_clipboard_reads.items.len);
+}
+
 test "clipboard_read effect callback" {
     var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
     defer t.deinit(testing.allocator);
