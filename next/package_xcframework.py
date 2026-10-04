@@ -30,7 +30,7 @@ from pathlib import Path
 ROOT = "GhosttyNextKit.xcframework"
 FIXED_DATE = (1980, 1, 1, 0, 0, 0)
 # Slices the ios target must produce (Info.plist LibraryIdentifier).
-REQUIRED_SLICES = {"ios-arm64", "ios-arm64-simulator", "macos-arm64"}
+REQUIRED_SLICES = {"ios-arm64", "ios-arm64-simulator", "macos-arm64_x86_64"}
 
 
 def sha256_file(path: Path) -> str:
