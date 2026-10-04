@@ -974,9 +974,11 @@ pub const LocalHistoryResult = enum {
 /// resized, and keep this surface's own primary history instead of
 /// receiving the owner's: resize the old terminal to the snapshot's grid
 /// the way the owner resized (Terminal.resize, which reflows the primary
-/// screen), compare its history digest (`terminalpkg.history_digest`)
-/// with the owner's, and on a match put the old primary history above the
-/// new primary screen. The caller contract is in ghostty.h
+/// screen), compare its history digest with the owner's
+/// (`terminalpkg.history_digest.matches`: equal digests, and equal row
+/// counts or a local history that its own smaller scrollback limit cut),
+/// and on a match put the old primary history above the new primary
+/// screen. The caller contract is in ghostty.h
 /// (ghostty_surface_restore_snapshot_local_history).
 ///
 /// `bytes` hold exactly the READY prefix; bytes after READY are an error.
@@ -2025,6 +2027,20 @@ fn testHistoryRows(t: *terminalpkg.Terminal) usize {
     return pages.total_rows - pages.rows;
 }
 
+/// The primary history rows a READY prefix itself carries: the rows
+/// above the active area in the active area's first page. A restore that
+/// has more history rows took the rest from the local terminal.
+fn testReadyHistoryRows(ready: []const u8) !usize {
+    const alloc = std.testing.allocator;
+    var reader: std.Io.Reader = .fixed(ready);
+    var decoder: terminalpkg.snapshot.Decoder = .init(&reader);
+    var decoded = try decoder.ready(alloc, global.io(), .{
+        .max_continuation_bytes = snapshot_continuation_max_bytes,
+    });
+    defer decoded.deinit(alloc);
+    return testHistoryRows(&decoded.terminal.?);
+}
+
 test "manual: snapshot local history restore keeps the reflowed scrollback" {
     const body = struct {
         fn run(io: *Termio, sink: *TestSink, _: bool) !void {
@@ -2036,13 +2052,15 @@ test "manual: snapshot local history restore keeps the reflowed scrollback" {
             try owner.init(io, 40, 10, null);
             defer owner.deinit();
 
+            // Enough history for several pages at 25 columns, so most of
+            // it is older than the READY's first page.
             testFeedBoth(io, &owner, "\x1b[1;31mfirst styled line\x1b[m\r\n");
-            try testFeedLines(io, &owner, 0, 300);
+            try testFeedLines(io, &owner, 0, 3000);
             testFeedBoth(io, &owner, "prompt$ ");
 
             const ready, const digest = try owner.resizeAndEncode(25, 10);
             defer alloc.free(ready);
-            try testing.expect(digest.history_rows > 300);
+            try testing.expect(digest.history_rows > 2 * try testReadyHistoryRows(ready));
 
             try testing.expectEqual(
                 LocalHistoryResult.restored,
@@ -2070,7 +2088,7 @@ test "manual: snapshot local history restore keeps the reflowed scrollback" {
             try testing.expectError(error.NoSnapshotInProgress, io.restoreSnapshot(&.{}, .history));
 
             // Later output keeps both sides equal.
-            try testFeedLines(io, &owner, 300, 120);
+            try testFeedLines(io, &owner, 3000, 120);
             testFeedBoth(io, &owner, "done$ ");
             try testExpectSamePrimary(io, &owner);
 
@@ -2091,13 +2109,14 @@ test "manual: snapshot local history restore with the alternate screen active" {
             try owner.init(io, 40, 10, null);
             defer owner.deinit();
 
-            try testFeedLines(io, &owner, 0, 300);
+            try testFeedLines(io, &owner, 0, 3000);
             // vim: alternate screen with a full-width status line.
             testFeedBoth(io, &owner, "\x1b[?1049h\x1b[H\x1b[2J~\r\n~\r\n\x1b[10;1H\x1b[7m" ++
                 ("-- INSERT --" ++ " " ** 28) ++ "\x1b[m\x1b[1;1H");
 
             const ready, const digest = try owner.resizeAndEncode(25, 12);
             defer alloc.free(ready);
+            try testing.expect(digest.history_rows > 2 * try testReadyHistoryRows(ready));
             try testing.expectEqual(
                 LocalHistoryResult.restored,
                 try io.restoreSnapshotLocalHistory(ready, digest),
@@ -2116,7 +2135,7 @@ test "manual: snapshot local history restore with the alternate screen active" {
             testFeedBoth(io, &owner, "\x1b[?1049l");
             try testing.expectEqual(terminalpkg.ScreenSet.Key.primary, io.terminal.screens.active_key);
             try testExpectSamePrimary(io, &owner);
-            try testFeedLines(io, &owner, 300, 40);
+            try testFeedLines(io, &owner, 3000, 40);
             try testExpectSamePrimary(io, &owner);
 
             try sink.expect("");
@@ -2159,6 +2178,57 @@ test "manual: snapshot local history restore under a scrollback limit" {
     try testManualTermio(true, body);
 }
 
+test "manual: snapshot local history restore with a smaller viewer scrollback limit" {
+    const body = struct {
+        fn run(io: *Termio, _: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            const alloc = testing.allocator;
+
+            // The viewer keeps at most 4000 history lines, the owner all
+            // of them: 2000 soft-wrapped lines (6000 rows at 25 columns).
+            try testSetScrollbackLines(io, 4000);
+            try testing.expect(io.setGrid(40, 10, 1));
+            var owner: TestOwner = undefined;
+            try owner.init(io, 40, 10, null);
+            defer owner.deinit();
+
+            var buf: [160]u8 = undefined;
+            for (0..2000) |i| {
+                testFeedBoth(io, &owner, try std.fmt.bufPrint(
+                    &buf,
+                    "\x1b[3{d}mline {d:0>4}\x1b[m " ++ ("abcdefghij" ** 6) ++ "\r\n",
+                    .{ i % 8, i },
+                ));
+            }
+            const ready, const digest = try owner.resizeAndEncode(25, 10);
+            defer alloc.free(ready);
+
+            try testing.expectEqual(
+                LocalHistoryResult.restored,
+                try io.restoreSnapshotLocalHistory(ready, digest),
+            );
+
+            // The viewer's history is the owner's newest history, from
+            // the viewer's first complete line (the oldest line can be a
+            // fragment that reflowed differently).
+            const kept = testHistoryRows(&io.terminal);
+            const owner_rows = testHistoryRows(&owner.t);
+            try testing.expect(kept < owner_rows);
+            try testing.expect(kept > try testReadyHistoryRows(ready));
+            const got_all = try testPrimaryText(&io.terminal, 0);
+            defer alloc.free(got_all);
+            const first_line = std.mem.indexOf(u8, got_all, "line ").?;
+            const got = got_all[first_line..];
+            const want = try testPrimaryText(&owner.t, 0);
+            defer alloc.free(want);
+            try testing.expect(got.len > 64 * 25);
+            try testing.expect(std.mem.endsWith(u8, want, got));
+            try testing.expect(std.mem.indexOf(u8, got, "line 1999") != null);
+        }
+    }.run;
+    try testManualTermio(true, body);
+}
+
 test "manual: snapshot local history restore refuses a diverged history" {
     const S = struct {
         /// The viewer misses one output frame before the resize.
@@ -2171,13 +2241,15 @@ test "manual: snapshot local history restore refuses a diverged history" {
             try owner.init(io, 40, 10, null);
             defer owner.deinit();
 
-            try testFeedLines(io, &owner, 0, 200);
+            try testFeedLines(io, &owner, 0, 2000);
             owner.stream.nextSlice("a frame the viewer never got\r\n");
-            try testFeedLines(io, &owner, 200, 100);
+            try testFeedLines(io, &owner, 2000, 1000);
 
             const ready, const digest = try owner.resizeAndEncode(25, 10);
             defer alloc.free(ready);
             try expectReadyOnly(io, &owner, ready, digest);
+            // The local history was discarded, not only the frame.
+            try testing.expect(testHistoryRows(&io.terminal) < digest.history_rows / 2);
         }
 
         /// The owner parses graphemes as legacy codepoints; the viewer
@@ -2203,23 +2275,6 @@ test "manual: snapshot local history restore refuses a diverged history" {
             try expectReadyOnly(io, &owner, ready, digest);
         }
 
-        /// The viewer keeps fewer history lines than the owner.
-        fn smallerLimit(io: *Termio, _: *TestSink, _: bool) !void {
-            const testing = std.testing;
-            const alloc = testing.allocator;
-
-            try testSetScrollbackLines(io, 2500);
-            try testing.expect(io.setGrid(40, 10, 1));
-            var owner: TestOwner = undefined;
-            try owner.init(io, 40, 10, null);
-            defer owner.deinit();
-
-            try testFeedLines(io, &owner, 0, 4000);
-            const ready, const digest = try owner.resizeAndEncode(25, 10);
-            defer alloc.free(ready);
-            try expectReadyOnly(io, &owner, ready, digest);
-        }
-
         /// A mismatch restores the READY terminal without the local
         /// history: the screen and the rows the READY carries above it
         /// equal the owner's, and nothing older is kept.
@@ -2239,7 +2294,7 @@ test "manual: snapshot local history restore refuses a diverged history" {
 
             const kept = testHistoryRows(&io.terminal);
             const owner_rows = testHistoryRows(&owner.t);
-            try testing.expect(kept < owner_rows);
+            try testing.expectEqual(try testReadyHistoryRows(ready), kept);
             const want = try testPrimaryText(&owner.t, owner_rows - kept);
             defer alloc.free(want);
             const got = try testPrimaryText(&io.terminal, 0);
@@ -2257,7 +2312,6 @@ test "manual: snapshot local history restore refuses a diverged history" {
     };
     try testManualTermio(true, S.missedFrame);
     try testManualTermio(true, S.graphemeMode);
-    try testManualTermio(true, S.smallerLimit);
 }
 
 test "manual: snapshot local history restore errors leave the terminal unchanged" {

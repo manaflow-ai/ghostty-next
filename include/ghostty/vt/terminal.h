@@ -3056,7 +3056,8 @@ GHOSTTY_API GhosttyResult ghostty_terminal_continuation_alloc(
  * H is the history row count, N = min(H, 64) and C the column count:
  *
  *   - the 22 ASCII bytes "ghostty-history-digest" and the version (u32)
- *   - H (u64), N (u32) and C (u16)
+ *   - N (u32) and C (u16) (H itself is not hashed: it is returned in
+ *     out_history_rows and compared separately)
  *   - for each of the N newest history rows, from the oldest of them to
  *     the row directly above the active area:
  *       - a flags byte (u8): bit 0 the row is soft-wrapped (it continues
@@ -3072,6 +3073,12 @@ GHOSTTY_API GhosttyResult ghostty_terminal_continuation_alloc(
  *
  * Styles, colors, hyperlinks, protection and semantic prompt marks are not
  * hashed (a mirror's local color policy changes colors).
+ *
+ * Match rule (what ghostty_surface_restore_snapshot_local_history applies):
+ * the digests are equal and either the history row counts are equal, or
+ * the mirror has fewer rows, both have at least 64, and the mirror's own
+ * scrollback limit dropped its oldest history rows. Anything else is a
+ * mismatch.
  *
  * The caller must serialize this operation with all other access to the
  * same terminal. It may decompress compressed scrollback pages that hold

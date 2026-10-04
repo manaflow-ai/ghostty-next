@@ -452,6 +452,13 @@ recycle_node: ?*List.Node = null,
 /// Limits for scrollback.
 limits: Limits,
 
+/// True once the oldest history rows were dropped to keep within `limits`
+/// (byte-limit recycling in `grow`, `Limits.enforce`, or a history page
+/// that `PageAllocation.finalize` or `prependHistoryFrom` refused). Then
+/// this list holds only the newest part of the history it received.
+/// `reset` clears it; a `clone` keeps it.
+history_truncated: bool = false,
+
 /// The total number of rows represented by this PageList. This is used
 /// specifically for scrollbar information so we can have the total size.
 total_rows: usize,
@@ -8066,8 +8073,9 @@ test "PageList prependHistoryFrom copies older history newest first within limit
         for ([_]usize{ 0, 1, 500, 997 }) |y| {
             try testing.expectEqual(@as(u32, @intCast(y)), S.mark(&dst, y));
         }
-        // The source is unchanged.
+        // The source is unchanged; nothing was dropped.
         try testing.expectEqual(@as(usize, 1003), src.total_rows);
+        try testing.expect(!dst.history_truncated);
     }
 
     // A line limit keeps a contiguous newest part and drops the oldest.
@@ -8079,6 +8087,8 @@ test "PageList prependHistoryFrom copies older history newest first within limit
         try testing.expect(result.rows < 1000);
         try testing.expectEqual(@as(u32, @intCast(1000 - result.rows)), S.mark(&dst, 0));
         try testing.expectEqual(@as(u32, 999), S.mark(&dst, result.rows - 1));
+        try testing.expect(dst.history_truncated);
+        try testing.expect(!src.history_truncated);
     }
 
     // Skipping all history copies nothing; another width is refused.

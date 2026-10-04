@@ -1568,12 +1568,15 @@ typedef enum {
 // Under the terminal lock the surface resizes its old terminal to the
 // snapshot's grid with Terminal.resize (the primary screen reflows
 // soft-wrapped lines when wraparound is on, the alternate screen clips or
-// pads), computes ghostty_terminal_history_digest of the result, and
-// compares the history row count and the digest with the expected
-// values. The comparison is made before this surface's scrollback limits
-// are applied to the copied history, but the old terminal already holds
-// only what its limits kept, so a match requires both sides to have kept
-// the same history (equal scrollback limits, or history below both).
+// pads; this surface's scrollback limits apply as in any resize), and
+// computes ghostty_terminal_history_digest of the result (H_local rows,
+// digest). It is a match when the digest equals expected_digest and
+// either H_local == expected_history_rows, or H_local < expected_history_rows,
+// both are at least 64, and this surface's scrollback limit has dropped
+// the oldest rows of its primary history (a mirror with a smaller limit
+// than the owner). Anything else is a mismatch. With a dropped oldest part
+// the oldest kept logical line can be a fragment whose reflowed rows differ
+// from the owner's; every newer row is the owner's.
 //
 // Returns GHOSTTY_SURFACE_LOCAL_HISTORY_RESTORED (0) on a match: the
 // terminal is the READY terminal (screens, modes, colors and cursor
@@ -1583,8 +1586,8 @@ typedef enum {
 // pages are dropped). An allocation failure while copying also drops the
 // oldest pages instead of failing.
 //
-// Returns GHOSTTY_SURFACE_LOCAL_HISTORY_MISMATCH (1) when the row count or
-// the digest differs, or the local reflow failed: the READY terminal is
+// Returns GHOSTTY_SURFACE_LOCAL_HISTORY_MISMATCH (1) for a mismatch or a
+// failed local reflow: the READY terminal is
 // restored WITHOUT history (the old history is discarded). The caller then
 // asks the owner for HISTORY (or a COMPLETE snapshot) and applies it with
 // ghostty_surface_restore_snapshot.

@@ -14,7 +14,7 @@
 //! `window_rows`) and C the column count:
 //!
 //!   - the ASCII bytes "ghostty-history-digest" and `version` (u32)
-//!   - H (u64), N (u32), C (u16)
+//!   - N (u32), C (u16); H itself is not hashed (see `matches`)
 //!   - for each of the N newest history rows, from the oldest of them to the
 //!     row directly above the active area:
 //!       - flags (u8): bit 0 `Row.wrap`, bit 1 `Row.wrap_continuation`
@@ -24,6 +24,9 @@
 //!
 //! Styles, colors, hyperlinks, protection and semantic marks are not hashed:
 //! a mirror applies its own color policy.
+//!
+//! `matches` is the rule a mirror applies: equal digests, and equal row
+//! counts or a mirror whose smaller scrollback limit dropped its oldest rows.
 //!
 //! This is the C API's `ghostty_terminal_history_digest` and the embedded
 //! surface's `ghostty_surface_history_digest`; keep the header docs in sync.
@@ -71,6 +74,23 @@ pub fn screen(s: *const Screen) Digest {
 pub fn pages(list: *const PageList) Digest {
     _ = list;
     return .{ .history_rows = 0, .bytes = @splat(0) }; // red: not implemented
+}
+
+/// Whether a mirror's history matches the owner's, after both reflowed
+/// at the same point of the byte stream: equal digests and either equal
+/// history row counts, or the mirror holds fewer rows only because its
+/// own scrollback limit dropped the oldest ones (`local_truncated`, see
+/// `PageList.history_truncated`) while both still have at least
+/// `window_rows` rows, so the digests cover the same full window.
+///
+/// With a dropped oldest part the oldest local logical line can be a
+/// fragment of the owner's, and its reflowed rows can differ from the
+/// owner's; every newer row is the owner's row.
+pub fn matches(local: Digest, local_truncated: bool, expected: Digest) bool {
+    _ = local;
+    _ = local_truncated;
+    _ = expected;
+    return false; // red: not implemented
 }
 
 fn update(hash: *std.crypto.hash.sha2.Sha256, comptime T: type, value: T) void {
@@ -146,6 +166,16 @@ test "history digest: equal after the same bytes and resize, changes with one ro
         testFeed(&e, try std.fmt.bufPrint(&buf, "\x1b[44mred {d}\x1b[m\r\n", .{i}));
     }
     try testing.expect(terminal(&d).eql(terminal(&e)));
+
+    // The rule a mirror applies.
+    const short: Digest = .{ .history_rows = da.history_rows - 1, .bytes = da.bytes };
+    try testing.expect(matches(da, false, da));
+    try testing.expect(!matches(dc, false, da));
+    try testing.expect(!matches(short, false, da));
+    try testing.expect(matches(short, true, da));
+    try testing.expect(!matches(da, true, short));
+    const tiny: Digest = .{ .history_rows = window_rows - 1, .bytes = da.bytes };
+    try testing.expect(!matches(tiny, true, da));
 
     // The alternate screen is never hashed.
     const before = terminal(&a);
