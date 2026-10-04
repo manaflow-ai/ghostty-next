@@ -1552,6 +1552,16 @@ GHOSTTY_API void ghostty_surface_complete_clipboard_request(
 GHOSTTY_API void ghostty_surface_deny_clipboard_request(ghostty_surface_t,
                                                            void*);
 GHOSTTY_API bool ghostty_surface_has_selection(ghostty_surface_t);
+// Clear the active selection. Returns false when there was none.
+GHOSTTY_API bool ghostty_surface_clear_selection(ghostty_surface_t);
+// Publish the active selection to the standard clipboard as plain text,
+// plus HTML when it also fits, each formatted into at most max_bytes. The
+// selection is not cleared. Returns false when there is no selection, the
+// selection spans more than max_bytes / 4 cells, or its plain text exceeds
+// max_bytes.
+GHOSTTY_API bool ghostty_surface_copy_selection_to_clipboard_bounded(
+    ghostty_surface_t,
+    uintptr_t max_bytes);
 GHOSTTY_API bool ghostty_surface_read_selection(ghostty_surface_t, ghostty_text_s*);
 GHOSTTY_API bool ghostty_surface_read_text(ghostty_surface_t,
                                               ghostty_selection_s,

@@ -2422,6 +2422,134 @@ fn clipboardWrite(self: *const Surface, data: []const u8, loc: apprt.Clipboard) 
     };
 }
 
+/// True when the selection spans at most `max_cells` grid cells, counted by
+/// whole rows, so bounded formatting never walks an unbounded selection.
+fn selectionWithinClipboardWorkBudget(
+    screen: *const terminal.Screen,
+    selection: terminal.Selection,
+    max_cells: usize,
+) bool {
+    if (max_cells == 0) return false;
+    const top_left = selection.topLeft(screen);
+    const bottom_right = selection.bottomRight(screen);
+    var remaining = max_cells;
+    var iterator = top_left.pageIterator(.right_down, bottom_right);
+    while (iterator.next()) |chunk| {
+        const row_count = chunk.end - chunk.start;
+        const cell_count = std.math.mul(
+            usize,
+            row_count,
+            chunk.node.cols(),
+        ) catch return false;
+        if (cell_count > remaining) return false;
+        remaining -= cell_count;
+    }
+    return true;
+}
+
+/// Plain text (required) and HTML (only when it fits) for `selection`, each
+/// formatted into at most `max_bytes`. error.ClipboardTooLarge when the
+/// selection or its plain text exceeds the bound.
+fn formatSelectionClipboardContentsBounded(
+    alloc: Allocator,
+    screen: *terminal.Screen,
+    selection: terminal.Selection,
+    opts_: terminal.formatter.Options,
+    max_bytes: usize,
+) ![]apprt.ClipboardContent {
+    if (max_bytes == 0 or
+        !selectionWithinClipboardWorkBudget(screen, selection, max_bytes / 4))
+        return error.ClipboardTooLarge;
+
+    const scratch = try alloc.alloc(u8, max_bytes);
+    defer alloc.free(scratch);
+
+    var contents: std.ArrayList(apprt.ClipboardContent) = try .initCapacity(alloc, 2);
+
+    var opts = opts_;
+    opts.emit = .plain;
+    var formatter: terminal.formatter.ScreenFormatter = .init(screen, opts);
+    formatter.content = .{ .selection = selection };
+    var writer: std.Io.Writer = .fixed(scratch);
+    formatter.format(&writer) catch |err| switch (err) {
+        error.WriteFailed => return error.ClipboardTooLarge,
+    };
+    contents.appendAssumeCapacity(.{
+        .mime = "text/plain",
+        .data = try alloc.dupeZ(u8, writer.buffered()),
+    });
+
+    // HTML carries no codepoint map and no default colors, as in
+    // copySelectionToClipboards.
+    opts.emit = .html;
+    opts.codepoint_map = null;
+    opts.background = null;
+    opts.foreground = null;
+    formatter = .init(screen, opts);
+    formatter.content = .{ .selection = selection };
+    writer = .fixed(scratch);
+    html: {
+        formatter.format(&writer) catch |err| switch (err) {
+            error.WriteFailed => break :html,
+        };
+        contents.appendAssumeCapacity(.{
+            .mime = "text/html",
+            .data = try alloc.dupeZ(u8, writer.buffered()),
+        });
+    }
+
+    return contents.items;
+}
+
+/// Publish the active selection to the standard clipboard as plain text,
+/// plus HTML when it fits, both within `max_bytes`. The selection stays.
+/// False when there is no selection or it is over the bound.
+pub fn copySelectionToClipboardBounded(self: *Surface, max_bytes: usize) !bool {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+
+    const screen = self.io.terminal.screens.active;
+    const selection = screen.selection orelse return false;
+    var arena = ArenaAllocator.init(self.alloc);
+    defer arena.deinit();
+    const contents = formatSelectionClipboardContentsBounded(
+        arena.allocator(),
+        screen,
+        selection,
+        .{
+            .emit = .plain,
+            .unwrap = true,
+            .trim = self.config.clipboard_trim_trailing_spaces,
+            .codepoint_map = self.config.clipboard_codepoint_map.map.list,
+            .background = self.io.terminal.colors.background.get(),
+            .foreground = self.io.terminal.colors.foreground.get(),
+            .palette = &self.io.terminal.colors.palette.current,
+        },
+        max_bytes,
+    ) catch |err| switch (err) {
+        error.ClipboardTooLarge => return false,
+        else => return err,
+    };
+
+    self.rt_surface.setClipboard(.standard, contents, false) catch |err| {
+        log.err("error setting bounded clipboard selection err={}", .{err});
+        return false;
+    };
+    return true;
+}
+
+/// Clear the active selection. False when there was none.
+pub fn clearSelection(self: *Surface) !bool {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+
+    const screen = self.io.terminal.screens.active;
+    if (screen.selection == null) return false;
+    try self.setSelection(null);
+    try self.queueRender();
+    return true;
+}
+
 fn copySelectionToClipboards(
     self: *Surface,
     sel: terminal.Selection,

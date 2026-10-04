@@ -2077,6 +2077,27 @@ pub const CAPI = struct {
         return surface.core_surface.hasSelection();
     }
 
+    /// Clear the active selection. False when there was none.
+    export fn ghostty_surface_clear_selection(surface: *Surface) bool {
+        return surface.core_surface.clearSelection() catch |err| {
+            log.warn("error clearing selection err={}", .{err});
+            return false;
+        };
+    }
+
+    /// Publish the active selection to the standard clipboard as plain
+    /// text, plus HTML when it fits, both within max_bytes. The selection
+    /// stays. False when there is none or it is over the bound.
+    export fn ghostty_surface_copy_selection_to_clipboard_bounded(
+        surface: *Surface,
+        max_bytes: usize,
+    ) bool {
+        return surface.core_surface.copySelectionToClipboardBounded(max_bytes) catch |err| {
+            log.warn("error copying bounded selection err={}", .{err});
+            return false;
+        };
+    }
+
     /// Same as ghostty_surface_read_text but reads from the user selection,
     /// if any.
     export fn ghostty_surface_read_selection(
