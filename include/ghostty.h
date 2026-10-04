@@ -1552,6 +1552,33 @@ GHOSTTY_API void ghostty_surface_complete_clipboard_request(
 GHOSTTY_API void ghostty_surface_deny_clipboard_request(ghostty_surface_t,
                                                            void*);
 GHOSTTY_API bool ghostty_surface_has_selection(ghostty_surface_t);
+// Keyboard copy mode on upstream selections: a one-cell selection is the
+// copy cursor, and the binding action "adjust_selection:<direction>"
+// (ghostty_surface_binding_action) moves its end and scrolls it into view.
+// Move without selecting: adjust, read the end, then select that cell.
+// Linewise: call ghostty_surface_select_lines after every adjust.
+typedef struct {
+  // Row relative to the viewport's top row; negative above the viewport,
+  // rows or more below it.
+  int32_t row;
+  // Column of the end cell's glyph lead.
+  uint16_t column;
+  // 2 for a wide glyph, 1 otherwise.
+  uint16_t width_cells;
+  bool in_viewport;
+} ghostty_surface_selection_end_s;
+// Select one visible cell (a wide glyph resolves to its lead). Returns
+// false outside the viewport.
+GHOSTTY_API bool ghostty_surface_select_viewport_cell(ghostty_surface_t,
+                                                      uint16_t column,
+                                                      uint16_t row);
+// The active selection's moving end. Returns false without a selection.
+GHOSTTY_API bool ghostty_surface_selection_end(
+    ghostty_surface_t,
+    ghostty_surface_selection_end_s*);
+// Widen the active selection to whole rows (anchor row to end row), keeping
+// its direction. Returns false without a selection.
+GHOSTTY_API bool ghostty_surface_select_lines(ghostty_surface_t);
 // Clear the active selection. Returns false when there was none.
 GHOSTTY_API bool ghostty_surface_clear_selection(ghostty_surface_t);
 // Publish the active selection to the standard clipboard as plain text,
