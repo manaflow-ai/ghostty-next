@@ -94,6 +94,7 @@ thread. New tab and split surfaces do not inherit the IO fields.
 | embedded: bounded selection copy and clear selection | `ghostty_surface_copy_selection_to_clipboard_bounded` (plain text required, HTML only when it fits, selection kept) and `ghostty_surface_clear_selection`. Adapted from manaflow-ai/ghostty 7a5d08b7c3. |
 | embedded: keyboard copy mode on upstream selections | `ghostty_surface_select_viewport_cell` (one-cell selection = copy cursor, wide glyphs resolve to the lead), `ghostty_surface_selection_end` (moving end in viewport rows, also above or below it) and `ghostty_surface_select_lines` (widen to whole rows). Movement is upstream `adjust_selection`; scrolling and prompt jumps are upstream binding actions. Replaces the desktop fork's keyboard copy API (about 2,800 lines in `Screen`/`Selection`); this one adds about 160 lines outside the terminal core, so libghostty-vt is unchanged. |
 | build: flavor apple-v6 with a universal macOS slice | The `ios` xcframework target ships `macos-arm64_x86_64` (upstream's macOS universal library) instead of the host-native macOS arm64 slice. The cmux-next Mac app ships for Apple silicon and Intel and links this GhosttyNextKit (coordinator decision 2026-10-04). The smoke links both macOS architectures. |
+| terminal: OSC 133 prompts start on their own logical line | An OSC 133;A or 133;P primary prompt that arrives after a padded partial line (zsh PROMPT_SP) starts a new logical line and drops the padding that forced a wrap, so the prompt stays at column 0 across a resize; a continuation prompt keeps its soft wrap. Parser behavior, so the cmux-tui session host (libghostty-vt) and every viewer get it from one port. Cherry-picked from manaflow-ai/ghostty 315d78b99b, e1b8bf5f47, f1906ae5a6, 1975783f42, 33620abfb1, c318e78253 (coordinator decision 2026-10-04). Not ported: 2d6e944e31 (stale prompt marks; the print path it patches was rewritten upstream) and 431f5fea06 (clear_screen order; a binding on EXEC surfaces, and mirrors leave clear_screen to the owner). |
 
 Next in the stack (tracked in the design): presentation callbacks for
 frame-exact acknowledgment, Kitty image replay after a snapshot, and a
@@ -117,6 +118,11 @@ reviewed commit that says why.
   title. Tests: `OSC 7: manual surfaces keep the raw URL and skip the host
   check`, `osc7Path decodes file and kitty-shell-cwd URLs without a host
   check`.
+- OSC 133 prompt placement (all modes, and libghostty-vt): a primary
+  prompt (133;A, or 133;P without k=c/s) after a partial line padded to the
+  margin starts its own logical line, and the padding that forced the wrap
+  is dropped. Upstream leaves the prompt soft-wrapped onto the padded line,
+  so a resize reflows it away from column 0. Tests: `Terminal: OSC133...`.
 - Prompt redraw in the MANUAL modes: MANUAL and MANUAL_MIRROR surfaces
   create their terminal with `shell_redraws_prompt = false`, the value
   that libghostty-vt's C API (`ghostty_terminal_new`) gives every embedder
