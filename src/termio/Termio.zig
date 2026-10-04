@@ -1895,6 +1895,92 @@ test "manual: the config scrollback limit holds across snapshot restores" {
     try testManualTermio(true, S.phone);
 }
 
+test "manual: snapshot restores take this surface's colors and cursor defaults" {
+    const S = struct {
+        const host_red: terminalpkg.color.RGB = .{ .r = 0xaa, .g = 0x01, .b = 0x01 };
+        const host_bg: terminalpkg.color.RGB = .{ .r = 0x10, .g = 0x20, .b = 0x30 };
+        const local_red: terminalpkg.color.RGB = .{ .r = 0xcc, .g = 0x02, .b = 0x02 };
+        const local_bg: terminalpkg.color.RGB = .{ .r = 0x40, .g = 0x50, .b = 0x60 };
+        const osc_green: terminalpkg.color.RGB = .{ .r = 0x11, .g = 0x22, .b = 0x33 };
+
+        /// READY with the program's cursor at its default, then READY
+        /// after an explicit DECSCUSR underline.
+        var follows_default: std.ArrayListUnmanaged(u8) = .empty;
+        var explicit: std.ArrayListUnmanaged(u8) = .empty;
+
+        fn encode(io: *Termio, out: *std.ArrayListUnmanaged(u8)) !void {
+            const alloc = std.testing.allocator;
+            var w: std.Io.Writer.Allocating = .init(alloc);
+            defer w.deinit();
+            try io.encodeSnapshot(&w.writer, .ready);
+            try out.appendSlice(alloc, w.written());
+        }
+
+        /// The owner: its own default palette, background and cursor
+        /// style, plus a program's override of palette index 2.
+        fn host(io: *Termio, _: *TestSink, _: bool) !void {
+            const alloc = std.testing.allocator;
+            const t = &io.terminal;
+            var palette = terminalpkg.color.default;
+            palette[1] = host_red;
+            try t.colors.palette.changeDefault(alloc, palette);
+            t.colors.background.default = host_bg;
+            t.setDefaultCursorStyle(.bar);
+            // A program's OSC 4 set, applied directly: these tests have no
+            // surface mailbox for the color_change message.
+            t.colors.palette.set(2, osc_green);
+            io.processOutput("prompt$ ");
+            try std.testing.expect(t.cursor.is_default);
+            try encode(io, &follows_default);
+            io.processOutput("\x1b[4 q");
+            try std.testing.expect(!t.cursor.is_default);
+            try encode(io, &explicit);
+        }
+
+        /// This surface: palette 1, background and cursor style from its
+        /// own config.
+        fn viewer(io: *Termio, _: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            const alloc = testing.allocator;
+            var config: configpkg.Config = try .default(alloc);
+            defer config.deinit();
+            config.palette.value[1] = local_red;
+            config.palette.mask.set(1);
+            config.background = .{ .r = local_bg.r, .g = local_bg.g, .b = local_bg.b };
+            config.@"cursor-style" = .block;
+            var derived: DerivedConfig = try .init(alloc, &config);
+            var td = io.manualThreadData();
+            try io.changeConfig(&td, &derived);
+
+            try io.restoreSnapshot(follows_default.items, .ready);
+            const t = &io.terminal;
+            try testing.expectEqual(local_red, t.colors.palette.original[1]);
+            try testing.expectEqual(local_red, t.colors.palette.current[1]);
+            // The program's OSC 4 override survives the restore.
+            try testing.expectEqual(osc_green, t.colors.palette.current[2]);
+            try testing.expectEqual(local_bg, t.colors.background.default.?);
+            try testing.expectEqual(terminalpkg.CursorStyle.block, t.cursor.default_style);
+            try testing.expectEqual(terminalpkg.CursorStyle.block, t.screens.active.cursor.cursor_style);
+
+            // A program's explicit cursor shape stays; the default is ours.
+            try io.restoreSnapshot(explicit.items, .ready);
+            try testing.expectEqual(terminalpkg.CursorStyle.underline, io.terminal.screens.active.cursor.cursor_style);
+            try testing.expectEqual(terminalpkg.CursorStyle.block, io.terminal.cursor.default_style);
+            try testing.expectEqual(local_bg, io.terminal.colors.background.default.?);
+
+            // DECSCUSR 0 then selects this surface's default.
+            io.processOutput("\x1b[0 q");
+            try testing.expectEqual(terminalpkg.CursorStyle.block, io.terminal.screens.active.cursor.cursor_style);
+        }
+    };
+    const alloc = std.testing.allocator;
+    defer S.follows_default.deinit(alloc);
+    defer S.explicit.deinit(alloc);
+
+    try testManualTermio(true, S.host);
+    try testManualTermio(true, S.viewer);
+}
+
 test "manual: a config scrollback limit change trims the live terminal" {
     const body = struct {
         fn run(io: *Termio, _: *TestSink, _: bool) !void {
