@@ -1532,6 +1532,92 @@ GHOSTTY_API bool ghostty_surface_restore_snapshot(
     size_t,
     ghostty_surface_snapshot_phase_e);
 
+// Results of ghostty_surface_restore_snapshot_local_history.
+typedef enum {
+  GHOSTTY_SURFACE_LOCAL_HISTORY_ERROR = -1,
+  GHOSTTY_SURFACE_LOCAL_HISTORY_RESTORED = 0,
+  GHOSTTY_SURFACE_LOCAL_HISTORY_MISMATCH = 1,
+} ghostty_surface_local_history_result_e;
+
+// The length of a history digest (ghostty_terminal_history_digest in
+// ghostty/vt/terminal.h, version GHOSTTY_TERMINAL_HISTORY_DIGEST_VERSION).
+#define GHOSTTY_SURFACE_HISTORY_DIGEST_LEN 32
+
+// Restore a READY snapshot prefix into a MANUAL_MIRROR (or MANUAL)
+// surface and keep this surface's own scrollback, reflowed, instead of
+// receiving the history from the owner. Use it after an owner resize so
+// the owner does not resend all history.
+//
+// Caller contract. The owner encodes the READY prefix under its terminal
+// lock directly after it resized (Terminal.resize, reflow on) and before
+// it parses more output, together with ghostty_terminal_history_digest
+// of its terminal at that point (expected_history_rows, expected_digest).
+// The mirror calls this function from the output queue (see
+// ghostty_io_write_cb) exactly at that point in the byte stream: it has
+// parsed the same bytes as the owner up to the resize, at the OLD grid,
+// and it has not called ghostty_surface_set_grid for the new size (that
+// clips or pads a mirror). On any doubt (a cut that is not a resize, a
+// lost frame, a restart, different config) send READY + HISTORY with
+// ghostty_surface_restore_snapshot instead.
+//
+// bytes hold exactly the READY prefix: from the snapshot envelope through
+// the READY marker. Bytes after READY are an error (history records go to
+// ghostty_surface_restore_snapshot). digest_len must be
+// GHOSTTY_SURFACE_HISTORY_DIGEST_LEN.
+//
+// Under the terminal lock the surface resizes its old terminal to the
+// snapshot's grid with Terminal.resize (the primary screen reflows
+// soft-wrapped lines when wraparound is on, the alternate screen clips or
+// pads), computes ghostty_terminal_history_digest of the result, and
+// compares the history row count and the digest with the expected
+// values. The comparison is made before this surface's scrollback limits
+// are applied to the copied history, but the old terminal already holds
+// only what its limits kept, so a match requires both sides to have kept
+// the same history (equal scrollback limits, or history below both).
+//
+// Returns GHOSTTY_SURFACE_LOCAL_HISTORY_RESTORED (0) on a match: the
+// terminal is the READY terminal (screens, modes, colors and cursor
+// defaults from local policy, continuation, as a READY restore) with the
+// old terminal's reflowed primary history above its primary screen. The
+// copied history stops at this surface's scrollback limits (the oldest
+// pages are dropped). An allocation failure while copying also drops the
+// oldest pages instead of failing.
+//
+// Returns GHOSTTY_SURFACE_LOCAL_HISTORY_MISMATCH (1) when the row count or
+// the digest differs, or the local reflow failed: the READY terminal is
+// restored WITHOUT history (the old history is discarded). The caller then
+// asks the owner for HISTORY (or a COMPLETE snapshot) and applies it with
+// ghostty_surface_restore_snapshot.
+//
+// Returns GHOSTTY_SURFACE_LOCAL_HISTORY_ERROR (-1) and changes nothing for
+// an EXEC surface, a malformed or unsupported READY prefix, bytes after
+// READY, a bad digest length or a failed decode allocation.
+//
+// After 0 or 1 the snapshot is complete: the history of an earlier
+// snapshot that was still arriving is abandoned (also after -1, as a
+// failed READY restore does), and a later HISTORY restore returns false.
+// A locked grid takes the snapshot's size and keeps its generation. The
+// swap, redraw and generation rules are those of a READY restore. Nothing
+// is written to io_write_cb.
+GHOSTTY_API int ghostty_surface_restore_snapshot_local_history(
+    ghostty_surface_t,
+    const uint8_t* bytes,
+    size_t len,
+    uint64_t expected_history_rows,
+    const uint8_t* expected_digest,
+    size_t digest_len);
+
+// The history digest of a MANUAL or MANUAL_MIRROR surface's primary
+// screen: the same value as ghostty_terminal_history_digest computes for
+// a libghostty-vt terminal (see ghostty/vt/terminal.h). Call it from the
+// output queue; it takes the terminal lock. out_len must be
+// GHOSTTY_SURFACE_HISTORY_DIGEST_LEN. Returns false, and writes nothing,
+// for an EXEC surface, a NULL pointer or a wrong length.
+GHOSTTY_API bool ghostty_surface_history_digest(ghostty_surface_t,
+                                                uint64_t* history_rows,
+                                                uint8_t* out,
+                                                size_t out_len);
+
 // Encode the terminal of a MANUAL or MANUAL_MIRROR surface as a snapshot
 // (READY prefix, HISTORY records, or COMPLETE) and pass the bytes to
 // write_cb, once, before returning. Call it from the output queue so the

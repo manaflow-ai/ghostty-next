@@ -868,33 +868,12 @@ fn replaceTerminal(
 ) void {
     var new = decoded.toOwned();
 
-
     var old: terminalpkg.Terminal = undefined;
     {
         self.renderer_state.mutex.lockUncancelable(global.io());
         defer self.renderer_state.mutex.unlock(global.io());
 
-        // Local policy, from this surface's config (which the lock
-        // guards): Kitty image limits, and the scrollback limits instead
-        // of the owner's, so history that arrives later stops at the
-        // local limit (the decoder drops a page that does not fit and
-        // every older page after it). An alternate screen made later
-        // copies these from the primary screen. Default colors and
-        // cursor style are this surface's too, not the owner's.
-        self.applyLocalPolicyLocked(&new);
-
-        // Every screen is new storage. Advance each generation past the
-        // old terminal's, as a screen removal does, so references into
-        // the old pages (selection gesture pins, search) are seen as
-        // stale. The decoder applies history only to the generations it
-        // saw at READY, so it follows the new values.
-        const ScreenKey = @TypeOf(new.screens.active_key);
-        for (std.enums.values(ScreenKey)) |key| {
-            new.screens.generations.put(
-                key,
-                self.terminal.screens.generation(key) +% 1,
-            );
-        }
+        self.prepareRestoredTerminalLocked(&new);
         switch (decoder.state) {
             .history => |*history| {
                 var it = history.generations.iterator();
@@ -905,42 +884,123 @@ fn replaceTerminal(
             else => {},
         }
 
-        old = self.terminal;
-        self.terminal = new;
-
-        // The parser state belonged to the old byte stream. The
-        // snapshot's continuation is the unfinished sequence of the new
-        // one; replaying it also restarts continuation tracking.
-        self.resetStreamLocked();
-        switch (decoded.continuation) {
-            .ground => {},
-            .bytes => |continuation| self.terminal_stream.nextSlice(continuation),
-        }
-
-        if (self.grid_lock) |*lock| {
-            lock.cols = self.terminal.cols;
-            lock.rows = self.terminal.rows;
-        }
-
-        // A snapshot cut inside a synchronized update (mode 2026) holds
-        // frames until the owner's output ends it. The parser starts the
-        // safety timer when it sees the mode set; a restored mode needs
-        // the same timer, or a lost end would stop drawing for good.
-        if (self.terminal.modes.get(.synchronized_output)) {
-            self.queueMessage(.{ .start_synchronized_output = {} }, .locked);
-        }
-
-        // Redraw everything, images included.
-        self.terminal.flags.dirty.clear = true;
-        if (comptime terminalpkg.options.kitty_graphics) {
-            var it = self.terminal.screens.all.iterator();
-            while (it.next()) |entry| entry.value.*.kitty_images.dirty = true;
-        }
-        self.terminal_stream.handler.queueRender() catch {};
+        old = self.swapTerminalLocked(new, decoded.continuation);
     }
 
     // The old terminal is unreachable now; free it off the lock.
     old.deinit(self.alloc);
+}
+
+/// Prepare a terminal restored from the owner's snapshot to replace the
+/// live one. Caller must hold `renderer_state.mutex`.
+fn prepareRestoredTerminalLocked(self: *Termio, new: *terminalpkg.Terminal) void {
+    // Local policy, from this surface's config (which the lock guards):
+    // Kitty image limits, and the scrollback limits instead of the
+    // owner's, so history that arrives later stops at the local limit
+    // (the decoder drops a page that does not fit and every older page
+    // after it). An alternate screen made later copies these from the
+    // primary screen. Default colors and cursor style are this surface's
+    // too, not the owner's.
+    self.applyLocalPolicyLocked(new);
+
+    // Every screen is new storage. Advance each generation past the old
+    // terminal's, as a screen removal does, so references into the old
+    // pages (selection gesture pins, search) are seen as stale. The
+    // decoder applies history only to the generations it saw at READY,
+    // so the caller updates those to the new values.
+    const ScreenKey = @TypeOf(new.screens.active_key);
+    for (std.enums.values(ScreenKey)) |key| {
+        new.screens.generations.put(
+            key,
+            self.terminal.screens.generation(key) +% 1,
+        );
+    }
+}
+
+/// Make `new` the live terminal and return the old one, which the caller
+/// frees after it releases the lock. Caller must hold
+/// `renderer_state.mutex`.
+fn swapTerminalLocked(
+    self: *Termio,
+    new: terminalpkg.Terminal,
+    continuation: terminalpkg.snapshot.Continuation,
+) terminalpkg.Terminal {
+    const old = self.terminal;
+    self.terminal = new;
+
+    // The parser state belonged to the old byte stream. The snapshot's
+    // continuation is the unfinished sequence of the new one; replaying it
+    // also restarts continuation tracking.
+    self.resetStreamLocked();
+    switch (continuation) {
+        .ground => {},
+        .bytes => |bytes| self.terminal_stream.nextSlice(bytes),
+    }
+
+    if (self.grid_lock) |*lock| {
+        lock.cols = self.terminal.cols;
+        lock.rows = self.terminal.rows;
+    }
+
+    // A snapshot cut inside a synchronized update (mode 2026) holds frames
+    // until the owner's output ends it. The parser starts the safety timer
+    // when it sees the mode set; a restored mode needs the same timer, or a
+    // lost end would stop drawing for good.
+    if (self.terminal.modes.get(.synchronized_output)) {
+        self.queueMessage(.{ .start_synchronized_output = {} }, .locked);
+    }
+
+    // Redraw everything, images included.
+    self.terminal.flags.dirty.clear = true;
+    if (comptime terminalpkg.options.kitty_graphics) {
+        var it = self.terminal.screens.all.iterator();
+        while (it.next()) |entry| entry.value.*.kitty_images.dirty = true;
+    }
+    self.terminal_stream.handler.queueRender() catch {};
+    return old;
+}
+
+/// The result of `restoreSnapshotLocalHistory`.
+pub const LocalHistoryResult = enum {
+    /// The READY terminal with this surface's reflowed history.
+    restored,
+
+    /// The READY terminal without history: the local history did not
+    /// match the owner's.
+    mismatch,
+};
+
+/// Restore the READY prefix that the owner encoded directly after it
+/// resized, and keep this surface's own primary history instead of
+/// receiving the owner's: resize the old terminal to the snapshot's grid
+/// the way the owner resized (Terminal.resize, which reflows the primary
+/// screen), compare its history digest (`terminalpkg.history_digest`)
+/// with the owner's, and on a match put the old primary history above the
+/// new primary screen. The caller contract is in ghostty.h
+/// (ghostty_surface_restore_snapshot_local_history).
+///
+/// `bytes` hold exactly the READY prefix; bytes after READY are an error.
+/// Errors leave the terminal unchanged (an earlier snapshot whose history
+/// is still arriving is abandoned). After a result the snapshot is
+/// complete: a later `.history` restore fails with NoSnapshotInProgress.
+pub fn restoreSnapshotLocalHistory(
+    self: *Termio,
+    bytes: []const u8,
+    expected: terminalpkg.history_digest.Digest,
+) !LocalHistoryResult {
+    _ = bytes;
+    _ = expected;
+    if (self.backend != .manual) return error.NotManual;
+    return error.Unimplemented; // red: not implemented
+}
+
+/// The history digest of the live terminal's primary screen
+/// (`terminalpkg.history_digest`). Takes the terminal lock.
+pub fn historyDigest(self: *Termio) !terminalpkg.history_digest.Digest {
+    if (self.backend != .manual) return error.NotManual;
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    return terminalpkg.history_digest.terminal(&self.terminal);
 }
 
 /// Apply the surface's config as local policy to a terminal of a manual
@@ -1846,6 +1906,396 @@ fn testActiveVt(io: *Termio) ![]u8 {
     errdefer out.deinit();
     try formatter.format(&out.writer);
     return try out.toOwnedSlice();
+}
+
+/// Change the surface config's scrollback line limit the way
+/// ghostty_surface_update_config does (null: unlimited).
+fn testSetScrollbackLines(io: *Termio, lines: ?usize) !void {
+    const alloc = std.testing.allocator;
+    var config: configpkg.Config = try .default(alloc);
+    defer config.deinit();
+    config.@"scrollback-limit-lines" = .{ .value = lines orelse std.math.maxInt(usize) };
+    var derived: DerivedConfig = try .init(alloc, &config);
+    var td = io.manualThreadData();
+    try io.changeConfig(&td, &derived);
+}
+
+/// The terminal core that owns the byte stream in the local history
+/// tests: a libghostty-vt Terminal with the viewer's parsing modes and
+/// scrollback limits (the same defaults as a MANUAL surface).
+const TestOwner = struct {
+    t: terminalpkg.Terminal,
+    stream: terminalpkg.TerminalStream,
+
+    /// The owner starts at the viewer's view grid and then takes the
+    /// locked grid without reflow, as the viewer did (setGrid on a
+    /// mirror), so both have the same pages from the start.
+    fn init(self: *TestOwner, io: *Termio, cols: u16, rows: u16, max_lines: ?usize) !void {
+        const alloc = std.testing.allocator;
+        const view = io.size.grid();
+        self.t = try .init(global.io(), alloc, .{
+            .cols = view.columns,
+            .rows = view.rows,
+            .max_scrollback_bytes = io.config.scrollback_limit_bytes,
+            .max_scrollback_lines = max_lines,
+        });
+        errdefer self.t.deinit(alloc);
+        try self.t.resize(alloc, .{ .cols = cols, .rows = rows, .reflow = false });
+        self.t.flags.shell_redraws_prompt = io.terminal.flags.shell_redraws_prompt;
+        self.t.modes.set(.grapheme_cluster, io.terminal.modes.get(.grapheme_cluster));
+        self.t.modes.set(.wraparound, io.terminal.modes.get(.wraparound));
+        self.stream = self.t.vtStream();
+    }
+
+    fn deinit(self: *TestOwner) void {
+        self.stream.deinit();
+        self.t.deinit(std.testing.allocator);
+    }
+
+    /// The owner's resize, then its READY prefix and history digest, as
+    /// the host encodes them under its lock at the resize.
+    fn resizeAndEncode(self: *TestOwner, cols: u16, rows: u16) !struct { []u8, terminalpkg.history_digest.Digest } {
+        const alloc = std.testing.allocator;
+        try self.t.resize(alloc, .{ .cols = cols, .rows = rows });
+        const snapshot = terminalpkg.snapshot;
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        errdefer out.deinit();
+        {
+            var stream: snapshot.record.Writer = .init(alloc, &out.writer);
+            defer stream.deinit();
+            try snapshot.envelope.encode(stream.writer());
+            try snapshot.terminal.encode(&self.t, &stream);
+            try snapshot.screen.encode(self.t.screens.get(.primary).?, .primary, &stream);
+            if (self.t.screens.get(.alternate)) |alternate| {
+                try snapshot.screen.encode(alternate, .alternate, &stream);
+            }
+            try snapshot.continuation.encode(.ground, &stream);
+            try snapshot.checkpoint.encode(.ready, &stream);
+        }
+        return .{ try out.toOwnedSlice(), terminalpkg.history_digest.terminal(&self.t) };
+    }
+};
+
+/// Feed the same bytes to the viewer and the owner.
+fn testFeedBoth(io: *Termio, owner: *TestOwner, bytes: []const u8) void {
+    io.processOutput(bytes);
+    owner.stream.nextSlice(bytes);
+}
+
+/// 300 numbered lines (from `first`): every third one a 70-character line
+/// that soft-wraps at 40 columns, some bold or colored.
+fn testFeedLines(io: *Termio, owner: *TestOwner, first: usize, count: usize) !void {
+    var buf: [160]u8 = undefined;
+    for (first..first + count) |i| {
+        const line = if (i % 3 == 0)
+            try std.fmt.bufPrint(&buf, "\x1b[1mline {d:0>4}\x1b[m " ++ ("abcdefghij" ** 6) ++ "\r\n", .{i})
+        else
+            try std.fmt.bufPrint(&buf, "\x1b[3{d}mline {d:0>4}\x1b[m short\r\n", .{ i % 8, i });
+        testFeedBoth(io, owner, line);
+    }
+}
+
+/// The primary screen as plain text, history and active area, one row
+/// per line, from history row `from` (0: the oldest row).
+fn testPrimaryText(t: *terminalpkg.Terminal, from: usize) ![]const u8 {
+    const alloc = std.testing.allocator;
+    const primary = t.screens.get(.primary).?;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try primary.dumpString(&out.writer, .{
+        .tl = primary.pages.pin(.{ .screen = .{ .y = @intCast(from) } }).?,
+        .unwrap = false,
+    });
+    return try out.toOwnedSlice();
+}
+
+fn testExpectSamePrimary(io: *Termio, owner: *TestOwner) !void {
+    const alloc = std.testing.allocator;
+    const want = try testPrimaryText(&owner.t, 0);
+    defer alloc.free(want);
+    const got = try testPrimaryText(&io.terminal, 0);
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings(want, got);
+    try std.testing.expect(terminalpkg.history_digest.terminal(&io.terminal)
+        .eql(terminalpkg.history_digest.terminal(&owner.t)));
+}
+
+fn testHistoryRows(t: *terminalpkg.Terminal) usize {
+    const pages = &t.screens.get(.primary).?.pages;
+    return pages.total_rows - pages.rows;
+}
+
+test "manual: snapshot local history restore keeps the reflowed scrollback" {
+    const body = struct {
+        fn run(io: *Termio, sink: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            const alloc = testing.allocator;
+
+            try testing.expect(io.setGrid(40, 10, 7));
+            var owner: TestOwner = undefined;
+            try owner.init(io, 40, 10, null);
+            defer owner.deinit();
+
+            testFeedBoth(io, &owner, "\x1b[1;31mfirst styled line\x1b[m\r\n");
+            try testFeedLines(io, &owner, 0, 300);
+            testFeedBoth(io, &owner, "prompt$ ");
+
+            const ready, const digest = try owner.resizeAndEncode(25, 10);
+            defer alloc.free(ready);
+            try testing.expect(digest.history_rows > 300);
+
+            try testing.expectEqual(
+                LocalHistoryResult.restored,
+                try io.restoreSnapshotLocalHistory(ready, digest),
+            );
+
+            // The grid takes the snapshot's size and keeps its generation.
+            try testing.expectEqual(@as(u16, 25), io.terminal.cols);
+            try testing.expectEqual(@as(u16, 25), io.grid_lock.?.cols);
+            try testing.expectEqual(@as(u64, 7), io.grid_lock.?.generation);
+
+            // History and screen equal the owner's, from the earliest line,
+            // with its style.
+            try testExpectSamePrimary(io, &owner);
+            {
+                const text = try testPrimaryText(&io.terminal, 0);
+                defer alloc.free(text);
+                try testing.expect(std.mem.startsWith(u8, text, "first styled line"));
+                const primary = io.terminal.screens.get(.primary).?;
+                const pin = primary.pages.pin(.{ .screen = .{} }).?;
+                try testing.expect(pin.style(pin.rowAndCell().cell).flags.bold);
+            }
+
+            // The snapshot is complete.
+            try testing.expectError(error.NoSnapshotInProgress, io.restoreSnapshot(&.{}, .history));
+
+            // Later output keeps both sides equal.
+            try testFeedLines(io, &owner, 300, 120);
+            testFeedBoth(io, &owner, "done$ ");
+            try testExpectSamePrimary(io, &owner);
+
+            try sink.expect("");
+        }
+    }.run;
+    try testManualTermio(true, body);
+}
+
+test "manual: snapshot local history restore with the alternate screen active" {
+    const body = struct {
+        fn run(io: *Termio, sink: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            const alloc = testing.allocator;
+
+            try testing.expect(io.setGrid(40, 10, 1));
+            var owner: TestOwner = undefined;
+            try owner.init(io, 40, 10, null);
+            defer owner.deinit();
+
+            try testFeedLines(io, &owner, 0, 300);
+            // vim: alternate screen with a full-width status line.
+            testFeedBoth(io, &owner, "\x1b[?1049h\x1b[H\x1b[2J~\r\n~\r\n\x1b[10;1H\x1b[7m" ++
+                ("-- INSERT --" ++ " " ** 28) ++ "\x1b[m\x1b[1;1H");
+
+            const ready, const digest = try owner.resizeAndEncode(25, 12);
+            defer alloc.free(ready);
+            try testing.expectEqual(
+                LocalHistoryResult.restored,
+                try io.restoreSnapshotLocalHistory(ready, digest),
+            );
+            try testing.expectEqual(terminalpkg.ScreenSet.Key.alternate, io.terminal.screens.active_key);
+            {
+                const want = try owner.t.plainString(alloc);
+                defer alloc.free(want);
+                const got = try io.terminal.plainString(alloc);
+                defer alloc.free(got);
+                try testing.expectEqualStrings(want, got);
+            }
+            try testExpectSamePrimary(io, &owner);
+
+            // Leaving vim shows the same primary screen and history.
+            testFeedBoth(io, &owner, "\x1b[?1049l");
+            try testing.expectEqual(terminalpkg.ScreenSet.Key.primary, io.terminal.screens.active_key);
+            try testExpectSamePrimary(io, &owner);
+            try testFeedLines(io, &owner, 300, 40);
+            try testExpectSamePrimary(io, &owner);
+
+            try sink.expect("");
+        }
+    }.run;
+    try testManualTermio(true, body);
+}
+
+test "manual: snapshot local history restore under a scrollback limit" {
+    const body = struct {
+        fn run(io: *Termio, _: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            const alloc = testing.allocator;
+
+            // Both sides keep at most 2500 history lines, fewer than the
+            // output: both dropped their oldest pages the same way.
+            try testSetScrollbackLines(io, 2500);
+            try testing.expect(io.setGrid(40, 10, 1));
+            var owner: TestOwner = undefined;
+            try owner.init(io, 40, 10, 2500);
+            defer owner.deinit();
+
+            try testFeedLines(io, &owner, 0, 4000);
+            const ready, const digest = try owner.resizeAndEncode(25, 10);
+            defer alloc.free(ready);
+
+            try testing.expectEqual(
+                LocalHistoryResult.restored,
+                try io.restoreSnapshotLocalHistory(ready, digest),
+            );
+            try testExpectSamePrimary(io, &owner);
+            const text = try testPrimaryText(&io.terminal, 0);
+            defer alloc.free(text);
+            try testing.expect(std.mem.indexOf(u8, text, "line 0000") == null);
+            try testing.expect(std.mem.indexOf(u8, text, "line 3999") != null);
+            const pages = &io.terminal.screens.get(.primary).?.pages;
+            try testing.expect(testHistoryRows(&io.terminal) <= pages.limits.max(.lines));
+        }
+    }.run;
+    try testManualTermio(true, body);
+}
+
+test "manual: snapshot local history restore refuses a diverged history" {
+    const S = struct {
+        /// The viewer misses one output frame before the resize.
+        fn missedFrame(io: *Termio, _: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            const alloc = testing.allocator;
+
+            try testing.expect(io.setGrid(40, 10, 1));
+            var owner: TestOwner = undefined;
+            try owner.init(io, 40, 10, null);
+            defer owner.deinit();
+
+            try testFeedLines(io, &owner, 0, 200);
+            owner.stream.nextSlice("a frame the viewer never got\r\n");
+            try testFeedLines(io, &owner, 200, 100);
+
+            const ready, const digest = try owner.resizeAndEncode(25, 10);
+            defer alloc.free(ready);
+            try expectReadyOnly(io, &owner, ready, digest);
+        }
+
+        /// The owner parses graphemes as legacy codepoints; the viewer
+        /// uses grapheme clusters (mode 2027).
+        fn graphemeMode(io: *Termio, _: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            const alloc = testing.allocator;
+
+            try testing.expect(io.setGrid(40, 10, 1));
+            try testing.expect(io.terminal.modes.get(.grapheme_cluster));
+            var owner: TestOwner = undefined;
+            try owner.init(io, 40, 10, null);
+            defer owner.deinit();
+            owner.t.modes.set(.grapheme_cluster, false);
+
+            for (0..100) |_| {
+                testFeedBoth(io, &owner, "family \u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467} " ++
+                    ("abcdefghij" ** 4) ++ "\r\n");
+            }
+
+            const ready, const digest = try owner.resizeAndEncode(25, 10);
+            defer alloc.free(ready);
+            try expectReadyOnly(io, &owner, ready, digest);
+        }
+
+        /// The viewer keeps fewer history lines than the owner.
+        fn smallerLimit(io: *Termio, _: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            const alloc = testing.allocator;
+
+            try testSetScrollbackLines(io, 2500);
+            try testing.expect(io.setGrid(40, 10, 1));
+            var owner: TestOwner = undefined;
+            try owner.init(io, 40, 10, null);
+            defer owner.deinit();
+
+            try testFeedLines(io, &owner, 0, 4000);
+            const ready, const digest = try owner.resizeAndEncode(25, 10);
+            defer alloc.free(ready);
+            try expectReadyOnly(io, &owner, ready, digest);
+        }
+
+        /// A mismatch restores the READY terminal without the local
+        /// history: the screen and the rows the READY carries above it
+        /// equal the owner's, and nothing older is kept.
+        fn expectReadyOnly(
+            io: *Termio,
+            owner: *TestOwner,
+            ready: []const u8,
+            digest: terminalpkg.history_digest.Digest,
+        ) !void {
+            const testing = std.testing;
+            const alloc = testing.allocator;
+            try testing.expectEqual(
+                LocalHistoryResult.mismatch,
+                try io.restoreSnapshotLocalHistory(ready, digest),
+            );
+            try testing.expectEqual(@as(u16, 25), io.terminal.cols);
+
+            const kept = testHistoryRows(&io.terminal);
+            const owner_rows = testHistoryRows(&owner.t);
+            try testing.expect(kept < owner_rows);
+            const want = try testPrimaryText(&owner.t, owner_rows - kept);
+            defer alloc.free(want);
+            const got = try testPrimaryText(&io.terminal, 0);
+            defer alloc.free(got);
+            try testing.expectEqualStrings(want, got);
+
+            // A plain READY restore keeps exactly the same rows.
+            try io.restoreSnapshot(ready, .ready);
+            try testing.expectEqual(kept, testHistoryRows(&io.terminal));
+            io.abandonSnapshotRestore();
+
+            // The caller then applies the owner's history.
+            try testing.expectError(error.NoSnapshotInProgress, io.restoreSnapshot(&.{}, .history));
+        }
+    };
+    try testManualTermio(true, S.missedFrame);
+    try testManualTermio(true, S.graphemeMode);
+    try testManualTermio(true, S.smallerLimit);
+}
+
+test "manual: snapshot local history restore errors leave the terminal unchanged" {
+    const body = struct {
+        fn run(io: *Termio, _: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            const alloc = testing.allocator;
+
+            try testing.expect(io.setGrid(40, 10, 1));
+            var owner: TestOwner = undefined;
+            try owner.init(io, 40, 10, null);
+            defer owner.deinit();
+            try testFeedLines(io, &owner, 0, 100);
+
+            const ready, const digest = try owner.resizeAndEncode(25, 10);
+            defer alloc.free(ready);
+            const before = try testPrimaryText(&io.terminal, 0);
+            defer alloc.free(before);
+
+            // Bytes after READY.
+            const trailing = try std.mem.concat(alloc, u8, &.{ ready, "x" });
+            defer alloc.free(trailing);
+            try testing.expectError(
+                error.TrailingSnapshotBytes,
+                io.restoreSnapshotLocalHistory(trailing, digest),
+            );
+            // A truncated READY.
+            if (io.restoreSnapshotLocalHistory(ready[0 .. ready.len - 1], digest)) |_| {
+                return error.TestUnexpectedResult;
+            } else |_| {}
+
+            try testing.expectEqual(@as(u16, 40), io.terminal.cols);
+            const after = try testPrimaryText(&io.terminal, 0);
+            defer alloc.free(after);
+            try testing.expectEqualStrings(before, after);
+        }
+    }.run;
+    try testManualTermio(true, body);
 }
 
 test "manual: the config scrollback limit holds across snapshot restores" {

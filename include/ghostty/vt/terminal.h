@@ -24,6 +24,30 @@
 #include <ghostty/vt/selection.h>
 #include <ghostty/vt/style.h>
 
+/**
+ * Version of the history digest algorithm that
+ * ghostty_terminal_history_digest() implements. Digests of different
+ * versions never compare equal (the version is hashed).
+ *
+ * @ingroup terminal
+ */
+#define GHOSTTY_TERMINAL_HISTORY_DIGEST_VERSION 1
+
+/**
+ * Length in bytes of a history digest (SHA-256).
+ *
+ * @ingroup terminal
+ */
+#define GHOSTTY_TERMINAL_HISTORY_DIGEST_LEN 32
+
+/**
+ * Most history rows a history digest covers: the newest rows directly
+ * above the active area.
+ *
+ * @ingroup terminal
+ */
+#define GHOSTTY_TERMINAL_HISTORY_DIGEST_WINDOW_ROWS 64
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -3010,6 +3034,63 @@ GHOSTTY_API GhosttyResult ghostty_terminal_continuation_alloc(
     const GhosttyAllocator* allocator,
     uint8_t** out_ptr,
     size_t* out_len);
+
+/**
+ * Compute the history digest of the terminal's primary screen.
+ *
+ * The digest identifies the primary screen's history (the scrollback rows
+ * above the active area) so that two terminals that parsed the same bytes
+ * and resized the same way can check that they hold the same history
+ * without sending it. A cmux host computes it directly after a resize and
+ * sends it with the READY snapshot prefix; the mirror computes the same
+ * value on its own reflowed terminal (ghostty_surface_restore_snapshot_local_history
+ * in ghostty.h) before it keeps its local history.
+ *
+ * out_history_rows receives the number of history rows of the primary
+ * screen (physical rows: a soft-wrapped line counts once per row). This
+ * is the active screen's history only when the primary screen is active;
+ * the alternate screen is never used.
+ *
+ * Algorithm, version GHOSTTY_TERMINAL_HISTORY_DIGEST_VERSION (1): SHA-256
+ * over the following bytes, every integer unsigned little-endian, where
+ * H is the history row count, N = min(H, 64) and C the column count:
+ *
+ *   - the 22 ASCII bytes "ghostty-history-digest" and the version (u32)
+ *   - H (u64), N (u32) and C (u16)
+ *   - for each of the N newest history rows, from the oldest of them to
+ *     the row directly above the active area:
+ *       - a flags byte (u8): bit 0 the row is soft-wrapped (it continues
+ *         on the next row), bit 1 the row continues a soft-wrapped row
+ *       - for each of the C cells, from the left:
+ *           - the cell width (u8): 0 narrow, 1 wide, 2 spacer tail of a
+ *             wide character, 3 spacer head (a wide character continued
+ *             on the next row)
+ *           - the first codepoint (u32), 0 for an empty cell or a cell
+ *             with only a background color
+ *           - the count of further grapheme cluster codepoints (u16),
+ *             then each of them (u32)
+ *
+ * Styles, colors, hyperlinks, protection and semantic prompt marks are not
+ * hashed (a mirror's local color policy changes colors).
+ *
+ * The caller must serialize this operation with all other access to the
+ * same terminal. It may decompress compressed scrollback pages that hold
+ * the newest history rows.
+ *
+ * @param terminal Terminal to read from (must not be NULL)
+ * @param[out] out_history_rows History row count (must not be NULL)
+ * @param[out] out_digest Digest destination (must not be NULL)
+ * @param out_digest_len Must be GHOSTTY_TERMINAL_HISTORY_DIGEST_LEN
+ * @return GHOSTTY_SUCCESS on success, or GHOSTTY_INVALID_VALUE for a NULL
+ *         argument or a wrong length (nothing is written)
+ *
+ * @ingroup terminal
+ */
+GHOSTTY_API GhosttyResult ghostty_terminal_history_digest(
+    GhosttyTerminal terminal,
+    uint64_t* out_history_rows,
+    uint8_t* out_digest,
+    size_t out_digest_len);
 
 /**
  * Scroll the terminal viewport.
