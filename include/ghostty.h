@@ -608,6 +608,23 @@ typedef enum {
 // into the surface. It can be called until ghostty_surface_free returns.
 typedef void (*ghostty_io_write_cb)(void*, const char*, uintptr_t);
 
+// Font binding actions reported after Ghostty applied them (increase,
+// decrease, reset, set). The callback runs synchronously on the surface's
+// GUI thread and must not free or reenter the surface.
+typedef enum {
+  GHOSTTY_FONT_SIZE_ACTION_INCREASE = 0,
+  GHOSTTY_FONT_SIZE_ACTION_DECREASE = 1,
+  GHOSTTY_FONT_SIZE_ACTION_RESET = 2,
+  GHOSTTY_FONT_SIZE_ACTION_SET = 3,
+} ghostty_font_size_action_e;
+typedef void (*ghostty_font_size_action_cb)(
+    void* userdata,
+    ghostty_font_size_action_e action,
+    float previous_points,
+    float current_points,
+    bool previous_adjusted,
+    bool current_adjusted);
+
 typedef struct {
   ghostty_platform_e platform_tag;
   ghostty_platform_u platform;
@@ -638,6 +655,22 @@ typedef struct {
   uint32_t cell_height_px;
 } ghostty_surface_size_s;
 
+// Grid geometry in the embedder's logical (point) coordinates. The cursor
+// fields name the canonical cursor cell (a wide glyph's lead) and are zero
+// with cursor_in_viewport false when the cursor is scrolled out of view.
+typedef struct {
+  uint16_t columns;
+  uint16_t rows;
+  uint16_t cursor_column;
+  uint16_t cursor_row;
+  uint16_t cursor_width_cells;
+  bool cursor_in_viewport;
+  double cell_width;
+  double cell_height;
+  double padding_left;
+  double padding_top;
+} ghostty_surface_grid_metrics_s;
+
 // The terminal grid of a surface, see ghostty_surface_grid.
 typedef struct {
   // True after ghostty_surface_set_grid locked the grid.
@@ -663,6 +696,12 @@ typedef struct {
   uint8_t g;
   uint8_t b;
 } ghostty_config_color_s;
+
+// config.WindowPadding.C (window-padding-x, window-padding-y), in points
+typedef struct {
+  uint32_t top_left;
+  uint32_t bottom_right;
+} ghostty_config_window_padding_s;
 
 // config.ColorList
 typedef struct {
@@ -1267,6 +1306,7 @@ GHOSTTY_API void ghostty_config_free(ghostty_config_t);
 GHOSTTY_API ghostty_config_t ghostty_config_clone(ghostty_config_t);
 GHOSTTY_API void ghostty_config_load_cli_args(ghostty_config_t);
 GHOSTTY_API void ghostty_config_load_file(ghostty_config_t, const char*);
+GHOSTTY_API void ghostty_config_load_string(ghostty_config_t, const char*, uintptr_t, const char*);
 GHOSTTY_API void ghostty_config_load_default_files(ghostty_config_t);
 GHOSTTY_API void ghostty_config_load_recursive_files(ghostty_config_t);
 GHOSTTY_API void ghostty_config_finalize(ghostty_config_t);
@@ -1309,8 +1349,21 @@ GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
 GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
+// Install a per-surface callback for performed font binding actions. Call
+// once after ghostty_surface_new; a second call returns false. Not inherited
+// by child surfaces. userdata must stay valid until ghostty_surface_free
+// returns.
+GHOSTTY_API bool ghostty_surface_set_font_size_action_callback(
+    ghostty_surface_t,
+    ghostty_font_size_action_cb,
+    void* userdata);
 GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t);
 GHOSTTY_API ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
+// Fills the grid metrics. Returns false while a resize of an unlocked grid
+// is in flight; with a host-locked grid (ghostty_surface_set_grid) the
+// metrics describe the locked grid. Takes the terminal lock briefly.
+GHOSTTY_API bool ghostty_surface_grid_metrics(ghostty_surface_t,
+                                              ghostty_surface_grid_metrics_s*);
 // Lock the terminal grid of a MANUAL or MANUAL_MIRROR surface to
 // cols x rows, the grid of the terminal core that owns the byte stream,
 // independent of the view's pixel size. Call it from the output queue
@@ -1499,6 +1552,16 @@ GHOSTTY_API void ghostty_surface_complete_clipboard_request(
 GHOSTTY_API void ghostty_surface_deny_clipboard_request(ghostty_surface_t,
                                                            void*);
 GHOSTTY_API bool ghostty_surface_has_selection(ghostty_surface_t);
+// Clear the active selection. Returns false when there was none.
+GHOSTTY_API bool ghostty_surface_clear_selection(ghostty_surface_t);
+// Publish the active selection to the standard clipboard as plain text,
+// plus HTML when it also fits, each formatted into at most max_bytes. The
+// selection is not cleared. Returns false when there is no selection, the
+// selection spans more than max_bytes / 4 cells, or its plain text exceeds
+// max_bytes.
+GHOSTTY_API bool ghostty_surface_copy_selection_to_clipboard_bounded(
+    ghostty_surface_t,
+    uintptr_t max_bytes);
 GHOSTTY_API bool ghostty_surface_read_selection(ghostty_surface_t, ghostty_text_s*);
 GHOSTTY_API bool ghostty_surface_read_text(ghostty_surface_t,
                                               ghostty_selection_s,

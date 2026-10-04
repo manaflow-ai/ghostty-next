@@ -4072,6 +4072,15 @@ fn loadFsFile(self: *Config, alloc: Allocator, file: *std.Io.File, path: []const
     try self.loadReader(alloc, reader, path);
 }
 
+/// Load config from in-memory contents.
+///
+/// `path` is used only as the synthetic source path for diagnostics and for
+/// resolving relative config values.
+pub fn loadString(self: *Config, alloc: Allocator, contents: []const u8, path: []const u8) !void {
+    var reader: std.Io.Reader = .fixed(contents);
+    try self.loadReader(alloc, &reader, path);
+}
+
 /// Load config from the given Reader.
 fn loadReader(self: *Config, alloc: Allocator, reader: *std.Io.Reader, path: []const u8) !void {
     bom: {
@@ -4087,6 +4096,36 @@ fn loadReader(self: *Config, alloc: Allocator, reader: *std.Io.Reader, path: []c
     var iter: cli.args.LineIterator = .{ .r = reader, .filepath = path };
     try self.loadIter(alloc, &iter);
     try self.expandPaths(std.fs.path.dirname(path).?);
+}
+
+test "loadString loads in-memory contents with a synthetic path" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+    try cfg.loadString(
+        alloc,
+        "\xef\xbb\xbfabnormal-command-exit-runtime = 2500\nfont-size = 15\n",
+        "/home/ghostty/.config/ghostty/cmux.json",
+    );
+    try cfg.finalize();
+
+    try testing.expect(cfg._diagnostics.empty());
+    try testing.expectEqual(2500, cfg.@"abnormal-command-exit-runtime");
+    try testing.expectEqual(15, cfg.@"font-size");
+}
+
+test "loadString reports diagnostics against the synthetic path" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+    try cfg.loadString(alloc, "not-a-real-key = 1\n", "/cmux/cmux-next");
+    try cfg.finalize();
+
+    try testing.expect(!cfg._diagnostics.empty());
 }
 
 test "handle bom in config files" {
@@ -10365,6 +10404,16 @@ pub const WindowPadding = struct {
 
     top_left: u32 = 0,
     bottom_right: u32 = 0,
+
+    /// ghostty_config_window_padding_s
+    pub const C = extern struct {
+        top_left: u32,
+        bottom_right: u32,
+    };
+
+    pub fn cval(self: Self) C {
+        return .{ .top_left = self.top_left, .bottom_right = self.bottom_right };
+    }
 
     pub fn clone(self: Self, _: Allocator) error{}!Self {
         return self;

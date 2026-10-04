@@ -206,6 +206,115 @@ pub const InputEffect = enum {
     closed,
 };
 
+/// The semantic font mutation performed by one binding action.
+pub const FontSizeActionKind = enum(c_int) {
+    increase = 0,
+    decrease = 1,
+    reset = 2,
+    set = 3,
+};
+
+/// The resolved native state surrounding one performed font binding action.
+pub const FontSizeActionEvent = struct {
+    kind: FontSizeActionKind,
+    previous_points: f32,
+    current_points: f32,
+    previous_adjusted: bool,
+    current_adjusted: bool,
+};
+
+fn fontSizeActionEvent(
+    action: input.Binding.Action,
+    previous_points: f32,
+    current_points: f32,
+    previous_adjusted: bool,
+    current_adjusted: bool,
+) ?FontSizeActionEvent {
+    const kind: FontSizeActionKind = switch (action) {
+        .increase_font_size => .increase,
+        .decrease_font_size => .decrease,
+        .reset_font_size => .reset,
+        .set_font_size => .set,
+        else => return null,
+    };
+    return .{
+        .kind = kind,
+        .previous_points = previous_points,
+        .current_points = current_points,
+        .previous_adjusted = previous_adjusted,
+        .current_adjusted = current_adjusted,
+    };
+}
+
+/// Tell the apprt that a font binding action changed (or kept) the size.
+/// Runs on the GUI thread after the mutation succeeded.
+fn fontSizeActionDidPerform(
+    self: *Surface,
+    action: input.Binding.Action,
+    previous_points: f32,
+    previous_adjusted: bool,
+) void {
+    if (comptime @hasDecl(
+        apprt.runtime.Surface,
+        "fontSizeActionDidPerform",
+    )) {
+        const event = fontSizeActionEvent(
+            action,
+            previous_points,
+            self.font_size.points,
+            previous_adjusted,
+            self.font_size_adjusted,
+        ) orelse return;
+        self.rt_surface.fontSizeActionDidPerform(event);
+    }
+}
+
+test "font size action event preserves semantic mutation" {
+    const absolute = fontSizeActionEvent(
+        .{ .set_font_size = 400 },
+        12,
+        255,
+        false,
+        true,
+    ).?;
+    try std.testing.expectEqual(
+        FontSizeActionKind.set,
+        absolute.kind,
+    );
+    try std.testing.expectEqual(@as(f32, 12), absolute.previous_points);
+    try std.testing.expectEqual(@as(f32, 255), absolute.current_points);
+    try std.testing.expect(!absolute.previous_adjusted);
+    try std.testing.expect(absolute.current_adjusted);
+
+    const clamped_relative = fontSizeActionEvent(
+        .{ .increase_font_size = 1 },
+        255,
+        255,
+        false,
+        true,
+    ).?;
+    try std.testing.expectEqual(
+        FontSizeActionKind.increase,
+        clamped_relative.kind,
+    );
+    try std.testing.expectEqual(
+        clamped_relative.previous_points,
+        clamped_relative.current_points,
+    );
+    try std.testing.expect(clamped_relative.current_adjusted);
+
+    try std.testing.expect(
+        fontSizeActionEvent(
+            .copy_title_to_clipboard,
+            12,
+            12,
+            false,
+            false,
+        ) == null,
+    );
+}
+
+
 /// The search state for the surface.
 const Search = struct {
     state: terminal.search.Thread,
@@ -2311,6 +2420,134 @@ fn clipboardWrite(self: *const Surface, data: []const u8, loc: apprt.Clipboard) 
         log.err("error setting clipboard string err={}", .{err});
         return;
     };
+}
+
+/// True when the selection spans at most `max_cells` grid cells, counted by
+/// whole rows, so bounded formatting never walks an unbounded selection.
+fn selectionWithinClipboardWorkBudget(
+    screen: *const terminal.Screen,
+    selection: terminal.Selection,
+    max_cells: usize,
+) bool {
+    if (max_cells == 0) return false;
+    const top_left = selection.topLeft(screen);
+    const bottom_right = selection.bottomRight(screen);
+    var remaining = max_cells;
+    var iterator = top_left.pageIterator(.right_down, bottom_right);
+    while (iterator.next()) |chunk| {
+        const row_count = chunk.end - chunk.start;
+        const cell_count = std.math.mul(
+            usize,
+            row_count,
+            chunk.node.cols(),
+        ) catch return false;
+        if (cell_count > remaining) return false;
+        remaining -= cell_count;
+    }
+    return true;
+}
+
+/// Plain text (required) and HTML (only when it fits) for `selection`, each
+/// formatted into at most `max_bytes`. error.ClipboardTooLarge when the
+/// selection or its plain text exceeds the bound.
+fn formatSelectionClipboardContentsBounded(
+    alloc: Allocator,
+    screen: *terminal.Screen,
+    selection: terminal.Selection,
+    opts_: terminal.formatter.Options,
+    max_bytes: usize,
+) ![]apprt.ClipboardContent {
+    if (max_bytes == 0 or
+        !selectionWithinClipboardWorkBudget(screen, selection, max_bytes / 4))
+        return error.ClipboardTooLarge;
+
+    const scratch = try alloc.alloc(u8, max_bytes);
+    defer alloc.free(scratch);
+
+    var contents: std.ArrayList(apprt.ClipboardContent) = try .initCapacity(alloc, 2);
+
+    var opts = opts_;
+    opts.emit = .plain;
+    var formatter: terminal.formatter.ScreenFormatter = .init(screen, opts);
+    formatter.content = .{ .selection = selection };
+    var writer: std.Io.Writer = .fixed(scratch);
+    formatter.format(&writer) catch |err| switch (err) {
+        error.WriteFailed => return error.ClipboardTooLarge,
+    };
+    contents.appendAssumeCapacity(.{
+        .mime = "text/plain",
+        .data = try alloc.dupeZ(u8, writer.buffered()),
+    });
+
+    // HTML carries no codepoint map and no default colors, as in
+    // copySelectionToClipboards.
+    opts.emit = .html;
+    opts.codepoint_map = null;
+    opts.background = null;
+    opts.foreground = null;
+    formatter = .init(screen, opts);
+    formatter.content = .{ .selection = selection };
+    writer = .fixed(scratch);
+    html: {
+        formatter.format(&writer) catch |err| switch (err) {
+            error.WriteFailed => break :html,
+        };
+        contents.appendAssumeCapacity(.{
+            .mime = "text/html",
+            .data = try alloc.dupeZ(u8, writer.buffered()),
+        });
+    }
+
+    return contents.items;
+}
+
+/// Publish the active selection to the standard clipboard as plain text,
+/// plus HTML when it fits, both within `max_bytes`. The selection stays.
+/// False when there is no selection or it is over the bound.
+pub fn copySelectionToClipboardBounded(self: *Surface, max_bytes: usize) !bool {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+
+    const screen = self.io.terminal.screens.active;
+    const selection = screen.selection orelse return false;
+    var arena = ArenaAllocator.init(self.alloc);
+    defer arena.deinit();
+    const contents = formatSelectionClipboardContentsBounded(
+        arena.allocator(),
+        screen,
+        selection,
+        .{
+            .emit = .plain,
+            .unwrap = true,
+            .trim = self.config.clipboard_trim_trailing_spaces,
+            .codepoint_map = self.config.clipboard_codepoint_map.map.list,
+            .background = self.io.terminal.colors.background.get(),
+            .foreground = self.io.terminal.colors.foreground.get(),
+            .palette = &self.io.terminal.colors.palette.current,
+        },
+        max_bytes,
+    ) catch |err| switch (err) {
+        error.ClipboardTooLarge => return false,
+        else => return err,
+    };
+
+    self.rt_surface.setClipboard(.standard, contents, false) catch |err| {
+        log.err("error setting bounded clipboard selection err={}", .{err});
+        return false;
+    };
+    return true;
+}
+
+/// Clear the active selection. False when there was none.
+pub fn clearSelection(self: *Surface) !bool {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+
+    const screen = self.io.terminal.screens.active;
+    if (screen.selection == null) return false;
+    try self.setSelection(null);
+    try self.queueRender();
+    return true;
 }
 
 fn copySelectionToClipboards(
@@ -5279,6 +5516,9 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         )) == .started,
 
         .increase_font_size => |delta| {
+            const previous_points = self.font_size.points;
+            const previous_adjusted = self.font_size_adjusted;
+
             // Max delta is somewhat arbitrary.
             const clamped_delta = @max(0, @min(255, delta));
 
@@ -5291,9 +5531,17 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
 
             // Mark that we manually adjusted the font size
             self.font_size_adjusted = true;
+            self.fontSizeActionDidPerform(
+                action,
+                previous_points,
+                previous_adjusted,
+            );
         },
 
         .decrease_font_size => |delta| {
+            const previous_points = self.font_size.points;
+            const previous_adjusted = self.font_size_adjusted;
+
             // Max delta is somewhat arbitrary.
             const clamped_delta = @max(0, @min(255, delta));
 
@@ -5305,9 +5553,17 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
 
             // Mark that we manually adjusted the font size
             self.font_size_adjusted = true;
+            self.fontSizeActionDidPerform(
+                action,
+                previous_points,
+                previous_adjusted,
+            );
         },
 
         .reset_font_size => {
+            const previous_points = self.font_size.points;
+            const previous_adjusted = self.font_size_adjusted;
+
             log.debug("reset font size", .{});
 
             var size = self.font_size;
@@ -5316,9 +5572,17 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
 
             // Reset font size also resets the manual adjustment state
             self.font_size_adjusted = false;
+            self.fontSizeActionDidPerform(
+                action,
+                previous_points,
+                previous_adjusted,
+            );
         },
 
         .set_font_size => |points| {
+            const previous_points = self.font_size.points;
+            const previous_adjusted = self.font_size_adjusted;
+
             log.debug("set font size={d}", .{points});
 
             var size = self.font_size;
@@ -5327,6 +5591,11 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
 
             // Mark that we manually adjusted the font size
             self.font_size_adjusted = true;
+            self.fontSizeActionDidPerform(
+                action,
+                previous_points,
+                previous_adjusted,
+            );
         },
 
         .prompt_surface_title => return try self.rt_app.performAction(
@@ -6763,4 +7032,135 @@ test "promptClickRelativeRow" {
         );
         try testing.expectEqual(case.expected, promptClickRelativeRow(&pages, prompt, click));
     }
+}
+
+fn boundedClipboardTestOptions(t: *terminal.Terminal) terminal.formatter.Options {
+    return .{
+        .emit = .plain,
+        .unwrap = true,
+        .trim = true,
+        .background = t.colors.background.get(),
+        .foreground = t.colors.foreground.get(),
+        .palette = &t.colors.palette.current,
+    };
+}
+
+test "bounded clipboard: plain and html for a styled selection" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 8, .rows = 2 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\x1b[31mred");
+
+    const screen = t.screens.active;
+    const selection = terminal.Selection.init(
+        screen.pages.pin(.{ .viewport = .{ .x = 0, .y = 0 } }).?,
+        screen.pages.pin(.{ .viewport = .{ .x = 2, .y = 0 } }).?,
+        false,
+    );
+    var arena = ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const contents = try formatSelectionClipboardContentsBounded(
+        arena.allocator(),
+        screen,
+        selection,
+        boundedClipboardTestOptions(&t),
+        4096,
+    );
+
+    try testing.expectEqual(@as(usize, 2), contents.len);
+    try testing.expectEqualStrings("text/plain", contents[0].mime);
+    try testing.expectEqualStrings("red", contents[0].data);
+    try testing.expectEqualStrings("text/html", contents[1].mime);
+    try testing.expect(std.mem.indexOf(u8, contents[1].data, "color:") != null);
+}
+
+test "bounded clipboard: plain text is kept when only html is over the bound" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 40, .rows = 2 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    // 30 cells, each with its own color: tiny as plain text, large as HTML.
+    var i: usize = 0;
+    while (i < 30) : (i += 1) {
+        var buf: [32]u8 = undefined;
+        stream.nextSlice(std.fmt.bufPrint(&buf, "\x1b[38;5;{d}mx", .{i + 16}) catch unreachable);
+    }
+
+    const screen = t.screens.active;
+    const selection = terminal.Selection.init(
+        screen.pages.pin(.{ .viewport = .{ .x = 0, .y = 0 } }).?,
+        screen.pages.pin(.{ .viewport = .{ .x = 29, .y = 0 } }).?,
+        false,
+    );
+    var arena = ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const contents = try formatSelectionClipboardContentsBounded(
+        arena.allocator(),
+        screen,
+        selection,
+        boundedClipboardTestOptions(&t),
+        200,
+    );
+
+    try testing.expectEqual(@as(usize, 1), contents.len);
+    try testing.expectEqualStrings("text/plain", contents[0].mime);
+    try testing.expectEqual(@as(usize, 30), contents[0].data.len);
+}
+
+test "bounded clipboard: refuses a selection over the bound" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 40, .rows = 4 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("0123456789012345678901234567890123456789");
+
+    const screen = t.screens.active;
+    const selection = terminal.Selection.init(
+        screen.pages.pin(.{ .viewport = .{ .x = 0, .y = 0 } }).?,
+        screen.pages.pin(.{ .viewport = .{ .x = 39, .y = 0 } }).?,
+        false,
+    );
+    var arena = ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    try testing.expectError(
+        error.ClipboardTooLarge,
+        formatSelectionClipboardContentsBounded(
+            arena.allocator(),
+            screen,
+            selection,
+            boundedClipboardTestOptions(&t),
+            16,
+        ),
+    );
+}
+
+test "bounded clipboard: an empty selection gives empty plain text" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 4, .rows = 2 });
+    defer t.deinit(alloc);
+    const screen = t.screens.active;
+    const pin = screen.pages.pin(.{ .viewport = .{ .x = 0, .y = 0 } }).?;
+    const selection = terminal.Selection.init(pin, pin, false);
+    var arena = ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const contents = try formatSelectionClipboardContentsBounded(
+        arena.allocator(),
+        screen,
+        selection,
+        boundedClipboardTestOptions(&t),
+        4096,
+    );
+    try testing.expectEqualStrings("", contents[0].data);
 }

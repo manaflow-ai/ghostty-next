@@ -16,6 +16,7 @@ const input = @import("../input.zig");
 const internal_os = @import("../os/main.zig");
 const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
+const grid_metrics = @import("grid_metrics.zig");
 const termio = @import("../termio.zig");
 const CoreApp = @import("../App.zig");
 const CoreInspector = @import("../inspector/main.zig").Inspector;
@@ -445,6 +446,16 @@ pub const EnvVar = extern struct {
     value: [*:0]const u8,
 };
 
+/// ghostty_font_size_action_cb
+pub const FontSizeActionCallback = *const fn (
+    ?*anyopaque,
+    CoreSurface.FontSizeActionKind,
+    f32,
+    f32,
+    bool,
+    bool,
+) callconv(.c) void;
+
 pub const Surface = struct {
     app: *App,
     platform: Platform,
@@ -459,6 +470,11 @@ pub const Surface = struct {
     io_mode: apprt.SurfaceIoMode = .exec,
     io_write_cb: ?termio.Manual.WriteCallback = null,
     io_write_userdata: ?*anyopaque = null,
+
+    /// Font binding callback, run on the GUI thread. Belongs to this exact
+    /// surface; child surfaces never inherit it.
+    font_size_action_cb: ?FontSizeActionCallback = null,
+    font_size_action_userdata: ?*anyopaque = null,
 
     /// The current title of the surface. The embedded apprt saves this so
     /// that getTitle works without the implementer needing to save it.
@@ -662,6 +678,22 @@ pub const Surface = struct {
             font_size.points = opts.font_size;
             try self.core_surface.setFontSize(font_size);
         }
+    }
+
+    /// Called by the core surface after a font binding action succeeded.
+    pub fn fontSizeActionDidPerform(
+        self: *Surface,
+        event: CoreSurface.FontSizeActionEvent,
+    ) void {
+        const callback = self.font_size_action_cb orelse return;
+        callback(
+            self.font_size_action_userdata,
+            event.kind,
+            event.previous_points,
+            event.current_points,
+            event.previous_adjusted,
+            event.current_adjusted,
+        );
     }
 
     pub fn deinit(self: *Surface) void {
@@ -1596,6 +1628,7 @@ pub const CAPI = struct {
         cell_height_px: u32,
     };
 
+
     // ghostty_clipboard_content_s
     //
     // One representation of clipboard contents. The data is binary-safe
@@ -1951,6 +1984,27 @@ pub const CAPI = struct {
         return surface.core_surface.hasSelection();
     }
 
+    /// Clear the active selection. False when there was none.
+    export fn ghostty_surface_clear_selection(surface: *Surface) bool {
+        return surface.core_surface.clearSelection() catch |err| {
+            log.warn("error clearing selection err={}", .{err});
+            return false;
+        };
+    }
+
+    /// Publish the active selection to the standard clipboard as plain
+    /// text, plus HTML when it fits, both within max_bytes. The selection
+    /// stays. False when there is none or it is over the bound.
+    export fn ghostty_surface_copy_selection_to_clipboard_bounded(
+        surface: *Surface,
+        max_bytes: usize,
+    ) bool {
+        return surface.core_surface.copySelectionToClipboardBounded(max_bytes) catch |err| {
+            log.warn("error copying bounded selection err={}", .{err});
+            return false;
+        };
+    }
+
     /// Same as ghostty_surface_read_text but reads from the user selection,
     /// if any.
     export fn ghostty_surface_read_selection(
@@ -2040,6 +2094,21 @@ pub const CAPI = struct {
 
     /// Update the size of a surface. This will trigger resize notifications
     /// to the pty and the renderer.
+    /// Install a callback for performed font binding actions on this
+    /// surface. One-shot: a second call returns false. The embedder keeps
+    /// userdata alive until ghostty_surface_free returns.
+    export fn ghostty_surface_set_font_size_action_callback(
+        surface: *Surface,
+        callback: ?FontSizeActionCallback,
+        userdata: ?*anyopaque,
+    ) bool {
+        const registered = callback orelse return false;
+        if (surface.font_size_action_cb != null) return false;
+        surface.font_size_action_cb = registered;
+        surface.font_size_action_userdata = userdata;
+        return true;
+    }
+
     export fn ghostty_surface_set_size(surface: *Surface, w: u32, h: u32) void {
         surface.updateSize(w, h);
     }
@@ -2064,6 +2133,25 @@ pub const CAPI = struct {
             .rows = state.rows,
             .generation = state.generation,
         };
+    }
+
+    /// Grid geometry in logical (point) coordinates: grid, canonical
+    /// cursor cell, cell size and padding. False while a resize of an
+    /// unlocked grid is in flight.
+    export fn ghostty_surface_grid_metrics(
+        surface: *Surface,
+        result: *grid_metrics.Metrics,
+    ) bool {
+        const locked = surface.core_surface.io.gridState().locked;
+        surface.core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer surface.core_surface.renderer_state.mutex.unlock(global.io());
+        result.* = grid_metrics.compute(
+            surface.core_surface.size,
+            surface.content_scale,
+            surface.core_surface.renderer_state.terminal.screens.active,
+            .{ .grid_locked = locked },
+        ) orelse return false;
+        return true;
     }
 
     /// Return the size information a surface has.
