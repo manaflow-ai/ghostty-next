@@ -60,4 +60,5 @@ test {
     _ = runtime;
     _ = action;
     _ = structs;
+    _ = @import("apprt/grid_metrics.zig");
 }
