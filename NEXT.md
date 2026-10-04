@@ -93,6 +93,7 @@ thread. New tab and split surfaces do not inherit the IO fields.
 | embedded: ghostty_surface_grid_metrics | Grid, canonical cursor cell, cell size and padding in points. With a host-locked grid (`set_grid`) the metrics describe the locked grid; an unlocked grid refuses a resize in flight. Ported from manaflow-ai/ghostty aeed68c443; the canonical-cell helper is private to the embedded apprt, so libghostty-vt is unchanged. |
 | embedded: bounded selection copy and clear selection | `ghostty_surface_copy_selection_to_clipboard_bounded` (plain text required, HTML only when it fits, selection kept) and `ghostty_surface_clear_selection`. Adapted from manaflow-ai/ghostty 7a5d08b7c3. |
 | embedded: keyboard copy mode on upstream selections | `ghostty_surface_select_viewport_cell` (one-cell selection = copy cursor, wide glyphs resolve to the lead), `ghostty_surface_selection_end` (moving end in viewport rows, also above or below it) and `ghostty_surface_select_lines` (widen to whole rows). Movement is upstream `adjust_selection`; scrolling and prompt jumps are upstream binding actions. Replaces the desktop fork's keyboard copy API (about 2,800 lines in `Screen`/`Selection`); this one adds about 160 lines outside the terminal core, so libghostty-vt is unchanged. |
+| build: flavor apple-v6 with a universal macOS slice | The `ios` xcframework target ships `macos-arm64_x86_64` (upstream's macOS universal library) instead of the host-native macOS arm64 slice. The cmux-next Mac app ships for Apple silicon and Intel and links this GhosttyNextKit (coordinator decision 2026-10-04). The smoke links both macOS architectures. |
 
 Next in the stack (tracked in the design): presentation callbacks for
 frame-exact acknowledgment, Kitty image replay after a snapshot, and a
@@ -153,7 +154,7 @@ A push to `main` runs `.github/workflows/next-xcframework.yml` on a remote
 macOS runner. It runs `next/build-xcframework.sh`, which pins Zig and Xcode
 from `next/toolchain.env`, builds with fixed flags and packages with
 `next/package_xcframework.py`. The release tag is
-`xcframework-<commit>-<flavor>` (flavor `ios-v2` and later; `ios-v3` is the first with a drawing iOS renderer; `ios-v4` adds `set_grid`, snapshot restore and encode, and non-blocking surface calls; `ios-v5` keeps the surface's scrollback limits across restores) and holds:
+`xcframework-<commit>-<flavor>` (flavor `ios-v2` and later; `ios-v3` is the first with a drawing iOS renderer; `ios-v4` adds `set_grid`, snapshot restore and encode, and non-blocking surface calls; `ios-v5` keeps the surface's scrollback limits across restores; `apple-v6` replaces the host-native macOS arm64 slice with a universal macOS arm64 + x86_64 slice, so the cmux-next Mac app links the same GhosttyNextKit as iOS) and holds:
 
 - `GhosttyNextKit.xcframework.zip`: deterministic zip. Its sha256 is also the
   SwiftPM checksum.

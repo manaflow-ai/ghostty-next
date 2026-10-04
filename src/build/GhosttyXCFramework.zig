@@ -120,10 +120,13 @@ pub fn init(
                     .headers = headers,
                     .dsym = ios_sim.dsym,
                 },
+                // ghostty-next: macOS arm64 + x86_64, so one GhosttyNextKit
+                // serves the iOS app and the cmux-next Mac app on Apple
+                // silicon and Intel (flavor apple-v6).
                 .{
-                    .library = macos_native.output,
+                    .library = macos_universal.output,
                     .headers = headers,
-                    .dsym = macos_native.dsym,
+                    .dsym = macos_universal.dsym,
                 },
             },
         },
