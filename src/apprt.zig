@@ -61,4 +61,5 @@ test {
     _ = action;
     _ = structs;
     _ = @import("apprt/grid_metrics.zig");
+    _ = @import("apprt/keyboard_selection.zig");
 }

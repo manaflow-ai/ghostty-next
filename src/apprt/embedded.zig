@@ -17,6 +17,7 @@ const internal_os = @import("../os/main.zig");
 const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
 const grid_metrics = @import("grid_metrics.zig");
+const keyboard_selection = @import("keyboard_selection.zig");
 const termio = @import("../termio.zig");
 const CoreApp = @import("../App.zig");
 const CoreInspector = @import("../inspector/main.zig").Inspector;
@@ -1982,6 +1983,35 @@ pub const CAPI = struct {
     /// Returns true if the surface has a selection.
     export fn ghostty_surface_has_selection(surface: *Surface) bool {
         return surface.core_surface.hasSelection();
+    }
+
+    /// Copy mode: a one-cell selection (the copy cursor) at a visible
+    /// cell. False outside the viewport.
+    export fn ghostty_surface_select_viewport_cell(
+        surface: *Surface,
+        column: u16,
+        row: u16,
+    ) bool {
+        return surface.core_surface.selectViewportCell(column, row) catch |err| {
+            log.warn("error selecting viewport cell err={}", .{err});
+            return false;
+        };
+    }
+
+    /// Copy mode: the selection's moving end in viewport cells.
+    export fn ghostty_surface_selection_end(
+        surface: *Surface,
+        result: *keyboard_selection.Endpoint,
+    ) bool {
+        return surface.core_surface.selectionEndpoint(result);
+    }
+
+    /// Copy mode: widen the selection to whole rows.
+    export fn ghostty_surface_select_lines(surface: *Surface) bool {
+        return surface.core_surface.selectLines() catch |err| {
+            log.warn("error selecting lines err={}", .{err});
+            return false;
+        };
     }
 
     /// Clear the active selection. False when there was none.

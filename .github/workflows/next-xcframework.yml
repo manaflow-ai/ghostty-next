@@ -107,6 +107,7 @@ jobs:
             -Dtest-filter="font size action event" \
             -Dtest-filter="grid metrics " \
             -Dtest-filter="bounded clipboard: " \
+            -Dtest-filter="keyboard selection: " \
             --summary all
           # libghostty-vt patches (VT replay formatter, terminal and Kitty
           # graphics C API). These live in the lib-vt test modules.
