@@ -206,6 +206,69 @@ pub const InputEffect = enum {
     closed,
 };
 
+/// The semantic font mutation performed by one binding action.
+pub const FontSizeActionKind = enum(c_int) {
+    increase = 0,
+    decrease = 1,
+    reset = 2,
+    set = 3,
+};
+
+/// The resolved native state surrounding one performed font binding action.
+pub const FontSizeActionEvent = struct {
+    kind: FontSizeActionKind,
+    previous_points: f32,
+    current_points: f32,
+    previous_adjusted: bool,
+    current_adjusted: bool,
+};
+
+fn fontSizeActionEvent(
+    action: input.Binding.Action,
+    previous_points: f32,
+    current_points: f32,
+    previous_adjusted: bool,
+    current_adjusted: bool,
+) ?FontSizeActionEvent {
+    const kind: FontSizeActionKind = switch (action) {
+        .increase_font_size => .increase,
+        .decrease_font_size => .decrease,
+        .reset_font_size => .reset,
+        .set_font_size => .set,
+        else => return null,
+    };
+    return .{
+        .kind = kind,
+        .previous_points = previous_points,
+        .current_points = current_points,
+        .previous_adjusted = previous_adjusted,
+        .current_adjusted = current_adjusted,
+    };
+}
+
+/// Tell the apprt that a font binding action changed (or kept) the size.
+/// Runs on the GUI thread after the mutation succeeded.
+fn fontSizeActionDidPerform(
+    self: *Surface,
+    action: input.Binding.Action,
+    previous_points: f32,
+    previous_adjusted: bool,
+) void {
+    if (comptime @hasDecl(
+        apprt.runtime.Surface,
+        "fontSizeActionDidPerform",
+    )) {
+        const event = fontSizeActionEvent(
+            action,
+            previous_points,
+            self.font_size.points,
+            previous_adjusted,
+            self.font_size_adjusted,
+        ) orelse return;
+        self.rt_surface.fontSizeActionDidPerform(event);
+    }
+}
+
 test "font size action event preserves semantic mutation" {
     const absolute = fontSizeActionEvent(
         .{ .set_font_size = 400 },
@@ -5325,6 +5388,9 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         )) == .started,
 
         .increase_font_size => |delta| {
+            const previous_points = self.font_size.points;
+            const previous_adjusted = self.font_size_adjusted;
+
             // Max delta is somewhat arbitrary.
             const clamped_delta = @max(0, @min(255, delta));
 
@@ -5337,9 +5403,17 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
 
             // Mark that we manually adjusted the font size
             self.font_size_adjusted = true;
+            self.fontSizeActionDidPerform(
+                action,
+                previous_points,
+                previous_adjusted,
+            );
         },
 
         .decrease_font_size => |delta| {
+            const previous_points = self.font_size.points;
+            const previous_adjusted = self.font_size_adjusted;
+
             // Max delta is somewhat arbitrary.
             const clamped_delta = @max(0, @min(255, delta));
 
@@ -5351,9 +5425,17 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
 
             // Mark that we manually adjusted the font size
             self.font_size_adjusted = true;
+            self.fontSizeActionDidPerform(
+                action,
+                previous_points,
+                previous_adjusted,
+            );
         },
 
         .reset_font_size => {
+            const previous_points = self.font_size.points;
+            const previous_adjusted = self.font_size_adjusted;
+
             log.debug("reset font size", .{});
 
             var size = self.font_size;
@@ -5362,9 +5444,17 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
 
             // Reset font size also resets the manual adjustment state
             self.font_size_adjusted = false;
+            self.fontSizeActionDidPerform(
+                action,
+                previous_points,
+                previous_adjusted,
+            );
         },
 
         .set_font_size => |points| {
+            const previous_points = self.font_size.points;
+            const previous_adjusted = self.font_size_adjusted;
+
             log.debug("set font size={d}", .{points});
 
             var size = self.font_size;
@@ -5373,6 +5463,11 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
 
             // Mark that we manually adjusted the font size
             self.font_size_adjusted = true;
+            self.fontSizeActionDidPerform(
+                action,
+                previous_points,
+                previous_adjusted,
+            );
         },
 
         .prompt_surface_title => return try self.rt_app.performAction(

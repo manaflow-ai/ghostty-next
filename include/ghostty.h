@@ -608,6 +608,23 @@ typedef enum {
 // into the surface. It can be called until ghostty_surface_free returns.
 typedef void (*ghostty_io_write_cb)(void*, const char*, uintptr_t);
 
+// Font binding actions reported after Ghostty applied them (increase,
+// decrease, reset, set). The callback runs synchronously on the surface's
+// GUI thread and must not free or reenter the surface.
+typedef enum {
+  GHOSTTY_FONT_SIZE_ACTION_INCREASE = 0,
+  GHOSTTY_FONT_SIZE_ACTION_DECREASE = 1,
+  GHOSTTY_FONT_SIZE_ACTION_RESET = 2,
+  GHOSTTY_FONT_SIZE_ACTION_SET = 3,
+} ghostty_font_size_action_e;
+typedef void (*ghostty_font_size_action_cb)(
+    void* userdata,
+    ghostty_font_size_action_e action,
+    float previous_points,
+    float current_points,
+    bool previous_adjusted,
+    bool current_adjusted);
+
 typedef struct {
   ghostty_platform_e platform_tag;
   ghostty_platform_u platform;
@@ -1316,6 +1333,14 @@ GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
 GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
+// Install a per-surface callback for performed font binding actions. Call
+// once after ghostty_surface_new; a second call returns false. Not inherited
+// by child surfaces. userdata must stay valid until ghostty_surface_free
+// returns.
+GHOSTTY_API bool ghostty_surface_set_font_size_action_callback(
+    ghostty_surface_t,
+    ghostty_font_size_action_cb,
+    void* userdata);
 GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t);
 GHOSTTY_API ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
 // Lock the terminal grid of a MANUAL or MANUAL_MIRROR surface to

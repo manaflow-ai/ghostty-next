@@ -445,6 +445,16 @@ pub const EnvVar = extern struct {
     value: [*:0]const u8,
 };
 
+/// ghostty_font_size_action_cb
+pub const FontSizeActionCallback = *const fn (
+    ?*anyopaque,
+    CoreSurface.FontSizeActionKind,
+    f32,
+    f32,
+    bool,
+    bool,
+) callconv(.c) void;
+
 pub const Surface = struct {
     app: *App,
     platform: Platform,
@@ -459,6 +469,11 @@ pub const Surface = struct {
     io_mode: apprt.SurfaceIoMode = .exec,
     io_write_cb: ?termio.Manual.WriteCallback = null,
     io_write_userdata: ?*anyopaque = null,
+
+    /// Font binding callback, run on the GUI thread. Belongs to this exact
+    /// surface; child surfaces never inherit it.
+    font_size_action_cb: ?FontSizeActionCallback = null,
+    font_size_action_userdata: ?*anyopaque = null,
 
     /// The current title of the surface. The embedded apprt saves this so
     /// that getTitle works without the implementer needing to save it.
@@ -662,6 +677,22 @@ pub const Surface = struct {
             font_size.points = opts.font_size;
             try self.core_surface.setFontSize(font_size);
         }
+    }
+
+    /// Called by the core surface after a font binding action succeeded.
+    pub fn fontSizeActionDidPerform(
+        self: *Surface,
+        event: CoreSurface.FontSizeActionEvent,
+    ) void {
+        const callback = self.font_size_action_cb orelse return;
+        callback(
+            self.font_size_action_userdata,
+            event.kind,
+            event.previous_points,
+            event.current_points,
+            event.previous_adjusted,
+            event.current_adjusted,
+        );
     }
 
     pub fn deinit(self: *Surface) void {
@@ -2040,6 +2071,21 @@ pub const CAPI = struct {
 
     /// Update the size of a surface. This will trigger resize notifications
     /// to the pty and the renderer.
+    /// Install a callback for performed font binding actions on this
+    /// surface. One-shot: a second call returns false. The embedder keeps
+    /// userdata alive until ghostty_surface_free returns.
+    export fn ghostty_surface_set_font_size_action_callback(
+        surface: *Surface,
+        callback: ?FontSizeActionCallback,
+        userdata: ?*anyopaque,
+    ) bool {
+        const registered = callback orelse return false;
+        if (surface.font_size_action_cb != null) return false;
+        surface.font_size_action_cb = registered;
+        surface.font_size_action_userdata = userdata;
+        return true;
+    }
+
     export fn ghostty_surface_set_size(surface: *Surface, w: u32, h: u32) void {
         surface.updateSize(w, h);
     }
