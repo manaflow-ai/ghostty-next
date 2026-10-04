@@ -11,12 +11,19 @@ share branches.
 
 ## Base
 
-`main` = upstream `ghostty-org/ghostty` `main` at the commit in
+`main` = upstream `ghostty-org/ghostty` `main` merged up to the commit in
 `next/UPSTREAM_BASE`, plus the patch stack below. Every patch is one
-self-describing commit. To move the base, rebase the stack onto a newer
-upstream commit, update `next/UPSTREAM_BASE` in the same push, and let CI
-publish a new GhosttyNextKit. Never merge `manaflow-ai/ghostty` into this repo;
-port a patch from it as a new commit that names the source commit.
+self-describing commit. To move the base, merge upstream `main` into a sync
+branch (`sync/upstream-<date>`), update `next/UPSTREAM_BASE` in the same
+branch, and land it with a pull request; CI then publishes a new
+GhosttyNextKit. Do not rebase `main`: cmux pins `main` commits (the
+`ghostty-next` gitlink in cmux and the commits of published GhosttyNextKit
+releases), and a pinned commit must stay an ancestor of `main` or
+`git submodule update` breaks for every checkout. When the stack needs a
+clean replay, rebase it on a side branch and record the old tip as an
+ancestor with `git merge -s ours <old main>` before it lands. Never merge
+`manaflow-ai/ghostty` into this repo; port a patch from it as a new commit
+that names the source commit.
 
 Never push to, or open a pull request against, `ghostty-org/ghostty`. In a
 local clone, keep the upstream remote fetch-only:
