@@ -11002,6 +11002,92 @@ test "theme priority is lower than config" {
     }, cfg.background);
 }
 
+test "keySource: the last assignment of each key and where it came from" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+    try cfg.loadString(alloc, "font-size = 12\n# comment\nfont-size = 14\n", "/cfg/main");
+    try cfg.loadString(alloc, "cursor-style = bar\n", "/cfg/included");
+    try cfg.finalize();
+
+    const font = cfg.keySource("font-size").?;
+    try testing.expectEqualStrings("/cfg/main", font.file.path);
+    try testing.expectEqual(@as(usize, 3), font.file.line);
+    const cursor = cfg.keySource("cursor-style").?;
+    try testing.expectEqualStrings("/cfg/included", cursor.file.path);
+    try testing.expectEqual(@as(usize, 1), cursor.file.line);
+
+    // A key at its default value has no source; neither does a non-key.
+    try testing.expect(cfg.keySource("background") == null);
+    try testing.expect(cfg.keySource("not-a-key") == null);
+
+    // A clone keeps the sources.
+    var copy = try cfg.clone(alloc);
+    defer copy.deinit();
+    try testing.expectEqual(@as(usize, 3), copy.keySource("font-size").?.file.line);
+}
+
+test "keySource: a user value over a theme names the user's line" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var td = try internal_os.TempDir.init();
+    defer td.deinit();
+    var buf: [4096]u8 = undefined;
+    {
+        var file = try td.dir.createFile(testing.io, "theme", .{});
+        defer file.close(testing.io);
+        var writer = file.writer(testing.io, &buf);
+        try writer.interface.writeAll("background = #123ABC\nforeground = #FFFFFF\n");
+        try writer.end();
+    }
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const theme_path = path_buf[0..try td.dir.realPathFile(testing.io, "theme", &path_buf)];
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+    const text = try std.fmt.allocPrint(alloc, "theme = {s}\nbackground = #ABCDEF\n", .{theme_path});
+    defer alloc.free(text);
+    try cfg.loadString(alloc, text, "/cfg/user");
+    try cfg.finalize();
+
+    // The user's line wins, in value and in source.
+    try testing.expectEqual(Color{ .r = 0xAB, .g = 0xCD, .b = 0xEF }, cfg.background);
+    const background = cfg.keySource("background").?;
+    try testing.expectEqualStrings("/cfg/user", background.file.path);
+    try testing.expectEqual(@as(usize, 2), background.file.line);
+    // A key only the theme sets names the theme file.
+    const foreground = cfg.keySource("foreground").?;
+    try testing.expectEqualStrings(theme_path, foreground.file.path);
+    try testing.expectEqual(@as(usize, 2), foreground.file.line);
+
+    // The theme file is among the loaded files (a watcher reloads on it).
+    var found = false;
+    for (cfg.loadedFiles()) |file| {
+        if (std.mem.eql(u8, file, theme_path)) found = true;
+    }
+    try testing.expect(found);
+}
+
+test "keySource: sources survive a conditional replay" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+    try cfg.loadString(alloc, "font-size = 15\nwindow-theme = system\n", "/cfg/main");
+    try cfg.finalize();
+    // Force a replay the way a light/dark switch does.
+    cfg._conditional_set.insert(.theme);
+    var next = (try cfg.changeConditionalState(.{ .theme = .dark })).?;
+    defer next.deinit();
+    const font = next.keySource("font-size").?;
+    try testing.expectEqualStrings("/cfg/main", font.file.path);
+    try testing.expectEqual(@as(usize, 1), font.file.line);
+}
+
 test "theme loading correct light/dark" {
     const testing = std.testing;
     const alloc = testing.allocator;

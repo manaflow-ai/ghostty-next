@@ -294,3 +294,38 @@ test "ghostty_config_trigger: default keybind" {
         try testing.expectEqual(.unidentified, trigger.key.physical);
     }
 }
+
+test "ghostty_config_key_name: every key, then null" {
+    const testing = std.testing;
+    const count = ghostty_config_key_count();
+    try testing.expectEqual(std.meta.fields(Key).len, count);
+    var saw_font_size = false;
+    for (0..count) |i| {
+        const name = std.mem.span(ghostty_config_key_name(i).?);
+        try testing.expect(name.len > 0 and name[0] != '_');
+        if (std.mem.eql(u8, name, "font-size")) saw_font_size = true;
+    }
+    try testing.expect(saw_font_size);
+    try testing.expect(ghostty_config_key_name(count) == null);
+}
+
+test "ghostty_config_key_source and ghostty_config_loaded_file" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+    try cfg.loadString(alloc, "\nfont-size = 14\n", "/cfg/main");
+    try cfg.finalize();
+
+    var source: Source = undefined;
+    try testing.expect(ghostty_config_key_source(&cfg, "font-size", 9, &source));
+    try testing.expectEqualStrings("/cfg/main", std.mem.span(source.path));
+    try testing.expectEqual(@as(usize, 2), source.line);
+    try testing.expect(!ghostty_config_key_source(&cfg, "background", 10, &source));
+
+    // In-memory loads are not files on disk.
+    try testing.expectEqual(@as(usize, 0), ghostty_config_loaded_file_count(&cfg));
+    try testing.expect(ghostty_config_loaded_file(&cfg, 0) == null);
+}
+
