@@ -193,7 +193,7 @@ pub fn initMacOSUniversal(
 
     const universal = LipoStep.create(b, .{
         .name = "ghostty",
-        .out_name = "ghostty-internal.a",
+        .out_name = "libghostty-internal.a",
         .input_a = aarch64.output,
         .input_b = x86_64.output,
     });
