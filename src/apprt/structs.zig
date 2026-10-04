@@ -306,6 +306,41 @@ test "ghostty.h SurfaceSnapshotPhase" {
     );
 }
 
+/// The result of ghostty_surface_restore_snapshot_local_history.
+///
+/// If this is changed, you must also update ghostty.h
+/// (ghostty_surface_local_history_result_e).
+pub const SurfaceLocalHistoryResult = enum(c_int) {
+    /// Nothing changed: not a manual surface, a malformed READY prefix,
+    /// bytes after READY, a bad digest length or a failed decode.
+    @"error" = -1,
+
+    /// The READY terminal with the surface's own reflowed history.
+    restored = 0,
+
+    /// The READY terminal without history; ask the owner for HISTORY.
+    mismatch = 1,
+};
+
+test "ghostty.h SurfaceLocalHistoryResult" {
+    try @import("../lib/enum.zig").checkGhosttyHEnum(
+        SurfaceLocalHistoryResult,
+        "GHOSTTY_SURFACE_LOCAL_HISTORY_",
+    );
+}
+
+test "ghostty.h history digest length and version" {
+    const c = @import("ghostty.h");
+    try std.testing.expectEqual(
+        @as(usize, terminal.history_digest.len),
+        @as(usize, c.GHOSTTY_SURFACE_HISTORY_DIGEST_LEN),
+    );
+    try std.testing.expectEqual(
+        @as(u32, terminal.history_digest.version),
+        @as(u32, c.GHOSTTY_SURFACE_HISTORY_DIGEST_VERSION),
+    );
+}
+
 test "ghostty.h surface grid" {
     const testing = std.testing;
     const c = @import("ghostty.h");

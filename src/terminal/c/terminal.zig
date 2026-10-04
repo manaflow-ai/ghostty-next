@@ -29,6 +29,7 @@ const grid_ref_tracked_c = @import("grid_ref_tracked.zig");
 const search_c = @import("search.zig");
 const selection_c = @import("selection.zig");
 const style_c = @import("style.zig");
+const history_digest = @import("../history_digest.zig");
 const color = @import("../color.zig");
 const clipboard = @import("../clipboard.zig");
 const kitty_clipboard = @import("../kitty/clipboard.zig");
@@ -1734,6 +1735,23 @@ pub fn resize(
     return .success;
 }
 
+/// C: ghostty_terminal_history_digest. See history_digest.zig.
+pub fn history_digest_compute(
+    terminal_: Terminal,
+    out_history_rows_: ?*u64,
+    out_digest_: ?[*]u8,
+    out_digest_len: usize,
+) callconv(lib.calling_conv) Result {
+    const wrapper = terminal_ orelse return .invalid_value;
+    const out_history_rows = out_history_rows_ orelse return .invalid_value;
+    const out_digest = out_digest_ orelse return .invalid_value;
+    if (out_digest_len != history_digest.len) return .invalid_value;
+    const digest = history_digest.terminal(wrapper.terminal);
+    out_history_rows.* = digest.history_rows;
+    @memcpy(out_digest[0..history_digest.len], &digest.bytes);
+    return .success;
+}
+
 pub fn reset(terminal_: Terminal) callconv(lib.calling_conv) void {
     const wrapper = terminal_ orelse return;
     const t: *ZigTerminal = wrapper.terminal;
@@ -3034,6 +3052,44 @@ test "resize" {
     try testing.expectEqual(Result.success, resize(t, 40, 12, 9, 18));
     try testing.expectEqual(40, t.?.terminal.cols);
     try testing.expectEqual(12, t.?.terminal.rows);
+}
+
+test "history digest" {
+    var a: Terminal = null;
+    var b: Terminal = null;
+    try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &a, 40, 5));
+    defer free(a);
+    try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &b, 40, 5));
+    defer free(b);
+
+    const line = "\x1b[31m" ++ ("0123456789" ** 7) ++ "\x1b[m\r\n";
+    for (0..50) |_| {
+        vt_write(a, line.ptr, line.len);
+        vt_write(b, line.ptr, line.len);
+    }
+    try testing.expectEqual(Result.success, resize(a, 25, 5, 9, 18));
+    try testing.expectEqual(Result.success, resize(b, 25, 5, 9, 18));
+
+    var rows_a: u64 = 0;
+    var rows_b: u64 = 0;
+    var digest_a: [history_digest.len]u8 = undefined;
+    var digest_b: [history_digest.len]u8 = undefined;
+    try testing.expectEqual(Result.success, history_digest_compute(a, &rows_a, &digest_a, digest_a.len));
+    try testing.expectEqual(Result.success, history_digest_compute(b, &rows_b, &digest_b, digest_b.len));
+    try testing.expect(rows_a > 0);
+    try testing.expectEqual(rows_a, rows_b);
+    try testing.expectEqualSlices(u8, &digest_a, &digest_b);
+
+    // The same value as the Zig function, which the embedded surface uses.
+    const zig = history_digest.terminal(a.?.terminal);
+    try testing.expectEqual(zig.history_rows, rows_a);
+    try testing.expectEqualSlices(u8, &zig.bytes, &digest_a);
+
+    // Bad arguments write nothing.
+    try testing.expectEqual(Result.invalid_value, history_digest_compute(null, &rows_a, &digest_a, digest_a.len));
+    try testing.expectEqual(Result.invalid_value, history_digest_compute(a, null, &digest_a, digest_a.len));
+    try testing.expectEqual(Result.invalid_value, history_digest_compute(a, &rows_a, null, digest_a.len));
+    try testing.expectEqual(Result.invalid_value, history_digest_compute(a, &rows_a, &digest_a, 31));
 }
 
 test "resize null" {

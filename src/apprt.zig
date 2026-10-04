@@ -38,6 +38,7 @@ pub const SurfaceSize = structs.SurfaceSize;
 pub const SurfaceIoMode = structs.SurfaceIoMode;
 pub const SurfaceGrid = structs.SurfaceGrid;
 pub const SurfaceSnapshotPhase = structs.SurfaceSnapshotPhase;
+pub const SurfaceLocalHistoryResult = structs.SurfaceLocalHistoryResult;
 
 /// The implementation to use for the app runtime. This is comptime chosen
 /// so that every build has exactly one application runtime implementation.

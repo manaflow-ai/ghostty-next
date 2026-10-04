@@ -452,6 +452,14 @@ recycle_node: ?*List.Node = null,
 /// Limits for scrollback.
 limits: Limits,
 
+/// True once the oldest history rows were dropped to keep within `limits`
+/// (byte-limit recycling in `grow`, `Limits.enforce`, or a history page
+/// that `PageAllocation.finalize` or `prependHistoryFrom` refused). Then
+/// this list holds only the newest part of the history it received.
+/// `reset` and erasing all history (CSI 3 J) clear it; a `clone` keeps it.
+/// It does not say the list is still at its limit: see `historyAtLimit`.
+history_truncated: bool = false,
+
 /// The total number of rows represented by this PageList. This is used
 /// specifically for scrollbar information so we can have the total size.
 total_rows: usize,
@@ -984,6 +992,9 @@ pub fn deinit(self: *PageList) void {
 pub fn reset(self: *PageList) void {
     defer self.assertIntegrity();
 
+    // Reset discards all scrollback: nothing is missing from it.
+    self.history_truncated = false;
+
     // Reset discards all scrollback, so there is nothing left to compress.
     self.page_compression.reset();
 
@@ -1184,6 +1195,7 @@ pub fn clone(
         .page_serial_epoch = 0,
         .page_size = page_size,
         .limits = self.limits,
+        .history_truncated = self.history_truncated,
         .cols = self.cols,
         .rows = self.rows,
         .total_rows = total_rows,
@@ -4057,6 +4069,7 @@ pub fn grow(self: *PageList) Allocator.Error!?*List.Node {
             self.total_rows += first.rows();
             break :prune;
         }
+        self.history_truncated = true;
 
         // If we have a pin viewport cache then we need to update it.
         if (self.viewport == .pin) viewport: {
@@ -4498,9 +4511,11 @@ pub const PageAllocation = struct {
         // Restored history is exact data, so reject a page which cannot
         // coexist with the receiving PageList's configured limits.
         if (page_size > destination.limits.max(.bytes)) {
+            destination.history_truncated = true;
             return error.MaxSizeExceeded;
         }
         if (total_rows - destination.rows > destination.limits.max(.lines)) {
+            destination.history_truncated = true;
             return error.MaxLinesExceeded;
         }
 
@@ -4532,6 +4547,114 @@ pub const PageAllocation = struct {
         }
     }
 };
+
+/// The result of `prependHistoryFrom`.
+pub const PrependHistory = struct {
+    /// Rows added above the existing first page.
+    rows: usize = 0,
+
+    /// Some added row or cell carries a semantic prompt mark.
+    semantic_prompt: bool = false,
+};
+
+pub const PrependHistoryError = Allocator.Error || error{
+    /// The source has a different column count.
+    ColumnMismatch,
+};
+
+/// Copy the history of `src` (its rows above the active area), except its
+/// newest `skip_newest` history rows, above this list's first page, so
+/// they become this list's oldest history. `src` must have this list's
+/// column count. `src` is not changed: a compressed source page is read
+/// through a temporary decoded copy.
+///
+/// Pages are copied newest first, each into one page of this list's pool
+/// with the source page's capacity (`Page.cloneFrom`, the same copy that
+/// `clone` makes), and joined with `PageAllocation.finalize(.prepend)`
+/// (compressed when not visible). Pages cannot move between lists: each
+/// list owns its own memory pool. The copy stops, without an error, at
+/// the first page that would exceed this list's byte or line limit, or
+/// that fails to allocate, so the result is always a contiguous newest
+/// part of the history and the oldest rows are the ones dropped.
+///
+/// Use this when a terminal that has the same history as `src` but no
+/// history of its own (such as one restored from a READY snapshot prefix)
+/// takes the history of `src`. `skip_newest` drops the history rows that
+/// this list already has above its active area in its first page.
+pub fn prependHistoryFrom(
+    self: *PageList,
+    alloc: Allocator,
+    src: *const PageList,
+    skip_newest: usize,
+) PrependHistoryError!PrependHistory {
+    if (src.cols != self.cols) return error.ColumnMismatch;
+
+    // History that the source already dropped is missing here too.
+    if (src.history_truncated) self.history_truncated = true;
+
+    var result: PrependHistory = .{};
+    const history_rows = src.total_rows - src.rows;
+    if (skip_newest >= history_rows) return result;
+    const copy_rows = history_rows - skip_newest;
+
+    var it = src.pageIterator(
+        .left_up,
+        .{ .screen = .{} },
+        .{ .screen = .{ .y = @intCast(copy_rows - 1) } },
+    );
+    // A copy that stops early (a limit or a failed allocation) keeps only
+    // the newest part.
+    var complete = false;
+    defer {
+        if (!complete) self.history_truncated = true;
+    }
+    while (it.next()) |chunk| {
+        var preserved = chunk.node.pagePreservingState(alloc) catch break;
+        defer preserved.deinit();
+        const src_page = preserved.page();
+
+        var allocation = self.allocatePage(chunk.node.capacity()) catch break;
+        defer allocation.deinit();
+        const dst_page = allocation.page();
+        dst_page.size.rows = chunk.end - chunk.start;
+        dst_page.size.cols = src_page.size.cols;
+        dst_page.cloneFrom(src_page, chunk.start, chunk.end) catch break;
+        dst_page.dirty = true;
+
+        const prompt = pageHasSemanticPrompt(dst_page);
+        allocation.finalize(.prepend, .{ .compress = true }) catch break;
+        result.rows += chunk.end - chunk.start;
+        if (prompt) result.semantic_prompt = true;
+    } else complete = true;
+
+    self.assertIntegrity();
+    return result;
+}
+
+/// Whether the history is at this list's effective scrollback limit: one
+/// more standard page of rows would exceed the line limit, or one more
+/// standard page would exceed the byte limit. Growing such a list drops
+/// its oldest page; a list well below its limits (after CSI 3 J or a
+/// raised limit) is not at its limit even when `history_truncated` is set.
+pub fn historyAtLimit(self: *const PageList) bool {
+    const history_rows = self.total_rows - self.rows;
+    const page_rows: usize = initialCapacity(self.cols).rows;
+    if (history_rows +| page_rows > self.limits.max(.lines)) return true;
+    if (self.page_size +| PagePool.item_size > self.limits.max(.bytes)) return true;
+    return false;
+}
+
+fn pageHasSemanticPrompt(page: *const Page) bool {
+    const rows = page.rows.ptr(page.memory)[0..page.size.rows];
+    for (rows) |*row| {
+        if (row.semantic_prompt != .none) return true;
+        const cells = row.cells.ptr(page.memory)[0..page.size.cols];
+        for (cells) |cell| {
+            if (cell.semantic_content == .prompt) return true;
+        }
+    }
+    return false;
+}
 
 /// Options for createPage and createPageExt.
 const CreatePage = struct {
@@ -5633,6 +5756,9 @@ fn eraseRows(
 
     // Update our total row count
     self.total_rows -= erased;
+
+    // No history is left, so none of it is missing.
+    if (self.total_rows <= self.rows) self.history_truncated = false;
 
     // If we deleted active, we need to regrow because one of our invariants
     // is that we always have full active space.
@@ -7112,6 +7238,7 @@ const Limits = struct {
             pagelist.erasePage(first);
             pagelist.total_rows -= first_rows;
             removed += first_rows;
+            pagelist.history_truncated = true;
         }
 
         // Reconcile viewport mode and cached row offsets with the combined prefix
@@ -7965,6 +8092,84 @@ test "PageList PageAllocation finalizes pages and preserves live state" {
     try testing.expectEqual(@as(usize, 2), scrollbar_state.len);
 
     result.assertIntegrity();
+}
+
+test "PageList prependHistoryFrom copies older history newest first within limits" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // A source with 1000 history rows over several pages, each row marked
+    // with its index in its first two cells.
+    var src = try init(alloc, .{ .cols = 80, .rows = 3, .max_size = null });
+    defer src.deinit();
+    for (0..1000) |_| _ = try src.grow();
+    const history_rows = src.total_rows - src.rows;
+    try testing.expectEqual(@as(usize, 1000), history_rows);
+    try testing.expect(src.totalPages() > 1);
+    {
+        var y: u32 = 0;
+        var it = src.rowIterator(.right_down, .{ .screen = .{} }, null);
+        while (it.next()) |p| : (y += 1) {
+            const cells = p.cells(.all);
+            cells[0] = .{ .content = .{ .codepoint = .{ .data = @intCast(y / 1000 + 1) } } };
+            cells[1] = .{ .content = .{ .codepoint = .{ .data = @intCast(y % 1000 + 1) } } };
+        }
+    }
+    const S = struct {
+        fn mark(list: *const PageList, y: usize) u32 {
+            const p = list.pin(.{ .screen = .{ .y = @intCast(y) } }).?;
+            const cells = p.cells(.all);
+            return (cells[0].content.codepoint.data - 1) * 1000 +
+                (cells[1].content.codepoint.data - 1);
+        }
+    };
+
+    // Unlimited: every history row except the skipped newest ones, in
+    // order, above the destination's own rows.
+    {
+        var dst = try init(alloc, .{ .cols = 80, .rows = 3, .max_size = null });
+        defer dst.deinit();
+        const result = try dst.prependHistoryFrom(alloc, &src, 2);
+        try testing.expectEqual(@as(usize, 998), result.rows);
+        try testing.expect(!result.semantic_prompt);
+        try testing.expectEqual(@as(usize, 3 + 998), dst.total_rows);
+        for ([_]usize{ 0, 1, 500, 997 }) |y| {
+            try testing.expectEqual(@as(u32, @intCast(y)), S.mark(&dst, y));
+        }
+        // The source is unchanged; nothing was dropped.
+        try testing.expectEqual(@as(usize, 1003), src.total_rows);
+        try testing.expect(!dst.history_truncated);
+    }
+
+    // A line limit keeps a contiguous newest part and drops the oldest.
+    {
+        var dst = try init(alloc, .{ .cols = 80, .rows = 3, .max_size = null, .max_lines = 1 });
+        defer dst.deinit();
+        const result = try dst.prependHistoryFrom(alloc, &src, 0);
+        try testing.expect(result.rows > 0);
+        try testing.expect(result.rows < 1000);
+        try testing.expectEqual(@as(u32, @intCast(1000 - result.rows)), S.mark(&dst, 0));
+        try testing.expectEqual(@as(u32, 999), S.mark(&dst, result.rows - 1));
+        try testing.expect(dst.history_truncated);
+        try testing.expect(dst.historyAtLimit());
+        try testing.expect(!src.history_truncated);
+        try testing.expect(!src.historyAtLimit());
+
+        // Erasing all history clears the flag.
+        dst.eraseHistory(null);
+        try testing.expect(!dst.history_truncated);
+        try testing.expect(!dst.historyAtLimit());
+    }
+
+    // Skipping all history copies nothing; another width is refused.
+    {
+        var dst = try init(alloc, .{ .cols = 80, .rows = 3, .max_size = null });
+        defer dst.deinit();
+        try testing.expectEqual(@as(usize, 0), (try dst.prependHistoryFrom(alloc, &src, 1000)).rows);
+        var narrow = try init(alloc, .{ .cols = 79, .rows = 3, .max_size = null });
+        defer narrow.deinit();
+        try testing.expectError(error.ColumnMismatch, narrow.prependHistoryFrom(alloc, &src, 0));
+    }
 }
 
 test "PageList PageAllocation compresses prepended pages unless visible" {

@@ -112,6 +112,9 @@ jobs:
             -Dtest-filter="keyboard selection: " \
             -Dtest-filter="keycodes: " \
             -Dtest-filter="Terminal: OSC133" \
+            -Dtest-filter="ghostty.h SurfaceLocalHistoryResult" \
+            -Dtest-filter="history digest" \
+            -Dtest-filter="PageList prependHistoryFrom" \
             --summary all
           # libghostty-vt patches (VT replay formatter, terminal and Kitty
           # graphics C API). These live in the lib-vt test modules.
@@ -147,6 +150,8 @@ jobs:
             -Dtest-filter="Terminal vt restores pending wrap with origin mode" \
             -Dtest-filter="Terminal vt selection after earlier rows keeps its rows with tabstops" \
             -Dtest-filter="Terminal vt with tabstops" \
+            -Dtest-filter="history digest" \
+            -Dtest-filter="PageList prependHistoryFrom" \
             --summary all
 
       - name: Build and package

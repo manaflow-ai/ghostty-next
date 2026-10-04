@@ -2370,6 +2370,57 @@ pub const CAPI = struct {
         return true;
     }
 
+    /// Restore a READY prefix that the owner encoded at its resize and
+    /// keep the surface's own reflowed history when its digest matches
+    /// the owner's. Returns 0 (restored), 1 (mismatch: READY without
+    /// history) or -1 (error: unchanged). See ghostty.h.
+    export fn ghostty_surface_restore_snapshot_local_history(
+        surface: *Surface,
+        ptr: ?[*]const u8,
+        len: usize,
+        expected_history_rows: u64,
+        expected_digest: ?[*]const u8,
+        digest_len: usize,
+    ) apprt.SurfaceLocalHistoryResult {
+        const digest_ptr = expected_digest orelse return .@"error";
+        if (digest_len != terminal.history_digest.len) return .@"error";
+        const bytes: []const u8 = if (len == 0) &.{} else (ptr orelse return .@"error")[0..len];
+        var expected: terminal.history_digest.Digest = .{
+            .history_rows = expected_history_rows,
+            .seam_rows = 0, // taken from the READY
+            .bytes = undefined,
+        };
+        @memcpy(&expected.bytes, digest_ptr[0..terminal.history_digest.len]);
+        const result = surface.core_surface.io.restoreSnapshotLocalHistory(
+            bytes,
+            expected,
+        ) catch |err| {
+            log.warn("error restoring snapshot with local history err={}", .{err});
+            return .@"error";
+        };
+        return switch (result) {
+            .restored => .restored,
+            .mismatch => .mismatch,
+        };
+    }
+
+    /// The history digest of a manual surface's primary screen. See
+    /// ghostty.h.
+    export fn ghostty_surface_history_digest(
+        surface: *Surface,
+        history_rows: ?*u64,
+        out: ?[*]u8,
+        out_len: usize,
+    ) bool {
+        const rows_ptr = history_rows orelse return false;
+        const out_ptr = out orelse return false;
+        if (out_len != terminal.history_digest.len) return false;
+        const digest = surface.core_surface.io.historyDigest() catch return false;
+        rows_ptr.* = digest.history_rows;
+        @memcpy(out_ptr[0..terminal.history_digest.len], &digest.bytes);
+        return true;
+    }
+
     /// Encode the terminal of a manual surface as a snapshot and pass
     /// the bytes to `write_cb` before returning. See ghostty.h.
     export fn ghostty_surface_encode_snapshot(

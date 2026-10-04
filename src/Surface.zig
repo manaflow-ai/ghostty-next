@@ -5360,6 +5360,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
 
             self.renderer_state.mutex.lockUncancelable(global.io());
             defer self.renderer_state.mutex.unlock(global.io());
+            self.io.live_epoch +%= 1;
             self.renderer_state.terminal.fullReset();
         },
 
