@@ -93,6 +93,10 @@ def slices(xcframework: Path) -> list[dict]:
                 raise SystemExit(f"{ident}: missing {required}")
         if "module GhosttyNextKit" not in (headers / "module.modulemap").read_text():
             raise SystemExit(f"{ident}: module map does not declare GhosttyNextKit")
+        # SwiftPM refuses a binary target's static archive without the lib
+        # prefix ("Static libraries should be prefixed with lib").
+        if not Path(lib["LibraryPath"]).name.startswith("lib"):
+            raise SystemExit(f"{ident}: {lib['LibraryPath']} must start with lib for SwiftPM")
         result.append({
             "identifier": ident,
             "platform": lib.get("SupportedPlatform"),
