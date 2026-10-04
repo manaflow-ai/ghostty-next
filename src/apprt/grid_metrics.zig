@@ -28,7 +28,7 @@ pub const Options = struct {
 
 /// The glyph lead and width of the cell at `pin`; a wide tail or a
 /// spacer head resolves to its wide glyph.
-fn canonicalCursorCell(pin: terminal.Pin) ?struct {
+pub fn canonicalCell(pin: terminal.Pin) ?struct {
     pin: terminal.Pin,
     width_cells: u16,
 } {
@@ -75,7 +75,7 @@ pub fn compute(
         (size_grid.columns != screen.pages.cols or
             size_grid.rows != screen.pages.rows)) return null;
 
-    const cursor_cell = canonicalCursorCell(screen.cursor.page_pin.*);
+    const cursor_cell = canonicalCell(screen.cursor.page_pin.*);
     const cursor = if (cursor_cell) |cell|
         if (screen.pages.pointFromPin(.viewport, cell.pin)) |pt|
             if (pt.viewport.x < screen.pages.cols and

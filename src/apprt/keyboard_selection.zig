@@ -10,6 +10,66 @@ const terminal = @import("../terminal/main.zig");
 
 const Screen = terminal.Screen;
 const Selection = terminal.Selection;
+const grid_metrics = @import("grid_metrics.zig");
+
+/// The moving end of a selection, in viewport cells.
+pub const Endpoint = extern struct {
+    /// Row relative to the viewport's top row: negative above the
+    /// viewport, `rows` or more below it.
+    row: i32,
+    /// Column of the end cell's glyph lead.
+    column: u16,
+    /// 2 for a wide glyph, 1 otherwise.
+    width_cells: u16,
+    /// The end cell is visible.
+    in_viewport: bool,
+};
+
+/// A one-cell selection at a visible cell (the copy cursor). A wide tail
+/// or a spacer head resolves to the wide glyph. Null outside the viewport.
+pub fn cellSelection(screen: *const Screen, column: u16, row: u16) ?Selection {
+    if (column >= screen.pages.cols or row >= screen.pages.rows) return null;
+    const pin = screen.pages.pin(.{ .viewport = .{ .x = column, .y = row } }) orelse return null;
+    const cell = grid_metrics.canonicalCell(pin) orelse return null;
+    return Selection.init(cell.pin, cell.pin, false);
+}
+
+/// Where the selection's moving end is relative to the viewport.
+pub fn endpoint(screen: *const Screen, sel: Selection) Endpoint {
+    const end = sel.end();
+    const cell = grid_metrics.canonicalCell(end);
+    const lead = if (cell) |c| c.pin else end;
+    const top = screen.pages.pointFromPin(.screen, screen.pages.getTopLeft(.viewport)).?.screen.y;
+    const y = screen.pages.pointFromPin(.screen, lead).?.screen.y;
+    const row = std.math.cast(i32, @as(i64, @intCast(y)) - @as(i64, @intCast(top))) orelse
+        (if (y < top) std.math.minInt(i32) else std.math.maxInt(i32));
+    return .{
+        .row = row,
+        .column = @intCast(lead.x),
+        .width_cells = if (cell) |c| c.width_cells else 1,
+        .in_viewport = row >= 0 and row < screen.pages.rows,
+    };
+}
+
+/// The selection widened to whole rows: the anchor (start) row and the
+/// moving end's row, keeping the direction so `adjust` keeps moving the end.
+pub fn linewise(screen: *const Screen, sel: Selection) Selection {
+    const last: terminal.size.CellCountInt = screen.pages.cols - 1;
+    var start = sel.start();
+    var end = sel.end();
+    const start_y = screen.pages.pointFromPin(.screen, start).?.screen.y;
+    const end_y = screen.pages.pointFromPin(.screen, end).?.screen.y;
+    const forward = start_y < end_y or (start_y == end_y and start.x <= end.x);
+    if (forward) {
+        start.x = 0;
+        end.x = last;
+    } else {
+        start.x = last;
+        end.x = 0;
+    }
+    return Selection.init(start, end, false);
+}
+
 
 test "keyboard selection: a cell selection resolves a wide tail to its lead" {
     const testing = std.testing;
