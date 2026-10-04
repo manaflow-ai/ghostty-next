@@ -72,8 +72,50 @@ pub fn screen(s: *const Screen) Digest {
 /// The digest of a page list's history. Reading a compressed page that
 /// holds one of the newest history rows decompresses it.
 pub fn pages(list: *const PageList) Digest {
-    _ = list;
-    return .{ .history_rows = 0, .bytes = @splat(0) }; // red: not implemented
+    const history_rows: u64 = list.total_rows - list.rows;
+    const n: u32 = @intCast(@min(history_rows, window_rows));
+
+    var hash: std.crypto.hash.sha2.Sha256 = .init(.{});
+    hash.update(domain);
+    update(&hash, u32, version);
+    update(&hash, u32, n);
+    update(&hash, u16, list.cols);
+
+    if (n > 0) {
+        const first: u32 = @intCast(history_rows - n);
+        var it = list.rowIterator(
+            .right_down,
+            .{ .history = .{ .y = first } },
+            .{ .history = .{ .y = first + n - 1 } },
+        );
+        while (it.next()) |pin| {
+            const rac = pin.rowAndCell();
+            const row = rac.row;
+            var flags: u8 = 0;
+            if (row.wrap) flags |= 1;
+            if (row.wrap_continuation) flags |= 2;
+            hash.update(&.{flags});
+
+            for (pin.cells(.all)) |*cell| {
+                hash.update(&.{@intFromEnum(cell.wide)});
+                const cp: u32 = switch (cell.content_tag) {
+                    .codepoint, .codepoint_grapheme => cell.content.codepoint.data,
+                    .bg_color_palette, .bg_color_rgb => 0,
+                };
+                update(&hash, u32, cp);
+                const extra: []const u21 = if (cell.content_tag == .codepoint_grapheme)
+                    pin.grapheme(cell) orelse &.{}
+                else
+                    &.{};
+                update(&hash, u16, @intCast(extra.len));
+                for (extra) |g| update(&hash, u32, g);
+            }
+        }
+    }
+
+    var result: Digest = .{ .history_rows = history_rows, .bytes = undefined };
+    hash.final(&result.bytes);
+    return result;
 }
 
 /// Whether a mirror's history matches the owner's, after both reflowed
@@ -87,10 +129,12 @@ pub fn pages(list: *const PageList) Digest {
 /// fragment of the owner's, and its reflowed rows can differ from the
 /// owner's; every newer row is the owner's row.
 pub fn matches(local: Digest, local_truncated: bool, expected: Digest) bool {
-    _ = local;
-    _ = local_truncated;
-    _ = expected;
-    return false; // red: not implemented
+    if (!std.mem.eql(u8, &local.bytes, &expected.bytes)) return false;
+    if (local.history_rows == expected.history_rows) return true;
+    return local_truncated and
+        local.history_rows >= window_rows and
+        expected.history_rows >= window_rows and
+        local.history_rows < expected.history_rows;
 }
 
 fn update(hash: *std.crypto.hash.sha2.Sha256, comptime T: type, value: T) void {

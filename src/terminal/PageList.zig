@@ -991,6 +991,9 @@ pub fn deinit(self: *PageList) void {
 pub fn reset(self: *PageList) void {
     defer self.assertIntegrity();
 
+    // Reset discards all scrollback: nothing is missing from it.
+    self.history_truncated = false;
+
     // Reset discards all scrollback, so there is nothing left to compress.
     self.page_compression.reset();
 
@@ -1191,6 +1194,7 @@ pub fn clone(
         .page_serial_epoch = 0,
         .page_size = page_size,
         .limits = self.limits,
+        .history_truncated = self.history_truncated,
         .cols = self.cols,
         .rows = self.rows,
         .total_rows = total_rows,
@@ -4064,6 +4068,7 @@ pub fn grow(self: *PageList) Allocator.Error!?*List.Node {
             self.total_rows += first.rows();
             break :prune;
         }
+        self.history_truncated = true;
 
         // If we have a pin viewport cache then we need to update it.
         if (self.viewport == .pin) viewport: {
@@ -4505,9 +4510,11 @@ pub const PageAllocation = struct {
         // Restored history is exact data, so reject a page which cannot
         // coexist with the receiving PageList's configured limits.
         if (page_size > destination.limits.max(.bytes)) {
+            destination.history_truncated = true;
             return error.MaxSizeExceeded;
         }
         if (total_rows - destination.rows > destination.limits.max(.lines)) {
+            destination.history_truncated = true;
             return error.MaxLinesExceeded;
         }
 
@@ -4579,10 +4586,48 @@ pub fn prependHistoryFrom(
     src: *const PageList,
     skip_newest: usize,
 ) PrependHistoryError!PrependHistory {
-    _ = alloc;
-    _ = skip_newest;
     if (src.cols != self.cols) return error.ColumnMismatch;
-    return .{}; // red: not implemented
+
+    var result: PrependHistory = .{};
+    const history_rows = src.total_rows - src.rows;
+    if (skip_newest >= history_rows) return result;
+
+    // History that the source already dropped is missing here too.
+    if (src.history_truncated) self.history_truncated = true;
+    const copy_rows = history_rows - skip_newest;
+
+    var it = src.pageIterator(
+        .left_up,
+        .{ .screen = .{} },
+        .{ .screen = .{ .y = @intCast(copy_rows - 1) } },
+    );
+    // A copy that stops early (a limit or a failed allocation) keeps only
+    // the newest part.
+    var complete = false;
+    defer {
+        if (!complete) self.history_truncated = true;
+    }
+    while (it.next()) |chunk| {
+        var preserved = chunk.node.pagePreservingState(alloc) catch break;
+        defer preserved.deinit();
+        const src_page = preserved.page();
+
+        var allocation = self.allocatePage(chunk.node.capacity()) catch break;
+        defer allocation.deinit();
+        const dst_page = allocation.page();
+        dst_page.size.rows = chunk.end - chunk.start;
+        dst_page.size.cols = src_page.size.cols;
+        dst_page.cloneFrom(src_page, chunk.start, chunk.end) catch break;
+        dst_page.dirty = true;
+
+        const prompt = pageHasSemanticPrompt(dst_page);
+        allocation.finalize(.prepend, .{ .compress = true }) catch break;
+        result.rows += chunk.end - chunk.start;
+        if (prompt) result.semantic_prompt = true;
+    } else complete = true;
+
+    self.assertIntegrity();
+    return result;
 }
 
 fn pageHasSemanticPrompt(page: *const Page) bool {
@@ -7176,6 +7221,7 @@ const Limits = struct {
             pagelist.erasePage(first);
             pagelist.total_rows -= first_rows;
             removed += first_rows;
+            pagelist.history_truncated = true;
         }
 
         // Reconcile viewport mode and cached row offsets with the combined prefix

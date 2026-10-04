@@ -990,10 +990,76 @@ pub fn restoreSnapshotLocalHistory(
     bytes: []const u8,
     expected: terminalpkg.history_digest.Digest,
 ) !LocalHistoryResult {
-    _ = bytes;
-    _ = expected;
     if (self.backend != .manual) return error.NotManual;
-    return error.Unimplemented; // red: not implemented
+    self.abandonSnapshotRestore();
+
+    var reader: std.Io.Reader = .fixed(bytes);
+    var decoder: terminalpkg.snapshot.Decoder = .init(&reader);
+    var decoded = try decoder.ready(self.alloc, global.io(), .{
+        .max_continuation_bytes = snapshot_continuation_max_bytes,
+    });
+    defer decoded.deinit(self.alloc);
+    if (reader.seek != bytes.len) return error.TrailingSnapshotBytes;
+
+    var new = decoded.toOwned();
+    var result: LocalHistoryResult = .mismatch;
+    var old: terminalpkg.Terminal = undefined;
+    {
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+
+        self.prepareRestoredTerminalLocked(&new);
+
+        // The owner's resize, on the old terminal, which the swap below
+        // discards. Both sides parsed the same bytes, so the reflowed
+        // primary history is the owner's when nothing diverged; the
+        // digest checks that. A failed resize discards the history.
+        const resized = resized: {
+            self.terminal.resize(self.alloc, .{
+                .cols = new.cols,
+                .rows = new.rows,
+                .cell_size_px = .{
+                    .width = self.size.cell.width,
+                    .height = self.size.cell.height,
+                },
+                .reflow = true,
+            }) catch |err| {
+                log.warn("local history resize failed err={}", .{err});
+                break :resized false;
+            };
+            break :resized true;
+        };
+
+        if (resized and terminalpkg.history_digest.matches(
+            terminalpkg.history_digest.terminal(&self.terminal),
+            self.terminal.screens.get(.primary).?.pages.history_truncated,
+            expected,
+        )) history: {
+            // The new primary screen holds the owner's newest history
+            // rows that share the active area's first page; take only the
+            // older rows from the old terminal.
+            const new_primary = new.screens.get(.primary).?;
+            const old_primary = self.terminal.screens.get(.primary).?;
+            const overlap = new_primary.pages.total_rows - new_primary.pages.rows;
+            const copied = new_primary.pages.prependHistoryFrom(
+                self.alloc,
+                &old_primary.pages,
+                overlap,
+            ) catch |err| {
+                log.warn("local history copy failed err={}", .{err});
+                break :history;
+            };
+            if (copied.semantic_prompt) new_primary.semantic_prompt.seen = true;
+            result = .restored;
+        }
+
+        old = self.swapTerminalLocked(new, decoded.continuation);
+    }
+
+    // The old terminal is unreachable now; free it off the lock.
+    old.deinit(self.alloc);
+    self.renderer_wakeup.notify() catch {};
+    return result;
 }
 
 /// The history digest of the live terminal's primary screen
