@@ -41,8 +41,12 @@ pub fn endpoint(screen: *const Screen, sel: Selection) Endpoint {
     const lead = if (cell) |c| c.pin else end;
     const top = screen.pages.pointFromPin(.screen, screen.pages.getTopLeft(.viewport)).?.screen.y;
     const y = screen.pages.pointFromPin(.screen, lead).?.screen.y;
-    const row = std.math.cast(i32, @as(i64, @intCast(y)) - @as(i64, @intCast(top))) orelse
-        (if (y < top) std.math.minInt(i32) else std.math.maxInt(i32));
+    const delta: i64 = @as(i64, @intCast(y)) - @as(i64, @intCast(top));
+    const row: i32 = @intCast(std.math.clamp(
+        delta,
+        @as(i64, std.math.minInt(i32)),
+        @as(i64, std.math.maxInt(i32)),
+    ));
     return .{
         .row = row,
         .column = @intCast(lead.x),
