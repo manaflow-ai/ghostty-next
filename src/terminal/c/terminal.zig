@@ -165,6 +165,10 @@ pub const ClipboardRead = extern struct {
     /// Terminal-owned reply state; opaque to the embedder.
     ctx: *const anyopaque,
     reply: ClipboardReadReplyFn,
+    /// Token for a deferred reply (GHOSTTY_CLIPBOARD_READ_RESULT_DEFERRED,
+    /// then ghostty_terminal_clipboard_read_complete). Zero when the read
+    /// cannot be deferred (Kitty OSC 5522).
+    token: u64,
 };
 
 /// C function pointer type for replying to a clipboard read.
@@ -495,6 +499,7 @@ const Effects = struct {
             .can_remember = read.can_remember,
             .ctx = &ctx,
             .reply = &clipboardReadReplyTrampoline,
+            .token = read.token,
         };
         func(@ptrCast(wrapper), wrapper.effects.userdata, &request);
     }
@@ -507,6 +512,7 @@ const Effects = struct {
         const read = ctx.read;
         switch (reply.result) {
             .success => {},
+            .deferred => return read.reply(.deferred),
             .denied => return read.reply(.denied),
             .busy => return read.reply(.busy),
             .io_error => return read.reply(.io_error),
@@ -1674,6 +1680,35 @@ pub fn scroll_viewport(
         .delta => .{ .delta = behavior.value.delta },
         .row => .{ .row = behavior.value.row },
     });
+}
+
+/// Answer an OSC 52 read deferred with GHOSTTY_CLIPBOARD_READ_RESULT_DEFERRED.
+/// The reply is written to the pty with the request's selector and
+/// terminator; anything but success (also a timeout) answers with an empty
+/// clipboard. INVALID_VALUE, with nothing written, for a token that is not
+/// pending. Pending reads are freed with the terminal.
+pub fn clipboard_read_complete(
+    terminal_: Terminal,
+    token: u64,
+    reply: ?*const ClipboardReadReply,
+) callconv(lib.calling_conv) Result {
+    const wrapper = terminal_ orelse return .invalid_value;
+    const r = reply orelse return .invalid_value;
+    var text: [1]clipboard.Content = undefined;
+    const result: clipboard.Read.Result = switch (r.result) {
+        .success => success: {
+            const contents: []const ClipboardContent = if (r.contents) |ptr| ptr[0..r.contents_len] else &.{};
+            for (contents) |content| {
+                const mime = content.mime.ptr[0..content.mime.len];
+                if (!clipboard.isTextMime(mime)) continue;
+                text[0] = .{ .mime = mime, .data = content.data.ptr[0..content.data.len] };
+                break :success .{ .success = .{ .contents = &text } };
+            }
+            break :success .{ .success = .{} };
+        },
+        else => .denied,
+    };
+    return if (wrapper.stream.handler.completeClipboardRead(token, result)) .success else .invalid_value;
 }
 
 pub fn resize(
@@ -5846,6 +5881,71 @@ test "set clipboard write max bytes" {
     try testing.expectEqual(Result.success, set(t, .clipboard_write_max_bytes, null));
     try testing.expectEqual(Result.success, get(t, .clipboard_write_max_bytes, @ptrCast(&max)));
     try testing.expectEqual(@as(usize, kitty_clipboard.max_write_size), max);
+}
+
+test "deferred clipboard_read via the C API" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &t, 80, 24));
+    defer free(t);
+
+    const S = struct {
+        var last_data: ?[]u8 = null;
+        var token: u64 = 0;
+
+        fn deinit() void {
+            if (last_data) |d| testing.allocator.free(d);
+            last_data = null;
+        }
+
+        fn writePty(_: Terminal, _: ?*anyopaque, ptr: [*]const u8, len: usize) callconv(lib.calling_conv) void {
+            if (last_data) |d| testing.allocator.free(d);
+            last_data = testing.allocator.dupe(u8, ptr[0..len]) catch @panic("OOM");
+        }
+
+        fn clipboardRead(_: Terminal, _: ?*anyopaque, request: *const ClipboardRead) callconv(lib.calling_conv) void {
+            token = request.token;
+            request.reply(request, &.{
+                .size = @sizeOf(ClipboardReadReply),
+                .result = .deferred,
+                .contents = null,
+                .contents_len = 0,
+                .available = null,
+                .available_len = 0,
+                .remember = false,
+            });
+        }
+    };
+    defer S.deinit();
+
+    try testing.expectEqual(Result.success, set(t, .write_pty, @ptrCast(&S.writePty)));
+    try testing.expectEqual(Result.success, set(t, .clipboard_read, @ptrCast(&S.clipboardRead)));
+
+    const read_bel = "\x1B]52;c;?\x07";
+    vt_write(t, read_bel, read_bel.len);
+    try testing.expect(S.token != 0);
+    try testing.expect(S.last_data == null);
+
+    const mime: []const u8 = "text/plain";
+    const data: []const u8 = "hello";
+    const contents = [_]ClipboardContent{.{ .mime = .init(mime), .data = .init(data) }};
+    const reply: ClipboardReadReply = .{
+        .size = @sizeOf(ClipboardReadReply),
+        .result = .success,
+        .contents = &contents,
+        .contents_len = contents.len,
+        .available = null,
+        .available_len = 0,
+        .remember = false,
+    };
+    try testing.expectEqual(Result.success, clipboard_read_complete(t, S.token, &reply));
+    try testing.expectEqualStrings("\x1B]52;c;aGVsbG8=\x07", S.last_data.?);
+    // Completed tokens and unknown ones are refused without a write.
+    S.deinit();
+    try testing.expectEqual(Result.invalid_value, clipboard_read_complete(t, S.token, &reply));
+    try testing.expect(S.last_data == null);
+
+    // A pending read is freed with the terminal (test allocator checks).
+    vt_write(t, read_bel, read_bel.len);
 }
 
 test "set clipboard_read callback" {

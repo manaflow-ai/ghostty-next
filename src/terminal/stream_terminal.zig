@@ -98,6 +98,14 @@ pub const Handler = struct {
     /// with EFBIG.
     kitty_clipboard_write_max_bytes: usize = kitty_clipboard.max_write_size,
 
+    /// OSC 52 reads the embedder deferred (`clipboard.Read.Result.deferred`)
+    /// and has not completed yet, oldest first. Bounded by
+    /// `max_deferred_clipboard_reads`; freed with the handler.
+    deferred_clipboard_reads: std.ArrayList(DeferredClipboardRead) = .empty,
+
+    /// The token of the next clipboard read. Never zero.
+    next_clipboard_read_token: u64 = 1,
+
     /// Called for escape sequences this library does not implement, so you
     /// can implement them yourself. See `UnknownSequence` for the kinds of
     /// sequences that are reported.
@@ -465,7 +473,39 @@ pub const Handler = struct {
         self.cursor_activity +%= 1;
     }
 
+    /// At most this many OSC 52 reads wait for a deferred reply; a
+    /// deferral past it is answered at once with an empty clipboard.
+    pub const max_deferred_clipboard_reads = 16;
+
+    pub const DeferredClipboardRead = struct {
+        token: u64,
+        location: clipboard.Location,
+        terminator: osc.Terminator,
+    };
+
+    /// Answer a deferred OSC 52 read: the reply goes to the pty with the
+    /// request's selector and terminator (an empty clipboard for anything
+    /// but success, which is also how a timeout answers). Returns false,
+    /// and writes nothing, for a token that is not pending (unknown, or
+    /// already completed).
+    pub fn completeClipboardRead(self: *Handler, token: u64, result: clipboard.Read.Result) bool {
+        const index = for (self.deferred_clipboard_reads.items, 0..) |pending, i| {
+            if (pending.token == token) break i;
+        } else return false;
+        const pending = self.deferred_clipboard_reads.orderedRemove(index);
+        var state: ClipboardReadState = .{
+            .handler = self,
+            .location = pending.location,
+            .terminator = pending.terminator,
+        };
+        state.respond(ClipboardReadState.textOf(result)) catch |err| {
+            log.warn("error replying to deferred clipboard read err={}", .{err});
+        };
+        return true;
+    }
+
     pub fn deinit(self: *Handler) void {
+        self.deferred_clipboard_reads.deinit(self.terminal.gpa());
         self.kittyClipboardAbort();
         self.kitty_clipboard_grants.deinit(self.terminal.gpa());
         self.apc_handler.deinit();
@@ -1010,12 +1050,16 @@ pub const Handler = struct {
     ) void {
         const func = self.effects.clipboard_read orelse return;
 
+        const token = self.next_clipboard_read_token;
+        self.next_clipboard_read_token = if (token == std.math.maxInt(u64)) 1 else token + 1;
         var state: ClipboardReadState = .{
             .handler = self,
             .location = location,
             .terminator = terminator,
+            .token = token,
         };
         func(self, .{
+            .token = token,
             .location = location,
             .mimes = &.{"text/plain"},
             .list = false,
@@ -1040,6 +1084,7 @@ pub const Handler = struct {
         handler: *Handler,
         location: clipboard.Location,
         terminator: osc.Terminator,
+        token: u64 = 0,
         replied: bool = false,
 
         fn reply(ctx: *anyopaque, result: clipboard.Read.Result) void {
@@ -1049,21 +1094,41 @@ pub const Handler = struct {
                 return;
             }
 
-            // OSC 52 carries a single text value.
-            const data: []const u8 = switch (result) {
-                .denied, .unsupported, .busy, .io_error => "",
-                .success => |s| for (s.contents) |c| {
-                    if (clipboard.isTextMime(c.mime)) break c.data;
-                } else "",
-            };
+            if (result == .deferred) {
+                const handler = self.handler;
+                if (handler.deferred_clipboard_reads.items.len < max_deferred_clipboard_reads) {
+                    if (handler.deferred_clipboard_reads.append(handler.terminal.gpa(), .{
+                        .token = self.token,
+                        .location = self.location,
+                        .terminator = self.terminator,
+                    })) |_| {
+                        self.replied = true;
+                        return;
+                    } else |_| {}
+                }
+                // Too many pending reads (or OOM): leave replied unset so
+                // clipboardRead answers with an empty clipboard now.
+                log.warn("cannot defer clipboard read, answering empty", .{});
+                return;
+            }
 
-            self.respond(data) catch |err| {
+            self.respond(textOf(result)) catch |err| {
                 // Leave replied unset so clipboardRead falls back to the
                 // empty reply.
                 log.warn("error replying to clipboard read err={}", .{err});
                 return;
             };
             self.replied = true;
+        }
+
+        /// OSC 52 carries a single text value.
+        fn textOf(result: clipboard.Read.Result) []const u8 {
+            return switch (result) {
+                .denied, .unsupported, .busy, .io_error, .deferred => "",
+                .success => |s| for (s.contents) |c| {
+                    if (clipboard.isTextMime(c.mime)) break c.data;
+                } else "",
+            };
         }
 
         fn respond(
@@ -1240,7 +1305,9 @@ pub const Handler = struct {
             self.replied = true;
 
             const success = switch (result) {
-                .denied => return self.respondStatus(.EPERM),
+                // Kitty reads cannot be deferred (a transaction answers
+                // in order); a deferral is a refusal.
+                .denied, .deferred => return self.respondStatus(.EPERM),
                 .unsupported => return self.respondStatus(.ENOSYS),
                 .busy => return self.respondStatus(.EBUSY),
                 .io_error => return self.respondStatus(.EIO),
@@ -4142,6 +4209,93 @@ test "clipboard_write effect callback" {
     // Reply results are intentionally ignored for protocols without a
     // write acknowledgement. The denied reply above did not stop later writes.
     try testing.expect(S.result == .denied);
+}
+
+test "deferred clipboard read: the reply comes later with the request's terminator" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = struct {
+        var written: std.ArrayList(u8) = .empty;
+        var tokens: [4]u64 = undefined;
+        var count: usize = 0;
+
+        fn writePty(_: *Handler, data: []const u8) void {
+            written.appendSlice(testing.allocator, data) catch @panic("OOM");
+        }
+
+        fn clipboardRead(_: *Handler, read: clipboard.Read) void {
+            tokens[count] = read.token;
+            count += 1;
+            read.reply(.deferred);
+        }
+    };
+    defer S.written.deinit(testing.allocator);
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    handler.effects.clipboard_read = &S.clipboardRead;
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    defer s.deinit();
+
+    // Deferred: nothing is written while the embedder asks the user.
+    s.nextSlice("\x1B]52;c;?\x1B\\");
+    s.nextSlice("\x1B]52;p;?\x07");
+    try testing.expectEqual(2, S.count);
+    try testing.expect(S.tokens[0] != S.tokens[1]);
+    try testing.expectEqual(0, S.written.items.len);
+
+    // The second request completes first, with its own selector and BEL.
+    try testing.expect(s.handler.completeClipboardRead(S.tokens[1], .{ .success = .{ .contents = &.{.{
+        .mime = "text/plain",
+        .data = "hi",
+    }} } }));
+    try testing.expectEqualStrings("\x1B]52;p;aGk=\x07", S.written.items);
+    S.written.clearRetainingCapacity();
+
+    // A denied (or timed-out) read answers with an empty clipboard.
+    try testing.expect(s.handler.completeClipboardRead(S.tokens[0], .denied));
+    try testing.expectEqualStrings("\x1B]52;c;\x1B\\", S.written.items);
+    S.written.clearRetainingCapacity();
+
+    // A token completes once.
+    try testing.expect(!s.handler.completeClipboardRead(S.tokens[0], .denied));
+    try testing.expect(!s.handler.completeClipboardRead(12345, .denied));
+    try testing.expectEqual(0, S.written.items.len);
+}
+
+test "deferred clipboard read: pending reads are bounded and freed with the terminal" {
+    var t: Terminal = try .init(testing.io, testing.allocator, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(testing.allocator);
+
+    const S = struct {
+        var written: std.ArrayList(u8) = .empty;
+
+        fn writePty(_: *Handler, data: []const u8) void {
+            written.appendSlice(testing.allocator, data) catch @panic("OOM");
+        }
+
+        fn clipboardRead(_: *Handler, read: clipboard.Read) void {
+            read.reply(.deferred);
+        }
+    };
+    defer S.written.deinit(testing.allocator);
+
+    var handler: Handler = .init(&t);
+    handler.effects.write_pty = &S.writePty;
+    handler.effects.clipboard_read = &S.clipboardRead;
+    var s: Stream = .init(.{ .allocator = testing.allocator, .handler = handler });
+    // The testing allocator fails the test if deinit leaks pending reads.
+    defer s.deinit();
+
+    for (0..Handler.max_deferred_clipboard_reads) |_| s.nextSlice("\x1B]52;c;?\x07");
+    try testing.expectEqual(0, S.written.items.len);
+    try testing.expectEqual(Handler.max_deferred_clipboard_reads, s.handler.deferred_clipboard_reads.items.len);
+
+    // Past the bound a deferral answers at once with an empty clipboard.
+    s.nextSlice("\x1B]52;c;?\x07");
+    try testing.expectEqualStrings("\x1B]52;c;\x07", S.written.items);
+    try testing.expectEqual(Handler.max_deferred_clipboard_reads, s.handler.deferred_clipboard_reads.items.len);
 }
 
 test "clipboard_read effect callback" {

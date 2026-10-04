@@ -193,6 +193,11 @@ pub const Read = struct {
     reply_ctx: *anyopaque,
     reply_fn: *const fn (*anyopaque, Result) void,
 
+    /// Identifies this read for a deferred reply (`Result.deferred`):
+    /// unique per terminal and never zero for a read that can be deferred.
+    /// Zero when the protocol cannot defer (Kitty OSC 5522 reads).
+    token: u64 = 0,
+
     /// Answer the read. May be called at most once; later calls are
     /// ignored. Result memory is borrowed only for the duration of this
     /// call.
@@ -207,11 +212,19 @@ pub const Read = struct {
         unsupported = 2,
         busy = 3,
         io_error = 4,
+        deferred = 5,
         _,
     };
 
     /// The reply to a clipboard read.
     pub const Result = union(enum) {
+        /// The embedder answers later (for example after asking a user on
+        /// another machine): nothing is written now, and the embedder must
+        /// complete the read's token with `Handler.completeClipboardRead`,
+        /// also when it gives up (timeout). Only OSC 52 reads can be
+        /// deferred; a deferred Kitty read is answered as denied.
+        deferred,
+
         /// The read was denied by policy or the user.
         denied,
 
