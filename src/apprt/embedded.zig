@@ -2768,3 +2768,121 @@ pub const CAPI = struct {
         }
     };
 };
+test "grid metrics reject resize skew and report an offscreen cursor" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var term = try terminal.Terminal.init(std.testing.io, alloc, .{
+        .cols = 10,
+        .rows = 2,
+    });
+    defer term.deinit(alloc);
+
+    var stream = term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("one\r\ntwo\r\nthree\r\nfour\r\n");
+    term.scrollViewport(.top);
+    const screen = term.screens.active;
+
+    const size: renderer.Size = .{
+        .screen = .{ .width = 83, .height = 37 },
+        .cell = .{ .width = 8, .height = 16 },
+        .padding = .{ .left = 3, .top = 5 },
+    };
+    const snapshot = CAPI.surfaceGridMetricsSnapshot(
+        size,
+        .{ .x = 2, .y = 2 },
+        screen,
+    ).?;
+    try testing.expectEqual(@as(u16, 10), snapshot.columns);
+    try testing.expectEqual(@as(u16, 2), snapshot.rows);
+    try testing.expect(!snapshot.cursor_in_viewport);
+    try testing.expectEqual(@as(u16, 0), snapshot.cursor_width_cells);
+    try testing.expectEqual(@as(f64, 4), snapshot.cell_width);
+    try testing.expectEqual(@as(f64, 8), snapshot.cell_height);
+    try testing.expectEqual(@as(f64, 1.5), snapshot.padding_left);
+    try testing.expectEqual(@as(f64, 2.5), snapshot.padding_top);
+
+    var mismatched_size = size;
+    mismatched_size.screen.width += size.cell.width;
+    try testing.expect(CAPI.surfaceGridMetricsSnapshot(
+        mismatched_size,
+        .{ .x = 2, .y = 2 },
+        screen,
+    ) == null);
+
+    term.scrollViewport(.bottom);
+    const active = CAPI.surfaceGridMetricsSnapshot(
+        size,
+        .{ .x = 2, .y = 2 },
+        screen,
+    ).?;
+    try testing.expect(active.cursor_in_viewport);
+    try testing.expectEqual(@as(u16, 1), active.cursor_width_cells);
+}
+
+test "grid metrics canonicalize a wide-tail cursor" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var term = try terminal.Terminal.init(std.testing.io, alloc, .{
+        .cols = 6,
+        .rows = 2,
+    });
+    defer term.deinit(alloc);
+
+    var stream = term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("A橋B\x1b[1;3H");
+    const cursor_pin = term.screens.active.cursor.page_pin.*;
+    try testing.expectEqual(
+        terminal.page.Cell.Wide.spacer_tail,
+        cursor_pin.rowAndCell().cell.wide,
+    );
+
+    const snapshot = CAPI.surfaceGridMetricsSnapshot(
+        .{
+            .screen = .{ .width = 51, .height = 37 },
+            .cell = .{ .width = 8, .height = 16 },
+            .padding = .{ .left = 3, .top = 5 },
+        },
+        .{ .x = 1, .y = 1 },
+        term.screens.active,
+    ).?;
+    try testing.expect(snapshot.cursor_in_viewport);
+    try testing.expectEqual(@as(u16, 1), snapshot.cursor_column);
+    try testing.expectEqual(@as(u16, 0), snapshot.cursor_row);
+    try testing.expectEqual(@as(u16, 2), snapshot.cursor_width_cells);
+}
+
+test "grid metrics resolve a spacer-head cursor to its wrapped glyph" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var term = try terminal.Terminal.init(std.testing.io, alloc, .{
+        .cols = 4,
+        .rows = 3,
+    });
+    defer term.deinit(alloc);
+
+    var stream = term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("ABC橋\x1b[1;4H");
+    const cursor_pin = term.screens.active.cursor.page_pin.*;
+    try testing.expectEqual(
+        terminal.page.Cell.Wide.spacer_head,
+        cursor_pin.rowAndCell().cell.wide,
+    );
+
+    const snapshot = CAPI.surfaceGridMetricsSnapshot(
+        .{
+            .screen = .{ .width = 35, .height = 53 },
+            .cell = .{ .width = 8, .height = 16 },
+            .padding = .{ .left = 3, .top = 5 },
+        },
+        .{ .x = 1, .y = 1 },
+        term.screens.active,
+    ).?;
+    try testing.expect(snapshot.cursor_in_viewport);
+    try testing.expectEqual(@as(u16, 0), snapshot.cursor_column);
+    try testing.expectEqual(@as(u16, 1), snapshot.cursor_row);
+    try testing.expectEqual(@as(u16, 2), snapshot.cursor_width_cells);
+}
+
