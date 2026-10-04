@@ -5,6 +5,7 @@
 pub const Termio = @This();
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
@@ -76,6 +77,13 @@ grid_lock: ?GridLock = null,
 /// A snapshot whose history is still arriving after its READY prefix
 /// was restored (see `restoreSnapshot`). Only the output queue uses it.
 snapshot_restore: ?SnapshotRestore = null,
+
+/// Advanced, under `renderer_state.mutex`, by every main-thread action
+/// that changes the live terminal outside the byte stream (clear screen,
+/// resize, set grid, viewport scroll, jump to prompt, the reset action),
+/// so a local history restore does not replace the terminal over such a
+/// change (see `restoreSnapshotLocalHistory`).
+live_epoch: u64 = 0,
 
 
 /// Last time the cursor was reset. This is used to prevent message
@@ -679,6 +687,7 @@ pub fn resize(
         // The stream handler and size reports read this under the lock,
         // and a manual backend resizes from the caller's thread.
         self.size = size;
+        self.live_epoch +%= 1;
 
         // Update the size of our terminal state
         const grid_size = self.gridSizeLocked();
@@ -743,6 +752,7 @@ pub fn setGrid(
         if (self.grid_lock) |current| {
             if (generation < current.generation) return false;
         }
+        self.live_epoch +%= 1;
 
         if (self.terminal.cols != cols or self.terminal.rows != rows) {
             self.terminal.resize(self.alloc, .{
@@ -1026,17 +1036,29 @@ pub fn restoreSnapshotLocalHistory(
 
     // 1. Swap in the READY terminal, under the lock.
     var old: terminalpkg.Terminal = undefined;
+    var limit_bytes: ?usize = undefined;
+    var limit_lines: ?usize = undefined;
     const live: LiveTerminalState = live: {
         self.renderer_state.mutex.lockUncancelable(global.io());
         defer self.renderer_state.mutex.unlock(global.io());
         self.prepareRestoredTerminalLocked(&new);
         old = self.swapTerminalLocked(new, decoded.continuation);
+        // The config is read under the lock; step 3 needs the limits.
+        limit_bytes = self.config.scrollback_limit_bytes;
+        limit_lines = self.config.scrollback_limit_lines;
         break :live self.liveStateLocked();
     };
     defer old.deinit(self.alloc);
     defer self.renderer_wakeup.notify() catch {};
 
-    // 2. Reflow and compare, without the lock.
+    // 2. Reflow and compare, without the lock. Whether the local limit
+    // cut the history is decided before the reflow too: a wider resize
+    // (line limit) or a narrower one with short lines (byte limit) leaves
+    // a cut history far below the limit.
+    const cut_before = cut: {
+        const pages = &old.screens.get(.primary).?.pages;
+        break :cut pages.history_truncated and pages.historyAtLimit();
+    };
     old.flags.shell_redraws_prompt = owner_redraw;
     old.modes.set(.wraparound, owner_wraparound);
     old.resize(self.alloc, .{ .cols = cols, .rows = rows, .reflow = true }) catch |err| {
@@ -1046,7 +1068,7 @@ pub fn restoreSnapshotLocalHistory(
     const old_pages = &old.screens.get(.primary).?.pages;
     if (!terminalpkg.history_digest.matches(
         terminalpkg.history_digest.pagesAtSeam(old_pages, seam),
-        old_pages.history_truncated and old_pages.historyAtLimit(),
+        old_pages.history_truncated and (cut_before or old_pages.historyAtLimit()),
         want,
     )) return .mismatch;
 
@@ -1059,6 +1081,11 @@ pub fn restoreSnapshotLocalHistory(
     var full = again.toOwned();
     var full_owned = true;
     defer if (full_owned) full.deinit(self.alloc);
+
+    // The copy stops at this surface's limits, not the owner's encoded
+    // ones (step 4 applies the rest of the local policy).
+    full.setScrollbackMaxBytes(limit_bytes);
+    full.setScrollbackMaxLines(limit_lines);
     {
         const full_primary = full.screens.get(.primary).?;
         const copied = full_primary.pages.prependHistoryFrom(
@@ -1070,6 +1097,10 @@ pub fn restoreSnapshotLocalHistory(
             return .mismatch;
         };
         if (copied.semantic_prompt) full_primary.semantic_prompt.seen = true;
+    }
+
+    if (comptime builtin.is_test) {
+        if (test_between_swaps) |hook| hook(self);
     }
 
     // 4. Swap it in, under the lock, if the live terminal is still the
@@ -1097,22 +1128,30 @@ var test_between_swaps: ?*const fn (*Termio) void = null;
 fn liveStateLocked(self: *Termio) LiveTerminalState {
     const primary = self.terminal.screens.get(.primary).?;
     return .{
+        .epoch = self.live_epoch,
+        .cols = self.terminal.cols,
+        .rows = self.terminal.rows,
         .active_key = self.terminal.screens.active_key,
         .primary = primary,
         .first = primary.pages.pages.first,
         .total_rows = primary.pages.total_rows,
         .generation = self.terminal.screens.generation(.primary),
-        .has_selection = primary.selection != null,
+        .primary_selection = primary.selection != null,
+        .active_selection = self.terminal.screens.active.selection != null,
     };
 }
 
 const LiveTerminalState = struct {
+    epoch: u64,
+    cols: terminalpkg.size.CellCountInt,
+    rows: terminalpkg.size.CellCountInt,
     active_key: terminalpkg.ScreenSet.Key,
     primary: *terminalpkg.Screen,
     first: ?*terminalpkg.PageList.List.Node,
     total_rows: usize,
     generation: usize,
-    has_selection: bool,
+    primary_selection: bool,
+    active_selection: bool,
 };
 
 /// Decode exactly one READY prefix: bytes after READY are an error.
@@ -1402,6 +1441,7 @@ pub fn clearScreen(self: *Termio, td: *ThreadData, history: bool) !void {
         // knowledge of where the cursor is and causes rendering issues. So,
         // for alt screen, we do nothing.
         if (self.terminal.screens.active_key == .alternate) return;
+        self.live_epoch +%= 1;
 
         // Clear our selection
         self.terminal.screens.active.clearSelection();
@@ -1454,6 +1494,7 @@ pub fn scrollViewport(
 ) void {
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
+    self.live_epoch +%= 1;
     self.terminal.scrollViewport(scroll);
 }
 
@@ -1462,6 +1503,7 @@ pub fn jumpToPrompt(self: *Termio, delta: isize) !void {
     {
         self.renderer_state.mutex.lockUncancelable(global.io());
         defer self.renderer_state.mutex.unlock(global.io());
+        self.live_epoch +%= 1;
         self.terminal.screens.active.scroll(.{ .delta_prompt = delta });
     }
 

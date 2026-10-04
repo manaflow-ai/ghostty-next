@@ -3083,7 +3083,8 @@ GHOSTTY_API GhosttyResult ghostty_terminal_continuation_alloc(
  * with the mirror's digest computed at the READY's seam): the digests are
  * equal and either the history row counts are equal, or the mirror has
  * fewer rows, both have at least 64 rows above the seam, and the mirror's
- * own scrollback limit cut its oldest history rows. Anything else is a
+ * own scrollback limit cut its oldest history rows (decided before or
+ * after the mirror's reflow). Anything else is a
  * mismatch. Rows older than the window are checked by the row count only.
  *
  * The caller must serialize this operation with all other access to the

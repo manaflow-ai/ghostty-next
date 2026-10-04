@@ -1584,8 +1584,9 @@ typedef enum {
 // H_local == expected_history_rows, or H_local < expected_history_rows,
 // both have at least 64 rows above the seam, and this surface's
 // scrollback limit cut its primary history: it dropped the oldest rows
-// and the history is still within one page of the line or byte limit (a
-// mirror with a smaller limit than the owner). Anything else is a
+// and the history is within one page of the line or byte limit before or
+// after the reflow (a mirror with a smaller limit than the owner; a wider
+// resize or short lines can leave a cut history far below the limit). Anything else is a
 // mismatch. The digest covers the 64 rows above the seam; older rows are
 // checked by the row count only, and not at all when the local limit cut
 // the history. With a cut oldest part the oldest kept logical line can be
@@ -1605,8 +1606,8 @@ typedef enum {
 //
 // Returns GHOSTTY_SURFACE_LOCAL_HISTORY_MISMATCH (1) for a mismatch, a
 // failed local reflow, or a main-thread change of the live terminal
-// (clear, reset, a new selection) between the two swaps: the READY
-// terminal stays,
+// between the two swaps (clear screen, reset, resize, set_grid, viewport
+// scroll, jump to prompt, a new selection): the READY terminal stays,
 // WITHOUT the older history (the old history is discarded), and the
 // snapshot is complete. The caller then requests a NEW READY + HISTORY
 // (or COMPLETE) snapshot from the owner and applies it with

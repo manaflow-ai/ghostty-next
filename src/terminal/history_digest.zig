@@ -153,7 +153,8 @@ pub fn pagesAtSeam(list: *const PageList, seam_rows: u64) Digest {
 /// digests, and either equal history row counts, or the mirror holds
 /// fewer rows only because its own scrollback limit cut the oldest ones
 /// (`local_cut`: `PageList.history_truncated` and
-/// `PageList.historyAtLimit`) while both have at least `window_rows` rows
+/// `PageList.historyAtLimit` before or after the mirror's reflow) while
+/// both have at least `window_rows` rows
 /// above the seam, so the digests cover the same full window.
 ///
 /// With a cut oldest part the oldest local logical line can be a fragment
