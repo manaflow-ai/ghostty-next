@@ -819,12 +819,16 @@ pub fn gridState(self: *Termio) GridState {
 /// no replies, and the unfinished sequence it carries (its continuation)
 /// is replayed into the parser, which produces no actions for it.
 ///
-/// The restored terminal keeps the snapshot's grid, colors and modes; a
-/// locked grid takes the snapshot's size and keeps its generation. Local
-/// policy from this surface's config replaces the owner's: the scrollback
-/// limits (`scrollback-limit-bytes`, `scrollback-limit-lines`), so history
-/// beyond them is dropped from the oldest end, the Kitty image storage
-/// limit, and in-band (direct) image loading only.
+/// The restored terminal keeps the snapshot's grid, modes and the
+/// program's color overrides; a locked grid takes the snapshot's size and
+/// keeps its generation. Local policy from this surface's config replaces
+/// the owner's: the scrollback limits (`scrollback-limit-bytes`,
+/// `scrollback-limit-lines`), so history beyond them is dropped from the
+/// oldest end, the Kitty image storage limit, in-band (direct) image
+/// loading only, the default palette (OSC 4 overrides stay), the default
+/// background, foreground and cursor colors (OSC 10/11/12 overrides stay),
+/// and the default cursor style and blink (a program's explicit DECSCUSR
+/// stays until it selects the default again).
 pub fn restoreSnapshot(
     self: *Termio,
     bytes: []const u8,
@@ -873,8 +877,9 @@ fn replaceTerminal(
         // of the owner's, so history that arrives later stops at the
         // local limit (the decoder drops a page that does not fit and
         // every older page after it). An alternate screen made later
-        // copies these from the primary screen.
-        self.applyLocalLimitsLocked(&new);
+        // copies these from the primary screen. Default colors and
+        // cursor style are this surface's too, not the owner's.
+        self.applyLocalPolicyLocked(&new);
 
         // Every screen is new storage. Advance each generation past the
         // old terminal's, as a screen removal does, so references into
@@ -936,16 +941,39 @@ fn replaceTerminal(
     old.deinit(self.alloc);
 }
 
-/// Apply the surface's config limits to a terminal of a manual backend:
-/// Kitty image storage and in-band loading, and the scrollback byte and
-/// line limits. Lowering a scrollback limit frees the oldest complete
-/// history pages, never a page of the active area. Caller must hold
-/// `renderer_state.mutex` when `t` is the live terminal.
-fn applyLocalLimitsLocked(self: *Termio, t: *terminalpkg.Terminal) void {
+/// Apply the surface's config as local policy to a terminal of a manual
+/// backend restored from the owner's snapshot: Kitty image storage and
+/// in-band loading, the scrollback byte and line limits, the default
+/// palette and default background, foreground and cursor colors, and the
+/// default cursor style and blink. Lowering a scrollback limit frees the
+/// oldest complete history pages, never a page of the active area. The
+/// program's state stays: palette entries it set (the palette mask),
+/// OSC 10/11/12 overrides, and an explicit DECSCUSR shape. Caller must
+/// hold `renderer_state.mutex` when `t` is the live terminal.
+fn applyLocalPolicyLocked(self: *Termio, t: *terminalpkg.Terminal) void {
     t.setKittyGraphicsSizeLimit(self.alloc, self.config.image_storage_limit);
     t.setKittyGraphicsLoadingLimits(kittyLoadingLimits(self.backend));
     t.setScrollbackMaxBytes(self.config.scrollback_limit_bytes);
     t.setScrollbackMaxLines(self.config.scrollback_limit_lines);
+
+    // Colors, as changeConfig applies them. A restore must not fail
+    // here, so an allocation failure falls back to the built-in palette.
+    t.colors.palette.changeDefault(self.alloc, self.config.palette) catch |err| {
+        log.warn("error applying the default palette after a snapshot restore, using built-in default err={}", .{err});
+        t.colors.palette.resetDefault(self.alloc);
+    };
+    t.flags.dirty.palette = true;
+    t.colors.background.default = self.config.background.toTerminalRGB();
+    t.colors.foreground.default = self.config.foreground.toTerminalRGB();
+    t.colors.cursor.default = cursor: {
+        const color = self.config.cursor_color orelse break :cursor null;
+        break :cursor color.toTerminalRGB() orelse break :cursor null;
+    };
+
+    // Cursor defaults, as the stream handler's changeConfig applies them:
+    // a cursor that follows its default takes this surface's style.
+    t.setDefaultCursorStyle(self.config.cursor_style);
+    t.setDefaultCursorBlink(self.config.cursor_blink);
 }
 
 /// Return the parser to ground and drop unfinished sequence state.
