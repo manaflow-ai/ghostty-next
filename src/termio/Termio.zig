@@ -1087,6 +1087,10 @@ pub fn restoreSnapshotLocalHistory(
     return .restored;
 }
 
+/// Tests only: called between the two swaps of a local history restore,
+/// in place of a main-thread action.
+var test_between_swaps: ?*const fn (*Termio) void = null;
+
 /// Identity of the live terminal's primary screen, to see whether
 /// anything changed it between two lock holds. Caller must hold
 /// `renderer_state.mutex`.
@@ -2586,21 +2590,27 @@ test "manual: snapshot local history restore after erased scrollback is not a cu
 
             // The viewer's limit cut its history, then both erase the
             // scrollback (CSI 3 J). Later the viewer misses one old frame:
-            // fewer rows, far below the limit, is a divergence.
-            try testSetScrollbackLines(io, 4000);
+            // fewer rows, far below the limit, is a divergence. After the
+            // erase there is more than one page of history, so the window
+            // above the seam is full and holds the same rows on both sides.
+            try testSetScrollbackLines(io, 12000);
             try testing.expect(io.setGrid(40, 10, 1));
             var owner: TestOwner = undefined;
             try owner.init(io, 40, 10, null);
             defer owner.deinit();
 
-            try testFeedWrapped(io, &owner, 0, 3000);
+            try testFeedWrapped(io, &owner, 0, 7000);
+            try testing.expect(io.terminal.screens.get(.primary).?.pages.history_truncated);
             testFeedBoth(io, &owner, "\x1b[3J");
             try testFeedShort(io, &owner, 0, 20);
             owner.stream.nextSlice("missed frame\r\n");
-            try testFeedShort(io, &owner, 20, 400);
+            try testFeedShort(io, &owner, 20, 3000);
 
             const ready, const digest = try owner.resizeAndEncode(25, 10);
             defer alloc.free(ready);
+            const overlap = try testReadyHistoryRows(ready);
+            try testing.expect(digest.history_rows > overlap + 64);
+            try testing.expect(digest.history_rows - try testOwnerRowOf(&owner, "missed frame") > overlap + 64);
             try testing.expectEqual(
                 LocalHistoryResult.mismatch,
                 try io.restoreSnapshotLocalHistory(ready, digest),
@@ -2633,6 +2643,113 @@ test "manual: a MANUAL surface's history digest equals libghostty-vt's after the
         }
     }.run;
     try testManualTermio(false, body);
+}
+
+/// Expect a RESTORED result whose history is the owner's newest history
+/// from the viewer's first complete line starting with `prefix` (the
+/// oldest line of a cut history can be a fragment).
+fn testExpectRestoredCut(io: *Termio, owner: *TestOwner, ready: []const u8, digest: terminalpkg.history_digest.Digest, prefix: []const u8) !void {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    try testing.expectEqual(
+        LocalHistoryResult.restored,
+        try io.restoreSnapshotLocalHistory(ready, digest),
+    );
+    const kept = testHistoryRows(&io.terminal);
+    try testing.expect(kept < testHistoryRows(&owner.t));
+    try testing.expect(kept > try testReadyHistoryRows(ready));
+    const got_all = try testPrimaryText(&io.terminal, 0);
+    defer alloc.free(got_all);
+    const got = got_all[std.mem.indexOf(u8, got_all, prefix).?..];
+    const want = try testPrimaryText(&owner.t, 0);
+    defer alloc.free(want);
+    try testing.expect(std.mem.endsWith(u8, want, got));
+}
+
+test "manual: snapshot local history restore keeps a cut history across a wider resize" {
+    const body = struct {
+        fn run(io: *Termio, _: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            const alloc = testing.allocator;
+
+            // Line limit: at 25 columns the viewer's 6000-line limit cut its
+            // history; at 80 columns the reflowed history has about a third
+            // of the rows, far below the limit, and is still a cut history.
+            try testSetScrollbackLines(io, 6000);
+            try testing.expect(io.setGrid(25, 10, 1));
+            var owner: TestOwner = undefined;
+            try owner.init(io, 25, 10, null);
+            defer owner.deinit();
+
+            try testFeedWrapped(io, &owner, 0, 4000);
+            try testing.expect(io.terminal.screens.get(.primary).?.pages.history_truncated);
+
+            const ready, const digest = try owner.resizeAndEncode(80, 10);
+            defer alloc.free(ready);
+            try testExpectRestoredCut(io, &owner, ready, digest, "line ");
+        }
+    }.run;
+    try testManualTermio(true, body);
+}
+
+test "manual: snapshot local history restore keeps a cut history across a narrower resize" {
+    const body = struct {
+        fn run(io: *Termio, _: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            const alloc = testing.allocator;
+
+            // Byte limit: at 80 columns the viewer keeps 20 pages; at 25
+            // columns the same short lines fit in about a third of the
+            // pages, far below the limit, and it is still a cut history.
+            try testing.expect(io.setGrid(80, 10, 1));
+            var owner: TestOwner = undefined;
+            try owner.init(io, 80, 10, null); // unlimited lines, 50 MB
+            defer owner.deinit();
+            const page_bytes = io.terminal.screens.get(.primary).?.pages.page_size;
+            try testSetScrollbackLimit(io, 20 * page_bytes);
+
+            try testFeedShort(io, &owner, 0, 30000);
+            try testing.expect(io.terminal.screens.get(.primary).?.pages.history_truncated);
+
+            const ready, const digest = try owner.resizeAndEncode(25, 10);
+            defer alloc.free(ready);
+            try testExpectRestoredCut(io, &owner, ready, digest, "short ");
+        }
+    }.run;
+    try testManualTermio(true, body);
+}
+
+test "manual: snapshot local history restore does not undo a change between the swaps" {
+    const body = struct {
+        fn run(io: *Termio, _: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            const alloc = testing.allocator;
+
+            try testing.expect(io.setGrid(40, 10, 1));
+            var owner: TestOwner = undefined;
+            try owner.init(io, 40, 10, null);
+            defer owner.deinit();
+            try testFeedLines(io, &owner, 0, 3000);
+
+            const ready, const digest = try owner.resizeAndEncode(25, 10);
+            defer alloc.free(ready);
+
+            // The main thread scrolls the live READY terminal between the
+            // two swaps.
+            test_between_swaps = &struct {
+                fn hook(t: *Termio) void {
+                    t.scrollViewport(.{ .delta = -3 });
+                }
+            }.hook;
+            defer test_between_swaps = null;
+            try testing.expectEqual(
+                LocalHistoryResult.mismatch,
+                try io.restoreSnapshotLocalHistory(ready, digest),
+            );
+            try testing.expectEqual(try testReadyHistoryRows(ready), testHistoryRows(&io.terminal));
+        }
+    }.run;
+    try testManualTermio(true, body);
 }
 
 test "manual: snapshot local history restore errors leave the terminal unchanged" {
