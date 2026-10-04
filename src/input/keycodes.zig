@@ -7,28 +7,44 @@ const builtin = @import("builtin");
 const Key = @import("key.zig").Key;
 
 /// The full list of entries for the current platform.
-pub const entries: []const Entry = entries: {
-    const native_idx = switch (builtin.os.tag) {
-        .ios, .macos => 4, // mac
-        .windows => 3, // win
-        .freebsd, .linux => 2, // xkb
-        else => @compileError("unsupported platform"),
-    };
+pub const entries: []const Entry = entriesFor(builtin.os.tag);
 
-    var result: [raw_entries.len]Entry = undefined;
-    for (raw_entries, 0..) |raw, i| {
-        @setEvalBranchQuota(10000);
-        result[i] = .{
-            .key = code_to_key.get(raw[5]) orelse .unidentified,
-            .usb = raw[0],
-            .code = raw[5],
-            .native = raw[native_idx],
+/// The entries with the native keycode of `os`.
+///
+/// iOS (ghostty-next): the native code is the USB HID usage on the
+/// keyboard page (0x07) without the page, which is what UIKit reports as
+/// `UIKey.keyCode` (`UIKeyboardHIDUsage`). Entries on other usage pages get
+/// no native code (0xffff), so they cannot shadow a keyboard usage.
+pub fn entriesFor(comptime os: std.Target.Os.Tag) []const Entry {
+    return comptime entries: {
+        const native_idx: ?usize = switch (os) {
+            .ios => null, // USB HID usage, see above
+            .macos => 4, // mac
+            .windows => 3, // win
+            .freebsd, .linux => 2, // xkb
+            else => @compileError("unsupported platform"),
         };
-    }
 
-    const final = result;
-    break :entries &final;
-};
+        var result: [raw_entries.len]Entry = undefined;
+        for (raw_entries, 0..) |raw, i| {
+            @setEvalBranchQuota(10000);
+            result[i] = .{
+                .key = code_to_key.get(raw[5]) orelse .unidentified,
+                .usb = raw[0],
+                .code = raw[5],
+                .native = if (native_idx) |idx|
+                    raw[idx]
+                else if (raw[0] >> 16 == 0x07)
+                    raw[0] & 0xffff
+                else
+                    0xffff,
+            };
+        }
+
+        const final = result;
+        break :entries &final;
+    };
+}
 
 /// Entry contains the USB code, native keycode, and W3C dom code for
 /// the current platform.
