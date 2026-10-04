@@ -2295,6 +2295,42 @@ test "manual: snapshot local history restore with a smaller viewer scrollback li
     try testManualTermio(true, body);
 }
 
+test "manual: snapshot local history restore reflows with the owner's prompt redraw" {
+    const body = struct {
+        fn run(io: *Termio, _: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            const alloc = testing.allocator;
+
+            // The owner assumes the shell redraws its prompt (the Terminal
+            // default); this MANUAL_MIRROR surface does not. The READY
+            // carries the owner's value; the restore still matches and
+            // takes it.
+            try testing.expect(io.setGrid(40, 10, 1));
+            var owner: TestOwner = undefined;
+            try owner.init(io, 40, 10, null);
+            defer owner.deinit();
+            owner.t.flags.shell_redraws_prompt = .true;
+            try testing.expectEqual(.false, io.terminal.flags.shell_redraws_prompt);
+
+            // No OSC 133 here: it messages the surface, which these
+            // tests do not have.
+            try testFeedLines(io, &owner, 0, 3000);
+            testFeedBoth(io, &owner, "~/src $ ");
+
+            const ready, const digest = try owner.resizeAndEncode(25, 10);
+            defer alloc.free(ready);
+            try testing.expect(digest.history_rows > 2 * try testReadyHistoryRows(ready));
+            try testing.expectEqual(
+                LocalHistoryResult.restored,
+                try io.restoreSnapshotLocalHistory(ready, digest),
+            );
+            try testing.expectEqual(.true, io.terminal.flags.shell_redraws_prompt);
+            try testExpectSamePrimary(io, &owner);
+        }
+    }.run;
+    try testManualTermio(true, body);
+}
+
 test "manual: snapshot local history restore refuses a diverged history" {
     const S = struct {
         /// The viewer misses one output frame before the resize.
