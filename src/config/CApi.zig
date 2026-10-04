@@ -162,6 +162,69 @@ const Diagnostic = extern struct {
     message: [*:0]const u8 = "",
 };
 
+/// Number of configuration keys (every `Config` field an embedder can
+/// set; internal fields excluded). With `ghostty_config_key_name` an
+/// embedder can enumerate the keys of the libghostty it links.
+export fn ghostty_config_key_count() usize {
+    return std.meta.fields(Key).len;
+}
+
+/// The name of key `index` (0 ..< `ghostty_config_key_count()`), a static
+/// NUL-terminated string; null when the index is out of range.
+export fn ghostty_config_key_name(index: usize) ?[*:0]const u8 {
+    const names = comptime names: {
+        const fields = std.meta.fields(Key);
+        var result: [fields.len][*:0]const u8 = undefined;
+        for (fields, 0..) |field, i| result[i] = field.name;
+        break :names result;
+    };
+    if (index >= names.len) return null;
+    return names[index];
+}
+
+/// Sync with ghostty_config_source_s
+const Source = extern struct {
+    /// NUL-terminated; owned by the config (valid until it is freed).
+    path: [*:0]const u8 = "",
+    line: usize = 0,
+};
+
+/// Where `key` got its current value: the file (or synthetic path of
+/// `ghostty_config_load_string`) and 1-based line of its last assignment.
+/// False when the key is at its default, came from the command line, or
+/// is not a key.
+export fn ghostty_config_key_source(
+    self: *Config,
+    key_ptr: [*]const u8,
+    key_len: usize,
+    out: *Source,
+) bool {
+    const location = self.keySource(key_ptr[0..key_len]) orelse return false;
+    switch (location) {
+        .file => |file| {
+            const arena = self._arena.?.allocator();
+            const path = arena.dupeZ(u8, file.path) catch return false;
+            out.* = .{ .path = path.ptr, .line = file.line };
+            return true;
+        },
+        .none, .cli => return false,
+    }
+}
+
+/// Number of files read while loading the config (config files,
+/// `config-file` includes, theme files), for a file watcher.
+export fn ghostty_config_loaded_file_count(self: *Config) usize {
+    return self.loadedFiles().len;
+}
+
+/// Loaded file `index`, NUL-terminated and owned by the config; null when
+/// the index is out of range.
+export fn ghostty_config_loaded_file(self: *Config, index: usize) ?[*:0]const u8 {
+    const files = self.loadedFiles();
+    if (index >= files.len) return null;
+    return files[index].ptr;
+}
+
 test "ghostty_config_get: bool" {
     const testing = std.testing;
     const alloc = testing.allocator;

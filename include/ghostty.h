@@ -450,6 +450,11 @@ typedef struct {
 } ghostty_string_s;
 
 typedef struct {
+  const char* path;
+  uintptr_t line;
+} ghostty_config_source_s;
+
+typedef struct {
   double tl_px_x;
   double tl_px_y;
   uint32_t offset_start;
@@ -1321,6 +1326,19 @@ GHOSTTY_API bool ghostty_config_key_is_binding(ghostty_config_t, ghostty_input_k
 GHOSTTY_API uint32_t ghostty_config_diagnostics_count(ghostty_config_t);
 GHOSTTY_API ghostty_diagnostic_s ghostty_config_get_diagnostic(ghostty_config_t, uint32_t);
 GHOSTTY_API ghostty_string_s ghostty_config_open_path(void);
+// Config introspection (ghostty-next). Keys: `ghostty_config_key_name`
+// returns a static NUL-terminated name for 0 ..< key_count, NULL past it.
+// Sources: the file and 1-based line of a key's last assignment; false when
+// the key is at its default, came from the command line, or is unknown. The
+// path and the loaded-file strings are owned by the config.
+GHOSTTY_API uintptr_t ghostty_config_key_count(void);
+GHOSTTY_API const char* ghostty_config_key_name(uintptr_t);
+GHOSTTY_API bool ghostty_config_key_source(ghostty_config_t,
+                                           const char*,
+                                           uintptr_t,
+                                           ghostty_config_source_s*);
+GHOSTTY_API uintptr_t ghostty_config_loaded_file_count(ghostty_config_t);
+GHOSTTY_API const char* ghostty_config_loaded_file(ghostty_config_t, uintptr_t);
 
 GHOSTTY_API ghostty_app_t ghostty_app_new(const ghostty_runtime_config_s*,
                                              ghostty_config_t);

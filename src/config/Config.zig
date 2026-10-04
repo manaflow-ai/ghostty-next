@@ -3975,12 +3975,51 @@ _conditional_set: std.EnumSet(conditional.Key) = .{},
 /// as loadTheme which has more details on why.
 _replay_steps: std.ArrayList(Replay.Step) = .empty,
 
+/// Where each key got its current value: the file and line of its last
+/// assignment (CLI arguments carry their index). Keys still at their
+/// default have no entry. Rebuilt by every replay, because replay steps
+/// carry the locations of their arguments (`Replay.Step.location`).
+/// Keys and paths are owned by the arena. See `keySource`.
+_sources: std.StringHashMapUnmanaged(cli.Location) = .empty,
+
+/// Every file read while loading: config files, `config-file` includes
+/// and theme files, in load order and without duplicates, so an embedder
+/// can watch them. Paths are owned by the arena. See `loadedFiles`.
+_loaded_files: std.ArrayList([:0]const u8) = .empty,
+
 /// Set to true if Ghostty was executed as xdg-terminal-exec on Linux.
 @"_xdg-terminal-exec": bool = false,
 
 pub fn deinit(self: *Config) void {
     if (self._arena) |arena| arena.deinit();
     self.* = undefined;
+}
+
+/// The location of the last assignment of `key`, or null when the key
+/// is still at its default (or is not a key). For repeatable keys this is
+/// the last line that added to (or reset) the list.
+pub fn keySource(self: *const Config, key: []const u8) ?cli.Location {
+    return self._sources.get(key);
+}
+
+/// The files read while loading this configuration, in load order.
+pub fn loadedFiles(self: *const Config) []const [:0]const u8 {
+    return self._loaded_files.items;
+}
+
+/// Record a file read during loading (once).
+fn noteLoadedFile(self: *Config, path: []const u8) Allocator.Error!void {
+    for (self._loaded_files.items) |existing| {
+        if (std.mem.eql(u8, existing, path)) return;
+    }
+    const alloc = self._arena.?.allocator();
+    try self._loaded_files.append(alloc, try alloc.dupeZ(u8, path));
+}
+
+/// Copy the loaded files of `other` into this configuration (a replay
+/// does not reread config files).
+fn inheritLoadedFiles(self: *Config, other: *const Config) Allocator.Error!void {
+    for (other._loaded_files.items) |path| try self.noteLoadedFile(path);
 }
 
 /// Load the configuration according to the default rules:
@@ -4066,6 +4105,7 @@ pub fn loadFile(self: *Config, alloc: Allocator, path: []const u8) !void {
 /// Load config from the given File.
 fn loadFsFile(self: *Config, alloc: Allocator, file: *std.Io.File, path: []const u8) !void {
     std.log.info("reading configuration file path={s}", .{path});
+    try self.noteLoadedFile(path);
     var buf: [2048]u8 = undefined;
     var file_reader = file.reader(global.io(), &buf);
     const reader = &file_reader.interface;
@@ -4567,6 +4607,7 @@ pub fn changeConditionalState(
     // Replay all of our steps to rebuild the configuration
     var it = Replay.iterator(self._replay_steps.items, &new_config);
     try new_config.loadIter(alloc_gpa, &it);
+    try new_config.inheritLoadedFiles(self);
     try new_config.finalize();
 
     return new_config;
@@ -4648,6 +4689,7 @@ fn loadTheme(self: *Config, theme: Theme) !void {
     const path = themefile.path;
     const file = themefile.file;
     defer file.close(global.io());
+    try self.noteLoadedFile(path);
 
     // From this point onwards, we load the theme and do a bit of a dance
     // to achieve two separate goals:
@@ -4677,7 +4719,7 @@ fn loadTheme(self: *Config, theme: Theme) !void {
     // Setup our replay to be conditional.
     conditional: for (new_config._replay_steps.items) |*item| {
         switch (item.*) {
-            .expand, .diagnostic => {},
+            .expand, .diagnostic, .location => {},
 
             // If we see "-e" then we do NOT make the following arguments
             // conditional since they are supposed to be part of the
@@ -4720,6 +4762,7 @@ fn loadTheme(self: *Config, theme: Theme) !void {
     // from the theme.
     var slice_it = Replay.iterator(self._replay_steps.items, &new_config);
     try new_config.loadIter(alloc_gpa, &slice_it);
+    try new_config.inheritLoadedFiles(self);
 
     // Success, swap our new config in and free the old.
     self.deinit();
@@ -4988,7 +5031,23 @@ pub fn parseManuallyHook(
         return false;
     }
 
-    // Keep track of our input args for replay
+    // Keep track of our input args for replay, preceded by where the
+    // arg came from so a replay reports the same location (key sources).
+    // Cloned into this config's arena: during a replay the iterator's
+    // location belongs to the config being replayed, which may be freed.
+    const location = try (try cli.Location.fromIter(iter, alloc)).clone(alloc);
+    if (location != .none) {
+        try self._replay_steps.append(alloc, .{ .location = location });
+        if (std.mem.startsWith(u8, arg, "--")) {
+            const rest = arg[2..];
+            const key = rest[0 .. std.mem.indexOfScalar(u8, rest, '=') orelse rest.len];
+            if (std.meta.stringToEnum(Key, key) != null) {
+                const entry = try self._sources.getOrPut(alloc, key);
+                if (!entry.found_existing) entry.key_ptr.* = try alloc.dupe(u8, key);
+                entry.value_ptr.* = location;
+            }
+        }
+    }
     try self._replay_steps.append(
         alloc,
         .{ .arg = try alloc.dupeZ(u8, arg) },
@@ -5222,6 +5281,17 @@ pub fn clone(
     // Copy the conditional set
     result._conditional_set = self._conditional_set;
 
+    // Copy where each key came from and the files read.
+    var sources = self._sources.iterator();
+    while (sources.next()) |entry| {
+        try result._sources.put(
+            alloc_arena,
+            try alloc_arena.dupe(u8, entry.key_ptr.*),
+            try entry.value_ptr.clone(alloc_arena),
+        );
+    }
+    try result.inheritLoadedFiles(self);
+
     return result;
 }
 
@@ -5390,6 +5460,11 @@ const Replay = struct {
         /// errors in their configuration.
         diagnostic: cli.Diagnostic,
 
+        /// Where the next arg or conditional_arg came from. A replay
+        /// reports it as the iterator location, so key sources
+        /// (`_sources`) and diagnostics name the original file and line.
+        location: cli.Location,
+
         /// The start of a "-e" argument. This marks the end of
         /// traditional configuration and the beginning of the
         /// "-e" initial command magic. This is separate from "arg"
@@ -5406,6 +5481,7 @@ const Replay = struct {
         ) Allocator.Error!Step {
             return switch (self) {
                 .@"-e" => self,
+                .location => |v| .{ .location = try v.clone(alloc) },
                 .diagnostic => |v| .{ .diagnostic = try v.clone(alloc) },
                 .arg => |v| .{ .arg = try alloc.dupeZ(u8, v) },
                 .expand => |v| .{ .expand = try alloc.dupe(u8, v) },
@@ -5427,12 +5503,22 @@ const Replay = struct {
         config: *Config,
         slice: []const Replay.Step,
         idx: usize = 0,
+        /// The location of the arg `next` last returned (`.location`).
+        current: cli.Location = .none,
+
+        /// For `cli.Location.fromIter`: where the last returned arg came
+        /// from, as recorded when it was first parsed.
+        pub fn location(self: *const Self, _: Allocator) error{}!?cli.Location {
+            return self.current;
+        }
 
         pub fn next(self: *Self) ?[]const u8 {
+            self.current = .none;
             while (true) {
                 if (self.idx >= self.slice.len) return null;
                 defer self.idx += 1;
                 switch (self.slice[self.idx]) {
+                    .location => |loc| self.current = loc,
                     .expand => |base| self.config.expandPaths(base) catch |err| {
                         // This shouldn't happen because to reach this step
                         // means that it succeeded before. Its possible since
@@ -5460,6 +5546,9 @@ const Replay = struct {
                         // All conditions must match.
                         for (v.conditions) |cond| {
                             if (!self.config._conditional_state.match(cond)) {
+                                // The skipped arg's location must not
+                                // name a later arg that has none.
+                                self.current = .none;
                                 break :conditional;
                             }
                         }
