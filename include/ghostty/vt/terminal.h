@@ -913,6 +913,17 @@ typedef enum GHOSTTY_ENUM_TYPED {
 
   /** Reading the clipboard failed due to an I/O error. */
   GHOSTTY_CLIPBOARD_READ_RESULT_IO_ERROR = 4,
+
+  /**
+   * Answer later (ghostty-next): nothing is written now; the embedder must
+   * call ghostty_terminal_clipboard_read_complete() with the request's
+   * `token`, also when it gives up (a timeout answers with an empty
+   * clipboard). Only OSC 52 reads can be deferred; a deferred Kitty
+   * (OSC 5522) read is answered with EPERM. At most 16 reads wait per
+   * terminal; past that a deferral is answered at once with an empty
+   * clipboard. Pending reads are freed with the terminal.
+   */
+  GHOSTTY_CLIPBOARD_READ_RESULT_DEFERRED = 5,
   GHOSTTY_CLIPBOARD_READ_RESULT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyClipboardReadResult;
 
@@ -1047,6 +1058,13 @@ struct GhosttyClipboardRead {
 
   /** Answer the read; see the struct documentation. */
   GhosttyClipboardReadReplyFn reply;
+
+  /**
+   * Token for a deferred reply (ghostty-next). Unique per terminal and
+   * nonzero for an OSC 52 read; zero when the read cannot be deferred.
+   * Check `size` before reading it.
+   */
+  uint64_t token;
 };
 
 /**
@@ -2764,6 +2782,28 @@ GHOSTTY_API void ghostty_terminal_free(GhosttyTerminal terminal);
  * @ingroup terminal
  */
 GHOSTTY_API void ghostty_terminal_reset(GhosttyTerminal terminal);
+
+/**
+ * Answer an OSC 52 clipboard read that the clipboard_read callback deferred
+ * with GHOSTTY_CLIPBOARD_READ_RESULT_DEFERRED (ghostty-next).
+ *
+ * The reply goes to the pty through the write_pty callback, with the
+ * request's selector and terminator. Any result other than
+ * GHOSTTY_CLIPBOARD_READ_RESULT_SUCCESS (use DENIED for a timeout) answers
+ * with an empty clipboard. The reply is borrowed for the call.
+ *
+ * @param terminal The terminal handle
+ * @param token GhosttyClipboardRead::token of the deferred request
+ * @param reply The answer
+ * @return GHOSTTY_SUCCESS, or GHOSTTY_INVALID_VALUE (nothing written) when
+ *         the token is not pending (unknown or already completed)
+ *
+ * @ingroup terminal
+ */
+GHOSTTY_API GhosttyResult ghostty_terminal_clipboard_read_complete(
+    GhosttyTerminal terminal,
+    uint64_t token,
+    const GhosttyClipboardReadReply* reply);
 
 /**
  * Resize the terminal to the given dimensions.

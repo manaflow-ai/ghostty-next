@@ -165,6 +165,10 @@ pub const ClipboardRead = extern struct {
     /// Terminal-owned reply state; opaque to the embedder.
     ctx: *const anyopaque,
     reply: ClipboardReadReplyFn,
+    /// Token for a deferred reply (GHOSTTY_CLIPBOARD_READ_RESULT_DEFERRED,
+    /// then ghostty_terminal_clipboard_read_complete). Zero when the read
+    /// cannot be deferred (Kitty OSC 5522).
+    token: u64,
 };
 
 /// C function pointer type for replying to a clipboard read.
@@ -495,6 +499,7 @@ const Effects = struct {
             .can_remember = read.can_remember,
             .ctx = &ctx,
             .reply = &clipboardReadReplyTrampoline,
+            .token = read.token,
         };
         func(@ptrCast(wrapper), wrapper.effects.userdata, &request);
     }
@@ -507,6 +512,7 @@ const Effects = struct {
         const read = ctx.read;
         switch (reply.result) {
             .success => {},
+            .deferred => return read.reply(.deferred),
             .denied => return read.reply(.denied),
             .busy => return read.reply(.busy),
             .io_error => return read.reply(.io_error),
@@ -1674,6 +1680,35 @@ pub fn scroll_viewport(
         .delta => .{ .delta = behavior.value.delta },
         .row => .{ .row = behavior.value.row },
     });
+}
+
+/// Answer an OSC 52 read deferred with GHOSTTY_CLIPBOARD_READ_RESULT_DEFERRED.
+/// The reply is written to the pty with the request's selector and
+/// terminator; anything but success (also a timeout) answers with an empty
+/// clipboard. INVALID_VALUE, with nothing written, for a token that is not
+/// pending. Pending reads are freed with the terminal.
+pub fn clipboard_read_complete(
+    terminal_: Terminal,
+    token: u64,
+    reply: ?*const ClipboardReadReply,
+) callconv(lib.calling_conv) Result {
+    const wrapper = terminal_ orelse return .invalid_value;
+    const r = reply orelse return .invalid_value;
+    var text: [1]clipboard.Content = undefined;
+    const result: clipboard.Read.Result = switch (r.result) {
+        .success => success: {
+            const contents: []const ClipboardContent = if (r.contents) |ptr| ptr[0..r.contents_len] else &.{};
+            for (contents) |content| {
+                const mime = content.mime.ptr[0..content.mime.len];
+                if (!clipboard.isTextMime(mime)) continue;
+                text[0] = .{ .mime = mime, .data = content.data.ptr[0..content.data.len] };
+                break :success .{ .success = .{ .contents = &text } };
+            }
+            break :success .{ .success = .{} };
+        },
+        else => .denied,
+    };
+    return if (wrapper.stream.handler.completeClipboardRead(token, result)) .success else .invalid_value;
 }
 
 pub fn resize(
