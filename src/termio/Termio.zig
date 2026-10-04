@@ -1014,6 +1014,14 @@ pub fn restoreSnapshotLocalHistory(
         // discards. Both sides parsed the same bytes, so the reflowed
         // primary history is the owner's when nothing diverged; the
         // digest checks that. A failed resize discards the history.
+        // Reflow with the owner's resize settings, which the READY
+        // carries (a resize does not change them): the owner's terminal
+        // may use other defaults than this surface (libghostty-vt
+        // terminals vs surface config). resize_pull_scrollback is not in
+        // the snapshot; both sides keep the Terminal default (true).
+        self.terminal.flags.shell_redraws_prompt = new.flags.shell_redraws_prompt;
+        self.terminal.modes.set(.wraparound, new.modes.get(.wraparound));
+
         const resized = resized: {
             self.terminal.resize(self.alloc, .{
                 .cols = new.cols,
