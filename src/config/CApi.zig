@@ -86,7 +86,7 @@ export fn ghostty_config_load_string(
 ) void {
     const contents_slice = contents[0..contents_len];
     const path_slice = std.mem.span(path);
-    self.loadString(state.alloc, contents_slice, path_slice) catch |err| {
+    self.loadString(global.alloc(), contents_slice, path_slice) catch |err| {
         log.err("error loading config from string path={s} err={}", .{ path_slice, err });
     };
 }
