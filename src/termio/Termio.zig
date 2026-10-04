@@ -819,12 +819,18 @@ pub fn gridState(self: *Termio) GridState {
 /// no replies, and the unfinished sequence it carries (its continuation)
 /// is replayed into the parser, which produces no actions for it.
 ///
-/// The restored terminal keeps the snapshot's grid, colors and modes; a
-/// locked grid takes the snapshot's size and keeps its generation. Local
-/// policy from this surface's config replaces the owner's: the scrollback
-/// limits (`scrollback-limit-bytes`, `scrollback-limit-lines`), so history
-/// beyond them is dropped from the oldest end, the Kitty image storage
-/// limit, and in-band (direct) image loading only.
+/// The restored terminal keeps the snapshot's grid, modes and the
+/// program's color overrides; a locked grid takes the snapshot's size and
+/// keeps its generation. Local policy from this surface's config replaces
+/// the owner's: the scrollback limits (`scrollback-limit-bytes`,
+/// `scrollback-limit-lines`), so history beyond them is dropped from the
+/// oldest end, the Kitty image storage limit, in-band (direct) image
+/// loading only, the default palette (OSC 4 overrides stay), the default
+/// background, foreground and cursor colors (OSC 10/11/12 overrides stay),
+/// and the default cursor style and blink (a program's explicit DECSCUSR
+/// stays until it selects the default again). While the cursor follows its
+/// default, mode 12 (cursor blinking) follows the local default blink, and
+/// every screen takes the local cursor style.
 pub fn restoreSnapshot(
     self: *Termio,
     bytes: []const u8,
@@ -873,8 +879,9 @@ fn replaceTerminal(
         // of the owner's, so history that arrives later stops at the
         // local limit (the decoder drops a page that does not fit and
         // every older page after it). An alternate screen made later
-        // copies these from the primary screen.
-        self.applyLocalLimitsLocked(&new);
+        // copies these from the primary screen. Default colors and
+        // cursor style are this surface's too, not the owner's.
+        self.applyLocalPolicyLocked(&new);
 
         // Every screen is new storage. Advance each generation past the
         // old terminal's, as a screen removal does, so references into
@@ -936,16 +943,50 @@ fn replaceTerminal(
     old.deinit(self.alloc);
 }
 
-/// Apply the surface's config limits to a terminal of a manual backend:
-/// Kitty image storage and in-band loading, and the scrollback byte and
-/// line limits. Lowering a scrollback limit frees the oldest complete
-/// history pages, never a page of the active area. Caller must hold
-/// `renderer_state.mutex` when `t` is the live terminal.
-fn applyLocalLimitsLocked(self: *Termio, t: *terminalpkg.Terminal) void {
+/// Apply the surface's config as local policy to a terminal of a manual
+/// backend restored from the owner's snapshot: Kitty image storage and
+/// in-band loading, the scrollback byte and line limits, the default
+/// palette and default background, foreground and cursor colors, and the
+/// default cursor style and blink. Lowering a scrollback limit frees the
+/// oldest complete history pages, never a page of the active area. The
+/// program's state stays: palette entries it set (the palette mask),
+/// OSC 10/11/12 overrides, and an explicit DECSCUSR shape. Caller must
+/// hold `renderer_state.mutex` when `t` is the live terminal.
+fn applyLocalPolicyLocked(self: *Termio, t: *terminalpkg.Terminal) void {
     t.setKittyGraphicsSizeLimit(self.alloc, self.config.image_storage_limit);
     t.setKittyGraphicsLoadingLimits(kittyLoadingLimits(self.backend));
     t.setScrollbackMaxBytes(self.config.scrollback_limit_bytes);
     t.setScrollbackMaxLines(self.config.scrollback_limit_lines);
+
+    // Colors, as changeConfig applies them. A restore must not fail
+    // here, so an allocation failure falls back to the built-in palette.
+    t.colors.palette.changeDefault(self.alloc, self.config.palette) catch |err| {
+        log.warn("error applying the default palette after a snapshot restore, using built-in default err={}", .{err});
+        t.colors.palette.resetDefault(self.alloc);
+    };
+    t.flags.dirty.palette = true;
+    t.colors.background.default = self.config.background.toTerminalRGB();
+    t.colors.foreground.default = self.config.foreground.toTerminalRGB();
+    t.colors.cursor.default = cursor: {
+        const color = self.config.cursor_color orelse break :cursor null;
+        break :cursor color.toTerminalRGB() orelse break :cursor null;
+    };
+
+    // Cursor defaults, as the stream handler's changeConfig applies them:
+    // a cursor that follows its default takes this surface's style, and
+    // mode 12 (cursor blinking) takes this surface's default blink.
+    t.setDefaultCursorStyle(self.config.cursor_style);
+    t.setDefaultCursorBlink(self.config.cursor_blink);
+
+    // setCursorStyle changes only the active screen. A snapshot taken on
+    // the alternate screen keeps the owner's shape on the primary one,
+    // and leaving the alternate screen (DECRC) does not restore the
+    // shape, so a cursor that follows its default takes the local shape
+    // on every screen.
+    if (t.cursor.is_default) {
+        var it = t.screens.all.iterator();
+        while (it.next()) |entry| entry.value.*.cursor.cursor_style = t.cursor.default_style;
+    }
 }
 
 /// Return the parser to ground and drop unfinished sequence state.
@@ -1893,6 +1934,109 @@ test "manual: the config scrollback limit holds across snapshot restores" {
 
     try testManualTermio(true, S.host);
     try testManualTermio(true, S.phone);
+}
+
+test "manual: snapshot restores take this surface's colors and cursor defaults" {
+    const S = struct {
+        const host_red: terminalpkg.color.RGB = .{ .r = 0xaa, .g = 0x01, .b = 0x01 };
+        const host_bg: terminalpkg.color.RGB = .{ .r = 0x10, .g = 0x20, .b = 0x30 };
+        const host_fg: terminalpkg.color.RGB = .{ .r = 0x70, .g = 0x71, .b = 0x72 };
+        const local_red: terminalpkg.color.RGB = .{ .r = 0xcc, .g = 0x02, .b = 0x02 };
+        const local_bg: terminalpkg.color.RGB = .{ .r = 0x40, .g = 0x50, .b = 0x60 };
+        const local_fg: terminalpkg.color.RGB = .{ .r = 0xe0, .g = 0xe1, .b = 0xe2 };
+        const osc_green: terminalpkg.color.RGB = .{ .r = 0x11, .g = 0x22, .b = 0x33 };
+        const osc_bg: terminalpkg.color.RGB = .{ .r = 0x05, .g = 0x06, .b = 0x07 };
+
+        /// READY with the program's cursor at its default (taken on the
+        /// alternate screen), then READY after an explicit DECSCUSR bar.
+        var follows_default: std.ArrayListUnmanaged(u8) = .empty;
+        var explicit: std.ArrayListUnmanaged(u8) = .empty;
+
+        fn encode(io: *Termio, out: *std.ArrayListUnmanaged(u8)) !void {
+            const alloc = std.testing.allocator;
+            var w: std.Io.Writer.Allocating = .init(alloc);
+            defer w.deinit();
+            try io.encodeSnapshot(&w.writer, .ready);
+            try out.appendSlice(alloc, w.written());
+        }
+
+        /// The owner: its own default palette, colors and cursor style
+        /// (block_hollow, blinking), plus a program's overrides of palette
+        /// index 2 and of the background (applied directly: these tests
+        /// have no surface mailbox for the color_change message).
+        fn host(io: *Termio, _: *TestSink, _: bool) !void {
+            const alloc = std.testing.allocator;
+            const t = &io.terminal;
+            var palette = terminalpkg.color.default;
+            palette[1] = host_red;
+            try t.colors.palette.changeDefault(alloc, palette);
+            t.colors.background.default = host_bg;
+            t.colors.foreground.default = host_fg;
+            t.setDefaultCursorStyle(.block_hollow);
+            t.setDefaultCursorBlink(true);
+            t.colors.palette.set(2, osc_green);
+            t.colors.background.override = osc_bg;
+            io.processOutput("prompt$ \x1b[?1049h");
+            try std.testing.expect(t.cursor.is_default);
+            try encode(io, &follows_default);
+            io.processOutput("\x1b[6 q");
+            try std.testing.expect(!t.cursor.is_default);
+            try encode(io, &explicit);
+        }
+
+        /// This surface: palette 1, colors and a steady underline cursor
+        /// from its own config.
+        fn viewer(io: *Termio, _: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            const alloc = testing.allocator;
+            var config: configpkg.Config = try .default(alloc);
+            defer config.deinit();
+            config.palette.value[1] = local_red;
+            config.palette.mask.set(1);
+            config.background = .{ .r = local_bg.r, .g = local_bg.g, .b = local_bg.b };
+            config.foreground = .{ .r = local_fg.r, .g = local_fg.g, .b = local_fg.b };
+            config.@"cursor-style" = .underline;
+            config.@"cursor-style-blink" = false;
+            var derived: DerivedConfig = try .init(alloc, &config);
+            var td = io.manualThreadData();
+            try io.changeConfig(&td, &derived);
+
+            try io.restoreSnapshot(follows_default.items, .ready);
+            const t = &io.terminal;
+            try testing.expectEqual(local_red, t.colors.palette.original[1]);
+            try testing.expectEqual(local_red, t.colors.palette.current[1]);
+            // The program's overrides survive the restore.
+            try testing.expectEqual(osc_green, t.colors.palette.current[2]);
+            try testing.expectEqual(osc_bg, t.colors.background.override.?);
+            try testing.expectEqual(local_bg, t.colors.background.default.?);
+            try testing.expectEqual(local_fg, t.colors.foreground.default.?);
+            try testing.expectEqual(terminalpkg.CursorStyle.underline, t.cursor.default_style);
+            try testing.expectEqual(terminalpkg.CursorStyle.underline, t.screens.active.cursor.cursor_style);
+            try testing.expect(!t.modes.get(.cursor_blinking));
+
+            // Back on the primary screen the cursor still follows this
+            // surface's default (DECRC does not restore the shape).
+            io.processOutput("\x1b[?1049l");
+            try testing.expectEqual(terminalpkg.CursorStyle.underline, io.terminal.screens.active.cursor.cursor_style);
+
+            // A program's explicit cursor shape stays; the default is ours.
+            try io.restoreSnapshot(explicit.items, .ready);
+            try testing.expectEqual(terminalpkg.CursorStyle.bar, io.terminal.screens.active.cursor.cursor_style);
+            try testing.expectEqual(terminalpkg.CursorStyle.underline, io.terminal.cursor.default_style);
+            try testing.expectEqual(local_bg, io.terminal.colors.background.default.?);
+
+            // DECSCUSR 0 then selects this surface's default.
+            io.processOutput("\x1b[0 q");
+            try testing.expectEqual(terminalpkg.CursorStyle.underline, io.terminal.screens.active.cursor.cursor_style);
+            try testing.expect(!io.terminal.modes.get(.cursor_blinking));
+        }
+    };
+    const alloc = std.testing.allocator;
+    defer S.follows_default.deinit(alloc);
+    defer S.explicit.deinit(alloc);
+
+    try testManualTermio(true, S.host);
+    try testManualTermio(true, S.viewer);
 }
 
 test "manual: a config scrollback limit change trims the live terminal" {

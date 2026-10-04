@@ -1483,12 +1483,18 @@ typedef void (*ghostty_surface_snapshot_write_cb)(void*,
 // replaced the screen.
 //
 // The restore emits nothing to io_write_cb. The restored terminal takes
-// the snapshot's grid, colors and modes; a grid locked with
-// ghostty_surface_set_grid takes the snapshot's size and keeps its
-// generation. The surface's own config replaces the owner's limits: the
-// scrollback limits (scrollback-limit-bytes, scrollback-limit-lines),
-// so HISTORY pages beyond them are dropped from the oldest end, the
-// Kitty image storage limit, and in-band only image loading. In the
+// the snapshot's grid, modes (except mode 12, cursor blinking, while the
+// cursor follows its default: it takes the local cursor-style-blink) and
+// the program's color overrides; a grid
+// locked with ghostty_surface_set_grid takes the snapshot's size and
+// keeps its generation. The surface's own config replaces the owner's
+// local policy: the scrollback limits (scrollback-limit-bytes,
+// scrollback-limit-lines), so HISTORY pages beyond them are dropped from
+// the oldest end, the Kitty image storage limit, in-band only image
+// loading, the default palette (OSC 4 overrides stay), the default
+// background, foreground and cursor colors (OSC 10/11/12 overrides
+// stay), and the default cursor style and blink (cursor-style,
+// cursor-style-blink; a program's explicit DECSCUSR stays). In the
 // MANUAL modes, ghostty_surface_update_config applies new scrollback
 // limits to the live terminal too: the oldest complete history pages
 // are freed, never the screen or the Kitty images on it. Snapshot format version 1 carries no Kitty
