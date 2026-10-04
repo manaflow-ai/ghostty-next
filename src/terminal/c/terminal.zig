@@ -5925,7 +5925,9 @@ test "deferred clipboard_read via the C API" {
     try testing.expect(S.token != 0);
     try testing.expect(S.last_data == null);
 
-    const contents = [_]ClipboardContent{.{ .mime = .init("text/plain"), .data = .init("hello") }};
+    const mime: []const u8 = "text/plain";
+    const data: []const u8 = "hello";
+    const contents = [_]ClipboardContent{.{ .mime = .init(mime), .data = .init(data) }};
     const reply: ClipboardReadReply = .{
         .size = @sizeOf(ClipboardReadReply),
         .result = .success,
