@@ -2809,6 +2809,42 @@ test "manual: program output cannot use the private replay keys" {
     try testManualTermio(true, body);
 }
 
+test "manual: a forged replay command gets the normal reply" {
+    const body = struct {
+        fn run(io: *Termio, sink: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            try testing.expect(io.setGrid(40, 10, 1));
+            const storage = &io.terminal.screens.get(.primary).?.kitty_images;
+            const cursor = storage.imageIdCursor();
+
+            // q=0: the forged keys are ignored and the reply is the
+            // ordinary OK for image 3, with no number. MANUAL queues
+            // replies for the termio thread.
+            io.processOutput("\x1b_Ga=t,f=32,s=1,v=1,i=3,J=9,E=1,M=1;AAAAAA==\x1b\\");
+            var reply: std.ArrayList(u8) = .empty;
+            defer reply.deinit(testing.allocator);
+            while (io.mailbox.spsc.queue.pop(global.io())) |msg| {
+                defer msg.deinit();
+                switch (msg) {
+                    .write_small => |v| try reply.appendSlice(testing.allocator, v.data[0..v.len]),
+                    .write_alloc => |v| try reply.appendSlice(testing.allocator, v.data),
+                    .write_stable => |v| try reply.appendSlice(testing.allocator, v),
+                    else => {},
+                }
+            }
+            try testing.expectEqualStrings("\x1b_Gi=3;OK\x1b\\", reply.items);
+            try testing.expectEqual(@as(u32, 0), storage.imageById(3).?.number);
+
+            // A forged reset neither clears nor moves the ID cursor.
+            io.processOutput("\x1b_Ga=d,q=2,d=i,i=99,R=5\x1b\\");
+            try testing.expectEqual(cursor, storage.imageIdCursor());
+            try testing.expect(storage.imageById(3) != null);
+            try sink.expect("");
+        }
+    }.run;
+    try testManualTermio(false, body);
+}
+
 test "manual: Kitty replay after a READY cut inside a sequence" {
     try testManualTermio(true, TestCutReplay("\x1b[3", "1mW").run);
     // OSC 8 (a hyperlink): the terminal handles it without a surface

@@ -818,3 +818,73 @@ test "replay: image IDs stay equal for later transmissions" {
     }
     try testing.expectEqual(@as(u32, 3), want.imageByNumber(5).?.id);
 }
+
+test "replay: an upload that apply opened never joins program output" {
+    const alloc = testing.allocator;
+    const first = "\x1b_Ga=d,q=2,E=0,R=40\x1b\\" ++
+        "\x1b_Ga=t,q=2,f=32,s=1,v=1,i=4,J=6,E=0,m=1;AAAA\x1b\\";
+    // A stream that ends after an m=1 chunk, and one cut inside a command.
+    const streams = [_][]const u8{ first, first ++ "\x1b_Gq=2,E=0,m=1;AA" };
+    for (streams) |bytes| {
+        var t = try Terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 5 });
+        defer t.deinit(alloc);
+        var stream = t.vtStream();
+        defer stream.deinit();
+        try testing.expectError(error.InvalidReplay, apply(testing.io, alloc, &t, bytes));
+        const storage = &t.screens.get(.primary).?.kitty_images;
+        try testing.expect(storage.loading == null);
+
+        // The final chunk from program output starts nothing it could
+        // finish: no image 4, no number 6.
+        stream.nextSlice("\x1b_Gm=0,q=2;AA==\x1b\\");
+        try testing.expect(storage.imageById(4) == null);
+        try testing.expect(storage.imageByNumber(6) == null);
+    }
+}
+
+test "replay: apply never moves the cursor" {
+    const alloc = testing.allocator;
+    var t = try Terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("top\x1b[5;3H");
+
+    // A display without C=1 on the bottom row would move the cursor and
+    // scroll.
+    try apply(testing.io, alloc, &t, "\x1b_Ga=d,q=2,E=0,R=40\x1b\\" ++
+        "\x1b_Ga=t,q=2,f=32,s=1,v=1,i=3,E=0;AAAAAA==\x1b\\" ++
+        "\x1b_Ga=p,q=2,i=3,E=0,B=4,L=0,c=2,r=3\x1b\\");
+    try testing.expectEqual(@as(@TypeOf(t.screens.active.cursor.x), 2), t.screens.active.cursor.x);
+    try testing.expectEqual(@as(@TypeOf(t.screens.active.cursor.y), 4), t.screens.active.cursor.y);
+    const text = try t.plainString(alloc);
+    defer alloc.free(text);
+    try testing.expect(std.mem.startsWith(u8, text, "top"));
+    try testing.expectEqual(@as(usize, 1), t.screens.get(.primary).?.kitty_images.placements.count());
+}
+
+test "replay: metadata entries never evict a full image" {
+    const alloc = testing.allocator;
+    var owner = try Terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 5 });
+    defer owner.deinit(alloc);
+    var owner_stream = owner.vtStream();
+    defer owner_stream.deinit();
+    // Image 1 placed (full); images 2 and 3, newer and unplaced, go as
+    // metadata only.
+    owner_stream.nextSlice("\x1b_Ga=T,q=2,f=32,s=1,v=1,i=1,c=1,r=1,C=1;AAAAAA==\x1b\\");
+    owner_stream.nextSlice("\x1b_Ga=t,q=2,f=32,s=1,v=1,i=2;AAAAAA==\x1b\\");
+    owner_stream.nextSlice("\x1b_Ga=t,q=2,f=32,s=1,v=1,i=3;AAAAAA==\x1b\\");
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    _ = try encode(alloc, &owner, std.math.maxInt(u64), &out.writer);
+
+    // The viewer stores at most two images.
+    var viewer = try Terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 5 });
+    defer viewer.deinit(alloc);
+    viewer.setKittyGraphicsImageCountLimit(alloc, 2);
+    try apply(testing.io, alloc, &viewer, out.written());
+    const storage = &viewer.screens.get(.primary).?.kitty_images;
+    const one = storage.imageById(1) orelse return error.TestExpectedImage;
+    try testing.expect(!one.data.isPending());
+    try testing.expectEqual(@as(usize, 1), storage.placements.count());
+}
