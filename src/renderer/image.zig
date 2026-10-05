@@ -702,11 +702,16 @@ pub const State = struct {
         pending: Image.Pending,
     ) PrepImageError!void {
         // If this image exists and its generation is the same it is the
-        // identical image so we don't need to send it to the GPU.
+        // identical image so we don't need to send it to the GPU. An
+        // earlier update may have marked it for unload because the image
+        // was missing for a moment (a snapshot restore swaps in a terminal
+        // without images, then the one with the moved images, which keep
+        // their generations): take it back, or the next upload frees it.
         const gop = try self.images.getOrPut(alloc, id);
         if (gop.found_existing and
             gop.value_ptr.generation == generation)
         {
+            gop.value_ptr.image.cancelUnload();
             return;
         }
 
@@ -1017,6 +1022,19 @@ pub const Image = union(enum) {
             .ready => |t| .{ .unload_ready = t },
             .pending => |p| .{ .unload_pending = p },
             .replace => |r| .{ .unload_replace = r },
+        };
+    }
+
+    /// Undo markForUnload: the image is in use again.
+    pub fn cancelUnload(self: *Image) void {
+        self.* = switch (self.*) {
+            .unload_pending => |p| .{ .pending = p },
+            .unload_replace => |r| .{ .replace = r },
+            .unload_ready => |t| .{ .ready = t },
+            .pending,
+            .replace,
+            .ready,
+            => return,
         };
     }
 
