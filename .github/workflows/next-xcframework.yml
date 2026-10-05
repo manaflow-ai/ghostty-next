@@ -115,6 +115,7 @@ jobs:
             -Dtest-filter="ghostty.h SurfaceLocalHistoryResult" \
             -Dtest-filter="history digest" \
             -Dtest-filter="PageList prependHistoryFrom" \
+            -Dtest-filter="replay: " \
             --summary all
           # libghostty-vt patches (VT replay formatter, terminal and Kitty
           # graphics C API). These live in the lib-vt test modules.
@@ -152,6 +153,8 @@ jobs:
             -Dtest-filter="Terminal vt with tabstops" \
             -Dtest-filter="history digest" \
             -Dtest-filter="PageList prependHistoryFrom" \
+            -Dtest-filter="replay: " \
+            -Dtest-filter="kitty replay encode" \
             --summary all
 
       - name: Build and package
