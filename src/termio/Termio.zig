@@ -2904,6 +2904,59 @@ fn TestCutReplay(comptime cut: []const u8, comptime rest: []const u8) type {
     };
 }
 
+test "manual: an implicit-ID PNG survives two local-history resizes and a plain READY replay" {
+    const body = struct {
+        fn run(io: *Termio, sink: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            const alloc = testing.allocator;
+
+            // The dogfood case: about 35 rows, 400 short lines, then a PNG
+            // through a=T with a c/r size, no i, no q, one chunk.
+            try testing.expect(io.setGrid(110, 35, 1));
+            var owner: TestOwner = undefined;
+            try owner.init(io, 110, 35, null);
+            defer owner.deinit();
+            var buf: [32]u8 = undefined;
+            for (0..400) |i| testFeedBoth(io, &owner, try std.fmt.bufPrint(&buf, "line {d}\r\n", .{i}));
+            testFeedBoth(io, &owner, "\x1b_Gf=100,a=T,c=8,r=4;" ++ test_kitty_png ++ "\x1b\\");
+            testFeedBoth(io, &owner, "prompt$ ");
+            try testing.expectEqual(@as(usize, 1), io.terminal.screens.get(.primary).?.kitty_images.images.count());
+            const id = blk: {
+                var it = owner.t.screens.get(.primary).?.kitty_images.images.keyIterator();
+                break :blk it.next().?.*;
+            };
+
+            // Narrower and shorter, then wider and taller: a local READY
+            // each time, and the image stays where the owner has it.
+            const sizes = [_][2]u16{ .{ 80, 22 }, .{ 130, 40 } };
+            for (sizes) |size| {
+                const ready, const digest = try owner.resizeAndEncode(size[0], size[1]);
+                defer alloc.free(ready);
+                try testing.expectEqual(
+                    LocalHistoryResult.restored,
+                    try io.restoreSnapshotLocalHistory(ready, digest),
+                );
+                try testExpectSamePrimary(io, &owner);
+                try testExpectSameKitty(&io.terminal, &owner.t, .primary, &.{id});
+            }
+
+            // A plain READY restore (a reattach) and the owner's replay.
+            const ready = try owner.encodeReady(.ground);
+            defer alloc.free(ready);
+            var stream: std.Io.Writer.Allocating = .init(alloc);
+            defer stream.deinit();
+            const stats = try terminalpkg.kitty.graphics.replay.encode(alloc, &owner.t, std.math.maxInt(u64), &stream.writer);
+            try testing.expectEqual(@as(u64, 1), stats.images);
+            try testing.expectEqual(@as(u64, 1), stats.placements);
+            try io.restoreSnapshot(ready, .ready);
+            try io.applyKittyReplay(stream.written());
+            try testExpectSameKitty(&io.terminal, &owner.t, .primary, &.{id});
+            try sink.expect("");
+        }
+    }.run;
+    try testManualTermio(true, body);
+}
+
 test "manual: snapshot local history mismatch drops the Kitty images" {
     const body = struct {
         fn run(io: *Termio, sink: *TestSink, _: bool) !void {
