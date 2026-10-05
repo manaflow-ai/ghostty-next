@@ -1213,6 +1213,51 @@ test "kitty renderer ignores pending payloads and removes replaced placements" {
     try testing.expect(state.images.get(.{ .kitty = 1 }).?.image.isUnloading());
 }
 
+test "kitty renderer keeps an image that returns with the same generation" {
+    // A local-history snapshot restore swaps in a READY terminal without
+    // images, then the terminal with the moved images, which keep their
+    // generations (ImageStorage.moveFrom). A renderer update between the
+    // two swaps marks the texture for unload; the update after the second
+    // swap must take it back, or the next upload frees it and the image
+    // is gone until it changes again.
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try terminal.Terminal.init(io, alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+    t.width_px = 30;
+    t.height_px = 30;
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\x1b_Ga=T,q=2,f=32,s=1,v=1,i=1,c=1,r=1,C=1;AAAAAA==\x1b\\");
+
+    var empty = try terminal.Terminal.init(io, alloc, .{ .rows = 3, .cols = 3 });
+    defer empty.deinit(alloc);
+    empty.width_px = 30;
+    empty.height_px = 30;
+
+    var state: State = .empty;
+    defer state.deinit(alloc);
+    const cell: CellSize = .{ .width = 10, .height = 10 };
+
+    state.kittyUpdate(alloc, &t, cell);
+    const generation = state.images.get(.{ .kitty = 1 }).?.generation;
+    try testing.expect(!state.images.get(.{ .kitty = 1 }).?.image.isUnloading());
+
+    // First swap: no images.
+    state.kittyUpdate(alloc, &empty, cell);
+    try testing.expect(state.images.get(.{ .kitty = 1 }).?.image.isUnloading());
+
+    // Second swap: the same image, same generation, placed again.
+    t.screens.active.kitty_images.dirty = true;
+    state.kittyUpdate(alloc, &t, cell);
+    const entry = state.images.get(.{ .kitty = 1 }).?;
+    try testing.expectEqual(generation, entry.generation);
+    try testing.expect(!entry.image.isUnloading());
+    try testing.expectEqual(@as(usize, 1), state.kitty_placements.items.len);
+}
+
 test "kitty renderer uses the intersected source rectangle" {
     const testing = std.testing;
     const alloc = testing.allocator;
