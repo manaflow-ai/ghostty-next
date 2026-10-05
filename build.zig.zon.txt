@@ -1,7 +1,7 @@
 git+https://github.com/jacobsandlund/uucode#2826a37a4562284fdacd8fa029d49509cc9bffcd
 git+https://github.com/rockorager/libvaxis.git#c1e1f23be38951c425cdf31af455ba23ef178940
 git+https://github.com/zigimg/zigimg#d695acd97c02e57bb151e8f659d1280f5cd6ca70
-https://codeberg.org/vancluever/translate-c/archive/4e879eb8aba615de112eabd1231ea6e01920cead.tar.gz
+https://github.com/manaflow-ai/ghostty-next/releases/download/deps-mirror-2026-10-05/translate-c-4e879eb8aba615de112eabd1231ea6e01920cead.tar.gz
 https://deps.files.ghostty.org/DearBindings_v0.17_ImGui_v1.92.5-docking.tar.gz
 https://deps.files.ghostty.org/JetBrainsMono-2.304.tar.gz
 https://deps.files.ghostty.org/N-V-__8AAEbOfQBnvcFcCX2W5z7tDaN8vaNZGamEQtNOe0UI.tar.gz
@@ -34,6 +34,6 @@ https://deps.files.ghostty.org/zf-c35c421f84895193246db06c40683c1a30e616ef.tar.g
 https://deps.files.ghostty.org/zig_js-3c23860e47fdcdc5af805efb7fd0bdac5fd3e9bc.tar.gz
 https://deps.files.ghostty.org/zig_objc-c8de82ff80281215ad92900866dab7103a8efa8b.tar.gz
 https://deps.files.ghostty.org/zlib-1220fed0c74e1019b3ee29edae2051788b080cd96e90d56836eea857b0b966742efb.tar.gz
-https://github.com/jacobsandlund/uucode/archive/9d55524551411b493cca41ca06363625d90aff1e.tar.gz
-https://github.com/vancluever/arocc/archive/f97cdfc3779aec4b242299e2fc9a1c828c3547c6.tar.gz
-https://gitlab.freedesktop.org/api/v4/projects/890/packages/generic/fontconfig/2.18.3/fontconfig-2.18.3.tar.xz
+https://github.com/manaflow-ai/ghostty-next/releases/download/deps-mirror-2026-10-05/uucode-9d55524551411b493cca41ca06363625d90aff1e.tar.gz
+https://github.com/manaflow-ai/ghostty-next/releases/download/deps-mirror-2026-10-05/arocc-f97cdfc3779aec4b242299e2fc9a1c828c3547c6.tar.gz
+https://github.com/manaflow-ai/ghostty-next/releases/download/deps-mirror-2026-10-05/fontconfig-2.18.3.tar.xz
