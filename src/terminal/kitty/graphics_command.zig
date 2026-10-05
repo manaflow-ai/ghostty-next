@@ -255,6 +255,7 @@ pub const Parser = struct {
         return .{
             .control = control,
             .quiet = quiet,
+            .replay = try Command.Replay.parse(self.kv),
             .data = try self.decodeData(alloc),
         };
     }
@@ -318,7 +319,7 @@ pub const Parser = struct {
         // store the fields as u32 as they can be bitcast back later during
         // building of the higher-level command tree.
         const v: u32 = switch (self.kv_current) {
-            'z', 'H', 'V' => @bitCast(try std.fmt.parseInt(i32, self.kv_temp[0..self.kv_temp_len], 10)),
+            'z', 'H', 'V', Command.Replay.row_key => @bitCast(try std.fmt.parseInt(i32, self.kv_temp[0..self.kv_temp_len], 10)),
             else => try std.fmt.parseInt(u32, self.kv_temp[0..self.kv_temp_len], 10),
         };
         self.kv.put(self.kv_current, v);
@@ -383,7 +384,51 @@ pub const Response = struct {
 pub const Command = struct {
     control: Control,
     quiet: Quiet = .no,
+    replay: Replay = .{},
     data: []const u8 = "",
+
+    /// Private ghostty-next keys that only the Kitty replay stream
+    /// (graphics_replay.zig, ghostty_terminal_kitty_replay_encode) writes.
+    /// They let the stream recreate stored state without changing any
+    /// other terminal state (no cursor movement, no screen switch) and
+    /// keep the protocol rule that `i` and `I` are mutually exclusive.
+    /// Kitty clients never send them; the protocol defines no such keys.
+    ///
+    ///   E=<0|1>  target screen: 0 primary, 1 alternate (any action).
+    ///            A missing screen makes the command fail (no reply
+    ///            with q=2).
+    ///   J=<n>    transmit with i>0 and no I: store image number n.
+    ///   L=<n>    display: anchor column, 0-based (with B).
+    ///   B=<n>    display: anchor row relative to the top of the active
+    ///            area, 0-based and signed (negative is scrollback).
+    pub const Replay = struct {
+        pub const screen_key: u8 = 'E';
+        pub const number_key: u8 = 'J';
+        pub const col_key: u8 = 'L';
+        pub const row_key: u8 = 'B';
+
+        pub const Screen = enum { primary, alternate };
+
+        screen: ?Screen = null,
+        number: u32 = 0,
+        col: ?u32 = null,
+        row: ?i32 = null,
+
+        fn parse(kv: KV) error{InvalidFormat}!Replay {
+            var result: Replay = .{};
+            if (kv.get(screen_key)) |v| result.screen = switch (v) {
+                0 => .primary,
+                1 => .alternate,
+                else => return error.InvalidFormat,
+            };
+            if (kv.get(number_key)) |v| result.number = v;
+            if (kv.get(col_key)) |v| result.col = v;
+            if (kv.get(row_key)) |v| result.row = @bitCast(v);
+            // A position needs both coordinates.
+            if ((result.col == null) != (result.row == null)) return error.InvalidFormat;
+            return result;
+        }
+    };
 
     pub const Action = enum {
         query, // q

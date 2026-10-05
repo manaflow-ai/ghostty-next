@@ -1516,7 +1516,11 @@ typedef void (*ghostty_surface_snapshot_write_cb)(void*,
 // MANUAL modes, ghostty_surface_update_config applies new scrollback
 // limits to the live terminal too: the oldest complete history pages
 // are freed, never the screen or the Kitty images on it. Snapshot format version 1 carries no Kitty
-// images: the owner replays the images on screen after the snapshot.
+// images: a READY restore leaves no images. The owner then sends the
+// stream of ghostty_terminal_kitty_replay_encode (libghostty-vt), which
+// the caller passes to ghostty_surface_process_output after the restore
+// (after HISTORY for placements above the screen); it writes nothing to
+// io_write_cb.
 //
 // A restored synchronized update (mode 2026) gets the same safety
 // timeout as one the output starts.
@@ -1603,6 +1607,17 @@ typedef enum {
 // (the oldest pages are dropped). An allocation failure while copying
 // also drops the oldest pages instead of failing. The renderer can draw
 // the READY terminal without the older history for a moment.
+//
+// Kitty images on a match: the old terminal's stored images and
+// placements, which its reflow moved as a resize moves them, go to the
+// restored terminal for each screen it has (primary and alternate). A
+// pinned placement keeps its distance from the bottom row; one whose row
+// the restored terminal does not have is dropped. This surface's Kitty
+// limits apply after the move. On a mismatch the images are dropped with
+// the history. The owner sends the replay stream after either result
+// when its image generation (ghostty_terminal_kitty_image_generation)
+// differs from the one this viewer has; a replayed image replaces the
+// kept image with the same ID.
 //
 // Returns GHOSTTY_SURFACE_LOCAL_HISTORY_MISMATCH (1) for a mismatch, a
 // failed local reflow, or a main-thread change of the live terminal

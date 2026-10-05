@@ -19,6 +19,7 @@ const storage = @import("graphics_storage.zig");
 pub const animation = @import("graphics_animation.zig");
 pub const pixel = @import("graphics_pixel.zig");
 pub const unicode = @import("graphics_unicode.zig");
+pub const replay = @import("graphics_replay.zig");
 pub const Animation = animation.Animation;
 pub const Command = command.Command;
 pub const CommandParser = command.Parser;
