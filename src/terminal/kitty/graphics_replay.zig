@@ -19,13 +19,16 @@
 //!    viewer and sets the owner's implicit image-ID cursor. So images that
 //!    a local-history restore carried, or that the owner deleted, and
 //!    internal-ID placements cannot double.
-//! 2. Every stored image of the owner, oldest first (by generation, the
-//!    transmission order), with its image ID and image number: in full
-//!    when it is selected (below), otherwise metadata only (M=1: ID,
-//!    number, size, format, no pixels; the viewer stores a pending image
-//!    that holds no bytes and is not drawn). So the viewer has the same
-//!    image IDs, and a later numbered transmission (I=) picks the same
-//!    free ID on both sides.
+//! 2. Every stored image of the owner with its image ID and image number:
+//!    first the images that are not selected (below), metadata only (M=1:
+//!    ID, number, size, format, no pixels; the viewer stores a pending
+//!    image that holds no bytes and is not drawn), then the selected ones
+//!    in full, each group oldest first (by generation, the transmission
+//!    order). So the viewer has the same image IDs, a later numbered
+//!    transmission (I=) picks the same free ID on both sides, and a viewer
+//!    with a smaller image count limit evicts metadata entries (older,
+//!    without placements) before a full image. A number that a metadata
+//!    entry and a full image share finds the full image in the viewer.
 //! 3. The placements that show in the active areas of the selected
 //!    images: pinned and virtual ones first, then relative ones, parents
 //!    before children.
@@ -169,18 +172,24 @@ pub fn encode(
         }
     }
 
-    // 2. Images, oldest first.
-    var next = images.items.len;
-    while (next > 0) {
-        next -= 1;
-        const c = images.items[next];
-        const img = imageOf(t, c);
-        if (c.send) {
-            try writeImage(alloc, &out, screen_keys[c.screen], img);
-            stats.images += 1;
-            try selections[c.screen].sent.put(alloc, c.id, {});
-        } else {
-            try writeMetadata(&out, screen_keys[c.screen], img);
+    // 2. Images, oldest first: every metadata-only entry, then every full
+    // image. A viewer that stores fewer images than the owner evicts the
+    // oldest image without placements first, so a full image (newer than
+    // every metadata entry) never makes room for a metadata entry.
+    for ([_]bool{ false, true }) |full_pass| {
+        var next = images.items.len;
+        while (next > 0) {
+            next -= 1;
+            const c = images.items[next];
+            if (c.send != full_pass) continue;
+            const img = imageOf(t, c);
+            if (c.send) {
+                try writeImage(alloc, &out, screen_keys[c.screen], img);
+                stats.images += 1;
+                try selections[c.screen].sent.put(alloc, c.id, {});
+            } else {
+                try writeMetadata(&out, screen_keys[c.screen], img);
+            }
         }
     }
 
@@ -222,6 +231,34 @@ pub fn apply(
     t: *Terminal,
     bytes: []const u8,
 ) ApplyError!void {
+    // A chunked upload that the stream opened and did not finish (the
+    // stream ended after an m=1 chunk, or was cut) is destroyed, so a
+    // later chunk from program output cannot finish it with the trusted
+    // ID and number.
+    var touched: [screen_keys.len]bool = @splat(false);
+    const result = applyCommands(io, alloc, t, bytes, &touched);
+    var open = false;
+    for (screen_keys, touched) |key, was_touched| {
+        if (!was_touched) continue;
+        const screen = t.screens.get(key) orelse continue;
+        const storage = &screen.kitty_images;
+        if (storage.loading) |loading| {
+            loading.destroy(alloc);
+            storage.loading = null;
+            open = true;
+        }
+    }
+    try result;
+    if (open) return error.InvalidReplay;
+}
+
+fn applyCommands(
+    io: std.Io,
+    alloc: Allocator,
+    t: *Terminal,
+    bytes: []const u8,
+    touched: *[screen_keys.len]bool,
+) ApplyError!void {
     var invalid = false;
     var rest = bytes;
     while (rest.len > 0) {
@@ -244,7 +281,7 @@ pub fn apply(
             continue;
         };
         defer cmd.deinit(alloc);
-        if (!try applyCommand(io, alloc, t, &cmd)) invalid = true;
+        if (!try applyCommand(io, alloc, t, &cmd, touched)) invalid = true;
     }
     if (invalid) return error.InvalidReplay;
 }
@@ -255,11 +292,16 @@ fn applyCommand(
     alloc: Allocator,
     t: *Terminal,
     cmd: *command.Command,
+    touched: *[screen_keys.len]bool,
 ) Allocator.Error!bool {
     const key: ScreenSet.Key = if (cmd.replay.screen) |screen| switch (screen) {
         .primary => .primary,
         .alternate => .alternate,
     } else t.screens.active_key;
+    touched[switch (key) {
+        .primary => 0,
+        .alternate => 1,
+    }] = true;
 
     switch (cmd.control) {
         .delete => {
@@ -293,7 +335,10 @@ fn applyCommand(
             }
         },
 
-        .display => {},
+        // A replayed placement never moves the cursor (C=1 always).
+        .display => |*d| {
+            d.cursor_movement = .none;
+        },
 
         else => return false,
     }

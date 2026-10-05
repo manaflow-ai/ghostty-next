@@ -1663,10 +1663,12 @@ GHOSTTY_API int ghostty_surface_restore_snapshot_local_history(
 // stay as they are), writes nothing to io_write_cb, and changes only the
 // Kitty image storage: each screen's images and placements are replaced
 // by the owner's, under this surface's Kitty limits. Only transmit (inline
-// data), display and the replay reset run.
+// data), display and the replay reset run; a placement never moves the
+// cursor, and an upload the stream leaves unfinished is destroyed.
 //
 // Returns false for an EXEC surface, a NULL pointer with a non-zero
-// length, an allocation failure, or a stream with skipped parts (bytes
+// length, an allocation failure, an unfinished upload, or a stream with
+// skipped parts (bytes
 // outside Kitty APC commands, other commands, malformed or truncated
 // commands); the valid commands before and after those still ran.
 GHOSTTY_API bool ghostty_surface_apply_kitty_replay(ghostty_surface_t,

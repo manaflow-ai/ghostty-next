@@ -3146,11 +3146,16 @@ typedef struct {
  * 1. for each screen of this terminal, a reset that clears the viewer's
  *    images, placements and in-progress upload on that screen and sets
  *    this terminal's implicit image-ID cursor;
- * 2. every stored image, oldest first, with its image ID and image number:
- *    with its pixels when selected, otherwise metadata only (ID, number,
- *    size, format; the viewer stores an image without pixels that is not
- *    drawn), so both sides have the same image IDs and a later numbered
- *    transmission picks the same ID;
+ * 2. every stored image with its image ID and image number: first every
+ *    image that is not selected, as metadata only (ID, number, size,
+ *    format; the viewer stores an image without pixels that is not drawn),
+ *    then every selected image with its pixels, each group oldest first.
+ *    So both sides have the same image IDs and a later numbered
+ *    transmission picks the same ID, and a viewer that stores fewer
+ *    images than this terminal evicts metadata entries before any full
+ *    image (it evicts the oldest image without placements first). An
+ *    image number that a metadata entry and a full image share finds the
+ *    full image in the viewer;
  * 3. the placements that show of the selected images: a pinned placement
  *    whose rectangle reaches into the primary active area or the
  *    alternate screen (not one only in scrollback), every virtual (U=1)
@@ -3178,6 +3183,8 @@ typedef struct {
  *
  * Not sent: animation frames and state (only the root frame), the pixels
  * of images still loading (metadata only), a chunked upload in progress.
+ * An implicit-ID (no i=, no I=) chunked upload in progress here is not
+ * replayed, so implicit IDs assigned after it can differ in the viewer.
  * A pinned placement above the active area is placed only when the viewer
  * has that row (apply the stream after the history).
  *
@@ -3212,7 +3219,11 @@ GHOSTTY_API GhosttyResult ghostty_terminal_kitty_replay_encode(
  * safe, and nothing is written (every reply is dropped). Only transmit
  * (a=t, inline data), display (a=p) and the replay reset run; any other
  * command (also a=T), bytes outside `ESC _ G ... ESC \`, and malformed or
- * truncated commands are skipped. The terminal's own Kitty limits apply.
+ * truncated commands are skipped. A replayed placement never moves the
+ * cursor (C=1 is forced). A chunked upload that the stream opens and does
+ * not finish (the stream ends after an m=1 chunk or is cut) is destroyed,
+ * so program output can never finish it. The terminal's own Kitty limits
+ * apply.
  *
  * Apply it after the snapshot restore, before later output. The caller
  * must serialize this operation with all other access to the same
@@ -3222,8 +3233,8 @@ GHOSTTY_API GhosttyResult ghostty_terminal_kitty_replay_encode(
  * @param bytes The complete stream (may be NULL when len is 0)
  * @param len Length of the stream
  * @return GHOSTTY_SUCCESS; GHOSTTY_INVALID_VALUE for a NULL terminal or
- *         bytes, or a stream with skipped parts (the valid commands still
- *         ran); GHOSTTY_NO_VALUE when Kitty graphics are disabled at build
+ *         bytes, a stream with skipped parts, or an unfinished upload
+ *         (the valid commands still ran); GHOSTTY_NO_VALUE when Kitty graphics are disabled at build
  *         time; GHOSTTY_OUT_OF_MEMORY
  *
  * @ingroup terminal
