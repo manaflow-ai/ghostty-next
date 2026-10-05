@@ -583,7 +583,11 @@ pub fn add(
         // This is LGPL but since our source code is open source we are
         // in compliance with the LGPL since end users can modify this
         // build script to replace the bundled libintl with their own.
-        if (b.lazyDependency("libintl", .{
+        //
+        // Only link it when i18n is on. With -Di18n=false nothing references
+        // a libintl symbol (src/os/i18n.zig returns first), and a static LGPL
+        // link must stay out of App Store builds (GhosttyNextKit).
+        if (self.config.i18n) if (b.lazyDependency("libintl", .{
             .target = target,
             .optimize = optimize,
         })) |libintl_dep| {
