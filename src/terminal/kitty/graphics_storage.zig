@@ -521,6 +521,71 @@ pub const ImageStorage = struct {
         self.markMutated(io);
     }
 
+    /// Move every image and placement of `src`, the storage of
+    /// `src_screen`, into this storage of `dst_screen`, which has no
+    /// images. Used when a snapshot restore keeps the local history
+    /// (Termio.restoreSnapshotLocalHistory): both screens have the same
+    /// grid and their rows match from the bottom of the active area up,
+    /// so a pinned placement keeps its distance from the bottom row. A
+    /// placement whose row `dst_screen` does not have is removed (with
+    /// its relative children). This storage keeps its limits; the caller
+    /// applies its local limits after the move. `src` is left empty
+    /// except for an in-progress chunked load, which stays with it.
+    pub fn moveFrom(
+        self: *ImageStorage,
+        io: std.Io,
+        alloc: Allocator,
+        dst_screen: *terminal.Screen,
+        src: *ImageStorage,
+        src_screen: *terminal.Screen,
+    ) void {
+        assert(self.images.count() == 0);
+        assert(self.placements.count() == 0);
+
+        const src_bottom = src_screen.pages.total_rows - 1;
+        const dst_bottom = dst_screen.pages.total_rows - 1;
+        var it = src.placements.iterator();
+        while (it.next()) |entry| {
+            const old_pin = switch (entry.value_ptr.location) {
+                .pin => |pin| pin,
+                .virtual, .relative => continue,
+            };
+            const moved: ?*PageList.Pin = moved: {
+                if (old_pin.garbage) break :moved null;
+                const pt = src_screen.pages.pointFromPin(.screen, old_pin.*) orelse
+                    break :moved null;
+                const from_bottom = src_bottom - pt.screen.y;
+                if (from_bottom > dst_bottom) break :moved null;
+                const pin = dst_screen.pages.pin(.{ .screen = .{
+                    .x = pt.screen.x,
+                    .y = @intCast(dst_bottom - from_bottom),
+                } }) orelse break :moved null;
+                break :moved dst_screen.pages.trackPin(pin) catch null;
+            };
+            if (moved) |pin| {
+                src_screen.pages.untrackPin(old_pin);
+                entry.value_ptr.location = .{ .pin = pin };
+            } else {
+                src.removePlacement(src_screen, entry);
+            }
+        }
+        _ = src.removeOrphans(src_screen, null);
+
+        // Every pin is tracked by dst_screen now: hand over the maps.
+        self.placements.deinit(alloc);
+        self.images.deinit(alloc);
+        self.images = src.images;
+        self.placements = src.placements;
+        self.total_bytes = src.total_bytes;
+        self.next_image_id = src.next_image_id;
+        self.next_internal_placement_id = src.next_internal_placement_id;
+        src.images = .{};
+        src.placements = .{};
+        src.total_bytes = 0;
+        src.markMutated(io);
+        self.markMutated(io);
+    }
+
     /// How the row operation behind a scrollMarginsBegin/end pair moves
     /// tracked pins, which determines how much repositioning work the
     /// placements need.

@@ -3844,15 +3844,19 @@ pub fn decaln(self: *Terminal) !void {
 /// counter of ImageStorage.generation.
 pub fn kittyImageGeneration(self: *const Terminal) u64 {
     if (comptime !build_options.kitty_graphics) return 0;
-    // Red test commit: not implemented yet.
-    return self.kitty_image_generation_floor;
+    var result = self.kitty_image_generation_floor;
+    for (std.enums.values(ScreenSet.Key)) |key| {
+        const screen = self.screens.get(key) orelse continue;
+        result = @max(result, screen.kitty_images.generation);
+    }
+    return result;
 }
 
 /// Record that a screen's image storage goes away or starts over, so
 /// `kittyImageGeneration` changes even when no remaining storage did.
 fn bumpKittyImageGenerationFloor(self: *Terminal) void {
     if (comptime !build_options.kitty_graphics) return;
-    _ = self;
+    self.kitty_image_generation_floor = kitty.graphics.nextGeneration(self.io());
 }
 
 pub fn kittyGraphics(

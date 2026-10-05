@@ -88,12 +88,75 @@ pub fn encode(
     max_image_bytes: u64,
     writer: *std.Io.Writer,
 ) Error!Stats {
-    // Red test commit: not implemented yet.
-    _ = alloc;
-    _ = t;
-    _ = max_image_bytes;
-    _ = writer;
-    return .{};
+    var stats: Stats = .{};
+
+    // The replayed placements and the images they use, per screen.
+    var selections: [screen_keys.len]Selection = undefined;
+    var selected: usize = 0;
+    defer for (selections[0..selected]) |*s| s.deinit(alloc);
+    for (screen_keys, 0..) |key, i| {
+        selections[i] = try .init(alloc, t, key);
+        selected += 1;
+    }
+
+    // Candidate images, newest first.
+    var candidates: std.ArrayList(Candidate) = .empty;
+    defer {
+        for (candidates.items) |c| alloc.free(c.bytes);
+        candidates.deinit(alloc);
+    }
+    for (selections[0..selected], 0..) |*s, si| {
+        const storage = &(t.screens.get(screen_keys[si]) orelse continue).kitty_images;
+        var it = s.images.keyIterator();
+        while (it.next()) |id| {
+            const img = storage.images.get(id.*).?;
+            try candidates.append(alloc, .{
+                .screen = si,
+                .id = id.*,
+                .generation = img.generation,
+            });
+        }
+    }
+    std.mem.sort(Candidate, candidates.items, {}, Candidate.newerFirst);
+
+    // Take images newest first while they fit the cap.
+    var kept: usize = 0;
+    for (candidates.items) |*c| {
+        const storage = &t.screens.get(screen_keys[c.screen]).?.kitty_images;
+        const img = storage.images.get(c.id).?;
+        c.bytes = try encodeImage(alloc, screen_keys[c.screen], img);
+        if (c.bytes.len > max_image_bytes - stats.image_bytes) break;
+        stats.image_bytes += c.bytes.len;
+        kept += 1;
+    }
+    stats.skipped_images = candidates.items.len - kept;
+
+    // Images, oldest first.
+    var next = kept;
+    while (next > 0) {
+        next -= 1;
+        const c = candidates.items[next];
+        try writer.writeAll(c.bytes);
+        stats.bytes += c.bytes.len;
+        stats.images += 1;
+        try selections[c.screen].sent.put(alloc, c.id, {});
+    }
+
+    // Placements, parents first.
+    for (selections[0..selected], 0..) |*s, si| {
+        const storage = &(t.screens.get(screen_keys[si]) orelse continue).kitty_images;
+        for (s.placements.items) |entry| {
+            if (!s.sent.contains(entry.key.image_id)) continue;
+            const p = storage.placements.get(entry.key).?;
+            // A relative placement needs its parent written.
+            if (p.location == .relative and !s.written.contains(p.location.relative.parent)) continue;
+            stats.bytes += try writePlacement(writer, t, screen_keys[si], entry.key, p);
+            stats.placements += 1;
+            try s.written.put(alloc, entry.key, {});
+        }
+    }
+
+    return stats;
 }
 
 const screen_keys = [_]ScreenSet.Key{ .primary, .alternate };

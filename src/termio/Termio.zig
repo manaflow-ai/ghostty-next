@@ -1109,9 +1109,7 @@ pub fn restoreSnapshotLocalHistory(
         for (std.enums.values(ScreenKey)) |key| {
             const src = old.screens.get(key) orelse continue;
             const dst = full.screens.get(key) orelse continue;
-            // Red test commit: not implemented yet.
-            _ = src;
-            _ = dst;
+            dst.kitty_images.moveFrom(global.io(), self.alloc, dst, &src.kitty_images, src);
         }
     }
 
