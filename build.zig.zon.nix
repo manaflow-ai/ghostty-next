@@ -39,7 +39,7 @@
   packages = {
     "aro-0.0.0-JSD1Qk6lNgDdcDV4Vh7Sfy-34m2TluIVOdPzMmj_0BjX" = fetchzip {
       name = "aro";
-      url = "https://github.com/vancluever/arocc/archive/f97cdfc3779aec4b242299e2fc9a1c828c3547c6.tar.gz";
+      url = "https://github.com/manaflow-ai/ghostty-next/releases/download/deps-mirror-2026-10-05/arocc-f97cdfc3779aec4b242299e2fc9a1c828c3547c6.tar.gz";
       hash = "sha256-G/NNgk7KhJSLdy17ip1igIzpYhAUlzO7ef8r3/iCv/s=";
     };
     "N-V-__8AANT61wB--nJ95Gj_ctmzAtcjloZ__hRqNw5lC1Kr" = fetchurl {
@@ -53,7 +53,7 @@
     };
     "N-V-__8AAOgqbADacob-q2_DMQlmgaG4xKHRuW-6PJ4oJzMZ" = fetchzip {
       name = "fontconfig";
-      url = "https://gitlab.freedesktop.org/api/v4/projects/890/packages/generic/fontconfig/2.18.3/fontconfig-2.18.3.tar.xz";
+      url = "https://github.com/manaflow-ai/ghostty-next/releases/download/deps-mirror-2026-10-05/fontconfig-2.18.3.tar.xz";
       hash = "sha256-fAe2C2MdhrVb12K8LBaUPU/OyWpulHpMsnarkuLHWS4=";
     };
     "N-V-__8AAKLKpwC4H27Ps_0iL3bPkQb-z6ZVSrB-x_3EEkub" = fetchzip {
@@ -152,7 +152,7 @@
     };
     "translate_c-0.0.0-Q_BUWhVNBwDOEcIqub4VFPJPB6D9dgwzUMHTX5KWr8Xr" = fetchzip {
       name = "translate_c";
-      url = "https://codeberg.org/vancluever/translate-c/archive/4e879eb8aba615de112eabd1231ea6e01920cead.tar.gz";
+      url = "https://github.com/manaflow-ai/ghostty-next/releases/download/deps-mirror-2026-10-05/translate-c-4e879eb8aba615de112eabd1231ea6e01920cead.tar.gz";
       hash = "sha256-/sT7W8Kp+O11xaFBgpb/kDiWzfQ0MuXk/d/TuGq1Am8=";
     };
     "uucode-0.2.0-ZZjBPlK5VADj7fdoq7G8LIHzD5o6FSkcBXXrRWr4jnrA" = fetchZigGit {
@@ -163,7 +163,7 @@
     };
     "uucode-0.2.0-ZZjBPuuFVgC8YZ8eld4fOKsZANLIhTFMzULQxhkLi1C7" = fetchzip {
       name = "uucode";
-      url = "https://github.com/jacobsandlund/uucode/archive/9d55524551411b493cca41ca06363625d90aff1e.tar.gz";
+      url = "https://github.com/manaflow-ai/ghostty-next/releases/download/deps-mirror-2026-10-05/uucode-9d55524551411b493cca41ca06363625d90aff1e.tar.gz";
       hash = "sha256-KZbp/0dlJc5BdxM19ZOXH74WEjEilTvzie/BjT1aYvw=";
     };
     "vaxis-0.6.0-BWNV_MjFCQCs9UDHiRkrgw_ayeiPkzOe4xVbaAqXkUWW" = fetchZigGit {

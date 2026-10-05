@@ -5,7 +5,7 @@
     .paths = .{""},
     .dependencies = .{
         .fontconfig = .{
-            .url = "https://gitlab.freedesktop.org/api/v4/projects/890/packages/generic/fontconfig/2.18.3/fontconfig-2.18.3.tar.xz",
+            .url = "https://github.com/manaflow-ai/ghostty-next/releases/download/deps-mirror-2026-10-05/fontconfig-2.18.3.tar.xz",
             .hash = "N-V-__8AAOgqbADacob-q2_DMQlmgaG4xKHRuW-6PJ4oJzMZ",
             .lazy = true,
         },

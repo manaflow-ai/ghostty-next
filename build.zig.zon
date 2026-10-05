@@ -42,7 +42,7 @@
         },
         .uucode = .{
             // jacobsandlund/uucode
-            .url = "https://github.com/jacobsandlund/uucode/archive/9d55524551411b493cca41ca06363625d90aff1e.tar.gz",
+            .url = "https://github.com/manaflow-ai/ghostty-next/releases/download/deps-mirror-2026-10-05/uucode-9d55524551411b493cca41ca06363625d90aff1e.tar.gz",
             .hash = "uucode-0.2.0-ZZjBPuuFVgC8YZ8eld4fOKsZANLIhTFMzULQxhkLi1C7",
         },
         .zig_wayland = .{
