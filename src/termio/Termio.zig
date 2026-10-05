@@ -3283,6 +3283,99 @@ test "manual: snapshot local history restore keeps a cut history across a narrow
     try testManualTermio(true, body);
 }
 
+/// What a renderer frame between the two swaps of a local history
+/// restore could show (test hook state).
+var test_between_frame: struct {
+    seen: bool = false,
+    renderable: bool = true,
+} = .{};
+
+fn testRecordBetweenFrame(t: *Termio) void {
+    t.renderer_state.mutex.lockUncancelable(global.io());
+    defer t.renderer_state.mutex.unlock(global.io());
+    test_between_frame = .{ .seen = true, .renderable = t.renderer_state.renderable() };
+}
+
+test "manual: no frame shows the READY terminal between the two swaps" {
+    const body = struct {
+        fn run(io: *Termio, sink: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            const alloc = testing.allocator;
+
+            try testing.expect(io.setGrid(40, 10, 1));
+            var owner: TestOwner = undefined;
+            try owner.init(io, 40, 10, null);
+            defer owner.deinit();
+            try testFeedLines(io, &owner, 0, 600);
+            testKittyImages(TestBoth{ .io = io, .o = &owner }, 3);
+
+            // RESTORED: a frame forced between the swaps is held; the first
+            // frame after the restore has the images and the history.
+            {
+                const ready, const digest = try owner.resizeAndEncode(25, 10);
+                defer alloc.free(ready);
+                test_between_frame = .{};
+                test_between_swaps = &testRecordBetweenFrame;
+                defer test_between_swaps = null;
+                try testing.expectEqual(
+                    LocalHistoryResult.restored,
+                    try io.restoreSnapshotLocalHistory(ready, digest),
+                );
+                try testing.expect(test_between_frame.seen);
+                try testing.expect(!test_between_frame.renderable);
+                io.renderer_state.mutex.lockUncancelable(global.io());
+                const after = io.renderer_state.renderable();
+                io.renderer_state.mutex.unlock(global.io());
+                try testing.expect(after);
+                try testExpectSamePrimary(io, &owner);
+                try testExpectSameKitty(&io.terminal, &owner.t, .primary, &.{ 1, 10, 20 });
+            }
+
+            // MISMATCH (a change between the swaps): held between them,
+            // then the READY terminal alone is renderable.
+            {
+                const ready, const digest = try owner.resizeAndEncode(30, 10);
+                defer alloc.free(ready);
+                test_between_frame = .{};
+                test_between_swaps = &struct {
+                    fn hook(t: *Termio) void {
+                        testRecordBetweenFrame(t);
+                        t.scrollViewport(.{ .delta = -3 });
+                    }
+                }.hook;
+                defer test_between_swaps = null;
+                try testing.expectEqual(
+                    LocalHistoryResult.mismatch,
+                    try io.restoreSnapshotLocalHistory(ready, digest),
+                );
+                try testing.expect(!test_between_frame.renderable);
+                io.renderer_state.mutex.lockUncancelable(global.io());
+                const after = io.renderer_state.renderable();
+                io.renderer_state.mutex.unlock(global.io());
+                try testing.expect(after);
+                try testing.expectEqual(try testReadyHistoryRows(ready), testHistoryRows(&io.terminal));
+            }
+
+            // MISMATCH (a diverged history, no hook): renderable after.
+            {
+                owner.stream.nextSlice("a frame the viewer never got\r\n");
+                const ready, const digest = try owner.resizeAndEncode(25, 10);
+                defer alloc.free(ready);
+                try testing.expectEqual(
+                    LocalHistoryResult.mismatch,
+                    try io.restoreSnapshotLocalHistory(ready, digest),
+                );
+                io.renderer_state.mutex.lockUncancelable(global.io());
+                const after = io.renderer_state.renderable();
+                io.renderer_state.mutex.unlock(global.io());
+                try testing.expect(after);
+            }
+            try sink.expect("");
+        }
+    }.run;
+    try testManualTermio(true, body);
+}
+
 test "manual: snapshot local history restore does not undo a change between the swaps" {
     const body = struct {
         fn run(io: *Termio, _: *TestSink, _: bool) !void {

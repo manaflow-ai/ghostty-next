@@ -19,6 +19,7 @@ mutex: *std.Io.Mutex,
 /// The terminal data.
 terminal: *terminalpkg.Terminal,
 
+
 /// The terminal inspector, if any. This will be null while the inspector
 /// is not active and will be set when it is active.
 inspector: ?*Inspector = null,
@@ -232,4 +233,11 @@ test "preedit range shifts left at right edge" {
     try testing.expectEqual(@as(terminalpkg.size.CellCountInt, 8), range.start);
     try testing.expectEqual(@as(terminalpkg.size.CellCountInt, 9), range.end);
     try testing.expectEqual(@as(usize, 0), range.cp_offset);
+}
+
+/// Whether a renderer may build a frame from the terminal now. False
+/// while the program holds frames (synchronized output, mode 2026).
+/// Caller must hold `mutex`.
+pub fn renderable(self: *const State) bool {
+    return !self.terminal.modes.get(.synchronized_output);
 }
