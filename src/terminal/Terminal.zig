@@ -97,6 +97,12 @@ glyph_glossary: glyph.Glossary = .empty,
 /// nothing for it. Non-null means a client currently accepts drops.
 kitty_dnd: ?*kitty.dnd.State = null,
 
+/// A Kitty image generation stamp (kitty.graphics.nextGeneration) taken
+/// when a screen's image storage was removed or reset, so
+/// `kittyImageGeneration` never goes back to an older value. Zero until
+/// then.
+kitty_image_generation_floor: u64 = 0,
+
 /// These are just a packed set of flags we may set on the terminal.
 flags: packed struct {
     // This supports a Kitty extension where programs using semantic
@@ -3838,6 +3844,32 @@ pub fn kittyGraphics(
     return kitty.graphics.execute(io_impl, alloc, self, cmd);
 }
 
+/// The Kitty image generation of the whole terminal: a stamp that
+/// changes (strictly increases) whenever the stored image set or any
+/// placement of either screen changes: transmit, replace, place, delete
+/// and eviction, a screen's storage removal and a reset. Scrolling,
+/// resizing and plain output do not change it. Zero means no image
+/// storage was ever changed. The stamps come from the process-global
+/// counter of ImageStorage.generation, so values are meaningful only in
+/// this process. Callers serialize access with every other terminal
+/// access.
+pub fn kittyImageGeneration(self: *const Terminal) u64 {
+    if (comptime !build_options.kitty_graphics) return 0;
+    var result = self.kitty_image_generation_floor;
+    for (std.enums.values(ScreenSet.Key)) |key| {
+        const screen = self.screens.get(key) orelse continue;
+        result = @max(result, screen.kitty_images.generation);
+    }
+    return result;
+}
+
+/// Record that a screen's image storage goes away or starts over, so
+/// `kittyImageGeneration` changes even when no remaining storage did.
+fn bumpKittyImageGenerationFloor(self: *Terminal) void {
+    if (comptime !build_options.kitty_graphics) return;
+    self.kitty_image_generation_floor = kitty.graphics.nextGeneration(self.io());
+}
+
 /// Execute a Glyph Protocol APC command against this terminal's per-session
 /// glossary. The returned response, if any, should be sent back to the pty as
 /// a complete APC sequence via `Response.formatWire`.
@@ -4204,6 +4236,7 @@ pub fn resize(
         // expected it to be saved.
         if (self.screens.active_key != .alternate) {
             self.screens.remove(alloc, .alternate);
+            self.bumpKittyImageGenerationFloor();
             break :alt;
         }
 
@@ -4213,6 +4246,7 @@ pub fn resize(
         const charset = alt.charset;
         self.screens.switchTo(.primary);
         self.screens.remove(alloc, .alternate);
+        self.bumpKittyImageGenerationFloor();
 
         // Replace the alt screen with an empty version. If this fails
         // we just go back to the primary screen. Not great, but best
@@ -5020,6 +5054,7 @@ pub fn fullReset(self: *Terminal) void {
 
     // Reset primary screen
     self.screens.active.reset();
+    self.bumpKittyImageGenerationFloor();
 
     // Reset our basic state
     self.flags = .{

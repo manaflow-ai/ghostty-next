@@ -3,6 +3,9 @@ const assert = @import("../../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 
 const Terminal = @import("../Terminal.zig");
+const Screen = @import("../Screen.zig");
+const PageList = @import("../PageList.zig");
+const CellCountInt = @import("../size.zig").CellCountInt;
 const command = @import("graphics_command.zig");
 const image = @import("graphics_image.zig");
 const animation = @import("graphics_animation.zig");
@@ -28,6 +31,31 @@ pub fn execute(
     terminal: *Terminal,
     cmd: *const Command,
 ) ?Response {
+    // The replay stream's private screen key (Command.Replay) runs the
+    // command against the named screen without a screen switch: the
+    // active screen pointer is swapped for this call only. Nothing in a
+    // command's execution keeps the pointer.
+    if (cmd.replay.screen) |target| {
+        const key: @TypeOf(terminal.screens.active_key) = switch (target) {
+            .primary => .primary,
+            .alternate => .alternate,
+        };
+        if (key != terminal.screens.active_key) {
+            const screen = terminal.screens.get(key) orelse return null;
+            const saved_key = terminal.screens.active_key;
+            const saved = terminal.screens.active;
+            terminal.screens.active_key = key;
+            terminal.screens.active = screen;
+            defer {
+                terminal.screens.active_key = saved_key;
+                terminal.screens.active = saved;
+            }
+            var local = cmd.*;
+            local.replay.screen = null;
+            return execute(io, alloc, terminal, &local);
+        }
+    }
+
     // If storage is disabled then we disable the full protocol. This means
     // we don't even respond to queries so the terminal completely acts as
     // if this feature is not supported.
@@ -295,11 +323,20 @@ fn display(
         if (d.virtual_placement) break :location .virtual;
 
         // No parent reference (P=): the placement is pinned to the
-        // cursor. The cursor is always tracked but we don't want
-        // this pin to move with the cursor.
+        // cursor, or to the replay stream's private position
+        // (Command.Replay), which does not move the cursor. The cursor
+        // is always tracked but we don't want this pin to move with the
+        // cursor.
         if (d.parent_id == 0) {
+            const anchor = if (cmd.replay.row) |row|
+                replayPin(terminal.screens.active, row, cmd.replay.col.?) orelse {
+                    result.message = "EINVAL: replay position out of range";
+                    return result;
+                }
+            else
+                terminal.screens.active.cursor.page_pin.*;
             const pin = terminal.screens.active.pages.trackPin(
-                terminal.screens.active.cursor.page_pin.*,
+                anchor,
             ) catch |err| {
                 log.warn("failed to create pin for Kitty graphics err={}", .{err});
                 result.message = "EINVAL: failed to prepare terminal state";
@@ -1032,6 +1069,13 @@ fn loadAndAddImage(
     // after we've copied the image out.
     errdefer loading.deinit(alloc);
 
+    // The replay stream's private number key (Command.Replay) stores an
+    // image number with an explicit ID; `i` and `I` stay exclusive. Only
+    // the first chunk carries an ID, so continuation chunks never match.
+    if (cmd.replay.number > 0 and t.image_id > 0 and t.image_number == 0) {
+        loading.image.number = cmd.replay.number;
+    }
+
     // If the image has no ID, we assign one
     if (loading.image.id == 0) {
         if (loading.image.number > 0) {
@@ -1070,6 +1114,25 @@ fn loadAndAddImage(
     loading.deinit(alloc);
 
     return .{ .image = img, .display = display_ };
+}
+
+/// The pin for a replay position: `row` rows below the top of the active
+/// area (negative: above it, in scrollback) and column `col`. Null if the
+/// row does not exist or the column is outside the grid.
+fn replayPin(
+    screen: *const Screen,
+    row: i32,
+    col: u32,
+) ?PageList.Pin {
+    if (col >= screen.pages.cols) return null;
+    const x: CellCountInt = @intCast(col);
+    if (row >= 0) {
+        if (row >= screen.pages.rows) return null;
+        return screen.pages.pin(.{ .active = .{ .x = x, .y = @intCast(row) } });
+    }
+    var top = screen.pages.pin(.{ .active = .{ .x = x } }) orelse return null;
+    top = top.up(@intCast(-@as(i64, row))) orelse return null;
+    return top;
 }
 
 const EncodeableError = Image.Error || Allocator.Error;

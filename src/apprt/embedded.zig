@@ -2404,6 +2404,21 @@ pub const CAPI = struct {
         };
     }
 
+    /// Apply a Kitty image replay stream to a manual surface. See
+    /// ghostty.h.
+    export fn ghostty_surface_apply_kitty_replay(
+        surface: *Surface,
+        ptr: ?[*]const u8,
+        len: usize,
+    ) bool {
+        const bytes: []const u8 = if (len == 0) &.{} else (ptr orelse return false)[0..len];
+        surface.core_surface.io.applyKittyReplay(bytes) catch |err| {
+            log.warn("error applying Kitty replay err={}", .{err});
+            return false;
+        };
+        return true;
+    }
+
     /// The history digest of a manual surface's primary screen. See
     /// ghostty.h.
     export fn ghostty_surface_history_digest(

@@ -1516,7 +1516,11 @@ typedef void (*ghostty_surface_snapshot_write_cb)(void*,
 // MANUAL modes, ghostty_surface_update_config applies new scrollback
 // limits to the live terminal too: the oldest complete history pages
 // are freed, never the screen or the Kitty images on it. Snapshot format version 1 carries no Kitty
-// images: the owner replays the images on screen after the snapshot.
+// images: a READY restore leaves no images. The owner then sends the
+// stream of ghostty_terminal_kitty_replay_encode (libghostty-vt), which
+// the caller applies with ghostty_surface_apply_kitty_replay after the
+// restore (after HISTORY for placements above the screen). Never pass
+// that stream to ghostty_surface_process_output.
 //
 // A restored synchronized update (mode 2026) gets the same safety
 // timeout as one the output starts.
@@ -1604,6 +1608,25 @@ typedef enum {
 // also drops the oldest pages instead of failing. The renderer can draw
 // the READY terminal without the older history for a moment.
 //
+// Kitty images on a match: the old terminal's stored images and
+// placements, which its reflow moved as a resize moves them, go to the
+// restored terminal for each screen it has (primary and alternate). A
+// pinned placement keeps its distance from the bottom row; one whose row
+// the restored terminal does not have is dropped. This surface's Kitty
+// limits apply after the move. On a mismatch the images are dropped with
+// the history.
+//
+// When the owner sends the Kitty replay stream
+// (ghostty_terminal_kitty_replay_encode, applied with
+// ghostty_surface_apply_kitty_replay):
+// - after a plain READY restore or a local-history MISMATCH: always, when
+//   the owner has images;
+// - after a local-history match (RESTORED): not, unless this viewer's
+//   Kitty image limits are smaller than the owner's (then the kept images
+//   may differ from the owner's after eviction).
+// The stream first clears each screen's images, so a replay after a
+// RESTORED result never doubles an image or placement.
+//
 // Returns GHOSTTY_SURFACE_LOCAL_HISTORY_MISMATCH (1) for a mismatch, a
 // failed local reflow, or a main-thread change of the live terminal
 // between the two swaps (clear screen, reset, resize, set_grid, viewport
@@ -1629,6 +1652,28 @@ GHOSTTY_API int ghostty_surface_restore_snapshot_local_history(
     uint64_t expected_history_rows,
     const uint8_t* expected_digest,
     size_t digest_len);
+
+// Apply a Kitty image replay stream that the owning libghostty-vt
+// terminal wrote with ghostty_terminal_kitty_replay_encode (see
+// include/ghostty/vt/terminal.h for the stream). MANUAL modes only; call
+// it on the output lane (the thread that calls
+// ghostty_surface_process_output), after the snapshot restore and before
+// later output. It holds the terminal lock, uses its own trusted parser
+// (the output parser and an unfinished sequence that a READY restored
+// stay as they are), writes nothing to io_write_cb, and changes only the
+// Kitty image storage: each screen's images and placements are replaced
+// by the owner's, under this surface's Kitty limits. Only transmit (inline
+// data), display and the replay reset run; a placement never moves the
+// cursor, and an upload the stream leaves unfinished is destroyed.
+//
+// Returns false for an EXEC surface, a NULL pointer with a non-zero
+// length, an allocation failure, an unfinished upload, or a stream with
+// skipped parts (bytes
+// outside Kitty APC commands, other commands, malformed or truncated
+// commands); the valid commands before and after those still ran.
+GHOSTTY_API bool ghostty_surface_apply_kitty_replay(ghostty_surface_t,
+                                                    const uint8_t*,
+                                                    size_t);
 
 // The history digest of a MANUAL or MANUAL_MIRROR surface's primary
 // screen: the same value as ghostty_terminal_history_digest computes for
