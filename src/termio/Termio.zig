@@ -986,7 +986,9 @@ pub const LocalHistoryResult = enum {
 /// (ghostty_surface_restore_snapshot_local_history).
 ///
 /// The terminal lock is held only for two swaps, never for O(history)
-/// work:
+/// work. The renderer holds its frames (renderer.State.hold_frames) from
+/// the first swap until the result, so no frame shows the READY terminal
+/// without the local history and images:
 /// 1. Under the lock, swap in the READY terminal (as a READY restore
 ///    does). The old terminal is private to this call from then on:
 ///    output arrives on this thread only.
@@ -1045,6 +1047,10 @@ pub fn restoreSnapshotLocalHistory(
         defer self.renderer_state.mutex.unlock(global.io());
         self.prepareRestoredTerminalLocked(&new);
         old = self.swapTerminalLocked(new, decoded.continuation);
+        // No frame may show this READY terminal without the local history
+        // and images: frames are held until step 4 or the mismatch result
+        // (released by the defer below, in every outcome).
+        self.renderer_state.hold_frames = true;
         // The config is read under the lock; step 3 needs the limits.
         limit_bytes = self.config.scrollback_limit_bytes;
         limit_lines = self.config.scrollback_limit_lines;
@@ -1052,6 +1058,15 @@ pub fn restoreSnapshotLocalHistory(
     };
     defer old.deinit(self.alloc);
     defer self.renderer_wakeup.notify() catch {};
+    // Runs before the wakeup above: release the frame hold under the lock
+    // and redraw. On a mismatch the READY terminal alone is shown now.
+    defer {
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+        self.renderer_state.hold_frames = false;
+        self.terminal.flags.dirty.clear = true;
+        self.terminal_stream.handler.queueRender() catch {};
+    }
 
     // 2. Reflow and compare, without the lock. Whether the local limit
     // cut the history is decided before the reflow too: a wider resize

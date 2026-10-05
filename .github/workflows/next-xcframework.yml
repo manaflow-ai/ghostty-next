@@ -117,6 +117,7 @@ jobs:
             -Dtest-filter="PageList prependHistoryFrom" \
             -Dtest-filter="replay: " \
             -Dtest-filter="kitty renderer keeps an image" \
+            -Dtest-filter="no frame shows the READY terminal" \
             --summary all
           # libghostty-vt patches (VT replay formatter, terminal and Kitty
           # graphics C API). These live in the lib-vt test modules.
