@@ -7,14 +7,23 @@
 #
 # For each library in Info.plist AvailableLibraries, and for each
 # architecture in that library, runs `ar t` and counts members whose names
-# match gettext/libintl objects. Fails when a count is not zero, when a
-# slice has no archive, or when the xcframework lists no libraries.
+# match gettext/libintl objects, and counts the string GETTEXT_LOG_UNTRANSLATED.
+# Fails when a count is not zero, when a slice has no archive, or when the
+# xcframework lists no libraries.
 set -euo pipefail
 x="${1:?usage: check-no-gettext.sh <xcframework>}"
 plist="$x/Info.plist"
 [ -f "$plist" ] || { echo "::error::no Info.plist in $x"; exit 1; }
 
+# Substring match for names that only gettext uses.
 pattern='dcigettext|bindtextdom|loadmsgcat|textdomain|libintl|gettext|localealias|l10nflist|plural-exp|finddomain|explodename|intl-compat'
+# Exact member names of every object in pkg/libintl/build.zig (30 sources).
+# Some are generic (log, version, compat), so they match the full name only:
+# a substring match on "version" would flag regversion.o and Versions.o.
+members_re='^(bindtextdom|dcgettext|dcigettext|dcngettext|dgettext|dngettext|explodename|finddomain|gettext|hash-string|intl-compat|l10nflist|langprefs|loadmsgcat|localealias|log|ngettext|plural-exp|plural|setlocale|textdomain|version|compat|getlocalename_l-unsafe|localename|localename-environ|localename-unsafe|setlocale-lock|setlocale_null|setlocale_null-unlocked)\.o$'
+# dcigettext.c reads this environment variable; the cmux license checker
+# uses the same marker.
+marker='GETTEXT_LOG_UNTRANSLATED'
 work="$(mktemp -d)"; trap 'rm -rf "$work"' EXIT
 
 libs="$(python3 -c '
@@ -51,11 +60,17 @@ while IFS=$'\t' read -r ident path; do
       fail=1
       continue
     fi
-    count="$(printf '%s\n' "$members" | grep -Eci "$pattern" || true)"
-    echo "slice $ident [$arch] $path: members=$total gettext_libintl=$count"
+    matched="$(printf '%s\n' "$members" | grep -Ei -e "$pattern" -e "$members_re" || true)"
+    count="$(printf '%s' "$matched" | grep -c . || true)"
+    markers="$(strings -a "$thin" | grep -c "$marker" || true)"
+    echo "slice $ident [$arch] $path: members=$total gettext_libintl=$count $marker=$markers"
     if [ "$count" -ne 0 ]; then
-      printf '%s\n' "$members" | grep -Ei "$pattern" | sed 's/^/  /'
+      printf '%s\n' "$matched" | sed 's/^/  /'
       echo "::error::slice $ident [$arch] links GNU gettext/libintl ($count objects)"
+      fail=1
+    fi
+    if [ "$markers" -ne 0 ]; then
+      echo "::error::slice $ident [$arch] contains the string $marker ($markers times)"
       fail=1
     fi
   done
