@@ -1788,12 +1788,29 @@ pub fn kitty_replay_encode(
     };
     adapter.interface.flush() catch
         return if (adapter.invalid_write) .limit_exceeded else .io_error;
-    if (out_stats_) |out| out.* = .{
-        .images = stats.images,
-        .placements = stats.placements,
-        .skipped_images = stats.skipped_images,
-        .image_bytes = stats.image_bytes,
-        .bytes = stats.bytes,
+    if (out_stats_) |out| {
+        out.images = stats.images;
+        out.placements = stats.placements;
+        out.skipped_images = stats.skipped_images;
+        out.image_bytes = stats.image_bytes;
+        out.bytes = stats.bytes;
+    }
+    return .success;
+}
+
+/// C: ghostty_terminal_kitty_replay_apply. See kitty/graphics_replay.zig.
+pub fn kitty_replay_apply(
+    terminal_: Terminal,
+    ptr: ?[*]const u8,
+    len: usize,
+) callconv(lib.calling_conv) Result {
+    const wrapper = terminal_ orelse return .invalid_value;
+    const bytes: []const u8 = if (len == 0) &.{} else (ptr orelse return .invalid_value)[0..len];
+    if (comptime !build_options.kitty_graphics) return .no_value;
+    const t: *ZigTerminal = wrapper.terminal;
+    kitty_graphics_replay.apply(t.io(), t.gpa(), t, bytes) catch |err| return switch (err) {
+        error.OutOfMemory => .out_of_memory,
+        error.InvalidReplay => .invalid_value,
     };
     return .success;
 }
@@ -3148,7 +3165,36 @@ test "kitty replay encode and image generation" {
     try testing.expectEqual(@as(u64, 1), stats.images);
     try testing.expectEqual(@as(u64, 1), stats.placements);
     try testing.expectEqual(@as(u64, collect.bytes.items.len), stats.bytes);
-    try testing.expect(std.mem.startsWith(u8, collect.bytes.items, "\x1b_Ga=t,q=2,t=d,f=32,o=z,s=1,v=1,i=5,"));
+    try testing.expect(std.mem.startsWith(u8, collect.bytes.items, "\x1b_Ga=d,q=2,E=0,R="));
+    try testing.expect(std.mem.indexOf(u8, collect.bytes.items, "\x1b_Ga=t,q=2,t=d,f=32,o=z,s=1,v=1,i=5,") != null);
+    try testing.expectEqual(@as(usize, @sizeOf(KittyReplayStats)), stats.size);
+
+    // Applied to another terminal through the trusted path.
+    var viewer: Terminal = null;
+    try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &viewer, 10, 5));
+    defer free(viewer);
+    try testing.expectEqual(Result.success, kitty_replay_apply(viewer, collect.bytes.items.ptr, collect.bytes.items.len));
+    {
+        const storage = &viewer.?.terminal.screens.get(.primary).?.kitty_images;
+        try testing.expect(storage.imageById(5) != null);
+        try testing.expectEqual(@as(usize, 1), storage.placements.count());
+    }
+    try testing.expectEqual(Result.invalid_value, kitty_replay_apply(viewer, "junk", 4));
+    try testing.expectEqual(Result.invalid_value, kitty_replay_apply(null, null, 0));
+    try testing.expectEqual(Result.invalid_value, kitty_replay_apply(viewer, null, 3));
+
+    // Program output (vt_write) ignores the private keys: the number and
+    // the reset have no effect.
+    var plain: Terminal = null;
+    try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &plain, 10, 5));
+    defer free(plain);
+    vt_write(plain, collect.bytes.items.ptr, collect.bytes.items.len);
+    const forged = "\x1b_Ga=t,q=2,f=32,s=1,v=1,i=6,J=4,E=1;AAAAAA==\x1b\\";
+    vt_write(plain, forged.ptr, forged.len);
+    {
+        const storage = &plain.?.terminal.screens.get(.primary).?.kitty_images;
+        try testing.expectEqual(@as(u32, 0), storage.imageById(6).?.number);
+    }
 
     // Encoding changed nothing.
     var after: u64 = 0;

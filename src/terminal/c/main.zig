@@ -194,6 +194,7 @@ pub const terminal_resize = terminal.resize;
 pub const terminal_history_digest = terminal.history_digest_compute;
 pub const terminal_kitty_replay_encode = terminal.kitty_replay_encode;
 pub const terminal_kitty_image_generation = terminal.kitty_image_generation;
+pub const terminal_kitty_replay_apply = terminal.kitty_replay_apply;
 pub const terminal_clipboard_read_complete = terminal.clipboard_read_complete;
 pub const terminal_set = terminal.set;
 pub const terminal_vt_write = terminal.vt_write;

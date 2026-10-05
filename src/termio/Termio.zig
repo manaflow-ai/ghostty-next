@@ -1132,6 +1132,25 @@ pub fn restoreSnapshotLocalHistory(
     return .restored;
 }
 
+/// Apply a Kitty image replay stream (kitty.graphics.replay.apply) that
+/// the owner encoded after a snapshot. The caller contract is in
+/// ghostty.h (ghostty_surface_apply_kitty_replay). Holds the terminal
+/// lock; the stream parser and its continuation are not touched and
+/// nothing is written to the pty.
+pub fn applyKittyReplay(self: *Termio, bytes: []const u8) !void {
+    if (self.backend != .manual) return error.NotManual;
+    if (comptime !terminalpkg.options.kitty_graphics) return error.KittyGraphicsDisabled;
+    defer self.renderer_wakeup.notify() catch {};
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    defer {
+        var it = self.terminal.screens.all.iterator();
+        while (it.next()) |entry| entry.value.*.kitty_images.dirty = true;
+        self.terminal_stream.handler.queueRender() catch {};
+    }
+    try terminalpkg.kitty.graphics.replay.apply(global.io(), self.alloc, &self.terminal, bytes);
+}
+
 /// Tests only: called between the two swaps of a local history restore,
 /// in place of a main-thread action.
 var test_between_swaps: ?*const fn (*Termio) void = null;
@@ -2148,8 +2167,14 @@ const TestOwner = struct {
     /// The owner's resize, then its READY prefix and history digest, as
     /// the host encodes them under its lock at the resize.
     fn resizeAndEncode(self: *TestOwner, cols: u16, rows: u16) !struct { []u8, terminalpkg.history_digest.Digest } {
+        try self.t.resize(std.testing.allocator, .{ .cols = cols, .rows = rows });
+        return .{ try self.encodeReady(.ground), terminalpkg.history_digest.terminal(&self.t) };
+    }
+
+    /// The owner's READY prefix, with the given unfinished sequence as
+    /// its continuation.
+    fn encodeReady(self: *TestOwner, continuation: terminalpkg.snapshot.Continuation) ![]u8 {
         const alloc = std.testing.allocator;
-        try self.t.resize(alloc, .{ .cols = cols, .rows = rows });
         const snapshot = terminalpkg.snapshot;
         var out: std.Io.Writer.Allocating = .init(alloc);
         errdefer out.deinit();
@@ -2162,10 +2187,10 @@ const TestOwner = struct {
             if (self.t.screens.get(.alternate)) |alternate| {
                 try snapshot.screen.encode(alternate, .alternate, &stream);
             }
-            try snapshot.continuation.encode(.ground, &stream);
+            try snapshot.continuation.encode(continuation, &stream);
             try snapshot.checkpoint.encode(.ready, &stream);
         }
-        return .{ try out.toOwnedSlice(), terminalpkg.history_digest.terminal(&self.t) };
+        return try out.toOwnedSlice();
     }
 };
 
@@ -2593,7 +2618,17 @@ fn testExpectSameKitty(
     const alloc = testing.allocator;
     const got = &viewer.screens.get(key).?.kitty_images;
     const want = &owner.screens.get(key).?.kitty_images;
-    try testing.expectEqual(ids.len, got.images.count());
+    // The same image IDs; images outside `ids` have no pixels in the
+    // viewer (metadata only).
+    try testing.expectEqual(want.images.count(), got.images.count());
+    var all = want.images.iterator();
+    while (all.next()) |entry| {
+        const g = got.images.get(entry.key_ptr.*) orelse return error.TestExpectedImage;
+        try testing.expectEqual(entry.value_ptr.number, g.number);
+        if (std.mem.indexOfScalar(u32, ids, entry.key_ptr.*) == null) {
+            try testing.expect(g.data.isPending());
+        }
+    }
     for (ids) |id| {
         const w = want.images.get(id).?;
         const g = got.images.get(id) orelse return error.TestExpectedImage;
@@ -2644,10 +2679,11 @@ test "manual: Kitty replay after a READY restore recreates the owner's images" {
             try testing.expectEqual(@as(u64, 4), stats.placements);
             try testing.expectEqual(@as(u64, 0), stats.skipped_images);
             try testing.expectEqual(@as(u64, stream.written().len), stats.bytes);
-            try testing.expect(std.mem.indexOf(u8, stream.written(), "i=10") == null);
+            try testing.expect(std.mem.indexOf(u8, stream.written(), "s=50,v=76,i=10,") != null);
+            try testing.expect(std.mem.indexOf(u8, stream.written(), "o=z,s=50,v=76,i=10,") == null);
 
             try io.restoreSnapshot(ready, .ready);
-            io.processOutput(stream.written());
+            try io.applyKittyReplay(stream.written());
 
             try testExpectSameKitty(&io.terminal, &owner.t, .primary, &.{ 1, 20 });
             // The stream moved no cursor and wrote nothing to the pty.
@@ -2663,8 +2699,8 @@ test "manual: Kitty replay after a READY restore recreates the owner's images" {
             try testing.expectEqual(@as(u64, 1), cut.images);
             try testing.expectEqual(@as(u64, 1), cut.skipped_images);
             try testing.expectEqual(@as(u64, 2), cut.placements);
-            try testing.expect(std.mem.indexOf(u8, capped.written(), "i=1,") == null);
-            try testing.expect(std.mem.indexOf(u8, capped.written(), "i=20,") != null);
+            try testing.expect(std.mem.indexOf(u8, capped.written(), "o=z,s=50,v=76,i=1,") == null);
+            try testing.expect(std.mem.indexOf(u8, capped.written(), "o=z,s=2,v=2,i=20,") != null);
 
             var none: std.Io.Writer.Allocating = .init(alloc);
             defer none.deinit();
@@ -2672,7 +2708,7 @@ test "manual: Kitty replay after a READY restore recreates the owner's images" {
             try testing.expectEqual(@as(u64, 0), zero.images);
             try testing.expectEqual(@as(u64, 2), zero.skipped_images);
             try testing.expectEqual(@as(u64, 0), zero.placements);
-            try testing.expectEqual(@as(usize, 0), none.written().len);
+            try testing.expect(std.mem.indexOf(u8, none.written(), "o=z") == null);
         }
     }.run;
     try testManualTermio(true, body);
@@ -2712,10 +2748,124 @@ test "manual: snapshot local history restore keeps the Kitty images" {
             // Every image (the one in scrollback too) and every placement,
             // where the owner's own reflow put them.
             try testExpectSameKitty(&io.terminal, &owner.t, .primary, &.{ 1, 10, 20 });
+
+            // A replay after the carry replaces them: nothing doubles
+            // (the internal-ID placement included).
+            var stream: std.Io.Writer.Allocating = .init(alloc);
+            defer stream.deinit();
+            const stats = try terminalpkg.kitty.graphics.replay.encode(alloc, &owner.t, std.math.maxInt(u64), &stream.writer);
+            try io.applyKittyReplay(stream.written());
+            var sent: std.ArrayList(u32) = .empty;
+            defer sent.deinit(alloc);
+            const viewer_storage = &io.terminal.screens.get(.primary).?.kitty_images;
+            var images = viewer_storage.images.iterator();
+            while (images.next()) |entry| {
+                if (!entry.value_ptr.data.isPending()) try sent.append(alloc, entry.key_ptr.*);
+            }
+            try testing.expectEqual(stats.images, sent.items.len);
+            try testing.expectEqual(stats.placements, viewer_storage.placements.count());
+            try testExpectSameKitty(&io.terminal, &owner.t, .primary, sent.items);
             try sink.expect("");
         }
     }.run;
     try testManualTermio(true, body);
+}
+
+test "manual: program output cannot use the private replay keys" {
+    const body = struct {
+        fn run(io: *Termio, sink: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            try testing.expect(io.setGrid(40, 10, 1));
+
+            // J (number), E (screen) and M (metadata) are unknown keys in
+            // program output: an ordinary image on the active screen.
+            io.processOutput("\x1b_Ga=t,q=2,f=32,s=1,v=1,i=1,J=9,E=1,M=1;AAAAAA==\x1b\\");
+            // An unknown key value never makes an old command fail.
+            io.processOutput("\x1b_Ga=t,q=2,f=32,s=1,v=1,i=2,E=2;AAAAAA==\x1b\\");
+            // B/L do not move the placement: it goes to the cursor. L
+            // without B is not an error.
+            io.processOutput("\x1b[3;5H\x1b_Ga=p,q=2,i=1,p=7,B=8,L=0,c=1,r=1,C=1\x1b\\");
+            io.processOutput("\x1b_Ga=p,q=2,i=2,p=8,L=3,c=1,r=1,C=1\x1b\\");
+            // R is no reset in program output.
+            io.processOutput("\x1b_Ga=d,q=2,d=i,i=99,R=5\x1b\\");
+
+            const storage = &io.terminal.screens.get(.primary).?.kitty_images;
+            try testing.expectEqual(@as(usize, 2), storage.images.count());
+            const one = storage.imageById(1).?;
+            try testing.expectEqual(@as(u32, 0), one.number);
+            try testing.expect(!one.data.isPending());
+            try testing.expect(storage.imageById(2) != null);
+            try testing.expectEqual(@as(usize, 2), storage.placements.count());
+            var it = storage.placements.iterator();
+            while (it.next()) |entry| {
+                const pin = entry.value_ptr.location.pin;
+                const pt = io.terminal.screens.get(.primary).?.pages.pointFromPin(.active, pin.*).?;
+                try testing.expectEqual(@as(u32, 4), pt.active.x);
+                try testing.expectEqual(@as(u32, 2), pt.active.y);
+            }
+            try sink.expect("");
+        }
+    }.run;
+    try testManualTermio(true, body);
+}
+
+test "manual: Kitty replay after a READY cut inside a sequence" {
+    try testManualTermio(true, TestCutReplay("\x1b[3", "1mW").run);
+    // OSC 8 (a hyperlink): the terminal handles it without a surface
+    // message, which the test surface cannot take.
+    try testManualTermio(true, TestCutReplay("\x1b]8;;http://ex", "ample\x07W\x1b]8;;\x07").run);
+}
+
+/// A READY cut inside `cut` (with a pending wrap), the replay, then
+/// `rest` on both sides.
+fn TestCutReplay(comptime cut: []const u8, comptime rest: []const u8) type {
+    return struct {
+        fn run(io: *Termio, sink: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            const alloc = testing.allocator;
+            try testing.expect(io.setGrid(40, 10, 1));
+            var owner: TestOwner = undefined;
+            try owner.init(io, 40, 10, null);
+            defer owner.deinit();
+
+            // Images, then a full last column (pending wrap), then an
+            // unfinished sequence, all only on the owner.
+            const OwnerOnly = struct {
+                o: *TestOwner,
+                fn feed(self: @This(), bytes: []const u8) void {
+                    self.o.stream.nextSlice(bytes);
+                }
+            };
+            testKittyImages(OwnerOnly{ .o = &owner }, 2);
+            owner.stream.nextSlice("\x1b[10;40HZ");
+            try testing.expect(owner.t.screens.active.cursor.pending_wrap);
+            owner.stream.nextSlice(cut);
+
+            const ready = try owner.encodeReady(.{ .bytes = cut });
+            defer alloc.free(ready);
+            var stream: std.Io.Writer.Allocating = .init(alloc);
+            defer stream.deinit();
+            _ = try terminalpkg.kitty.graphics.replay.encode(alloc, &owner.t, std.math.maxInt(u64), &stream.writer);
+
+            try io.restoreSnapshot(ready, .ready);
+            try io.applyKittyReplay(stream.written());
+            try testing.expect(io.terminal.screens.active.cursor.pending_wrap);
+            // Two lines do not scroll PNG 10 off the screen: all three go.
+            try testExpectSameKitty(&io.terminal, &owner.t, .primary, &.{ 1, 10, 20 });
+
+            // The rest of the sequence finishes on both sides alike.
+            testFeedBoth(io, &owner, rest);
+            const want = try owner.t.plainString(alloc);
+            defer alloc.free(want);
+            const got = try io.terminal.plainString(alloc);
+            defer alloc.free(got);
+            try testing.expectEqualStrings(want, got);
+            try testing.expectEqual(owner.t.screens.active.cursor.x, io.terminal.screens.active.cursor.x);
+            try testing.expectEqual(owner.t.screens.active.cursor.y, io.terminal.screens.active.cursor.y);
+            try testing.expectEqualDeep(owner.t.screens.active.cursor.style, io.terminal.screens.active.cursor.style);
+            try sink.expect("");
+        }
+    };
 }
 
 test "manual: snapshot local history mismatch drops the Kitty images" {

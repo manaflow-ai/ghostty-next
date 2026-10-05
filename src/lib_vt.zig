@@ -323,6 +323,7 @@ comptime {
         @export(&c.terminal_history_digest, .{ .name = "ghostty_terminal_history_digest" });
         @export(&c.terminal_kitty_replay_encode, .{ .name = "ghostty_terminal_kitty_replay_encode" });
         @export(&c.terminal_kitty_image_generation, .{ .name = "ghostty_terminal_kitty_image_generation" });
+        @export(&c.terminal_kitty_replay_apply, .{ .name = "ghostty_terminal_kitty_replay_apply" });
         @export(&c.terminal_clipboard_read_complete, .{ .name = "ghostty_terminal_clipboard_read_complete" });
         @export(&c.terminal_set, .{ .name = "ghostty_terminal_set" });
         @export(&c.terminal_vt_write, .{ .name = "ghostty_terminal_vt_write" });

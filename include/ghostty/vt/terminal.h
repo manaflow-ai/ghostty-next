@@ -3110,84 +3110,90 @@ GHOSTTY_API GhosttyResult ghostty_terminal_history_digest(
  * What ghostty_terminal_kitty_replay_encode() wrote.
  *
  * This struct uses the sized-struct ABI pattern. Initialize with
- * GHOSTTY_INIT_SIZED(GhosttyKittyReplayStats).
+ * GHOSTTY_INIT_SIZED(GhosttyKittyReplayStats). The call does not change
+ * `size`.
  *
  * @ingroup terminal
  */
 typedef struct {
   /** Size of this struct in bytes. */
   size_t size;
-  /** Images transmitted. */
+  /** Images transmitted with their pixels. */
   uint64_t images;
   /** Placements written. */
   uint64_t placements;
-  /** Images that a replayed placement uses but the byte cap skipped. */
+  /** Images that a showing placement uses but the byte cap skipped. */
   uint64_t skipped_images;
-  /** Bytes of the image transmissions (what the cap limits). */
+  /** Decoded pixel bytes of the transmitted images (what the cap limits). */
   uint64_t image_bytes;
   /** All bytes written. */
   uint64_t bytes;
 } GhosttyKittyReplayStats;
 
 /**
- * Write a Kitty graphics byte stream that recreates the images and
- * placements on the terminal's active areas in a viewer that restored the
+ * Write a Kitty image replay stream: it recreates this terminal's images
+ * and the placements on its active areas in a viewer that restored the
  * same snapshot (snapshot format version 1 carries no images).
  *
- * The stream holds:
- * - every placement that shows on the primary screen's active area or on
- *   the alternate screen: a pinned placement whose rectangle reaches into
- *   the active area (not one only in scrollback), every virtual (U=1,
- *   unicode placeholder) placement, and every relative (P=) placement
- *   whose parent chain ends at one of these. A placement keeps its image
- *   ID, external placement ID (an internal p=0 ID is assigned again),
- *   z-index, cell offsets, source rectangle, columns and rows, parent and
- *   parent offsets;
- * - before them, every image those placements use, with the same image ID
- *   and image number. Images without such a placement are not sent.
+ * The viewer applies the stream ONLY with ghostty_terminal_kitty_replay_apply()
+ * (libghostty-vt) or ghostty_surface_apply_kitty_replay() (embedded
+ * surface). Never feed it to ghostty_terminal_vt_write() or
+ * ghostty_surface_process_output(): program output ignores the stream's
+ * private keys, and a restored READY can leave that parser inside a
+ * sequence.
  *
- * Every command is quiet (q=2): the viewer writes no reply. An image goes
- * inline (t=d), in chunks of at most 4096 base64 bytes, as zlib-compressed
- * (o=z) raw pixels: RGB as f=24, RGBA as f=32 (stored grayscale as f=32).
- * Stored images are always decoded pixels (PNG is decoded when it loads),
- * so no f=100 command occurs and the caller never compresses the stream.
- * Placements follow the images, parents before children.
+ * The stream holds, in order:
+ * 1. for each screen of this terminal, a reset that clears the viewer's
+ *    images, placements and in-progress upload on that screen and sets
+ *    this terminal's implicit image-ID cursor;
+ * 2. every stored image, oldest first, with its image ID and image number:
+ *    with its pixels when selected, otherwise metadata only (ID, number,
+ *    size, format; the viewer stores an image without pixels that is not
+ *    drawn), so both sides have the same image IDs and a later numbered
+ *    transmission picks the same ID;
+ * 3. the placements that show of the selected images: a pinned placement
+ *    whose rectangle reaches into the primary active area or the
+ *    alternate screen (not one only in scrollback), every virtual (U=1)
+ *    placement, and every relative (P=) placement whose parent chain ends
+ *    at one of these. A relative placement whose parent has an internal
+ *    (p=0) ID goes only when that parent image has exactly one placement.
+ *    A placement keeps its image ID, external placement ID (an internal ID
+ *    is assigned again), z-index, cell offsets, source rectangle, columns
+ *    and rows, parent and parent offsets.
  *
- * The stream uses private ghostty-next keys that no Kitty client sends:
- * E=0|1 (target screen, primary or alternate, on every command), J=n
- * (image number of an image sent with i=), and B=row,L=col (a pinned
- * placement's row relative to the top of the active area, negative in
- * scrollback, and its column). So the stream moves no cursor, switches no
- * screen and changes nothing but the image storage of the viewer. Only a
- * ghostty-next terminal understands it.
+ * Selected images are those the showing placements use. They are taken
+ * newest first while their decoded pixel bytes (RGB or RGBA; grayscale
+ * counts as RGBA) fit `max_image_bytes` (UINT64_MAX: no cap). The first
+ * that does not fit and every older one go as metadata only, without
+ * their placements, and are counted in `skipped_images`.
  *
- * Byte cap: images are taken newest first (by transmission order) while
- * their transmission bytes fit `max_image_bytes` (UINT64_MAX: no cap). The
- * first image that does not fit and every older one are skipped, with
- * their placements, and counted in `skipped_images`. Kept images are
- * written oldest first, so the viewer's image ages (eviction order, the
- * newest image for an image number) follow this terminal's.
+ * Every command is quiet (q=2). Pixels go inline as zlib (o=z), RGB as
+ * f=24 and RGBA as f=32, in chunks of at most 4096 base64 bytes. Stored
+ * images are decoded pixels (PNG is decoded when it loads), so no f=100
+ * command occurs and the caller never compresses the stream. Private
+ * ghostty-next keys (E screen, J image number, B/L row and column, R
+ * reset, M metadata) mean that applying it moves no cursor, switches no
+ * screen and changes only the image storage. Only the apply functions
+ * read them.
  *
- * Not sent: animation frames and animation state (only the root frame),
- * images whose data is still loading, a chunked transmission in progress.
+ * Not sent: animation frames and state (only the root frame), the pixels
+ * of images still loading (metadata only), a chunked upload in progress.
  * A pinned placement above the active area is placed only when the viewer
- * has that row (send the stream after the history).
+ * has that row (apply the stream after the history).
  *
- * The viewer feeds the stream to its parser while the parser is in the
- * ground state, for example right after a snapshot restore whose
- * continuation is ground, before other output.
- *
- * Encoding only reads the terminal. The caller must serialize this
- * operation with all other access to the same terminal.
+ * Encoding only reads the terminal and holds one compressed image at a
+ * time. The caller must serialize this operation with all other access
+ * to the same terminal.
  *
  * @param terminal The terminal handle
- * @param max_image_bytes Cap for the image transmission bytes
+ * @param max_image_bytes Cap for the decoded pixel bytes of the images
  * @param writer Receives the stream, in pieces
  * @param[out] out_stats What was written (may be NULL)
- * @return GHOSTTY_SUCCESS, GHOSTTY_INVALID_VALUE for a NULL terminal or
- *         writer callback or a too small stats size, GHOSTTY_NO_VALUE when
- *         Kitty graphics are disabled at build time, GHOSTTY_OUT_OF_MEMORY,
- *         GHOSTTY_IO_ERROR when the writer fails
+ * @return GHOSTTY_SUCCESS; GHOSTTY_INVALID_VALUE for a NULL terminal or
+ *         writer callback or a too small stats size; GHOSTTY_NO_VALUE when
+ *         Kitty graphics are disabled at build time; GHOSTTY_OUT_OF_MEMORY;
+ *         GHOSTTY_IO_ERROR when the writer callback fails;
+ *         GHOSTTY_LIMIT_EXCEEDED when the written byte count overflows
  *
  * @ingroup terminal
  */
@@ -3198,13 +3204,44 @@ GHOSTTY_API GhosttyResult ghostty_terminal_kitty_replay_encode(
     GhosttyKittyReplayStats* out_stats);
 
 /**
+ * Apply a complete stream of ghostty_terminal_kitty_replay_encode().
+ *
+ * This is the only trusted path for the stream's private keys. Each
+ * command is parsed by its own parser: the terminal's VT parser state is
+ * not used or changed, so a restored READY with an unfinished sequence is
+ * safe, and nothing is written (every reply is dropped). Only transmit
+ * (a=t, inline data), display (a=p) and the replay reset run; any other
+ * command (also a=T), bytes outside `ESC _ G ... ESC \`, and malformed or
+ * truncated commands are skipped. The terminal's own Kitty limits apply.
+ *
+ * Apply it after the snapshot restore, before later output. The caller
+ * must serialize this operation with all other access to the same
+ * terminal.
+ *
+ * @param terminal The terminal handle
+ * @param bytes The complete stream (may be NULL when len is 0)
+ * @param len Length of the stream
+ * @return GHOSTTY_SUCCESS; GHOSTTY_INVALID_VALUE for a NULL terminal or
+ *         bytes, or a stream with skipped parts (the valid commands still
+ *         ran); GHOSTTY_NO_VALUE when Kitty graphics are disabled at build
+ *         time; GHOSTTY_OUT_OF_MEMORY
+ *
+ * @ingroup terminal
+ */
+GHOSTTY_API GhosttyResult ghostty_terminal_kitty_replay_apply(
+    GhosttyTerminal terminal,
+    const uint8_t* bytes,
+    size_t len);
+
+/**
  * The terminal's Kitty image generation: a value that changes (strictly
  * increases) whenever the stored images or placements of either screen
  * change: transmit, replace, place, delete, eviction, a screen's storage
  * removal and a reset. Scrolling, resizing and plain output do not change
- * it. Zero means the image storage never changed. A host compares it with
- * the value a viewer has to decide whether to send
- * ghostty_terminal_kitty_replay_encode() again.
+ * it. Zero means the image storage never changed. Values come from a
+ * process-wide counter: compare them only within this process. The
+ * caller must serialize this operation with all other access to the same
+ * terminal.
  *
  * @param terminal The terminal handle
  * @param[out] out_generation The generation

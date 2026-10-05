@@ -440,6 +440,21 @@ fn rowOffset(screen: *const Screen, top: PageList.Pin, pin: PageList.Pin) i64 {
     return @as(i64, @intCast(pin_y)) - @as(i64, @intCast(top_y));
 }
 
+pub const ApplyError = Allocator.Error || error{InvalidReplay};
+
+/// Red test commit: not implemented yet.
+pub fn apply(
+    io: std.Io,
+    alloc: Allocator,
+    t: *Terminal,
+    bytes: []const u8,
+) ApplyError!void {
+    _ = io;
+    _ = alloc;
+    _ = t;
+    _ = bytes;
+}
+
 const testing = std.testing;
 
 test "replay: the Kitty image generation follows image changes only" {
@@ -512,7 +527,7 @@ test "replay: both screens round trip without moving the cursor" {
     defer viewer_stream.deinit();
     viewer_stream.nextSlice("\x1b[5;1H\r\n\x1b[?1049h\x1b[2;3H");
     const cursor = viewer.screens.active.cursor;
-    viewer_stream.nextSlice(out.written());
+    try apply(testing.io, alloc, &viewer, out.written());
     try testing.expectEqual(cursor.x, viewer.screens.active.cursor.x);
     try testing.expectEqual(cursor.y, viewer.screens.active.cursor.y);
     try testing.expectEqual(ScreenSet.Key.alternate, viewer.screens.active_key);
@@ -530,7 +545,7 @@ test "replay: both screens round trip without moving the cursor" {
         try testing.expectEqual(want.placements.count(), got.placements.count());
         var pit = want.placements.iterator();
         while (pit.next()) |entry| {
-            const g = got.placements.get(entry.key_ptr.*) orelse continue;
+            const g = got.placements.get(entry.key_ptr.*) orelse return error.TestExpectedPlacement;
             const want_pt = owner.screens.get(key).?.pages.pointFromPin(.screen, entry.value_ptr.location.pin.*).?;
             const got_pt = viewer.screens.get(key).?.pages.pointFromPin(.screen, g.location.pin.*).?;
             try testing.expectEqual(want_pt.screen, got_pt.screen);
@@ -539,4 +554,104 @@ test "replay: both screens round trip without moving the cursor" {
     }
     // The alternate image kept its number.
     try testing.expectEqual(@as(u32, 4), viewer.screens.get(.alternate).?.kitty_images.imageById(1).?.number);
+}
+
+test "replay: program output ignores the private keys" {
+    const alloc = testing.allocator;
+    var t = try Terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+
+    // Enter and leave the alternate screen so it exists.
+    stream.nextSlice("\x1b[?1049h\x1b[?1049l");
+    stream.nextSlice("\x1b_Ga=t,q=2,f=32,s=1,v=1,i=1,J=9,E=1,M=1;AAAAAA==\x1b\\");
+    stream.nextSlice("\x1b_Ga=t,q=2,f=32,s=1,v=1,i=2,E=2;AAAAAA==\x1b\\");
+    stream.nextSlice("\x1b[2;3H\x1b_Ga=p,q=2,i=1,p=4,B=3,L=0,E=1,c=1,r=1,C=1\x1b\\");
+    stream.nextSlice("\x1b_Ga=p,q=2,i=2,p=5,L=1,c=1,r=1,C=1\x1b\\");
+    stream.nextSlice("\x1b_Ga=d,q=2,d=i,i=99,R=5\x1b\\");
+
+    const primary = &t.screens.get(.primary).?.kitty_images;
+    try testing.expectEqual(@as(usize, 2), primary.images.count());
+    try testing.expectEqual(@as(u32, 0), primary.imageById(1).?.number);
+    try testing.expect(!primary.imageById(1).?.data.isPending());
+    try testing.expectEqual(@as(usize, 2), primary.placements.count());
+    var it = primary.placements.iterator();
+    while (it.next()) |entry| {
+        const pt = t.screens.get(.primary).?.pages.pointFromPin(.active, entry.value_ptr.location.pin.*).?;
+        try testing.expectEqual(@as(u32, 2), pt.active.x);
+        try testing.expectEqual(@as(u32, 1), pt.active.y);
+    }
+    try testing.expectEqual(@as(usize, 0), t.screens.get(.alternate).?.kitty_images.images.count());
+}
+
+test "replay: apply skips foreign commands and replaces the storage" {
+    const alloc = testing.allocator;
+    var t = try Terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    // Existing images and an internal-ID placement.
+    stream.nextSlice("\x1b_Ga=T,q=2,f=32,s=1,v=1,i=7,c=1,r=1,C=1;AAAAAA==\x1b\\");
+
+    const bytes = "\x1b_Ga=d,q=2,E=0,R=40\x1b\\" ++
+        "\x1b_Ga=T,q=2,f=32,s=1,v=1,i=8,E=0;AAAAAA==\x1b\\" ++ // a=T is refused
+        "\x1b_Ga=t,q=2,t=f,f=32,s=1,v=1,i=9,E=0;L3RtcC94\x1b\\" ++ // file medium is refused
+        "\x1b_Ga=t,q=2,f=32,s=1,v=1,i=3,E=0;AAAAAA==\x1b\\" ++
+        "\x1b_Ga=p,q=2,i=3,E=0,B=1,L=2,c=1,r=1,C=1\x1b\\";
+    try testing.expectError(error.InvalidReplay, apply(testing.io, alloc, &t, bytes));
+    try testing.expectError(error.InvalidReplay, apply(testing.io, alloc, &t, "junk"));
+
+    const storage = &t.screens.get(.primary).?.kitty_images;
+    try testing.expectEqual(@as(usize, 1), storage.images.count());
+    try testing.expect(storage.imageById(3) != null);
+    try testing.expectEqual(@as(usize, 1), storage.placements.count());
+    try testing.expectEqual(@as(u32, 40), storage.imageIdCursor());
+    var it = storage.placements.iterator();
+    const pin = it.next().?.value_ptr.location.pin;
+    const pt = t.screens.get(.primary).?.pages.pointFromPin(.active, pin.*).?;
+    try testing.expectEqual(@as(u32, 2), pt.active.x);
+    try testing.expectEqual(@as(u32, 1), pt.active.y);
+    // The cursor did not move.
+    try testing.expectEqual(@as(@TypeOf(t.screens.active.cursor.x), 0), t.screens.active.cursor.x);
+    try testing.expectEqual(@as(@TypeOf(t.screens.active.cursor.y), 0), t.screens.active.cursor.y);
+}
+
+test "replay: image IDs stay equal for later transmissions" {
+    const alloc = testing.allocator;
+    var owner = try Terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 5 });
+    defer owner.deinit(alloc);
+    var owner_stream = owner.vtStream();
+    defer owner_stream.deinit();
+    // ID 1 placed, ID 2 never placed (not sent with pixels), and an
+    // implicit ID.
+    owner_stream.nextSlice("\x1b_Ga=T,q=2,f=32,s=1,v=1,i=1,c=1,r=1,C=1;AAAAAA==\x1b\\");
+    owner_stream.nextSlice("\x1b_Ga=t,q=2,f=32,s=1,v=1,i=2;AAAAAA==\x1b\\");
+    owner_stream.nextSlice("\x1b_Ga=t,q=2,f=32,s=1,v=1;AAAAAA==\x1b\\");
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    const stats = try encode(alloc, &owner, std.math.maxInt(u64), &out.writer);
+    try testing.expectEqual(@as(u64, 1), stats.images);
+
+    var viewer = try Terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 5 });
+    defer viewer.deinit(alloc);
+    var viewer_stream = viewer.vtStream();
+    defer viewer_stream.deinit();
+    try apply(testing.io, alloc, &viewer, out.written());
+
+    // A numbered and an implicit transmission pick the same IDs.
+    const later = "\x1b_Ga=t,q=2,f=32,s=1,v=1,I=5;AAAAAA==\x1b\\" ++
+        "\x1b_Ga=t,q=2,f=32,s=1,v=1;AAAAAA==\x1b\\";
+    owner_stream.nextSlice(later);
+    viewer_stream.nextSlice(later);
+    const want = &owner.screens.get(.primary).?.kitty_images;
+    const got = &viewer.screens.get(.primary).?.kitty_images;
+    try testing.expectEqual(want.images.count(), got.images.count());
+    var it = want.images.iterator();
+    while (it.next()) |entry| {
+        const g = got.images.get(entry.key_ptr.*) orelse return error.TestExpectedImage;
+        try testing.expectEqual(entry.value_ptr.number, g.number);
+    }
+    try testing.expectEqual(@as(u32, 3), want.imageByNumber(5).?.id);
 }
