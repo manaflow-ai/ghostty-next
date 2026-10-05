@@ -169,6 +169,10 @@ jobs:
           cat "$RUNNER_TEMP/out/SHA256SUMS"
           cat "$RUNNER_TEMP/out/manifest.json"
 
+      # License gate: no GNU gettext/libintl (LGPL-2.1) objects in any slice.
+      - name: No gettext in Apple slices
+        run: next/check-no-gettext.sh macos/GhosttyNextKit.xcframework
+
       - name: Link and run smoke
         run: |
           set -euo pipefail
