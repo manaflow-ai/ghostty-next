@@ -20,6 +20,10 @@ class ReleasePlanTests(unittest.TestCase):
         self.git("config", "user.name", "t")
         self.git("config", "tag.gpgSign", "false")
         self.git("config", "commit.gpgSign", "false")
+        # No detached auto gc or maintenance: it can still write into .git
+        # while tearDown removes the directory (ENOTEMPTY on CI).
+        self.git("config", "gc.auto", "0")
+        self.git("config", "maintenance.auto", "false")
         self.commit("src/a.zig", "one")
         self.base = self.head()
         self.git("tag", f"xcframework-{self.base}-ios-v5")
