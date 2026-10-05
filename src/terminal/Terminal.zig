@@ -3835,13 +3835,24 @@ pub fn decaln(self: *Terminal) !void {
 /// If an error occurs, the caller should response to the pty that a
 /// an error occurred otherwise the behavior of the graphics protocol is
 /// undefined.
+pub fn kittyGraphics(
+    self: *Terminal,
+    io_impl: std.Io,
+    alloc: Allocator,
+    cmd: *kitty.graphics.Command,
+) ?kitty.graphics.Response {
+    return kitty.graphics.execute(io_impl, alloc, self, cmd);
+}
+
 /// The Kitty image generation of the whole terminal: a stamp that
 /// changes (strictly increases) whenever the stored image set or any
 /// placement of either screen changes: transmit, replace, place, delete
 /// and eviction, a screen's storage removal and a reset. Scrolling,
 /// resizing and plain output do not change it. Zero means no image
 /// storage was ever changed. The stamps come from the process-global
-/// counter of ImageStorage.generation.
+/// counter of ImageStorage.generation, so values are meaningful only in
+/// this process. Callers serialize access with every other terminal
+/// access.
 pub fn kittyImageGeneration(self: *const Terminal) u64 {
     if (comptime !build_options.kitty_graphics) return 0;
     var result = self.kitty_image_generation_floor;
@@ -3857,15 +3868,6 @@ pub fn kittyImageGeneration(self: *const Terminal) u64 {
 fn bumpKittyImageGenerationFloor(self: *Terminal) void {
     if (comptime !build_options.kitty_graphics) return;
     self.kitty_image_generation_floor = kitty.graphics.nextGeneration(self.io());
-}
-
-pub fn kittyGraphics(
-    self: *Terminal,
-    io_impl: std.Io,
-    alloc: Allocator,
-    cmd: *kitty.graphics.Command,
-) ?kitty.graphics.Response {
-    return kitty.graphics.execute(io_impl, alloc, self, cmd);
 }
 
 /// Execute a Glyph Protocol APC command against this terminal's per-session

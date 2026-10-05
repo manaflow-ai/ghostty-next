@@ -81,6 +81,11 @@ pub const Parser = struct {
     /// Internal state for parsing.
     state: State,
 
+    /// Read the private replay keys (Command.Replay). Only the trusted
+    /// replay entry points (graphics_replay.apply) set this; for program
+    /// output the keys stay unknown keys and are ignored.
+    trusted: bool = false,
+
     const State = enum {
         /// Parsing k/v pairs. The "ignore" variants are in that state
         /// but ignore any data because we know they're invalid.
@@ -255,7 +260,7 @@ pub const Parser = struct {
         return .{
             .control = control,
             .quiet = quiet,
-            .replay = try Command.Replay.parse(self.kv),
+            .replay = if (self.trusted) try Command.Replay.parse(self.kv) else .{},
             .data = try self.decodeData(alloc),
         };
     }
@@ -318,10 +323,14 @@ pub const Parser = struct {
         // Handle integer fields, parsing signed fields accordingly. We still
         // store the fields as u32 as they can be bitcast back later during
         // building of the higher-level command tree.
-        const v: u32 = switch (self.kv_current) {
-            'z', 'H', 'V', Command.Replay.row_key => @bitCast(try std.fmt.parseInt(i32, self.kv_temp[0..self.kv_temp_len], 10)),
-            else => try std.fmt.parseInt(u32, self.kv_temp[0..self.kv_temp_len], 10),
+        const signed = switch (self.kv_current) {
+            'z', 'H', 'V' => true,
+            else => self.trusted and self.kv_current == Command.Replay.row_key,
         };
+        const v: u32 = if (signed)
+            @bitCast(try std.fmt.parseInt(i32, self.kv_temp[0..self.kv_temp_len], 10))
+        else
+            try std.fmt.parseInt(u32, self.kv_temp[0..self.kv_temp_len], 10);
         self.kv.put(self.kv_current, v);
 
         // Clear our temp buffer
@@ -388,24 +397,33 @@ pub const Command = struct {
     data: []const u8 = "",
 
     /// Private ghostty-next keys that only the Kitty replay stream
-    /// (graphics_replay.zig, ghostty_terminal_kitty_replay_encode) writes.
-    /// They let the stream recreate stored state without changing any
-    /// other terminal state (no cursor movement, no screen switch) and
-    /// keep the protocol rule that `i` and `I` are mutually exclusive.
-    /// Kitty clients never send them; the protocol defines no such keys.
+    /// (graphics_replay.zig) writes. Only a trusted parser
+    /// (Parser.trusted, set by graphics_replay.apply) reads them; in
+    /// program output they are unknown keys and are ignored, so a program
+    /// can neither use them nor make an old command fail with them. They
+    /// let the stream recreate stored state without changing other
+    /// terminal state (no cursor movement, no screen switch) and keep the
+    /// protocol rule that `i` and `I` are mutually exclusive.
     ///
-    ///   E=<0|1>  target screen: 0 primary, 1 alternate (any action).
-    ///            A missing screen makes the command fail (no reply
-    ///            with q=2).
+    ///   E=<0|1>  target screen: 0 primary, 1 alternate. A missing screen
+    ///            makes the command do nothing.
     ///   J=<n>    transmit with i>0 and no I: store image number n.
     ///   L=<n>    display: anchor column, 0-based (with B).
     ///   B=<n>    display: anchor row relative to the top of the active
     ///            area, 0-based and signed (negative is scrollback).
+    ///   R=<n>    delete: clear the screen's images and placements (an
+    ///            in-progress upload too) and set its implicit image-ID
+    ///            cursor to n (n > 0).
+    ///   M=1      transmit: metadata only. Store the image ID, number,
+    ///            size and format with no pixel data (a pending image
+    ///            that holds no bytes), so image IDs stay equal.
     pub const Replay = struct {
         pub const screen_key: u8 = 'E';
         pub const number_key: u8 = 'J';
         pub const col_key: u8 = 'L';
         pub const row_key: u8 = 'B';
+        pub const reset_key: u8 = 'R';
+        pub const metadata_key: u8 = 'M';
 
         pub const Screen = enum { primary, alternate };
 
@@ -413,6 +431,8 @@ pub const Command = struct {
         number: u32 = 0,
         col: ?u32 = null,
         row: ?i32 = null,
+        reset: u32 = 0,
+        metadata: bool = false,
 
         fn parse(kv: KV) error{InvalidFormat}!Replay {
             var result: Replay = .{};
@@ -424,6 +444,8 @@ pub const Command = struct {
             if (kv.get(number_key)) |v| result.number = v;
             if (kv.get(col_key)) |v| result.col = v;
             if (kv.get(row_key)) |v| result.row = @bitCast(v);
+            if (kv.get(reset_key)) |v| result.reset = v;
+            if (kv.get(metadata_key)) |v| result.metadata = v == 1;
             // A position needs both coordinates.
             if ((result.col == null) != (result.row == null)) return error.InvalidFormat;
             return result;

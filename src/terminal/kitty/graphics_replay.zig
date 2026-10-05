@@ -2,48 +2,70 @@
 //! the images and placements of a terminal's active areas in another
 //! terminal (a snapshot viewer) that restored the same snapshot. The
 //! GHOSTSNP format carries no images; the owner sends this stream after
-//! the snapshot (C API: ghostty_terminal_kitty_replay_encode).
+//! the snapshot.
 //!
-//! What the stream recreates, for the primary screen's active area and the
-//! alternate screen:
+//! C API: ghostty_terminal_kitty_replay_encode writes the stream (`encode`);
+//! ghostty_terminal_kitty_replay_apply (libghostty-vt) and
+//! ghostty_surface_apply_kitty_replay (embedded MANUAL surfaces) apply it
+//! (`apply`). The stream must never go through the program output path
+//! (vt_write, ghostty_surface_process_output): there its private keys are
+//! ignored, so it does not recreate the state, and the parser may be in
+//! the middle of a sequence that a READY restored.
 //!
-//! - Every placement that shows in the active area: a placement pinned to
-//!   a cell whose rectangle reaches into the active area (a placement only
-//!   in scrollback is not replayed), every virtual (U=1, unicode
-//!   placeholder) placement, and every relative (P=) placement whose
-//!   parent chain ends at such a placement. A placement keeps its image ID,
-//!   external placement ID (an internal p=0 ID is assigned again by the
-//!   viewer), z-index, cell offsets, source rectangle, columns and rows,
-//!   parent and parent offsets.
-//! - Every image that those placements use, with its image ID and image
-//!   number. Images without such a placement are not replayed.
+//! The stream, in order:
 //!
-//! Wire format. Every command is quiet (q=2), so the viewer writes no
-//! reply. An image goes inline (t=d) as zlib-compressed (o=z) raw pixels:
-//! the storage holds decoded pixels only (a PNG was decoded at load, so
-//! f=100 never occurs), RGB as f=24 and RGBA as f=32 (grayscale storage
-//! is widened to f=32). Its base64 payload is cut into chunks of at most
-//! 4096 bytes (m=1 on every chunk but the last). Placements follow all
-//! images: pinned and virtual ones first, then relative ones, parents
-//! before children. The stream uses the private ghostty-next keys of
-//! Command.Replay: E (screen) on every command, J (image number) on an
-//! image, and B/L (row and column) on a pinned placement, so it moves no
-//! cursor and switches no screen. A Kitty client never sends them.
+//! 1. For each screen the owner has: a reset (a=d,R=<cursor>) that clears
+//!    the screen's images, placements and any in-progress upload in the
+//!    viewer and sets the owner's implicit image-ID cursor. So images that
+//!    a local-history restore carried, or that the owner deleted, and
+//!    internal-ID placements cannot double.
+//! 2. Every stored image of the owner, oldest first (by generation, the
+//!    transmission order), with its image ID and image number: in full
+//!    when it is selected (below), otherwise metadata only (M=1: ID,
+//!    number, size, format, no pixels; the viewer stores a pending image
+//!    that holds no bytes and is not drawn). So the viewer has the same
+//!    image IDs, and a later numbered transmission (I=) picks the same
+//!    free ID on both sides.
+//! 3. The placements that show in the active areas of the selected
+//!    images: pinned and virtual ones first, then relative ones, parents
+//!    before children.
 //!
-//! Byte cap. Images are taken newest first (by generation, the
-//! transmission order) while their transmission bytes fit the cap; the
-//! first image that does not fit and every older one are skipped and
-//! counted, with their placements. The kept images go on the wire oldest
-//! first, so the viewer's image ages (eviction order and the newest image
-//! for a number) follow the owner's.
+//! Selected images: those that a placement showing in the primary active
+//! area or on the alternate screen uses. A placement shows when it is
+//! pinned to a cell and its rectangle reaches into the active area (a
+//! placement only in scrollback does not), when it is virtual (U=1,
+//! unicode placeholder), or when it is relative (P=) and its parent chain
+//! ends at such a placement. A relative placement whose parent has an
+//! internal ID is replayed only when the parent image has exactly one
+//! placement (an internal ID cannot be named, and the viewer resolves
+//! Q=0 to that one placement); otherwise it is skipped. A chain with an
+//! image whose data is still loading is skipped. A placement keeps its
+//! image ID, external placement ID (an internal p=0 ID is assigned again),
+//! z-index, cell offsets, source rectangle, columns and rows, parent and
+//! parent offsets.
 //!
-//! Not replayed: animation frames and state (only the root frame), images
-//! whose data is still loading, an in-progress chunked transmission, and
-//! the internal placement ID values. A pinned placement above the active
-//! area needs its row in the viewer (history restored before the stream);
-//! the viewer drops it otherwise.
+//! Byte cap: candidates are taken newest first while their decoded pixel
+//! bytes (RGB or RGBA as stored, grayscale counted as RGBA) fit the cap;
+//! the first that does not fit and every older one go as metadata only,
+//! with their placements skipped, and are counted as skipped.
 //!
-//! Encoding only reads the terminal. The caller holds the terminal's lock.
+//! Wire format. Every command is quiet (q=2). A full image goes inline
+//! (t=d) as zlib (o=z, fastest level) raw pixels: the storage holds
+//! decoded pixels only (a PNG was decoded at load, so f=100 never occurs),
+//! RGB as f=24 and RGBA as f=32 (grayscale is widened to f=32). Its base64
+//! payload is cut into chunks of at most 4096 bytes. The private keys of
+//! Command.Replay (E screen on every command, J number, B/L position, R
+//! reset, M metadata) mean the stream moves no cursor and switches no
+//! screen. Only a trusted parser reads them.
+//!
+//! Not replayed: animation frames and state (only the root frame), the
+//! data of images still loading (metadata only), an in-progress chunked
+//! upload, and the internal placement ID values. A pinned placement above
+//! the active area needs its row in the viewer (history restored before
+//! the stream); the viewer drops it otherwise.
+//!
+//! Encoding only reads the terminal and holds one compressed image at a
+//! time. The caller holds the terminal's lock.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -54,6 +76,7 @@ const Screen = @import("../Screen.zig");
 const ScreenSet = @import("../ScreenSet.zig");
 const PageList = @import("../PageList.zig");
 const command = @import("graphics_command.zig");
+const exec = @import("graphics_exec.zig");
 const Image = @import("graphics_image.zig").Image;
 const ImageStorage = @import("graphics_storage.zig").ImageStorage;
 const Placement = ImageStorage.Placement;
@@ -63,16 +86,20 @@ const Replay = command.Command.Replay;
 /// The Kitty limit for the base64 payload of one chunk.
 pub const chunk_len = 4096;
 
+/// Raw bytes per chunk: 4096 base64 bytes.
+const chunk_raw_len = chunk_len / 4 * 3;
+
 /// What one encode wrote.
 pub const Stats = struct {
-    /// Images transmitted.
+    /// Images transmitted with their pixels.
     images: u64 = 0,
     /// Placements written.
     placements: u64 = 0,
-    /// Images that a replayed placement uses but that the byte cap
-    /// skipped (their placements are skipped too).
+    /// Images that a showing placement uses but that the byte cap
+    /// skipped (sent as metadata only; their placements are skipped).
     skipped_images: u64 = 0,
-    /// Bytes of the image transmissions (the value the cap limits).
+    /// Decoded pixel bytes of the transmitted images (what the cap
+    /// limits).
     image_bytes: u64 = 0,
     /// All bytes written.
     bytes: u64 = 0,
@@ -81,7 +108,8 @@ pub const Stats = struct {
 pub const Error = Allocator.Error || std.Io.Writer.Error;
 
 /// Write the replay stream of `t` to `writer`. `max_image_bytes` caps the
-/// bytes of the image transmissions (std.math.maxInt(u64) for no cap).
+/// decoded pixel bytes of the full images (std.math.maxInt(u64) for no
+/// cap).
 pub fn encode(
     alloc: Allocator,
     t: *const Terminal,
@@ -89,8 +117,20 @@ pub fn encode(
     writer: *std.Io.Writer,
 ) Error!Stats {
     var stats: Stats = .{};
+    var out: Counting = .{ .w = writer, .stats = &stats };
 
-    // The replayed placements and the images they use, per screen.
+    // 1. Resets.
+    for (screen_keys) |key| {
+        const screen = t.screens.get(key) orelse continue;
+        try out.print("\x1b_Ga=d,q=2,{c}={d},{c}={d}\x1b\\", .{
+            Replay.screen_key,
+            screenValue(key),
+            Replay.reset_key,
+            screen.kitty_images.imageIdCursor(),
+        });
+    }
+
+    // The showing placements and the images they use, per screen.
     var selections: [screen_keys.len]Selection = undefined;
     var selected: usize = 0;
     defer for (selections[0..selected]) |*s| s.deinit(alloc);
@@ -99,64 +139,167 @@ pub fn encode(
         selected += 1;
     }
 
-    // Candidate images, newest first.
-    var candidates: std.ArrayList(Candidate) = .empty;
-    defer {
-        for (candidates.items) |c| alloc.free(c.bytes);
-        candidates.deinit(alloc);
+    // Every stored image, and which ones placements use.
+    var images: std.ArrayList(Candidate) = .empty;
+    defer images.deinit(alloc);
+    for (screen_keys, 0..) |key, si| {
+        const screen = t.screens.get(key) orelse continue;
+        var it = screen.kitty_images.images.iterator();
+        while (it.next()) |entry| try images.append(alloc, .{
+            .screen = si,
+            .id = entry.key_ptr.*,
+            .generation = entry.value_ptr.generation,
+            .used = selections[si].images.contains(entry.key_ptr.*),
+        });
     }
-    for (selections[0..selected], 0..) |*s, si| {
-        const storage = &(t.screens.get(screen_keys[si]) orelse continue).kitty_images;
-        var it = s.images.keyIterator();
-        while (it.next()) |id| {
-            const img = storage.images.get(id.*).?;
-            try candidates.append(alloc, .{
-                .screen = si,
-                .id = id.*,
-                .generation = img.generation,
-            });
+
+    // Select used images newest first while their decoded bytes fit.
+    std.mem.sort(Candidate, images.items, {}, Candidate.newerFirst);
+    var full = true;
+    for (images.items) |*c| {
+        if (!c.used) continue;
+        const img = imageOf(t, c.*);
+        const len = decodedLen(img);
+        if (full and len <= max_image_bytes - stats.image_bytes) {
+            c.send = true;
+            stats.image_bytes += len;
+        } else {
+            full = false;
+            stats.skipped_images += 1;
         }
     }
-    std.mem.sort(Candidate, candidates.items, {}, Candidate.newerFirst);
 
-    // Take images newest first while they fit the cap.
-    var kept: usize = 0;
-    for (candidates.items) |*c| {
-        const storage = &t.screens.get(screen_keys[c.screen]).?.kitty_images;
-        const img = storage.images.get(c.id).?;
-        c.bytes = try encodeImage(alloc, screen_keys[c.screen], img);
-        if (c.bytes.len > max_image_bytes - stats.image_bytes) break;
-        stats.image_bytes += c.bytes.len;
-        kept += 1;
-    }
-    stats.skipped_images = candidates.items.len - kept;
-
-    // Images, oldest first.
-    var next = kept;
+    // 2. Images, oldest first.
+    var next = images.items.len;
     while (next > 0) {
         next -= 1;
-        const c = candidates.items[next];
-        try writer.writeAll(c.bytes);
-        stats.bytes += c.bytes.len;
-        stats.images += 1;
-        try selections[c.screen].sent.put(alloc, c.id, {});
+        const c = images.items[next];
+        const img = imageOf(t, c);
+        if (c.send) {
+            try writeImage(alloc, &out, screen_keys[c.screen], img);
+            stats.images += 1;
+            try selections[c.screen].sent.put(alloc, c.id, {});
+        } else {
+            try writeMetadata(&out, screen_keys[c.screen], img);
+        }
     }
 
-    // Placements, parents first.
+    // 3. Placements, parents first.
     for (selections[0..selected], 0..) |*s, si| {
-        const storage = &(t.screens.get(screen_keys[si]) orelse continue).kitty_images;
+        const screen = t.screens.get(screen_keys[si]) orelse continue;
+        const storage = &screen.kitty_images;
         for (s.placements.items) |entry| {
-            if (!s.sent.contains(entry.key.image_id)) continue;
+            if (!s.chainSent(storage, entry.key)) continue;
             const p = storage.placements.get(entry.key).?;
             // A relative placement needs its parent written.
             if (p.location == .relative and !s.written.contains(p.location.relative.parent)) continue;
-            stats.bytes += try writePlacement(writer, t, screen_keys[si], entry.key, p);
+            try writePlacement(&out, screen, screen_keys[si], entry.key, p);
             stats.placements += 1;
             try s.written.put(alloc, entry.key, {});
         }
     }
 
     return stats;
+}
+
+pub const ApplyError = Allocator.Error || error{InvalidReplay};
+
+/// The largest replay command that `apply` takes.
+const max_command_bytes = 1024 * 1024;
+
+/// Apply a complete replay stream to `t` (the trusted path: the private
+/// keys work here). Each command is parsed by its own trusted parser; the
+/// terminal's VT parser state is not used or changed, and nothing is
+/// written anywhere (every reply is dropped). Only these commands run:
+/// transmit (a=t, direct medium only; M=1 for metadata only), display
+/// (a=p) and the reset (a=d with R). Anything else (another action, a=T,
+/// bytes outside `ESC _ G ... ESC \`, a malformed or truncated command) is
+/// skipped and makes the result error.InvalidReplay after the rest of the
+/// stream is applied. The caller holds the terminal's lock.
+pub fn apply(
+    io: std.Io,
+    alloc: Allocator,
+    t: *Terminal,
+    bytes: []const u8,
+) ApplyError!void {
+    var invalid = false;
+    var rest = bytes;
+    while (rest.len > 0) {
+        if (!std.mem.startsWith(u8, rest, "\x1b_G")) return error.InvalidReplay;
+        const end = std.mem.indexOfPos(u8, rest, 3, "\x1b\\") orelse return error.InvalidReplay;
+        const body = rest[3..end];
+        rest = rest[end + 2 ..];
+
+        var parser = command.Parser.init(alloc, max_command_bytes);
+        parser.trusted = true;
+        defer parser.deinit();
+        parser.feedSlice(body) catch |err| {
+            if (err == error.OutOfMemory and body.len <= max_command_bytes) return error.OutOfMemory;
+            invalid = true;
+            continue;
+        };
+        var cmd = parser.complete(alloc) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            invalid = true;
+            continue;
+        };
+        defer cmd.deinit(alloc);
+        if (!try applyCommand(io, alloc, t, &cmd)) invalid = true;
+    }
+    if (invalid) return error.InvalidReplay;
+}
+
+/// Run one trusted replay command. False if it is not a replay command.
+fn applyCommand(
+    io: std.Io,
+    alloc: Allocator,
+    t: *Terminal,
+    cmd: *command.Command,
+) Allocator.Error!bool {
+    const key: ScreenSet.Key = if (cmd.replay.screen) |screen| switch (screen) {
+        .primary => .primary,
+        .alternate => .alternate,
+    } else t.screens.active_key;
+
+    switch (cmd.control) {
+        .delete => {
+            if (cmd.replay.reset == 0) return false;
+            const screen = t.screens.get(key) orelse return true;
+            screen.kitty_images.clearAll(io, alloc, screen, cmd.replay.reset);
+            return true;
+        },
+
+        .transmit => |tr| {
+            if (tr.medium != .direct) return false;
+            if (cmd.replay.metadata) {
+                if (tr.image_id == 0 or tr.image_number != 0) return false;
+                const screen = t.screens.get(key) orelse return true;
+                if (!screen.kitty_images.enabled()) return true;
+                const format: command.Transmission.Format = switch (tr.format) {
+                    .rgb, .rgba => tr.format,
+                    else => return false,
+                };
+                _ = screen.kitty_images.addPendingImage(io, alloc, screen, .{
+                    .id = tr.image_id,
+                    .number = cmd.replay.number,
+                    .width = tr.width,
+                    .height = tr.height,
+                    .format = format,
+                    .data = .{ .pending = 0 },
+                }) catch |err| switch (err) {
+                    error.OutOfMemory => return true, // limits refused it, as a transmit would be
+                };
+                return true;
+            }
+        },
+
+        .display => {},
+
+        else => return false,
+    }
+
+    _ = exec.execute(io, alloc, t, cmd);
+    return true;
 }
 
 const screen_keys = [_]ScreenSet.Key{ .primary, .alternate };
@@ -166,8 +309,10 @@ const Candidate = struct {
     screen: usize,
     id: u32,
     generation: u64,
-    /// The encoded transmission, once encoded.
-    bytes: []u8 = &.{},
+    /// A showing placement uses it.
+    used: bool,
+    /// Sent with its pixels.
+    send: bool = false,
 
     fn newerFirst(_: void, a: Candidate, b: Candidate) bool {
         if (a.generation != b.generation) return a.generation > b.generation;
@@ -176,13 +321,45 @@ const Candidate = struct {
     }
 };
 
-/// The replayed placements of one screen and the images they use.
+fn imageOf(t: *const Terminal, c: Candidate) Image {
+    return t.screens.get(screen_keys[c.screen]).?.kitty_images.images.get(c.id).?;
+}
+
+/// Decoded bytes as sent: grayscale is widened to RGBA.
+fn decodedLen(img: Image) u64 {
+    const data = img.data.bytes() orelse return 0;
+    return switch (img.format) {
+        .gray => @as(u64, data.len) * 4,
+        .gray_alpha => @as(u64, data.len) * 2,
+        else => data.len,
+    };
+}
+
+/// A writer that counts the bytes into the stats.
+const Counting = struct {
+    w: *std.Io.Writer,
+    stats: *Stats,
+
+    fn writeAll(self: *Counting, bytes: []const u8) std.Io.Writer.Error!void {
+        try self.w.writeAll(bytes);
+        self.stats.bytes += bytes.len;
+    }
+
+    fn print(self: *Counting, comptime fmt: []const u8, args: anytype) std.Io.Writer.Error!void {
+        var buf: [256]u8 = undefined;
+        var fixed: std.Io.Writer = .fixed(&buf);
+        fixed.print(fmt, args) catch unreachable; // commands are short
+        try self.writeAll(fixed.buffered());
+    }
+};
+
+/// The showing placements of one screen and the images they use.
 const Selection = struct {
     const Entry = struct { key: PlacementKey, depth: usize };
 
     placements: std.ArrayList(Entry) = .empty,
     images: std.AutoHashMapUnmanaged(u32, void) = .empty,
-    /// Images on the wire and placements written, during the encode.
+    /// Images sent with pixels and placements written, during the encode.
     sent: std.AutoHashMapUnmanaged(u32, void) = .empty,
     written: std.AutoHashMapUnmanaged(PlacementKey, void) = .empty,
 
@@ -202,29 +379,19 @@ const Selection = struct {
                 .virtual => 0,
                 .pin => if (pinShows(t, screen, img, p)) 0 else continue,
                 .relative => |rel| depth: {
-                    const chain = storage.resolveChain(rel) orelse continue;
-                    switch (chain.root.location) {
-                        .virtual => {},
-                        .pin => {
-                            const root_img = storage.images.get(chain.root_key.image_id) orelse continue;
-                            if (!pinShows(t, screen, root_img, chain.root)) continue;
-                        },
-                        .relative => continue,
-                    }
-                    break :depth chainDepth(storage, rel);
+                    break :depth relativeDepth(t, screen, rel) orelse continue;
                 },
             };
             try self.placements.append(alloc, .{ .key = entry.key_ptr.*, .depth = depth });
-            try self.images.put(alloc, entry.key_ptr.image_id, {});
         }
 
-        // A relative placement also needs every image up its chain.
+        // The images of every placement and of every parent up its chain.
         for (self.placements.items) |entry| {
-            var p = storage.placements.get(entry.key).?;
-            while (p.location == .relative) {
-                const parent = p.location.relative.parent;
-                try self.images.put(alloc, parent.image_id, {});
-                p = storage.placements.get(parent) orelse break;
+            var k = entry.key;
+            while (storage.placements.get(k)) |p| {
+                try self.images.put(alloc, k.image_id, {});
+                if (p.location != .relative) break;
+                k = p.location.relative.parent;
             }
         }
 
@@ -239,6 +406,17 @@ const Selection = struct {
         self.written.deinit(alloc);
     }
 
+    /// Whether every image up the placement's chain was sent.
+    fn chainSent(self: *const Selection, storage: *const ImageStorage, key: PlacementKey) bool {
+        var k = key;
+        while (storage.placements.get(k)) |p| {
+            if (!self.sent.contains(k.image_id)) return false;
+            if (p.location != .relative) return true;
+            k = p.location.relative.parent;
+        }
+        return false;
+    }
+
     fn entryLess(_: void, a: Entry, b: Entry) bool {
         if (a.depth != b.depth) return a.depth < b.depth;
         if (a.key.image_id != b.key.image_id) return a.key.image_id < b.key.image_id;
@@ -249,20 +427,27 @@ const Selection = struct {
     }
 };
 
-/// The number of parents up to the chain's root.
-fn chainDepth(storage: *const ImageStorage, rel: Placement.Relative) usize {
-    var depth: usize = 1;
-    var key = rel.parent;
-    while (storage.placements.get(key)) |p| {
+/// The chain depth of a relative placement that shows and can be
+/// replayed, or null: its chain must end at a showing pinned or virtual
+/// placement, every image on it must have its data, and every parent with
+/// an internal ID must be its image's only placement.
+fn relativeDepth(t: *const Terminal, screen: *const Screen, rel: Placement.Relative) ?usize {
+    const storage = &screen.kitty_images;
+    var depth: usize = 0;
+    var parent = rel.parent;
+    while (true) {
+        depth += 1;
+        if (depth > ImageStorage.parent_chain_limit) return null;
+        const p = storage.placements.get(parent) orelse return null;
+        const img = storage.images.get(parent.image_id) orelse return null;
+        if (img.data.bytes() == null) return null;
+        if (parent.placement_id.tag == .internal and img.metadata.placement_count != 1) return null;
         switch (p.location) {
-            .relative => |parent| {
-                depth += 1;
-                key = parent.parent;
-            },
-            .pin, .virtual => break,
+            .virtual => return depth,
+            .pin => return if (pinShows(t, screen, img, p)) depth else null,
+            .relative => |next| parent = next.parent,
         }
     }
-    return depth;
 }
 
 /// Whether a pinned placement shows in the active area: its anchor or its
@@ -283,29 +468,52 @@ fn screenValue(key: ScreenSet.Key) u8 {
     };
 }
 
-/// The complete transmission commands of one image.
-fn encodeImage(alloc: Allocator, key: ScreenSet.Key, img: Image) Error![]u8 {
+/// The protocol format of an image as sent.
+fn wireFormat(img: Image) u8 {
+    return switch (img.format) {
+        .rgb => 24,
+        else => 32,
+    };
+}
+
+/// A metadata-only image (M=1).
+fn writeMetadata(out: *Counting, key: ScreenSet.Key, img: Image) std.Io.Writer.Error!void {
+    try out.print("\x1b_Ga=t,q=2,t=d,f={d},s={d},v={d},i={d}", .{
+        wireFormat(img),
+        img.width,
+        img.height,
+        img.id,
+    });
+    if (img.number > 0) try out.print(",{c}={d}", .{ Replay.number_key, img.number });
+    try out.print(",{c}={d},{c}=1\x1b\\", .{
+        Replay.screen_key,
+        screenValue(key),
+        Replay.metadata_key,
+    });
+}
+
+/// The transmission commands of one image. Holds one compressed copy.
+fn writeImage(alloc: Allocator, out: *Counting, key: ScreenSet.Key, img: Image) Error!void {
     const data = img.data.bytes().?;
 
     // RGB and RGBA go as stored; grayscale widens to RGBA.
     var widened: ?[]u8 = null;
     defer if (widened) |w| alloc.free(w);
-    const pixels: []const u8, const format: u8 = switch (img.format) {
-        .rgb => .{ data, 24 },
-        .rgba => .{ data, 32 },
+    const pixels: []const u8 = switch (img.format) {
+        .rgb, .rgba => data,
         .gray, .gray_alpha => pixels: {
             const bpp: usize = if (img.format == .gray) 1 else 2;
             const count = data.len / bpp;
-            const out = try alloc.alloc(u8, count * 4);
-            widened = out;
+            const wide = try alloc.alloc(u8, count * 4);
+            widened = wide;
             for (0..count) |px| {
                 const v = data[px * bpp];
-                out[px * 4 + 0] = v;
-                out[px * 4 + 1] = v;
-                out[px * 4 + 2] = v;
-                out[px * 4 + 3] = if (bpp == 2) data[px * bpp + 1] else 255;
+                wide[px * 4 + 0] = v;
+                wide[px * 4 + 1] = v;
+                wide[px * 4 + 2] = v;
+                wide[px * 4 + 3] = if (bpp == 2) data[px * bpp + 1] else 255;
             }
-            break :pixels .{ out, 32 };
+            break :pixels wide;
         },
         // Stored images are decoded; PNG never reaches the storage.
         .png => unreachable,
@@ -319,7 +527,7 @@ fn encodeImage(alloc: Allocator, key: ScreenSet.Key, img: Image) Error![]u8 {
         defer alloc.free(window);
         const compress = try alloc.create(flate.Compress);
         defer alloc.destroy(compress);
-        compress.* = flate.Compress.init(&deflated.writer, window, .zlib, .default) catch
+        compress.* = flate.Compress.init(&deflated.writer, window, .zlib, .fastest) catch
             return error.OutOfMemory;
         compress.writer.writeAll(pixels) catch return error.OutOfMemory;
         compress.finish() catch return error.OutOfMemory;
@@ -327,90 +535,62 @@ fn encodeImage(alloc: Allocator, key: ScreenSet.Key, img: Image) Error![]u8 {
     const zlib = deflated.written();
 
     const b64 = std.base64.standard.Encoder;
-    const encoded = try alloc.alloc(u8, b64.calcSize(zlib.len));
-    defer alloc.free(encoded);
-    _ = b64.encode(encoded, zlib);
-
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer out.deinit();
-    const w = &out.writer;
     const screen = screenValue(key);
     var offset: usize = 0;
     var first = true;
     while (true) {
-        const end = @min(offset + chunk_len, encoded.len);
-        const more: u8 = if (end < encoded.len) 1 else 0;
-        writeChunk(w, img, format, screen, first, more, encoded[offset..end]) catch
-            return error.OutOfMemory;
+        const end = @min(offset + chunk_raw_len, zlib.len);
+        const more: u8 = if (end < zlib.len) 1 else 0;
+        if (first) {
+            try out.print("\x1b_Ga=t,q=2,t=d,f={d},o=z,s={d},v={d},i={d}", .{
+                wireFormat(img),
+                img.width,
+                img.height,
+                img.id,
+            });
+            if (img.number > 0) try out.print(",{c}={d}", .{ Replay.number_key, img.number });
+            if (img.metadata.transient) try out.writeAll(",N=1");
+        } else {
+            try out.writeAll("\x1b_Gq=2");
+        }
+        try out.print(",{c}={d},m={d};", .{ Replay.screen_key, screen, more });
+        var encoded: [chunk_len]u8 = undefined;
+        try out.writeAll(b64.encode(&encoded, zlib[offset..end]));
+        try out.writeAll("\x1b\\");
         first = false;
         offset = end;
         if (more == 0) break;
     }
-    return try out.toOwnedSlice();
 }
 
-fn writeChunk(
-    w: *std.Io.Writer,
-    img: Image,
-    format: u8,
-    screen: u8,
-    first: bool,
-    more: u8,
-    payload: []const u8,
-) std.Io.Writer.Error!void {
-    try w.writeAll("\x1b_G");
-    if (first) {
-        try w.print("a=t,q=2,t=d,f={d},o=z,s={d},v={d},i={d}", .{
-            format,
-            img.width,
-            img.height,
-            img.id,
-        });
-        if (img.number > 0) try w.print(",{c}={d}", .{ Replay.number_key, img.number });
-        if (img.metadata.transient) try w.writeAll(",N=1");
-    } else {
-        try w.writeAll("q=2");
-    }
-    try w.print(",{c}={d},m={d};", .{ Replay.screen_key, screen, more });
-    try w.writeAll(payload);
-    try w.writeAll("\x1b\\");
-}
-
-/// Write one placement command and return its length.
+/// Write one placement command.
 fn writePlacement(
-    writer: *std.Io.Writer,
-    t: *const Terminal,
+    out: *Counting,
+    screen: *const Screen,
     key: ScreenSet.Key,
     pkey: PlacementKey,
     p: Placement,
-) std.Io.Writer.Error!u64 {
-    var buf: [512]u8 = undefined;
-    var w: std.Io.Writer = .fixed(&buf);
-    w.print("\x1b_Ga=p,q=2,i={d}", .{pkey.image_id}) catch unreachable;
+) std.Io.Writer.Error!void {
+    try out.print("\x1b_Ga=p,q=2,i={d}", .{pkey.image_id});
     if (pkey.placement_id.tag == .external) {
-        w.print(",p={d}", .{pkey.placement_id.id}) catch unreachable;
+        try out.print(",p={d}", .{pkey.placement_id.id});
     }
-    w.print(",{c}={d}", .{ Replay.screen_key, screenValue(key) }) catch unreachable;
+    try out.print(",{c}={d}", .{ Replay.screen_key, screenValue(key) });
     switch (p.location) {
-        .pin => |pin| {
-            const screen = t.screens.get(key).?;
-            const top = screen.pages.pin(.{ .active = .{} }).?;
-            const row = rowOffset(screen, top, pin.*);
-            w.print(",{c}={d},{c}={d},C=1", .{
-                Replay.row_key,
-                row,
-                Replay.col_key,
-                pin.x,
-            }) catch unreachable;
-        },
-        .virtual => w.writeAll(",U=1") catch unreachable,
+        .pin => |pin| try out.print(",{c}={d},{c}={d},C=1", .{
+            Replay.row_key,
+            rowOffset(screen, pin.*),
+            Replay.col_key,
+            pin.x,
+        }),
+        .virtual => try out.writeAll(",U=1"),
         .relative => |rel| {
-            w.print(",P={d}", .{rel.parent.image_id}) catch unreachable;
+            try out.print(",P={d}", .{rel.parent.image_id});
             if (rel.parent.placement_id.tag == .external) {
-                w.print(",Q={d}", .{rel.parent.placement_id.id}) catch unreachable;
+                try out.print(",Q={d}", .{rel.parent.placement_id.id});
             }
-            if (rel.horizontal_offset != 0) w.print(",H={d}", .{rel.horizontal_offset}) catch unreachable;
-            if (rel.vertical_offset != 0) w.print(",V={d}", .{rel.vertical_offset}) catch unreachable;
+            if (rel.horizontal_offset != 0) try out.print(",H={d}", .{rel.horizontal_offset});
+            if (rel.vertical_offset != 0) try out.print(",V={d}", .{rel.vertical_offset});
         },
     }
     const fields = [_]struct { k: u8, v: u32 }{
@@ -424,35 +604,18 @@ fn writePlacement(
         .{ .k = 'r', .v = p.rows },
     };
     for (fields) |f| {
-        if (f.v != 0) w.print(",{c}={d}", .{ f.k, f.v }) catch unreachable;
+        if (f.v != 0) try out.print(",{c}={d}", .{ f.k, f.v });
     }
-    if (p.z != 0) w.print(",z={d}", .{p.z}) catch unreachable;
-    w.writeAll("\x1b\\") catch unreachable;
-    const bytes = w.buffered();
-    try writer.writeAll(bytes);
-    return bytes.len;
+    if (p.z != 0) try out.print(",z={d}", .{p.z});
+    try out.writeAll("\x1b\\");
 }
 
 /// Rows from the top of the active area to `pin` (negative above it).
-fn rowOffset(screen: *const Screen, top: PageList.Pin, pin: PageList.Pin) i64 {
+fn rowOffset(screen: *const Screen, pin: PageList.Pin) i64 {
+    const top = screen.pages.pin(.{ .active = .{} }).?;
     const top_y = screen.pages.pointFromPin(.screen, top).?.screen.y;
     const pin_y = screen.pages.pointFromPin(.screen, pin).?.screen.y;
     return @as(i64, @intCast(pin_y)) - @as(i64, @intCast(top_y));
-}
-
-pub const ApplyError = Allocator.Error || error{InvalidReplay};
-
-/// Red test commit: not implemented yet.
-pub fn apply(
-    io: std.Io,
-    alloc: Allocator,
-    t: *Terminal,
-    bytes: []const u8,
-) ApplyError!void {
-    _ = io;
-    _ = alloc;
-    _ = t;
-    _ = bytes;
 }
 
 const testing = std.testing;

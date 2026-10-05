@@ -521,9 +521,32 @@ pub const ImageStorage = struct {
         self.markMutated(io);
     }
 
+    /// Remove every image and placement and any in-progress upload,
+    /// keeping the limits, and set the implicit image-ID cursor. Used by
+    /// the trusted replay stream (graphics_replay.apply) before it
+    /// recreates the owner's images.
+    pub fn clearAll(
+        self: *ImageStorage,
+        io: std.Io,
+        alloc: Allocator,
+        s: *terminal.Screen,
+        next_image_id: u32,
+    ) void {
+        const keep: ImageStorage = .{
+            .image_limits = self.image_limits,
+            .total_limit = self.total_limit,
+            .image_count_limit = self.image_count_limit,
+            .placement_count_limit = self.placement_count_limit,
+            .next_image_id = if (next_image_id == 0) default_image_id else next_image_id,
+        };
+        self.deinit(alloc, s);
+        self.* = keep;
+        self.markMutated(io);
+    }
+
     /// Move every image and placement of `src`, the storage of
-    /// `src_screen`, into this storage of `dst_screen`, which has no
-    /// images. Used when a snapshot restore keeps the local history
+    /// `src_screen`, into this storage of `dst_screen`. This storage is
+    /// cleared first (clearAll). Used when a snapshot restore keeps the local history
     /// (Termio.restoreSnapshotLocalHistory): both screens have the same
     /// grid and their rows match from the bottom of the active area up,
     /// so a pinned placement keeps its distance from the bottom row. A
@@ -539,8 +562,7 @@ pub const ImageStorage = struct {
         src: *ImageStorage,
         src_screen: *terminal.Screen,
     ) void {
-        assert(self.images.count() == 0);
-        assert(self.placements.count() == 0);
+        self.clearAll(io, alloc, dst_screen, src.next_image_id);
 
         const src_bottom = src_screen.pages.total_rows - 1;
         const dst_bottom = dst_screen.pages.total_rows - 1;
@@ -572,8 +594,7 @@ pub const ImageStorage = struct {
         _ = src.removeOrphans(src_screen, null);
 
         // Every pin is tracked by dst_screen now: hand over the maps.
-        self.placements.deinit(alloc);
-        self.images.deinit(alloc);
+        // clearAll left this storage's maps empty and unallocated.
         self.images = src.images;
         self.placements = src.placements;
         self.total_bytes = src.total_bytes;
