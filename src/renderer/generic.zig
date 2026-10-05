@@ -1446,9 +1446,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 state.lockDemand(global.io());
                 defer state.unlockDemand(global.io());
 
-                // If we're in a synchronized output state, we pause all rendering.
-                if (state.terminal.modes.get(.synchronized_output)) {
-                    log.debug("synchronized output started, skipping render", .{});
+                // While frames are held (synchronized output), we pause
+                // all rendering.
+                if (!state.renderable()) {
+                    log.debug("frames held, skipping render", .{});
                     return;
                 }
 

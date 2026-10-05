@@ -702,11 +702,16 @@ pub const State = struct {
         pending: Image.Pending,
     ) PrepImageError!void {
         // If this image exists and its generation is the same it is the
-        // identical image so we don't need to send it to the GPU.
+        // identical image so we don't need to send it to the GPU. An
+        // earlier update may have marked it for unload because the image
+        // was missing for a moment (a snapshot restore swaps in a terminal
+        // without images, then the one with the moved images, which keep
+        // their generations): take it back, or the next upload frees it.
         const gop = try self.images.getOrPut(alloc, id);
         if (gop.found_existing and
             gop.value_ptr.generation == generation)
         {
+            gop.value_ptr.image.cancelUnload();
             return;
         }
 
@@ -1020,6 +1025,19 @@ pub const Image = union(enum) {
         };
     }
 
+    /// Undo markForUnload: the image is in use again.
+    pub fn cancelUnload(self: *Image) void {
+        self.* = switch (self.*) {
+            .unload_pending => |p| .{ .pending = p },
+            .unload_replace => |r| .{ .replace = r },
+            .unload_ready => |t| .{ .ready = t },
+            .pending,
+            .replace,
+            .ready,
+            => return,
+        };
+    }
+
     /// Mark the current image to be replaced with a pending one. This will
     /// attempt to update the existing texture if we have one, otherwise it
     /// will act like a new upload.
@@ -1211,6 +1229,51 @@ test "kitty renderer ignores pending payloads and removes replaced placements" {
     try testing.expectEqual(tracked, t.screens.active.pages.countTrackedPins());
     try testing.expectEqual(@as(usize, 0), state.kitty_placements.items.len);
     try testing.expect(state.images.get(.{ .kitty = 1 }).?.image.isUnloading());
+}
+
+test "kitty renderer keeps an image that returns with the same generation" {
+    // A local-history snapshot restore swaps in a READY terminal without
+    // images, then the terminal with the moved images, which keep their
+    // generations (ImageStorage.moveFrom). A renderer update between the
+    // two swaps marks the texture for unload; the update after the second
+    // swap must take it back, or the next upload frees it and the image
+    // is gone until it changes again.
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try terminal.Terminal.init(io, alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+    t.width_px = 30;
+    t.height_px = 30;
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\x1b_Ga=T,q=2,f=32,s=1,v=1,i=1,c=1,r=1,C=1;AAAAAA==\x1b\\");
+
+    var empty = try terminal.Terminal.init(io, alloc, .{ .rows = 3, .cols = 3 });
+    defer empty.deinit(alloc);
+    empty.width_px = 30;
+    empty.height_px = 30;
+
+    var state: State = .empty;
+    defer state.deinit(alloc);
+    const cell: CellSize = .{ .width = 10, .height = 10 };
+
+    state.kittyUpdate(alloc, &t, cell);
+    const generation = state.images.get(.{ .kitty = 1 }).?.generation;
+    try testing.expect(!state.images.get(.{ .kitty = 1 }).?.image.isUnloading());
+
+    // First swap: no images.
+    state.kittyUpdate(alloc, &empty, cell);
+    try testing.expect(state.images.get(.{ .kitty = 1 }).?.image.isUnloading());
+
+    // Second swap: the same image, same generation, placed again.
+    t.screens.active.kitty_images.dirty = true;
+    state.kittyUpdate(alloc, &t, cell);
+    const entry = state.images.get(.{ .kitty = 1 }).?;
+    try testing.expectEqual(generation, entry.generation);
+    try testing.expect(!entry.image.isUnloading());
+    try testing.expectEqual(@as(usize, 1), state.kitty_placements.items.len);
 }
 
 test "kitty renderer uses the intersected source rectangle" {

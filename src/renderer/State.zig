@@ -19,6 +19,14 @@ mutex: *std.Io.Mutex,
 /// The terminal data.
 terminal: *terminalpkg.Terminal,
 
+/// Set while the terminal is between two halves of one change that must
+/// not be shown apart: a local-history snapshot restore holds frames from
+/// its first swap (the READY terminal without the local history and
+/// images) until its second swap or its mismatch result. Protected by
+/// `mutex`.
+hold_frames: bool = false,
+
+
 /// The terminal inspector, if any. This will be null while the inspector
 /// is not active and will be set when it is active.
 inspector: ?*Inspector = null,
@@ -232,4 +240,12 @@ test "preedit range shifts left at right edge" {
     try testing.expectEqual(@as(terminalpkg.size.CellCountInt, 8), range.start);
     try testing.expectEqual(@as(terminalpkg.size.CellCountInt, 9), range.end);
     try testing.expectEqual(@as(usize, 0), range.cp_offset);
+}
+
+/// Whether a renderer may build a frame from the terminal now. False
+/// while the program holds frames (synchronized output, mode 2026) or
+/// `hold_frames` is set; the renderer keeps showing its last frame.
+/// Caller must hold `mutex`.
+pub fn renderable(self: *const State) bool {
+    return !self.hold_frames and !self.terminal.modes.get(.synchronized_output);
 }

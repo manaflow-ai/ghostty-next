@@ -986,7 +986,9 @@ pub const LocalHistoryResult = enum {
 /// (ghostty_surface_restore_snapshot_local_history).
 ///
 /// The terminal lock is held only for two swaps, never for O(history)
-/// work:
+/// work. The renderer holds its frames (renderer.State.hold_frames) from
+/// the first swap until the result, so no frame shows the READY terminal
+/// without the local history and images:
 /// 1. Under the lock, swap in the READY terminal (as a READY restore
 ///    does). The old terminal is private to this call from then on:
 ///    output arrives on this thread only.
@@ -1045,6 +1047,10 @@ pub fn restoreSnapshotLocalHistory(
         defer self.renderer_state.mutex.unlock(global.io());
         self.prepareRestoredTerminalLocked(&new);
         old = self.swapTerminalLocked(new, decoded.continuation);
+        // No frame may show this READY terminal without the local history
+        // and images: frames are held until step 4 or the mismatch result
+        // (released by the defer below, in every outcome).
+        self.renderer_state.hold_frames = true;
         // The config is read under the lock; step 3 needs the limits.
         limit_bytes = self.config.scrollback_limit_bytes;
         limit_lines = self.config.scrollback_limit_lines;
@@ -1052,6 +1058,15 @@ pub fn restoreSnapshotLocalHistory(
     };
     defer old.deinit(self.alloc);
     defer self.renderer_wakeup.notify() catch {};
+    // Runs before the wakeup above: release the frame hold under the lock
+    // and redraw. On a mismatch the READY terminal alone is shown now.
+    defer {
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+        self.renderer_state.hold_frames = false;
+        self.terminal.flags.dirty.clear = true;
+        self.terminal_stream.handler.queueRender() catch {};
+    }
 
     // 2. Reflow and compare, without the lock. Whether the local limit
     // cut the history is decided before the reflow too: a wider resize
@@ -2904,6 +2919,59 @@ fn TestCutReplay(comptime cut: []const u8, comptime rest: []const u8) type {
     };
 }
 
+test "manual: an implicit-ID PNG survives two local-history resizes and a plain READY replay" {
+    const body = struct {
+        fn run(io: *Termio, sink: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            const alloc = testing.allocator;
+
+            // The dogfood case: about 35 rows, 400 short lines, then a PNG
+            // through a=T with a c/r size, no i, no q, one chunk.
+            try testing.expect(io.setGrid(110, 35, 1));
+            var owner: TestOwner = undefined;
+            try owner.init(io, 110, 35, null);
+            defer owner.deinit();
+            var buf: [32]u8 = undefined;
+            for (0..400) |i| testFeedBoth(io, &owner, try std.fmt.bufPrint(&buf, "line {d}\r\n", .{i}));
+            testFeedBoth(io, &owner, "\x1b_Gf=100,a=T,c=8,r=4;" ++ test_kitty_png ++ "\x1b\\");
+            testFeedBoth(io, &owner, "prompt$ ");
+            try testing.expectEqual(@as(usize, 1), io.terminal.screens.get(.primary).?.kitty_images.images.count());
+            const id = blk: {
+                var it = owner.t.screens.get(.primary).?.kitty_images.images.keyIterator();
+                break :blk it.next().?.*;
+            };
+
+            // Narrower and shorter, then wider and taller: a local READY
+            // each time, and the image stays where the owner has it.
+            const sizes = [_][2]u16{ .{ 80, 22 }, .{ 130, 40 } };
+            for (sizes) |size| {
+                const ready, const digest = try owner.resizeAndEncode(size[0], size[1]);
+                defer alloc.free(ready);
+                try testing.expectEqual(
+                    LocalHistoryResult.restored,
+                    try io.restoreSnapshotLocalHistory(ready, digest),
+                );
+                try testExpectSamePrimary(io, &owner);
+                try testExpectSameKitty(&io.terminal, &owner.t, .primary, &.{id});
+            }
+
+            // A plain READY restore (a reattach) and the owner's replay.
+            const ready = try owner.encodeReady(.ground);
+            defer alloc.free(ready);
+            var stream: std.Io.Writer.Allocating = .init(alloc);
+            defer stream.deinit();
+            const stats = try terminalpkg.kitty.graphics.replay.encode(alloc, &owner.t, std.math.maxInt(u64), &stream.writer);
+            try testing.expectEqual(@as(u64, 1), stats.images);
+            try testing.expectEqual(@as(u64, 1), stats.placements);
+            try io.restoreSnapshot(ready, .ready);
+            try io.applyKittyReplay(stream.written());
+            try testExpectSameKitty(&io.terminal, &owner.t, .primary, &.{id});
+            try sink.expect("");
+        }
+    }.run;
+    try testManualTermio(true, body);
+}
+
 test "manual: snapshot local history mismatch drops the Kitty images" {
     const body = struct {
         fn run(io: *Termio, sink: *TestSink, _: bool) !void {
@@ -3225,6 +3293,99 @@ test "manual: snapshot local history restore keeps a cut history across a narrow
             const ready, const digest = try owner.resizeAndEncode(25, 10);
             defer alloc.free(ready);
             try testExpectRestoredCut(io, &owner, ready, digest, "short ");
+        }
+    }.run;
+    try testManualTermio(true, body);
+}
+
+/// What a renderer frame between the two swaps of a local history
+/// restore could show (test hook state).
+var test_between_frame: struct {
+    seen: bool = false,
+    renderable: bool = true,
+} = .{};
+
+fn testRecordBetweenFrame(t: *Termio) void {
+    t.renderer_state.mutex.lockUncancelable(global.io());
+    defer t.renderer_state.mutex.unlock(global.io());
+    test_between_frame = .{ .seen = true, .renderable = t.renderer_state.renderable() };
+}
+
+test "manual: no frame shows the READY terminal between the two swaps" {
+    const body = struct {
+        fn run(io: *Termio, sink: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            const alloc = testing.allocator;
+
+            try testing.expect(io.setGrid(40, 10, 1));
+            var owner: TestOwner = undefined;
+            try owner.init(io, 40, 10, null);
+            defer owner.deinit();
+            try testFeedLines(io, &owner, 0, 600);
+            testKittyImages(TestBoth{ .io = io, .o = &owner }, 3);
+
+            // RESTORED: a frame forced between the swaps is held; the first
+            // frame after the restore has the images and the history.
+            {
+                const ready, const digest = try owner.resizeAndEncode(25, 10);
+                defer alloc.free(ready);
+                test_between_frame = .{};
+                test_between_swaps = &testRecordBetweenFrame;
+                defer test_between_swaps = null;
+                try testing.expectEqual(
+                    LocalHistoryResult.restored,
+                    try io.restoreSnapshotLocalHistory(ready, digest),
+                );
+                try testing.expect(test_between_frame.seen);
+                try testing.expect(!test_between_frame.renderable);
+                io.renderer_state.mutex.lockUncancelable(global.io());
+                const after = io.renderer_state.renderable();
+                io.renderer_state.mutex.unlock(global.io());
+                try testing.expect(after);
+                try testExpectSamePrimary(io, &owner);
+                try testExpectSameKitty(&io.terminal, &owner.t, .primary, &.{ 1, 10, 20 });
+            }
+
+            // MISMATCH (a change between the swaps): held between them,
+            // then the READY terminal alone is renderable.
+            {
+                const ready, const digest = try owner.resizeAndEncode(30, 10);
+                defer alloc.free(ready);
+                test_between_frame = .{};
+                test_between_swaps = &struct {
+                    fn hook(t: *Termio) void {
+                        testRecordBetweenFrame(t);
+                        t.scrollViewport(.{ .delta = -3 });
+                    }
+                }.hook;
+                defer test_between_swaps = null;
+                try testing.expectEqual(
+                    LocalHistoryResult.mismatch,
+                    try io.restoreSnapshotLocalHistory(ready, digest),
+                );
+                try testing.expect(!test_between_frame.renderable);
+                io.renderer_state.mutex.lockUncancelable(global.io());
+                const after = io.renderer_state.renderable();
+                io.renderer_state.mutex.unlock(global.io());
+                try testing.expect(after);
+                try testing.expectEqual(try testReadyHistoryRows(ready), testHistoryRows(&io.terminal));
+            }
+
+            // MISMATCH (a diverged history, no hook): renderable after.
+            {
+                owner.stream.nextSlice("a frame the viewer never got\r\n");
+                const ready, const digest = try owner.resizeAndEncode(25, 10);
+                defer alloc.free(ready);
+                try testing.expectEqual(
+                    LocalHistoryResult.mismatch,
+                    try io.restoreSnapshotLocalHistory(ready, digest),
+                );
+                io.renderer_state.mutex.lockUncancelable(global.io());
+                const after = io.renderer_state.renderable();
+                io.renderer_state.mutex.unlock(global.io());
+                try testing.expect(after);
+            }
+            try sink.expect("");
         }
     }.run;
     try testManualTermio(true, body);
