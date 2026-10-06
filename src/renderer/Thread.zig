@@ -569,6 +569,10 @@ fn renderCallback(
     // Kitty graphics animations pause with us and resume on visibility.
     if (!t.flags.visible) return .disarm;
 
+    // A running display link means frames are already being paced; one
+    // that is stopped means the terminal was idle until this update.
+    const paced = t.renderer.hasVsync();
+
     // Update our frame data
     t.renderer.updateFrame(
         t.state,
@@ -576,8 +580,12 @@ fn renderCallback(
     ) catch |err|
         log.warn("error rendering err={}", .{err});
 
-    // Draw
-    t.drawFrame(false);
+    // Draw. updateFrame starts the display link for the rebuilt cells, so
+    // a vsync-deferred draw would hold the first frame after idle (a
+    // keystroke's echo) until the next refresh: up to a full interval,
+    // 16.7 ms at 60 Hz. Draw that frame now; frames that follow while the
+    // link runs stay paced to the display.
+    t.drawFrame(!paced);
 
     // Schedule the next animation wake, if the renderer needs one.
     t.armAnimationTimer();
