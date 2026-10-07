@@ -1283,3 +1283,15 @@ test "Parser allocating capture limit includes parser-added bytes" {
     try testing.expectEqual(@as(usize, 4), cap.trailing().len);
     try testing.expectEqual(@as(usize, 4), cap.writer.buffer.len);
 }
+
+test "OSC 7501: parser returns a command for a program status report" {
+    // manaflow-ai: guards the port of ghostty-org/ghostty#14560. Before the
+    // port the parser drops OSC 7501 and returns null.
+    const testing = std.testing;
+
+    var p: Parser = .init(testing.allocator);
+    defer p.deinit();
+
+    p.nextSlice("7501;state=working:progress=40");
+    try testing.expect(p.end('\x1b') != null);
+}
