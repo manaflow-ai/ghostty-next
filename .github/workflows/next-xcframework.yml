@@ -33,7 +33,7 @@ jobs:
   # since the newest ancestor release; a label (<flavor>+<sha12>) and tag are
   # never reused, and an existing tag refuses the publish.
   plan:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 10
     outputs:
       publish: ${{ steps.plan.outputs.publish }}
@@ -217,7 +217,7 @@ jobs:
       github.ref == 'refs/heads/main' &&
       (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish))
     needs: [plan, build]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest # runner-policy-exception: actions/attest-build-provenance release attestation; kept GitHub-hosted for a GitHub-hosted provenance record
     timeout-minutes: 15
     permissions:
       contents: write
