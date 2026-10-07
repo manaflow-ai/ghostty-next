@@ -118,6 +118,7 @@ jobs:
             -Dtest-filter="replay: " \
             -Dtest-filter="kitty renderer keeps an image" \
             -Dtest-filter="no frame shows the READY terminal" \
+            -Dtest-filter="OSC 7501" \
             --summary all
           # libghostty-vt patches (VT replay formatter, terminal and Kitty
           # graphics C API). These live in the lib-vt test modules.
@@ -157,6 +158,9 @@ jobs:
             -Dtest-filter="PageList prependHistoryFrom" \
             -Dtest-filter="replay: " \
             -Dtest-filter="kitty replay encode" \
+            -Dtest-filter="OSC 7501" \
+            -Dtest-filter="program_status effect callback" \
+            -Dtest-filter="set program_status callback" \
             --summary all
 
       - name: Build and package
