@@ -1,0 +1,25 @@
+name: Runner policy
+
+# A GitHub billing block must never stop CI: every job runs on a Blacksmith
+# label or an owned runner. scripts/ci/check-runner-labels.py refuses
+# GitHub-hosted labels (ubuntu-*, macos-*, windows-*) in workflow text.
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  runner-policy:
+    name: Runner policy
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: No GitHub-hosted runner labels
+        run: python3 scripts/ci/check-runner-labels.py
