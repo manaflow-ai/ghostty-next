@@ -12,6 +12,14 @@
 //! (LC_DYSYMTAB), and relocation and indirect-symbol indices follow.
 //! Then `zig ranlib` rebuilds the archive index.
 //!
+//! It also marks compiler_rt.o's remaining global definitions weak
+//! (N_WEAK_DEF). Zig declares them weak (lib/compiler_rt.zig: "we prefer
+//! weak linkage because some of the routines ... may also be provided by
+//! system/dynamic libc"), and an ELF build keeps that, but Zig 0.16's
+//! Mach-O objects carry them as strong definitions. Apple ld64 tolerates
+//! a strong duplicate from an archive; ld64.lld does not (for example
+//! __negdf2 from Rust's compiler_builtins).
+//!
 //! Without this, a non-Darwin host shipped compiler-rt's strong memset
 //! beside quirks_memset.zig's (ld64.lld: "duplicate symbol: memset")
 //! and bound memcpy and friends to compiler-rt.
@@ -115,7 +123,9 @@ pub fn patchArchive(alloc: Allocator, archive: []u8) Error!usize {
         name = std.mem.trimEnd(u8, name, "/");
 
         if (std.mem.eql(u8, name, "compiler_rt.o")) {
-            total += try localizeObject(alloc, archive[body_start .. data_start + size], &localize);
+            const obj = archive[body_start .. data_start + size];
+            total += try localizeObject(alloc, obj, &localize);
+            try weakenObject(obj);
         }
         pos = data_start + size;
         pos += pos & 1; // members are 2-byte aligned
@@ -127,6 +137,7 @@ const N_EXT: u8 = 0x01;
 const N_PEXT: u8 = 0x10;
 const N_TYPE: u8 = 0x0e;
 const N_SECT: u8 = 0x0e;
+const N_WEAK_DEF: u16 = 0x0080;
 const INDIRECT_SYMBOL_LOCAL: u32 = 0x80000000;
 const INDIRECT_SYMBOL_ABS: u32 = 0x40000000;
 
@@ -238,6 +249,36 @@ pub fn localizeObject(alloc: Allocator, obj: []u8, names: []const []const u8) Er
         wr(u32, obj, at, new_index[sym]);
     }
     return moved;
+}
+
+/// Mark every global definition of a 64-bit Mach-O object weak, as
+/// Zig declares compiler-rt's. Returns how many changed.
+pub fn weakenObject(obj: []u8) Error!usize {
+    if (try rd(u32, obj, 0) != 0xfeedfacf) return error.UnsupportedMachO;
+    const ncmds = try rd(u32, obj, 16);
+    var cmd_pos: usize = 32;
+    var changed: usize = 0;
+    for (0..ncmds) |_| {
+        const cmd = try rd(u32, obj, cmd_pos);
+        const cmdsize = try rd(u32, obj, cmd_pos + 4);
+        if (cmd == 0x2) { // LC_SYMTAB
+            const symoff = try rd(u32, obj, cmd_pos + 8);
+            const nsyms = try rd(u32, obj, cmd_pos + 12);
+            for (0..nsyms) |i| {
+                const at = symoff + i * 16;
+                if (at + 16 > obj.len) return error.InvalidMachO;
+                const n_type = obj[at + 4];
+                if (n_type & N_EXT == 0 or n_type & N_TYPE != N_SECT) continue;
+                const n_desc = try rd(u16, obj, at + 6);
+                if (n_desc & N_WEAK_DEF != 0) continue;
+                wr(u16, obj, at + 6, n_desc | N_WEAK_DEF);
+                changed += 1;
+            }
+        }
+        if (cmdsize == 0) return error.InvalidMachO;
+        cmd_pos += cmdsize;
+    }
+    return changed;
 }
 
 fn wantsLocal(symbols: []const u8, strtab: []const u8, i: usize, names: []const []const u8) bool {
@@ -377,6 +418,14 @@ test "localizes listed definitions and keeps relocations on their symbols" {
 
     // A second pass finds nothing left to localize.
     try testing.expectEqual(@as(usize, 0), try localizeObject(alloc, obj, &localize));
+
+    // Weakening touches only the remaining global definition.
+    try testing.expectEqual(@as(usize, 1), try weakenObject(obj));
+    const symoff = try rd(u32, obj, 32 + 152 + 8);
+    try testing.expectEqual(N_WEAK_DEF, try rd(u16, obj, symoff + 3 * 16 + 6)); // ___udivti3
+    try testing.expectEqual(@as(u16, 0), try rd(u16, obj, symoff + 1 * 16 + 6)); // _memcpy, now local
+    try testing.expectEqual(@as(u16, 0), try rd(u16, obj, symoff + 4 * 16 + 6)); // undefined
+    try testing.expectEqual(@as(usize, 0), try weakenObject(obj));
 }
 
 test "an object without listed symbols is unchanged" {
