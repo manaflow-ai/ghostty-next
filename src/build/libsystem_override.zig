@@ -32,22 +32,22 @@ const Allocator = std.mem.Allocator;
 /// The symbols to prefer from libSystem. Keep in sync with
 /// libsystem_override.sh (the Darwin-host path).
 pub const localize = [_][]const u8{
-    "_bcmp",           "_memcmp",         "_memcpy",         "_memmove",
-    "_memset",         "_strlen",         "___memcpy_chk",   "___memmove_chk",
-    "___memset_chk",   "___strcat_chk",   "___strcpy_chk",   "_ceil",
-    "_ceilf",          "_ceill",          "_cos",            "_cosf",
-    "_cosl",           "_exp",            "_exp2",           "_exp2f",
-    "_exp2l",          "_expf",           "_expl",           "_fabs",
-    "_fabsf",          "_fabsl",          "_floor",          "_floorf",
-    "_floorl",         "_fma",            "_fmaf",           "_fmal",
-    "_fmax",           "_fmaxf",          "_fmaxl",          "_fmin",
-    "_fminf",          "_fminl",          "_fmod",           "_fmodf",
-    "_fmodl",          "_log",            "_log10",          "_log10f",
-    "_log10l",         "_log2",           "_log2f",          "_log2l",
-    "_logf",           "_logl",           "_round",          "_roundf",
-    "_roundl",         "_sin",            "_sinf",           "_sinl",
-    "_sqrt",           "_sqrtf",          "_sqrtl",          "_tan",
-    "_tanf",           "_tanl",           "_trunc",          "_truncf",
+    "_bcmp",         "_memcmp",       "_memcpy",       "_memmove",
+    "_memset",       "_strlen",       "___memcpy_chk", "___memmove_chk",
+    "___memset_chk", "___strcat_chk", "___strcpy_chk", "_ceil",
+    "_ceilf",        "_ceill",        "_cos",          "_cosf",
+    "_cosl",         "_exp",          "_exp2",         "_exp2f",
+    "_exp2l",        "_expf",         "_expl",         "_fabs",
+    "_fabsf",        "_fabsl",        "_floor",        "_floorf",
+    "_floorl",       "_fma",          "_fmaf",         "_fmal",
+    "_fmax",         "_fmaxf",        "_fmaxl",        "_fmin",
+    "_fminf",        "_fminl",        "_fmod",         "_fmodf",
+    "_fmodl",        "_log",          "_log10",        "_log10f",
+    "_log10l",       "_log2",         "_log2f",        "_log2l",
+    "_logf",         "_logl",         "_round",        "_roundf",
+    "_roundl",       "_sin",          "_sinf",         "_sinl",
+    "_sqrt",         "_sqrtf",        "_sqrtl",        "_tan",
+    "_tanf",         "_tanl",         "_trunc",        "_truncf",
     "_truncl",
 };
 
@@ -125,7 +125,7 @@ pub fn patchArchive(alloc: Allocator, archive: []u8) Error!usize {
         if (std.mem.eql(u8, name, "compiler_rt.o")) {
             const obj = archive[body_start .. data_start + size];
             total += try localizeObject(alloc, obj, &localize);
-            try weakenObject(obj);
+            _ = try weakenObject(obj);
         }
         pos = data_start + size;
         pos += pos & 1; // members are 2-byte aligned
