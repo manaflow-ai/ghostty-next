@@ -78,9 +78,15 @@ pub fn main(init: std.process.Init) !void {
         .stderr = .inherit,
     });
     const term = try child.wait(init.io);
-    if (term.exited != 0) {
-        std.log.err("zig ranlib exited with code {d}", .{term.exited});
-        std.process.exit(1);
+    switch (term) {
+        .exited => |code| if (code != 0) {
+            std.log.err("zig ranlib exited with code {d}", .{code});
+            std.process.exit(1);
+        },
+        else => {
+            std.log.err("zig ranlib terminated abnormally: {any}", .{term});
+            std.process.exit(1);
+        },
     }
 }
 
