@@ -34,7 +34,8 @@ trap 'rm -rf "$tmp"' EXIT
 cp -f "$in" "$out"
 chmod u+w "$out"
 
-# The symbols to prefer from libSystem. Everything listed here is a
+# The symbols to prefer from libSystem (libsystem_override.zig, the
+# non-Darwin-host path, has the same list). Everything listed here is a
 # stable macOS export (verified against libSystem's link surface).
 # Notably NOT listed (not exported by libSystem): the *q (f128)
 # variants, sincos/sincosf/sincosl, and all ___-prefixed compiler

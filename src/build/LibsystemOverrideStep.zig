@@ -26,20 +26,38 @@ pub const Result = struct {
     output: std.Build.LazyPath,
 };
 
-/// Post-process the given static archive on Darwin. Requires a Darwin
-/// host for the Apple toolchain (nmedit); in all other configurations
-/// this is a no-op and the input is returned unmodified, which is
-/// functional (the bundled compiler-rt symbols are used), just slower.
+/// Post-process the given static archive for a Darwin target. A Darwin
+/// host uses the Apple toolchain (libsystem_override.sh, nmedit); any
+/// other host uses the portable libsystem_override.zig tool, which
+/// localizes the same symbols, so a cross-compiled archive matches a
+/// Mac-built one. Without it, a non-Darwin host shipped compiler-rt's
+/// strong memset beside quirks_memset.zig's, which strict linkers
+/// (ld64.lld) reject as a duplicate symbol. A non-Darwin target is a
+/// no-op.
 pub fn create(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     input: std.Build.LazyPath,
     out_name: []const u8,
 ) Result {
-    if (!target.result.os.tag.isDarwin() or
-        comptime !builtin.os.tag.isDarwin())
-    {
+    if (!target.result.os.tag.isDarwin()) {
         return .{ .step = null, .output = input };
+    }
+
+    if (comptime !builtin.os.tag.isDarwin()) {
+        const tool = b.addExecutable(.{
+            .name = "libsystem_override",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/build/libsystem_override.zig"),
+                .target = b.graph.host,
+            }),
+        });
+        const run = b.addRunArtifact(tool);
+        run.setName("libsystem override");
+        run.addArg(b.graph.zig_exe);
+        run.addFileArg(input);
+        const output = run.addOutputFileArg(out_name);
+        return .{ .step = &run.step, .output = output };
     }
 
     const run = b.addSystemCommand(&.{"/bin/sh"});
