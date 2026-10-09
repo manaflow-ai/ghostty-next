@@ -3127,6 +3127,14 @@ test "XTGETTCAP responses" {
     );
     S.reset();
 
+    // The program status protocol (OSC 7501) asks terminals to advertise
+    // support with the extended capability Pst, the report sequence with
+    // the body as its only parameter. A parameterized string is returned in
+    // terminfo source form.
+    s.nextSlice("\x1BP+q" ++ std.fmt.bytesToHex("Pst", .upper) ++ "\x1B\\");
+    try S.expectResponse("\x1BP1+r" ++ std.fmt.bytesToHex("Pst", .upper) ++ "=" ++
+        std.fmt.bytesToHex("\\E]7501;%p1%s\\E\\\\", .upper) ++ "\x1B\\");
+
     // Unknown and malformed keys are skipped without an error.
     s.nextSlice("\x1BP+qWHO;5;GG\x1B\\");
     try testing.expectEqual(@as(usize, 0), S.calls);
