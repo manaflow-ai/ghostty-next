@@ -125,6 +125,11 @@ pub const ghostty: Source = .{
         // Synchronized output
         .{ .name = "Sync", .value = .{ .string = "\\E[?2026%?%p1%{1}%-%tl%eh%;" } },
 
+        // Program status protocol (OSC 7501): advertises support. The value
+        // is the report sequence with the body as its only parameter.
+        // https://www.superlogical.com/rex/docs/build/program-status#terminfo
+        .{ .name = "Pst", .value = .{ .string = "\\E]7501;%p1%s\\E\\\\" } },
+
         // Bracketed paste mode
         .{ .name = "BD", .value = .{ .string = "\\E[?2004l" } },
         .{ .name = "BE", .value = .{ .string = "\\E[?2004h" } },
