@@ -625,6 +625,16 @@ typedef enum {
   GHOSTTY_FONT_SIZE_ACTION_RESET = 2,
   GHOSTTY_FONT_SIZE_ACTION_SET = 3,
 } ghostty_font_size_action_e;
+// Whether `len` bytes of `text` (not NUL-terminated), a regex link under the
+// pointer, are a link. False: no hover underline, no pointer change, no
+// mouse-over-link and no open. OSC 8 links and always-highlighted links are
+// not asked. Called on the renderer thread and on the app thread with the
+// terminal lock held, so it answers from what it already knows and never
+// calls into Ghostty; to change an answer, the embedder sends the pointer
+// position again (ghostty_surface_mouse_pos) or refreshes.
+typedef bool (*ghostty_surface_link_filter_cb)(void* userdata,
+                                               const char* text,
+                                               uintptr_t len);
 typedef void (*ghostty_font_size_action_cb)(
     void* userdata,
     ghostty_font_size_action_e action,
@@ -1378,6 +1388,12 @@ GHOSTTY_API bool ghostty_surface_set_font_size_action_callback(
     ghostty_surface_t,
     ghostty_font_size_action_cb,
     void* userdata);
+// Installs the link filter for this surface; a NULL callback removes it.
+// userdata must stay valid until the filter is removed or
+// ghostty_surface_free returns.
+GHOSTTY_API void ghostty_surface_set_link_filter(ghostty_surface_t,
+                                                 ghostty_surface_link_filter_cb,
+                                                 void* userdata);
 GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t);
 GHOSTTY_API ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
 // Fills the grid metrics. Returns false while a resize of an unlocked grid
