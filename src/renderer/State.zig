@@ -27,6 +27,10 @@ terminal: *terminalpkg.Terminal,
 hold_frames: bool = false,
 
 
+/// The embedder's link filter (`ghostty_surface_set_link_filter`), if any.
+/// Protected by `mutex`.
+link_filter: ?renderer.LinkFilter = null,
+
 /// The terminal inspector, if any. This will be null while the inspector
 /// is not active and will be set when it is active.
 inspector: ?*Inspector = null,

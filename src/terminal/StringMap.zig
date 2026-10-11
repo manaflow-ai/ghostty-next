@@ -106,6 +106,13 @@ pub const Match = struct {
         self.region.deinit();
     }
 
+    /// Returns the matched text.
+    pub fn text(self: Match) []const u8 {
+        const start_idx: usize = @intCast(self.region.starts()[0]);
+        const end_idx: usize = @intCast(self.region.ends()[0]);
+        return self.map.string[self.offset + start_idx .. self.offset + end_idx];
+    }
+
     /// Returns the selection containing the full match.
     pub fn selection(self: Match) Selection {
         const start_idx: usize = @intCast(self.region.starts()[0]);
@@ -169,6 +176,41 @@ test "StringMap searchIterator" {
     }
 
     try testing.expect(try it.next() == null);
+}
+
+test "StringMap match text" {
+    if (comptime !build_options.oniguruma) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    try oni.testing.ensureInit();
+    var re = try oni.Regex.init(
+        "[C-D]{2}",
+        .{},
+        oni.Encoding.utf8,
+        oni.Syntax.default,
+        null,
+    );
+    defer re.deinit();
+
+    var s = try Screen.init(io, alloc, .{ .cols = 5, .rows = 5, .max_scrollback_bytes = 0 });
+    defer s.deinit();
+    try s.testWriteString("1ABCD2EFGH");
+    const line = s.selectLine(.{
+        .pin = s.pages.pin(.{ .active = .{ .x = 2, .y = 0 } }).?,
+    }).?;
+    const map = try s.selectionStringMap(alloc, .{
+        .sel = line,
+        .trim = false,
+    });
+    defer map.deinit(alloc);
+
+    var it = map.searchIterator(re);
+    var match = (try it.next()).?;
+    defer match.deinit();
+    try testing.expectEqualStrings("CD", match.text());
 }
 
 test "StringMap searchIterator URL detection" {

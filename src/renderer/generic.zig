@@ -1425,6 +1425,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Data we extract out of the critical area.
             const Critical = struct {
                 links: terminal.RenderState.CellSet,
+                link_filter: ?renderer.LinkFilter,
                 mouse: renderer.State.Mouse,
                 preedit: ?renderer.State.Preedit,
                 scrollbar: terminal.Scrollbar,
@@ -1580,6 +1581,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 break :critical .{
                     .links = links,
+                    .link_filter = state.link_filter,
                     .mouse = state.mouse,
                     .preedit = preedit,
                     .scrollbar = scrollbar,
@@ -1600,6 +1602,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 &self.terminal_state,
                 state.mouse.point,
                 state.mouse.mods,
+                critical.link_filter,
             ) catch |err| {
                 log.warn("error searching for regex links err={}", .{err});
             };

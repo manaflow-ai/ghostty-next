@@ -102,6 +102,8 @@ jobs:
             -Dtest-filter="ghostty.h surface grid" \
             -Dtest-filter="ghostty.h SurfaceSnapshotPhase" \
             -Dtest-filter="renderer mailbox: " \
+            -Dtest-filter="renderCellMap link filter" \
+            -Dtest-filter="StringMap match text" \
             -Dtest-filter="loadString " \
             -Dtest-filter="keySource: " \
             -Dtest-filter="ghostty_config_key_" \

@@ -37,6 +37,23 @@ pub const Link = struct {
     }
 };
 
+/// The embedder's check on a regex link under the pointer
+/// (`ghostty_surface_set_link_filter`): false means the text is no link, so it
+/// gets no hover underline, pointer change or open. OSC 8 links and always
+/// highlighted links are not filtered. Called on the renderer thread, and on
+/// the app thread with the terminal lock held: it answers from what it
+/// already knows and never calls back into Ghostty.
+pub const Filter = struct {
+    pub const Callback = *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) bool;
+
+    callback: Callback,
+    userdata: ?*anyopaque,
+
+    pub fn accepts(self: Filter, text: []const u8) bool {
+        return self.callback(self.userdata, text.ptr, text.len);
+    }
+};
+
 /// A set of links. This provides a higher level API for renderers
 /// to match against a viewport and determine if cells are part of
 /// a link.
@@ -76,6 +93,7 @@ pub const Set = struct {
         render_state: *const terminal.RenderState,
         mouse_viewport: ?point.Coordinate,
         mouse_mods: inputpkg.Mods,
+        filter: ?Filter,
     ) !void {
         // Fast path, not very likely since we have default links.
         if (self.links.len == 0) return;
@@ -132,6 +150,7 @@ pub const Set = struct {
                         for (map.items[start..end]) |pt| {
                             if (pt.eql(vp)) break;
                         } else continue;
+                        if (filter) |f| if (!f.accepts(str[start..end])) continue;
                     } else continue,
                 }
 
@@ -188,6 +207,7 @@ test "renderCellMap" {
         &state,
         null,
         .{},
+        null,
     );
     try testing.expect(!result.contains(.{ .x = 0, .y = 0 }));
     try testing.expect(result.contains(.{ .x = 1, .y = 0 }));
@@ -242,6 +262,7 @@ test "renderCellMap hover links" {
             &state,
             null,
             .{},
+            null,
         );
 
         // Test our matches
@@ -263,6 +284,7 @@ test "renderCellMap hover links" {
             &state,
             .{ .x = 1, .y = 0 },
             .{},
+            null,
         );
 
         // Test our matches
@@ -272,6 +294,66 @@ test "renderCellMap hover links" {
         try testing.expect(!result.contains(.{ .x = 3, .y = 0 }));
         try testing.expect(result.contains(.{ .x = 1, .y = 1 }));
         try testing.expect(!result.contains(.{ .x = 1, .y = 2 }));
+    }
+}
+
+/// Accepts only the text "AB" (the link filter tests).
+fn acceptsOnlyAB(_: ?*anyopaque, ptr: [*]const u8, len: usize) callconv(.c) bool {
+    return std.mem.eql(u8, ptr[0..len], "AB");
+}
+
+test "renderCellMap link filter: a hover link the filter rejects is not highlighted" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(testing.io, alloc, .{
+        .cols = 5,
+        .rows = 3,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("1ABCD2CDEF\r\n3IJKL");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    var set = try Set.fromConfig(alloc, &.{
+        .{
+            .regex = "AB|CD",
+            .action = .{ .open = {} },
+            .highlight = .{ .hover = {} },
+        },
+    });
+    defer set.deinit(alloc);
+    const filter: Filter = .{ .callback = acceptsOnlyAB, .userdata = null };
+
+    // "CD" under the pointer: the filter rejects it, so nothing is highlighted.
+    {
+        var result: terminal.RenderState.CellSet = .empty;
+        defer result.deinit(alloc);
+        try set.renderCellMap(alloc, &result, &state, .{ .x = 3, .y = 0 }, .{}, filter);
+        try testing.expect(!result.contains(.{ .x = 3, .y = 0 }));
+        try testing.expect(!result.contains(.{ .x = 4, .y = 0 }));
+    }
+
+    // "AB" under the pointer: accepted and highlighted.
+    {
+        var result: terminal.RenderState.CellSet = .empty;
+        defer result.deinit(alloc);
+        try set.renderCellMap(alloc, &result, &state, .{ .x = 1, .y = 0 }, .{}, filter);
+        try testing.expect(result.contains(.{ .x = 1, .y = 0 }));
+        try testing.expect(result.contains(.{ .x = 2, .y = 0 }));
+    }
+
+    // Without a filter "CD" is highlighted as before.
+    {
+        var result: terminal.RenderState.CellSet = .empty;
+        defer result.deinit(alloc);
+        try set.renderCellMap(alloc, &result, &state, .{ .x = 3, .y = 0 }, .{}, null);
+        try testing.expect(result.contains(.{ .x = 3, .y = 0 }));
     }
 }
 
@@ -330,6 +412,7 @@ test "renderCellMap inactive links don't allocate" {
         &state,
         null,
         .{},
+        null,
     );
 
     try testing.expectEqual(@as(usize, 0), result.count());
@@ -379,6 +462,7 @@ test "renderCellMap mods no match" {
         &state,
         null,
         .{},
+        null,
     );
 
     // Test our matches

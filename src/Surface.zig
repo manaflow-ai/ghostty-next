@@ -4746,6 +4746,18 @@ const Link = struct {
 /// Returns the link at the given cursor position, if any.
 ///
 /// Requires the renderer mutex is held.
+/// Installs the embedder's link filter, or with null removes it
+/// (`ghostty_surface_set_link_filter`). The renderer reads it on its next frame.
+pub fn setLinkFilter(self: *Surface, filter: ?rendererpkg.LinkFilter) void {
+    {
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+        self.renderer_state.link_filter = filter;
+        self.renderer_state.terminal.screens.active.dirty.hyperlink_hover = true;
+    }
+    self.queueRender() catch |err| log.warn("error queueing render after link filter change err={}", .{err});
+}
+
 fn linkAtPos(
     self: *Surface,
     pos: apprt.CursorPos,
@@ -4820,6 +4832,11 @@ fn linkAtPin(
             defer match.deinit();
             const sel = match.selection();
             if (!sel.contains(screen, mouse_pin)) continue;
+            // The embedder's filter decides a pointer link (not a double-click
+            // word selection, which passes no mods).
+            if (mouse_mods != null) if (self.renderer_state.link_filter) |f| {
+                if (!f.accepts(match.text())) continue;
+            };
             return .{
                 .action = link.action,
                 .selection = sel,
