@@ -161,6 +161,37 @@ test "c_get: color" {
     try testing.expectEqual(0, cval.b);
 }
 
+test "c_get: terminal color" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c = try Config.default(alloc);
+    defer c.deinit();
+
+    // A plain color reads as a color, so embedders get `cursor-color` and
+    // `selection-*` from the config.
+    {
+        c.@"cursor-color" = .{ .color = .{ .r = 255, .g = 136, .b = 0 } };
+        var cval: Color.C = undefined;
+        try testing.expect(get(&c, .@"cursor-color", @ptrCast(&cval)));
+        try testing.expectEqual(255, cval.r);
+        try testing.expectEqual(136, cval.g);
+        try testing.expectEqual(0, cval.b);
+    }
+
+    // Cell-relative values and unset ones are not colors.
+    {
+        c.@"selection-background" = .@"cell-foreground";
+        var cval: Color.C = undefined;
+        try testing.expect(!get(&c, .@"selection-background", @ptrCast(&cval)));
+    }
+    {
+        c.@"cursor-text" = null;
+        var cval: Color.C = undefined;
+        try testing.expect(!get(&c, .@"cursor-text", @ptrCast(&cval)));
+    }
+}
+
 test "c_get: window-padding" {
     const testing = std.testing;
     const alloc = testing.allocator;
