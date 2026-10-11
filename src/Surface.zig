@@ -4832,6 +4832,11 @@ fn linkAtPin(
             defer match.deinit();
             const sel = match.selection();
             if (!sel.contains(screen, mouse_pin)) continue;
+            // The embedder's filter decides a pointer link (not a double-click
+            // word selection, which passes no mods).
+            if (mouse_mods != null) if (self.renderer_state.link_filter) |f| {
+                if (!f.accepts(match.text())) continue;
+            };
             return .{
                 .action = link.action,
                 .selection = sel,

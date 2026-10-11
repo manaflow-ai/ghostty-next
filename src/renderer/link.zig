@@ -95,7 +95,6 @@ pub const Set = struct {
         mouse_mods: inputpkg.Mods,
         filter: ?Filter,
     ) !void {
-        _ = filter;
         // Fast path, not very likely since we have default links.
         if (self.links.len == 0) return;
 
@@ -151,6 +150,7 @@ pub const Set = struct {
                         for (map.items[start..end]) |pt| {
                             if (pt.eql(vp)) break;
                         } else continue;
+                        if (filter) |f| if (!f.accepts(str[start..end])) continue;
                     } else continue,
                 }
 
