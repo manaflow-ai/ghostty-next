@@ -52,6 +52,13 @@ fn getValue(ptr_raw: *anyopaque, value: anytype) bool {
             ptr.* = @floatCast(value);
         },
 
+        // A plain color reads as a color; cell-relative values have no color
+        // of their own, so they read as unsupported.
+        Config.TerminalColor => switch (value) {
+            .color => |color| return getValue(ptr_raw, color),
+            .@"cell-foreground", .@"cell-background" => return false,
+        },
+
         else => |T| switch (@typeInfo(T)) {
             .optional => {
                 // If an optional has no value we return false.
