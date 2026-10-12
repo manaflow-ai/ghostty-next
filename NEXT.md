@@ -105,6 +105,7 @@ thread. New tab and split surfaces do not inherit the IO fields.
 | libghostty-vt: program status protocol (OSC 7501) | Port of upstream ghostty-org/ghostty#14560 (bae2c3cdb, merged as a4aacd918) before the next upstream sync: the OSC parser, the `program_status` stream action and Handler effect, the C API (`GHOSTTY_OSC_COMMAND_PROGRAM_STATUS`, `GhosttyTerminalProgramStatus`, `GhosttyTerminalProgramStatusFn`). The fork appends `GHOSTTY_TERMINAL_OPT_PROGRAM_STATUS = 47` because upstream's 46 is taken by the Kitty additions (upstream 44 and 45 are the XTCHECKSUM options, already on upstream main and not yet synced into this fork; the fork's Kitty additions 44-46 already collide with them); the next upstream sync renumbers the four fork options 44-47. cmux-tui keeps the per-terminal records. |
 | renderer: minimum contrast uses the glass background | With a macOS glass style (`background-blur = macos-glass-regular` or `macos-glass-clear`) `updateFrame` zeroes the background uniform's alpha so the host paints it, and the Metal `cell_text` vertex shader premultiplied that to black before `minimum-contrast` ran: on a light theme dark text failed the check against black and was drawn white (invisible). `updateFrame` now sets a Metal-only `bools.host_paints_background` uniform where it zeroes the alpha, and the text shader treats `bg_color` as opaque for contrast and linear correction when it is set; the fill is still skipped. `bools` stays the last member of `Uniforms` (size 144) with the same field order in Zig and MSL; GLSL is unchanged (`@hasField` guards OpenGL). Ported from manaflow-ai/ghostty 2b3fdc58e (#269); this fork has no `macos-background-from-layer`. The next row extends the flag to `background-opacity = 0`. Covered by cmux-next `GhosttyGlassMinimumContrastTests`. |
 | renderer: minimum contrast uses the background at background-opacity 0 | cmux-next draws a translucent window (`background-opacity` below 1, no glass) by giving its surfaces `background-opacity = 0` and painting the background itself, so the text shader again ran `minimum-contrast` against black and turned dark text white on a light theme (cmux-next cx-d07pp). `bools.host_paints_background` is now set whenever the background uniform's alpha is zero on macOS (glass, or an opacity that rounds to 0), not only for the glass styles. See "Behavior that differs from upstream". Covered by cmux-next `GhosttyGlassMinimumContrastTests`. |
+| termio: CSI 996 reports the surface's runtime color scheme | `CSI ? 996 n` and mode 2031 reports read `Termio.color_scheme`, seeded in `Surface.init` from the surface's conditional state and set under `renderer_state.mutex` in `colorSchemeCallback`. They used to read the config's `_conditional_state`, which a config only follows when `.theme` is in `_conditional_set` (a light/dark pair with different sides), so a plain theme (`theme = Dracula`) in dark mode answered light. `DerivedConfig.conditional_state` is gone. See "Behavior that differs from upstream". Ported from manaflow-ai/ghostty fca69640e (#270). Covered by cmux-next `GhosttyColorSchemeQueryTests`. |
 
 Next in the stack (tracked in the design): presentation callbacks for
 frame-exact acknowledgment, Kitty image replay after a snapshot, and a
@@ -115,6 +116,12 @@ local scrollback window limit for restored snapshots.
 The next upstream sync must keep these behaviors, or change them in a
 reviewed commit that says why.
 
+- Color scheme reports (`CSI ? 996 n`, mode 2031): the reply follows the
+  scheme the embedder set on the surface (`ghostty_surface_set_color_scheme`)
+  whatever the theme. Upstream reads the config's conditional state, which
+  stays light unless the config has a light/dark theme pair with different
+  sides. Why: cmux-next users with a plain theme in dark mode got a light
+  reply, and programs picked light colors.
 - Minimum contrast at `background-opacity = 0` (macOS, Metal): text is
   checked against the configured `background` as if it were opaque, the
   way the glass styles are, instead of against the black that a zero

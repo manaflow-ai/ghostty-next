@@ -805,6 +805,7 @@ pub fn init(
             .size = size,
             .full_config = config,
             .config = try termio.Termio.DerivedConfig.init(alloc, config),
+            .color_scheme = self.config_conditional_state.theme,
             .backend = io_backend,
             .suppress_terminal_responses = if (manual_io) |v| v.mirror else false,
             .mailbox = io_mailbox,
@@ -5203,6 +5204,9 @@ pub fn colorSchemeCallback(self: *Surface, scheme: apprt.ColorScheme) !void {
 
     // Setup our conditional state which has the current color theme.
     self.config_conditional_state.theme = new_scheme;
+    // Reports must follow the surface even if a plain config has no conditional
+    // theme to reload, or the embedder coalesces the reload notification.
+    self.io.updateColorScheme(new_scheme);
     self.notifyConfigConditionalState();
 
     // If mode 2031 is on, then we report the change live.
