@@ -253,10 +253,10 @@ pub const Uniforms = extern struct {
         /// (thickness) to gamma-incorrect blending.
         use_linear_correction: bool align(1) = false,
 
-        /// The host app paints the background (a macOS glass style), so
-        /// `bg_color`'s alpha is zeroed to skip our fill. Text shaders
-        /// still treat `bg_color` as opaque for minimum contrast and
-        /// linear correction.
+        /// The host app paints the background (a macOS glass style, or
+        /// `background-opacity = 0`), so `bg_color`'s alpha is zero and
+        /// our fill is skipped. Text shaders still treat `bg_color` as
+        /// opaque for minimum contrast and linear correction.
         host_paints_background: bool align(1) = false,
     },
 

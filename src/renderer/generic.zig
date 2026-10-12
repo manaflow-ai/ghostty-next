@@ -1713,16 +1713,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // the background opacity because the glass effect handles
                 // it.
                 if (comptime builtin.os.tag == .macos) {
-                    const host_paints_background = switch (self.config.background_blur) {
+                    switch (self.config.background_blur) {
                         .@"macos-glass-regular",
                         .@"macos-glass-clear",
-                        => true,
+                        => self.uniforms.bg_color[3] = 0,
 
-                        else => false,
-                    };
-                    if (host_paints_background) self.uniforms.bg_color[3] = 0;
+                        else => {},
+                    }
+                    // A zero alpha (glass, or background-opacity = 0, which
+                    // cmux-next sets when its window paints a translucent
+                    // background) means the host paints the background.
                     // Text shaders still need that color for minimum
                     // contrast; only the Metal uniforms carry the flag.
+                    const host_paints_background = self.uniforms.bg_color[3] == 0;
                     if (comptime @hasField(@TypeOf(self.uniforms.bools), "host_paints_background"))
                         self.uniforms.bools.host_paints_background = host_paints_background;
                 }
