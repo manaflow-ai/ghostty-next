@@ -1712,13 +1712,20 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // If we're on macOS and have glass styles, we remove
                 // the background opacity because the glass effect handles
                 // it.
-                if (comptime builtin.os.tag == .macos) switch (self.config.background_blur) {
-                    .@"macos-glass-regular",
-                    .@"macos-glass-clear",
-                    => self.uniforms.bg_color[3] = 0,
+                if (comptime builtin.os.tag == .macos) {
+                    const host_paints_background = switch (self.config.background_blur) {
+                        .@"macos-glass-regular",
+                        .@"macos-glass-clear",
+                        => true,
 
-                    else => {},
-                };
+                        else => false,
+                    };
+                    if (host_paints_background) self.uniforms.bg_color[3] = 0;
+                    // Text shaders still need that color for minimum
+                    // contrast; only the Metal uniforms carry the flag.
+                    if (comptime @hasField(@TypeOf(self.uniforms.bools), "host_paints_background"))
+                        self.uniforms.bools.host_paints_background = host_paints_background;
+                }
 
                 // Prepare our overlay image for upload (or unload). This
                 // has to use our general allocator since it modifies

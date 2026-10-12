@@ -24,6 +24,7 @@ struct Uniforms {
   bool use_display_p3;
   bool use_linear_blending;
   bool use_linear_correction;
+  bool host_paints_background;
 };
 
 //-------------------------------------------------------------------
@@ -639,9 +640,17 @@ vertex CellTextVertexOut cell_text_vertex(
     uniforms.use_display_p3,
     true
   );
-  // Blend it with the global bg color
+  // Blend it with the global bg color.
+  //
+  // When the host paints the background (a macOS glass style), bg_color's
+  // alpha is zeroed so we skip the fill. The text still lands on that
+  // color, so minimum contrast and linear correction compare against it
+  // as opaque, not against the premultiplied zero (black), which turns
+  // dark text white on a light background.
+  uchar4 global_bg_color = uniforms.bg_color;
+  if (uniforms.host_paints_background) global_bg_color.a = 255;
   float4 global_bg = load_color(
-    uniforms.bg_color,
+    global_bg_color,
     uniforms.use_display_p3,
     true
   );
