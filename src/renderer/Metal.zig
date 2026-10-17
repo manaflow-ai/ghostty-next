@@ -188,8 +188,8 @@ pub fn setHostedLayerSize(
 ///
 /// While a host-sized view's bounds change and the embedder holds its size
 /// (a divider drag), nothing is drawn or allocated: the layer keeps showing
-/// the last frame from its top-left corner (`contentsGravity`), clipped by
-/// the view, and new output still draws at the held size. A new size draws
+/// the last frame from its top-left corner (`contentsGravity`; the embedder
+/// clips the view), and new output still draws at the held size. A new size draws
 /// one synchronous frame at the next display pass, as a bounds change does
 /// for a surface that follows its layer.
 pub fn setHostDrawableSize(self: *Metal, enabled: bool, width_px: u32, height_px: u32) void {
@@ -202,7 +202,8 @@ pub fn setHostDrawableSize(self: *Metal, enabled: bool, width_px: u32, height_px
     if (self.host_size.swap(value, .acq_rel) == value) return;
     self.layer.setHostSize(value);
     self.layer.layer.setProperty("needsDisplayOnBoundsChange", value == 0);
-    if (value != 0) self.layer.layer.msgSend(void, objc.sel("setNeedsDisplay"), .{});
+    // One synchronous frame at the new target size (or at the bounds again).
+    self.layer.layer.msgSend(void, objc.sel("setNeedsDisplay"), .{});
 }
 
 /// iOS only: detach the IOSurfaceLayer from the embedder's view before

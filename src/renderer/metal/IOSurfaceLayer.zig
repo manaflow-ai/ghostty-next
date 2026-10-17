@@ -80,10 +80,16 @@ pub fn detachFromHostIfDisplayCallbackOwned(
 /// width << 32 | height; 0 when the target follows the bounds), which
 /// `setSurfaceCallback` checks frames against. Main thread.
 pub fn setHostSize(self: *IOSurfaceLayer, value: u64) void {
-    self.layer.setInstanceVariable(
-        "host_size",
-        objc.Object.fromId(@ptrFromInt(@as(usize, @intCast(value)))),
-    );
+    // Stored shifted left by 3 so the object-typed ivar holds an 8-aligned
+    // pointer value (safe builds check the alignment of @ptrFromInt). The
+    // ivar is never retained or released (no ARC layout on this class).
+    const stored: usize = @intCast(value << 3);
+    self.layer.setInstanceVariable("host_size", .{ .value = @ptrFromInt(stored) });
+}
+
+/// The value `setHostSize` stored.
+fn hostSize(layer: objc.Object) u64 {
+    return @as(u64, @intFromPtr(layer.getInstanceVariable("host_size").value)) >> 3;
 }
 
 /// Sets the layer's `contents` to the provided IOSurface.
@@ -170,7 +176,7 @@ fn setSurfaceCallback(
     // discard the improperly sized surface it creates jank.
     // A host-sized layer expects the host's size, not its bounds (which
     // move ahead of it during a drag).
-    const host: u64 = @intFromPtr(layer.getInstanceVariable("host_size").value);
+    const host = hostSize(layer);
     const bounds = layer.getProperty(macos.graphics.Rect, "bounds");
     const scale = layer.getProperty(f64, "contentsScale");
     const width: usize = if (host != 0) @intCast(host >> 32) else @intFromFloat(bounds.size.width * scale);

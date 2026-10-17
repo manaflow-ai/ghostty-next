@@ -1399,8 +1399,10 @@ GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t)
 // ghostty_surface_set_size, not at the view's bounds. While the view's
 // bounds change and the embedder holds its size (a divider drag), nothing
 // is drawn or allocated: the layer keeps the last frame at its top-left
-// corner, clipped by the view, and new output still draws at the held size.
-// Each new size draws one synchronous frame at the next display pass.
+// corner (clip the view to keep it inside), and new output still draws at the
+// held size. Each new size draws one synchronous frame at the next display
+// pass. Until the first ghostty_surface_set_size the target follows the
+// bounds.
 // Default false (the target follows the bounds). No effect on iOS, where the
 // target always follows ghostty_surface_set_size. Main thread.
 GHOSTTY_API void ghostty_surface_set_host_sized(ghostty_surface_t, bool);

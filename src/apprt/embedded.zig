@@ -471,6 +471,9 @@ pub const Surface = struct {
     /// `ghostty_surface_set_size`), not the view's bounds. See
     /// `ghostty_surface_set_host_sized`.
     host_sized: bool = false,
+    /// The embedder called ghostty_surface_set_size at least once; until
+    /// then `size` is a placeholder a host-sized target must not use.
+    size_reported: bool = false,
 
     /// Who owns the terminal byte stream. See Options.io_mode.
     io_mode: apprt.SurfaceIoMode = .exec,
@@ -1110,7 +1113,7 @@ pub const Surface = struct {
             @hasDecl(@TypeOf(self.core_surface.renderer.api), "setHostDrawableSize"))
         {
             self.core_surface.renderer.api.setHostDrawableSize(
-                self.host_sized,
+                self.host_sized and self.size_reported,
                 self.size.width,
                 self.size.height,
             );
@@ -1127,7 +1130,15 @@ pub const Surface = struct {
         // if the size did not actually change (SwiftUI). We check
         // that the size actually changed from what we last recorded
         // since resizes are expensive.
-        if (self.size.width == width and self.size.height == height) return;
+        if (self.size.width == width and self.size.height == height) {
+            // The first report may equal the placeholder size.
+            if (!self.size_reported) {
+                self.size_reported = true;
+                self.syncHostedLayer();
+            }
+            return;
+        }
+        self.size_reported = true;
 
         self.size = .{
             .width = width,
