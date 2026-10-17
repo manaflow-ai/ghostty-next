@@ -126,6 +126,9 @@ jobs:
           # graphics C API). These live in the lib-vt test modules.
           zig build test-lib-vt \
             -Dtest-filter="Terminal: OSC133" \
+            -Dtest-filter="Terminal: narrowing a multi-line prompt" \
+            -Dtest-filter="PageList resize reflow" \
+            -Dtest-filter="Screen: resize" \
             -Dtest-filter="Terminal vt restores cursor" \
             -Dtest-filter="Terminal vt clamps an outside origin cursor" \
             -Dtest-filter="Terminal vt cursor is absolute when origin mode is omitted" \
