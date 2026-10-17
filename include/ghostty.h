@@ -1395,6 +1395,17 @@ GHOSTTY_API void ghostty_surface_set_link_filter(ghostty_surface_t,
                                                  ghostty_surface_link_filter_cb,
                                                  void* userdata);
 GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t);
+// macOS: with enabled true the renderer draws at the pixel size of the last
+// ghostty_surface_set_size, not at the view's bounds. While the view's
+// bounds change and the embedder holds its size (a divider drag), nothing
+// is drawn or allocated: the layer keeps the last frame at its top-left
+// corner (clip the view to keep it inside), and new output still draws at the
+// held size. Each new size draws one synchronous frame at the next display
+// pass. Until the first ghostty_surface_set_size the target follows the
+// bounds.
+// Default false (the target follows the bounds). No effect on iOS, where the
+// target always follows ghostty_surface_set_size. Main thread.
+GHOSTTY_API void ghostty_surface_set_host_sized(ghostty_surface_t, bool);
 GHOSTTY_API ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
 // Fills the grid metrics. Returns false while a resize of an unlocked grid
 // is in flight; with a host-locked grid (ghostty_surface_set_grid) the

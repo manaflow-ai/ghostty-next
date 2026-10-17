@@ -467,6 +467,14 @@ pub const Surface = struct {
     cursor_pos: apprt.CursorPos,
     inspector: ?*Inspector = null,
 
+    /// macOS: the renderer's target follows `size` (the embedder's
+    /// `ghostty_surface_set_size`), not the view's bounds. See
+    /// `ghostty_surface_set_host_sized`.
+    host_sized: bool = false,
+    /// The embedder called ghostty_surface_set_size at least once; until
+    /// then `size` is a placeholder a host-sized target must not use.
+    size_reported: bool = false,
+
     /// Who owns the terminal byte stream. See Options.io_mode.
     io_mode: apprt.SurfaceIoMode = .exec,
     io_write_cb: ?termio.Manual.WriteCallback = null,
@@ -1091,6 +1099,8 @@ pub const Surface = struct {
     /// iOS: the renderer's layer is a sublayer of the embedder's view and
     /// does not follow its bounds, so the surface keeps it at the size the
     /// embedder reported. See `Metal.setHostedLayerSize`.
+    /// macOS: a host-sized surface's target follows the reported size
+    /// (`Metal.setHostDrawableSize`).
     fn syncHostedLayer(self: *Surface) void {
         if (comptime builtin.os.tag == .ios) {
             self.core_surface.renderer.api.setHostedLayerSize(
@@ -1099,6 +1109,20 @@ pub const Surface = struct {
                 self.content_scale.x,
             );
         }
+        if (comptime builtin.os.tag == .macos and
+            @hasDecl(@TypeOf(self.core_surface.renderer.api), "setHostDrawableSize"))
+        {
+            self.core_surface.renderer.api.setHostDrawableSize(
+                self.host_sized and self.size_reported,
+                self.size.width,
+                self.size.height,
+            );
+        }
+    }
+
+    pub fn setHostSized(self: *Surface, enabled: bool) void {
+        self.host_sized = enabled;
+        self.syncHostedLayer();
     }
 
     pub fn updateSize(self: *Surface, width: u32, height: u32) void {
@@ -1106,7 +1130,15 @@ pub const Surface = struct {
         // if the size did not actually change (SwiftUI). We check
         // that the size actually changed from what we last recorded
         // since resizes are expensive.
-        if (self.size.width == width and self.size.height == height) return;
+        if (self.size.width == width and self.size.height == height) {
+            // The first report may equal the placeholder size.
+            if (!self.size_reported) {
+                self.size_reported = true;
+                self.syncHostedLayer();
+            }
+            return;
+        }
+        self.size_reported = true;
 
         self.size = .{
             .width = width,
@@ -2155,6 +2187,12 @@ pub const CAPI = struct {
 
     export fn ghostty_surface_set_size(surface: *Surface, w: u32, h: u32) void {
         surface.updateSize(w, h);
+    }
+
+    /// macOS: the render target follows ghostty_surface_set_size, not the
+    /// view's bounds. See ghostty.h.
+    export fn ghostty_surface_set_host_sized(surface: *Surface, enabled: bool) void {
+        surface.setHostSized(enabled);
     }
 
     /// Lock the terminal grid of a manual surface to the grid of the
