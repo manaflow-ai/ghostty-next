@@ -326,6 +326,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         last_drawn: ?*const terminal.Terminal = null,
         last_live_generation: usize = 0,
 
+        /// A key of each row's content as the cells were last built from
+        /// it (rowKey). When only the drawn terminal changed (a restore,
+        /// the reflow preview starting or ending) at the same grid, colors
+        /// and font, rows whose key did not change keep their cells.
+        row_keys: std.ArrayListUnmanaged(u64) = .empty,
+
         /// The source of the block cursor's text color
         /// (`Uniforms.cursor_color`), resolved each frame from the shown
         /// table.
@@ -954,6 +960,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             self.cells.deinit(self.alloc);
+            self.row_keys.deinit(self.alloc);
 
             self.font_shaper.deinit();
             self.font_shaper_cache.deinit(self.alloc);
@@ -1860,6 +1867,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.full_rebuild_cause = .none;
                 defer self.countRebuild(cause, critical);
                 self.rebuildCells(
+                    // Only the drawn terminal changed: keep the rows whose
+                    // content is the same (row_keys).
+                    cause == .none and critical.swapped and !critical.resized and !critical.palette_dirty,
                     critical.preedit,
                     renderer.cursorStyle(&self.terminal_state, .{
                         .preedit = critical.preedit != null,
@@ -2929,6 +2939,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Dirty state on terminal state won't be reset by this.
         fn rebuildCells(
             self: *Self,
+            same_rows_keep: bool,
             preedit: ?renderer.State.Preedit,
             cursor_style_: ?renderer.CursorStyle,
             links: *const terminal.RenderState.CellSet,
@@ -2952,7 +2963,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.uniforms.grid_size = .{ new_size.columns, new_size.rows };
             }
 
-            const rebuild = state.dirty == .full or grid_size_diff;
+            // Rows keep their cells when only the drawn terminal changed
+            // and their content key is the same; otherwise a full rebuild
+            // builds every row.
+            const keyed = state.dirty == .full and same_rows_keep and !grid_size_diff and
+                preedit == null and self.row_keys.items.len == state.rows;
+            if (self.row_keys.items.len != state.rows) {
+                self.row_keys.resize(self.alloc, state.rows) catch {
+                    self.row_keys.clearRetainingCapacity();
+                };
+                @memset(self.row_keys.items, 0);
+            }
+            const rebuild = (state.dirty == .full or grid_size_diff) and !keyed;
             self.rebuilt_full = rebuild;
             if (rebuild) {
                 // If we are doing a full rebuild, then we clear the entire cell buffer.
@@ -3031,12 +3053,32 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             ) |y_usize, row, *cells, *dirty, selection, *highlights| {
                 const y: terminal.size.CellCountInt = @intCast(y_usize);
 
-                if (!rebuild) {
-                    // Only rebuild if we are doing a full rebuild or this row is dirty.
-                    if (!dirty.*) continue;
-
-                    // Clear the cells if the row is dirty
+                // Shaping breaks at the cursor, so the cursor's column is
+                // part of its row's key.
+                const cursor_x: ?terminal.size.CellCountInt = if (state.cursor.viewport) |vp|
+                    (if (vp.y == y_usize) vp.x else null)
+                else
+                    null;
+                if (keyed) {
+                    // A new drawn terminal: every row is marked, but a row
+                    // whose content is the same keeps its cells.
+                    const key = rowKey(cells, selection, highlights, cursor_x);
+                    if (self.row_keys.items[y_usize] == key) {
+                        dirty.* = false;
+                        continue;
+                    }
                     self.cells.clear(y);
+                    self.row_keys.items[y_usize] = key;
+                } else {
+                    if (!rebuild) {
+                        // Only rebuild if we are doing a full rebuild or this row is dirty.
+                        if (!dirty.*) continue;
+
+                        // Clear the cells if the row is dirty
+                        self.cells.clear(y);
+                    }
+                    if (y_usize < self.row_keys.items.len)
+                        self.row_keys.items[y_usize] = rowKey(cells, selection, highlights, cursor_x);
                 }
 
                 self.rebuilt_rows += 1;
@@ -4118,3 +4160,32 @@ fn cellsKey(
     return h.final();
 }
 
+/// A key of one row's content as rebuildRow draws it: each cell (without
+/// its page-relative style id), its style, its grapheme, and the row's
+/// selection and highlights. Equal keys build equal cells (colors are
+/// table references, the font and config are the same).
+fn rowKey(
+    cells: *const std.MultiArrayList(terminal.RenderState.Cell),
+    selection: anytype,
+    highlights: anytype,
+    cursor_x: ?terminal.size.CellCountInt,
+) u64 {
+    var h = std.hash.Wyhash.init(0x6b657973);
+    const slice = cells.slice();
+    const raws = slice.items(.raw);
+    const styles = slice.items(.style);
+    const graphemes = slice.items(.grapheme);
+    std.hash.autoHash(&h, raws.len);
+    for (raws, styles, graphemes) |raw, style, grapheme| {
+        var cell = raw;
+        const styled = cell.hasStyling();
+        cell.style_id = 0;
+        std.hash.autoHash(&h, @as(u64, @bitCast(cell)));
+        if (styled) std.hash.autoHash(&h, style);
+        if (cell.content_tag == .codepoint_grapheme) h.update(std.mem.sliceAsBytes(grapheme));
+    }
+    std.hash.autoHash(&h, selection);
+    std.hash.autoHash(&h, cursor_x);
+    for (highlights.items) |hl| std.hash.autoHash(&h, hl);
+    return h.final();
+}
