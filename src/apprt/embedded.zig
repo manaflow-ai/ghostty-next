@@ -2243,6 +2243,8 @@ pub const CAPI = struct {
         full_config: u64,
         full_font: u64,
         full_other: u64,
+        full_swap: u64,
+        full_resize: u64,
     };
 
     /// The renderer's frame counters. See ghostty.h.
@@ -2257,6 +2259,8 @@ pub const CAPI = struct {
             .full_config = c.full_config.load(.monotonic),
             .full_font = c.full_font.load(.monotonic),
             .full_other = c.full_other.load(.monotonic),
+            .full_swap = c.full_swap.load(.monotonic),
+            .full_resize = c.full_resize.load(.monotonic),
         };
     }
 

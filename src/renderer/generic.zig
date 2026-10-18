@@ -40,6 +40,11 @@ pub const RenderCounters = struct {
     full_config: std.atomic.Value(u64) = .init(0),
     full_font: std.atomic.Value(u64) = .init(0),
     full_other: std.atomic.Value(u64) = .init(0),
+    /// The drawn terminal changed: a snapshot restore swapped the live
+    /// terminal, or the reflow preview started or ended.
+    full_swap: std.atomic.Value(u64) = .init(0),
+    /// The drawn terminal's grid changed size.
+    full_resize: std.atomic.Value(u64) = .init(0),
 };
 const imagepkg = @import("image.zig");
 const ImageState = imagepkg.State;
@@ -315,6 +320,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Rows the last `rebuildCells` built, and whether it built all.
         rebuilt_rows: usize = 0,
         rebuilt_full: bool = false,
+
+        /// The terminal the last frame update drew and the live
+        /// terminal's screen generation then (RenderCounters full_swap).
+        last_drawn: ?*const terminal.Terminal = null,
+        last_live_generation: usize = 0,
 
         /// The source of the block cursor's text color
         /// (`Uniforms.cursor_color`), resolved each frame from the shown
@@ -1518,6 +1528,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 color_config_epoch: u32,
                 color_config_at: ?std.Io.Timestamp,
                 palette_dirty: bool,
+                swapped: bool,
+                resized: bool,
                 color_transition: ColorBlend.Spec,
             };
 
@@ -1572,6 +1584,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // reflow preview while that is current. Input, selection,
                 // search and the scrollbar stay on the live terminal.
                 const drawn = self.reflow_preview.source(self.alloc, reflow_preview, state.terminal, fit);
+
+                // Rebuild causes (RenderCounters): another drawn terminal
+                // (a restore swaps the live one and advances its screen
+                // generation; the preview starts or ends), or a new grid.
+                const live_generation = state.terminal.screens.generation(state.terminal.screens.active_key);
+                const swapped = (if (self.last_drawn) |last| last != drawn else true) or
+                    self.last_live_generation != live_generation;
+                self.last_drawn = drawn;
+                self.last_live_generation = live_generation;
+                const resized = drawn.rows != self.terminal_state.rows or drawn.cols != self.terminal_state.cols;
 
                 // Begin the update of our terminal state. Work that
                 // doesn't require terminal access (e.g. style
@@ -1696,6 +1718,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .overlay_features = overlay_features,
                     .color_config_epoch = state.color_config_epoch,
                     .palette_dirty = palette_dirty,
+                    .swapped = swapped,
+                    .resized = resized,
                     .color_config_at = state.color_config_at,
                     .color_transition = state.color_transition,
                 };
@@ -1834,7 +1858,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 _ = self.counters.frame_updates.fetchAdd(1, .monotonic);
                 const cause = self.full_rebuild_cause;
                 self.full_rebuild_cause = .none;
-                defer self.countRebuild(cause, critical.palette_dirty);
+                defer self.countRebuild(cause, critical);
                 self.rebuildCells(
                     critical.preedit,
                     renderer.cursorStyle(&self.terminal_state, .{
@@ -2852,14 +2876,21 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         /// Counts the rows the last rebuildCells built and, for a full
         /// rebuild, its cause (RenderCounters).
-        fn countRebuild(self: *Self, cause: RebuildCause, palette_dirty: bool) void {
+        fn countRebuild(self: *Self, cause: RebuildCause, critical: anytype) void {
             if (self.rebuilt_rows == 0) return;
             _ = self.counters.cell_rebuilds.fetchAdd(1, .monotonic);
             if (!self.rebuilt_full) return;
             const counter = switch (cause) {
                 .font => &self.counters.full_font,
                 .config => &self.counters.full_config,
-                .none => if (palette_dirty) &self.counters.full_palette else &self.counters.full_other,
+                .none => if (critical.swapped)
+                    &self.counters.full_swap
+                else if (critical.resized)
+                    &self.counters.full_resize
+                else if (critical.palette_dirty)
+                    &self.counters.full_palette
+                else
+                    &self.counters.full_other,
             };
             _ = counter.fetchAdd(1, .monotonic);
         }
