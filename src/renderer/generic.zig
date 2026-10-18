@@ -1814,7 +1814,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     const fg_changed = !table[ColorBlend.Slot.foreground].eql(old[ColorBlend.Slot.foreground]);
                     const padding_changed = fg_changed or
                         !table[ColorBlend.Slot.background].eql(old[ColorBlend.Slot.background]) or
-                        !std.mem.eql(terminal.color.RGB, table[0..256], old[0..256]);
+                        palette: {
+                            for (table[0..256], old[0..256]) |a, b| if (!a.eql(b)) break :palette true;
+                            break :palette false;
+                        };
                     const bold_reads_fg = if (self.config.bold_color) |b| b == .color else false;
                     if ((self.config.padding_color == .extend and padding_changed) or
                         (bold_reads_fg and fg_changed))
