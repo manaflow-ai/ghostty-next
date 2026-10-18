@@ -21,6 +21,13 @@ const rowNeverExtendBg = @import("row.zig").neverExtendBg;
 const Overlay = @import("Overlay.zig");
 const ReflowPreview = @import("ReflowPreview.zig");
 const ColorBlend = @import("ColorBlend.zig");
+
+/// A renderer's frame diagnostics (`ghostty_surface_render_counters`).
+pub const RenderCounters = struct {
+    frames: std.atomic.Value(u64) = .init(0),
+    cell_rebuilds: std.atomic.Value(u64) = .init(0),
+    blend_frames: std.atomic.Value(u64) = .init(0),
+};
 const imagepkg = @import("image.zig");
 const ImageState = imagepkg.State;
 const shadertoy = @import("shadertoy.zig");
@@ -295,13 +302,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Frame diagnostics (`ghostty_surface_render_counters`): frames
         /// drawn, cell rebuilds, and frames drawn while a color blend
         /// ran. Atomic: any thread may read them.
-        counters: Counters = .{},
-
-        pub const Counters = struct {
-            frames: std.atomic.Value(u64) = .init(0),
-            cell_rebuilds: std.atomic.Value(u64) = .init(0),
-            blend_frames: std.atomic.Value(u64) = .init(0),
-        };
+        counters: RenderCounters = .{},
 
         /// Our overlay state, if any.
         overlay: ?Overlay = null,

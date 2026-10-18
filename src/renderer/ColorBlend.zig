@@ -140,9 +140,9 @@ pub fn setTarget(
     const now: std.Io.Timestamp = .now(global.io(), .awake);
     if (config_change != null and spec.duration_ns > 0 and !tablesEql(new, &self.to)) {
         // Retarget from the colors on screen now.
-        var shown: Table = undefined;
-        self.shownAt(now, &shown);
-        self.from = shown;
+        var on_screen: Table = undefined;
+        self.shownAt(now, &on_screen);
+        self.from = on_screen;
         self.to = new.*;
         self.spec = spec;
         self.start = config_change;
