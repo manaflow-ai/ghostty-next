@@ -111,6 +111,7 @@ thread. New tab and split surfaces do not inherit the IO fields.
 | renderer + Surface: a color-only config change rebuilds no cells | Because cells keep color references, `Termio.changeConfig` no longer marks the palette dirty: the renderer copies the live palette into its color table on `State.color_config_epoch`. The renderer's `changeConfig` redoes the shaper and rebuilds the rows only when `DerivedConfig.cells_key` changes (fonts and shaping, cell alphas, padding, which config colors follow a cell, links); a color change that padding extension or a bold true color equal to the foreground reads still rebuilds. `Surface.setFontSize` sends no font grid when the config resolves to the grid the renderer has. `ghostty_surface_render_counters` adds frame updates and full rebuilds by cause (palette, config, font, other). |
 | renderer + termio: a font change rebuilds the cells once | When only the drawn terminal changed (a snapshot restore swapped the live terminal, or the reflow preview started or ended) at the same grid, colors and font, `rebuildCells` keeps each row whose content key (`rowKey`: cells without their page-relative style id, styles, graphemes, selection, highlights, the cursor column) is unchanged. A restore marks the palette dirty only when its palette differs. Render counters add `full_swap` and `full_resize`. |
 | renderer: the cell size follows the font grid only | `setScreenSize` keeps the cell size of the renderer's font grid; a resize that arrives before a new grid (a font size change) does not lay out the new grid with the old glyphs, so a font change is one full rebuild. |
+| termio: CSI 996 reports the surface's runtime color scheme | `CSI ? 996 n` and mode 2031 reports read `Termio.color_scheme`, seeded in `Surface.init` from the surface's conditional state and set under `renderer_state.mutex` in `colorSchemeCallback`. They used to read the config's `_conditional_state`, which a config only follows when `.theme` is in `_conditional_set` (a light/dark pair with different sides), so a plain theme (`theme = Dracula`) in dark mode answered light. `DerivedConfig.conditional_state` is gone. See "Behavior that differs from upstream". Ported from manaflow-ai/ghostty fca69640e (#270). Covered by cmux-next `GhosttyColorSchemeQueryTests`. |
 
 Next in the stack (tracked in the design): presentation callbacks for
 frame-exact acknowledgment, Kitty image replay after a snapshot, and a
@@ -121,6 +122,12 @@ local scrollback window limit for restored snapshots.
 The next upstream sync must keep these behaviors, or change them in a
 reviewed commit that says why.
 
+- Color scheme reports (`CSI ? 996 n`, mode 2031): the reply follows the
+  scheme the embedder set on the surface (`ghostty_surface_set_color_scheme`)
+  whatever the theme. Upstream reads the config's conditional state, which
+  stays light unless the config has a light/dark theme pair with different
+  sides. Why: cmux-next users with a plain theme in dark mode got a light
+  reply, and programs picked light colors.
 - Minimum contrast at `background-opacity = 0` (macOS, Metal): text is
   checked against the configured `background` as if it were opaque, the
   way the glass styles are, instead of against the black that a zero

@@ -38,6 +38,10 @@ backend: termio.Backend,
 /// The derived configuration for this termio implementation.
 config: DerivedConfig,
 
+/// Runtime scheme used by CSI 996 queries and mode 2031 reports. Guarded by
+/// renderer_state.mutex; config swaps must never overwrite appearance state.
+color_scheme: configpkg.ConditionalState.Theme,
+
 /// The terminal emulator internal state. This is the abstract "terminal"
 /// that manages input, grid updating, etc. and is renderer-agnostic. It
 /// just stores internal state about a grid.
@@ -226,7 +230,6 @@ pub const DerivedConfig = struct {
     clipboard_write: configpkg.ClipboardAccess,
     clipboard_write_limit: usize,
     enquiry_response: []const u8,
-    conditional_state: configpkg.ConditionalState,
 
     pub fn init(
         alloc_gpa: Allocator,
@@ -265,7 +268,6 @@ pub const DerivedConfig = struct {
             .clipboard_write = config.@"clipboard-write",
             .clipboard_write_limit = config.@"clipboard-write-limit-bytes".value,
             .enquiry_response = try alloc.dupe(u8, config.@"enquiry-response"),
-            .conditional_state = config._conditional_state,
 
             // This has to be last so that we copy AFTER the arena allocations
             // above happen (Zig assigns in order).
@@ -367,6 +369,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .alloc = alloc,
         .terminal = term,
         .config = opts.config,
+        .color_scheme = opts.color_scheme,
         .renderer_state = opts.renderer_state,
         .renderer_wakeup = opts.renderer_wakeup,
         .renderer_mailbox = opts.renderer_mailbox,
@@ -657,6 +660,14 @@ pub fn changeConfig(self: *Termio, td: *ThreadData, config: *DerivedConfig) !voi
         self.terminal.setScrollbackMaxBytes(config.scrollback_limit_bytes);
         self.terminal.setScrollbackMaxLines(config.scrollback_limit_lines);
     }
+}
+
+/// Update report state synchronously with the surface appearance callback.
+/// The IO thread reads it under the same lock when it handles a queued query.
+pub fn updateColorScheme(self: *Termio, scheme: configpkg.ConditionalState.Theme) void {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    self.color_scheme = scheme;
 }
 
 /// The Kitty graphics transmission mediums the terminal may load from.
@@ -1682,7 +1693,7 @@ pub fn colorSchemeReportLocked(self: *Termio, td: *ThreadData, force: bool) !voi
     if (!force and !self.renderer_state.terminal.modes.get(.report_color_scheme)) {
         return;
     }
-    const scheme: terminalpkg.device_status.ColorScheme = switch (self.config.conditional_state.theme) {
+    const scheme: terminalpkg.device_status.ColorScheme = switch (self.color_scheme) {
         .light => .light,
         .dark => .dark,
     };
@@ -1816,6 +1827,7 @@ fn testManualTermio(
         },
         .full_config = &config,
         .config = try .init(alloc, &config),
+        .color_scheme = .light,
         .backend = .{ .manual = try termio.Manual.init(alloc, .{
             .write_cb = TestSink.cb,
             .write_userdata = &sink,
