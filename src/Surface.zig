@@ -81,6 +81,9 @@ rt_surface: *apprt.runtime.Surface,
 
 /// The font structures
 font_grid_key: font.SharedGridSet.Key,
+/// The grid of `font_grid_key`, the one the renderer draws with: a config
+/// change that resolves to the same grid sends no new grid (setFontSize).
+font_grid: *font.SharedGrid,
 font_size: font.face.DesiredSize,
 font_metrics: font.Metrics,
 
@@ -717,6 +720,7 @@ pub fn init(
         .rt_app = rt_app,
         .rt_surface = rt_surface,
         .font_grid_key = font_grid_key,
+        .font_grid = font_grid,
         .font_size = font_size,
         .font_size_adjusted = false,
         .font_metrics = font_grid.metrics,
@@ -2813,6 +2817,19 @@ pub fn setFontSize(self: *Surface, size: font.face.DesiredSize) !void {
     );
     errdefer self.app.font_grid_set.deref(font_grid_key);
 
+    // The same grid (a config change that changed no font, such as a theme
+    // change): the renderer keeps its grid, its atlas and its cells. The
+    // cell size still applies, as before (padding balance, the terminal
+    // resize, the initial size).
+    if (font_grid == self.font_grid) {
+        self.app.font_grid_set.deref(font_grid_key);
+        try self.setCellSize(.{
+            .width = font_grid.metrics.cell_width,
+            .height = font_grid.metrics.cell_height,
+        });
+        return;
+    }
+
     // Set our cell size
     try self.setCellSize(.{
         .width = font_grid.metrics.cell_width,
@@ -2832,6 +2849,7 @@ pub fn setFontSize(self: *Surface, size: font.face.DesiredSize) !void {
 
     // Once we've sent the key we can replace our key
     self.font_grid_key = font_grid_key;
+    self.font_grid = font_grid;
     self.font_metrics = font_grid.metrics;
 
     // Schedule render which also drains our mailbox

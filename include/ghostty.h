@@ -726,10 +726,19 @@ typedef struct {
 typedef struct {
   // Frames drawn.
   uint64_t frames;
-  // Frame updates that rebuilt cells (any number of rows).
+  // Frame updates that rebuilt at least one row of cells.
   uint64_t cell_rebuilds;
   // Frames drawn while a color transition ran.
   uint64_t blend_frames;
+  // Frame updates, whether or not they rebuilt cells.
+  uint64_t frame_updates;
+  // Full rebuilds (every row) by cause: the terminal's palette changed
+  // (OSC 4, a snapshot restore), the config changed what cells hold (not
+  // only colors), a new font grid, anything else (resize, screen clear).
+  uint64_t full_palette;
+  uint64_t full_config;
+  uint64_t full_font;
+  uint64_t full_other;
 } ghostty_surface_render_counters_s;
 
 // Config types
