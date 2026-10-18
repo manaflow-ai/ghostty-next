@@ -2201,6 +2201,55 @@ pub const CAPI = struct {
         surface.core_surface.setReflowPreview(enabled);
     }
 
+    /// The C layout of `renderer.ColorBlend.Spec` (ghostty.h).
+    pub const ColorTransition = extern struct {
+        duration: f64,
+        space: c_int,
+        sample_count: u32,
+        samples: [renderer.ColorBlend.max_samples]f32,
+    };
+
+    /// How the colors animate when a config change sets them. See
+    /// ghostty.h.
+    export fn ghostty_surface_set_color_transition(
+        surface: *Surface,
+        transition: ?*const ColorTransition,
+    ) void {
+        const t = transition orelse {
+            surface.core_surface.setColorTransition(.instant);
+            return;
+        };
+        var spec: renderer.ColorBlend.Spec = .instant;
+        if (std.math.isFinite(t.duration) and t.duration > 0) {
+            spec.duration_ns = @intFromFloat(@min(t.duration, 60.0) * std.time.ns_per_s);
+        }
+        spec.space = if (t.space == 1) .srgb else .oklab;
+        const count: usize = @min(t.sample_count, renderer.ColorBlend.max_samples);
+        spec.sample_count = @intCast(count);
+        for (0..count) |i| {
+            const v = t.samples[i];
+            spec.samples[i] = if (std.math.isFinite(v)) v else 1;
+        }
+        surface.core_surface.setColorTransition(spec);
+    }
+
+    /// The C layout of the renderer's frame counters (ghostty.h).
+    pub const RenderCounters = extern struct {
+        frames: u64,
+        cell_rebuilds: u64,
+        blend_frames: u64,
+    };
+
+    /// The renderer's frame counters. See ghostty.h.
+    export fn ghostty_surface_render_counters(surface: *Surface) RenderCounters {
+        const c = &surface.core_surface.renderer.counters;
+        return .{
+            .frames = c.frames.load(.monotonic),
+            .cell_rebuilds = c.cell_rebuilds.load(.monotonic),
+            .blend_frames = c.blend_frames.load(.monotonic),
+        };
+    }
+
     /// The grid of the terminal the last frame drew. See ghostty.h.
     export fn ghostty_surface_drawn_grid(surface: *Surface, cols: *u16, rows: *u16) bool {
         const packed_grid = surface.core_surface.renderer.reflow_preview.drawn_grid.load(.acquire);

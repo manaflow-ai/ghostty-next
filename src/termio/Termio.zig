@@ -629,6 +629,11 @@ pub fn changeConfig(self: *Termio, td: *ThreadData, config: *DerivedConfig) !voi
     };
     self.terminal.flags.dirty.palette = true;
 
+    // The renderer blends this color change with the surface's color
+    // transition (renderer/ColorBlend.zig).
+    self.renderer_state.color_config_epoch +%= 1;
+    self.renderer_state.color_config_at = .now(global.io(), .awake);
+
     // Update all our other colors
     self.terminal.colors.background.default = config.background.toTerminalRGB();
     self.terminal.colors.foreground.default = config.foreground.toTerminalRGB();

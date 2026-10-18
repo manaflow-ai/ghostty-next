@@ -4765,6 +4765,14 @@ pub fn setReflowPreview(self: *Surface, enabled: bool) void {
     self.queueRender() catch |err| log.warn("error queueing render after reflow preview change err={}", .{err});
 }
 
+/// How the colors animate when a config change sets them
+/// (`renderer.ColorBlend`). See ghostty.h.
+pub fn setColorTransition(self: *Surface, spec: rendererpkg.ColorBlend.Spec) void {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    self.renderer_state.color_transition = spec;
+}
+
 fn linkAtPos(
     self: *Surface,
     pos: apprt.CursorPos,

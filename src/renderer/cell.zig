@@ -128,7 +128,7 @@ pub const Contents = struct {
 
     /// Reset the cell contents to an empty state without resizing.
     pub fn reset(self: *Contents) void {
-        @memset(self.bg_cells, .{ 0, 0, 0, 0 });
+        @memset(self.bg_cells, .empty);
         for (self.fg_rows) |*row| row.clearRetainingCapacity();
     }
 
@@ -206,7 +206,7 @@ pub const Contents = struct {
     pub fn clear(self: *Contents, y: terminal.size.CellCountInt) void {
         assert(y < self.size.rows);
 
-        @memset(self.bg_cells[@as(usize, y) * self.size.columns ..][0..self.size.columns], .{ 0, 0, 0, 0 });
+        @memset(self.bg_cells[@as(usize, y) * self.size.columns ..][0..self.size.columns], .empty);
 
         // We have a special list containing the cursor cell at the start
         // of our fg row collection, so we need to add 1 to the y to get
@@ -361,7 +361,7 @@ test Contents {
     for (0..rows) |y| {
         try testing.expect(c.fg_rows[y + 1].items.len == 0);
         for (0..cols) |x| {
-            try testing.expectEqual(.{ 0, 0, 0, 0 }, c.bgCell(y, x).*);
+            try testing.expectEqual(shaderpkg.CellBg.empty, c.bgCell(y, x).*);
         }
     }
     // And the cursor row should have a capacity of 1 and also be empty.
@@ -369,7 +369,7 @@ test Contents {
     try testing.expect(c.fg_rows[0].items.len == 0);
 
     // Add some contents.
-    const bg_cell: shaderpkg.CellBg = .{ 0, 0, 0, 1 };
+    const bg_cell: shaderpkg.CellBg = .{ .color = .{ 0, 0, 0, 1 } };
     const fg_cell: shaderpkg.CellText = .{
         .atlas = .grayscale,
         .grid_pos = .{ 4, 1 },
@@ -386,7 +386,7 @@ test Contents {
     for (0..rows) |y| {
         try testing.expect(c.fg_rows[y + 1].items.len == 0);
         for (0..cols) |x| {
-            try testing.expectEqual(.{ 0, 0, 0, 0 }, c.bgCell(y, x).*);
+            try testing.expectEqual(shaderpkg.CellBg.empty, c.bgCell(y, x).*);
         }
     }
 
@@ -426,11 +426,11 @@ test "Contents resize grows and shrinks" {
         .color = .{ 0, 0, 0, 1 },
     };
     try c.add(alloc, .text, cell);
-    c.bgCell(1, 1).* = .{ 0, 0, 0, 1 };
+    c.bgCell(1, 1).* = .{ .color = .{ 0, 0, 0, 1 } };
     c.setCursor(cell, .bar);
 
     try c.resize(alloc, .{ .rows = 3, .columns = 4 });
-    try testing.expectEqual(.{ 0, 0, 0, 0 }, c.bgCell(1, 1).*);
+    try testing.expectEqual(shaderpkg.CellBg.empty, c.bgCell(1, 1).*);
     try testing.expectEqual(@as(usize, 0), c.fg_rows[2].items.len);
     try testing.expectEqual(@as(?shaderpkg.CellText, null), c.getCursorGlyph());
     cell.grid_pos = .{ 3, 2 };
@@ -454,7 +454,7 @@ test "Contents clear retains other content" {
 
     // Set some contents
     // bg and fg cells in row 1
-    const bg_cell_1: shaderpkg.CellBg = .{ 0, 0, 0, 1 };
+    const bg_cell_1: shaderpkg.CellBg = .{ .color = .{ 0, 0, 0, 1 } };
     const fg_cell_1: shaderpkg.CellText = .{
         .atlas = .grayscale,
         .grid_pos = .{ 4, 1 },
@@ -463,7 +463,7 @@ test "Contents clear retains other content" {
     c.bgCell(1, 4).* = bg_cell_1;
     try c.add(alloc, .text, fg_cell_1);
     // bg and fg cells in row 2
-    const bg_cell_2: shaderpkg.CellBg = .{ 0, 0, 0, 1 };
+    const bg_cell_2: shaderpkg.CellBg = .{ .color = .{ 0, 0, 0, 1 } };
     const fg_cell_2: shaderpkg.CellText = .{
         .atlas = .grayscale,
         .grid_pos = .{ 4, 2 },
@@ -494,7 +494,7 @@ test "Contents clear last added content" {
 
     // Set some contents
     // bg and fg cells in row 1
-    const bg_cell_1: shaderpkg.CellBg = .{ 0, 0, 0, 1 };
+    const bg_cell_1: shaderpkg.CellBg = .{ .color = .{ 0, 0, 0, 1 } };
     const fg_cell_1: shaderpkg.CellText = .{
         .atlas = .grayscale,
         .grid_pos = .{ 4, 1 },
@@ -503,7 +503,7 @@ test "Contents clear last added content" {
     c.bgCell(1, 4).* = bg_cell_1;
     try c.add(alloc, .text, fg_cell_1);
     // bg and fg cells in row 2
-    const bg_cell_2: shaderpkg.CellBg = .{ 0, 0, 0, 1 };
+    const bg_cell_2: shaderpkg.CellBg = .{ .color = .{ 0, 0, 0, 1 } };
     const fg_cell_2: shaderpkg.CellText = .{
         .atlas = .grayscale,
         .grid_pos = .{ 4, 2 },
