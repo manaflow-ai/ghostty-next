@@ -22,11 +22,24 @@ const Overlay = @import("Overlay.zig");
 const ReflowPreview = @import("ReflowPreview.zig");
 const ColorBlend = @import("ColorBlend.zig");
 
+/// Why a frame update rebuilds every row (RenderCounters).
+const RebuildCause = enum { none, config, font };
+
 /// A renderer's frame diagnostics (`ghostty_surface_render_counters`).
 pub const RenderCounters = struct {
     frames: std.atomic.Value(u64) = .init(0),
+    /// Frame updates (`updateFrame`), whether or not they rebuilt cells.
+    frame_updates: std.atomic.Value(u64) = .init(0),
+    /// Frame updates that rebuilt at least one row of cells.
     cell_rebuilds: std.atomic.Value(u64) = .init(0),
     blend_frames: std.atomic.Value(u64) = .init(0),
+    /// Full rebuilds by cause: the terminal's palette changed (OSC 4 or a
+    /// snapshot restore), the renderer's config changed what cells hold,
+    /// a new font grid, anything else (a resize, a screen clear, ...).
+    full_palette: std.atomic.Value(u64) = .init(0),
+    full_config: std.atomic.Value(u64) = .init(0),
+    full_font: std.atomic.Value(u64) = .init(0),
+    full_other: std.atomic.Value(u64) = .init(0),
 };
 const imagepkg = @import("image.zig");
 const ImageState = imagepkg.State;
@@ -293,6 +306,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// change came from the config (the renderer's own config colors:
         /// selection, cursor text, search, bold) and blends from then.
         color_config_changed_at: ?std.Io.Timestamp = null,
+
+        /// Why the next frame update rebuilds every row (RenderCounters):
+        /// set by changeConfig and setFontGrid when they mark the cells
+        /// dirty. Written and read under `draw_mutex`.
+        full_rebuild_cause: RebuildCause = .none,
+
+        /// Rows the last `rebuildCells` built, and whether it built all.
+        rebuilt_rows: usize = 0,
+        rebuilt_full: bool = false,
 
         /// The source of the block cursor's text color
         /// (`Uniforms.cursor_color`), resolved each frame from the shown
@@ -667,6 +689,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             bg_image_fit: configpkg.BackgroundImageFit,
             bg_image_repeat: bool,
             links: link.Set,
+            /// A hash of every config value that changes what the cells
+            /// hold, apart from colors (the cells keep color references,
+            /// ColorBlend): fonts and shaping, cell alphas, padding,
+            /// which config colors follow a cell, links. changeConfig
+            /// rebuilds the cells only when it changes.
+            cells_key: u64,
             vsync: bool,
             colorspace: configpkg.Config.WindowColorspace,
             blending: configpkg.Config.AlphaBlending,
@@ -742,6 +770,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .bg_image_fit = config.@"background-image-fit",
                     .bg_image_repeat = config.@"background-image-repeat",
                     .links = links,
+                    .cells_key = cellsKey(config, font_styles),
                     .vsync = config.@"window-vsync",
                     .colorspace = config.@"window-colorspace",
                     .blending = config.@"alpha-blending",
@@ -1429,6 +1458,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // an outdated atlas from the old grid and this can cause garbage
             // to be rendered.
             self.markDirty();
+            self.full_rebuild_cause = .font;
         }
 
         /// Update uniforms that are based on the font grid.
@@ -1487,6 +1517,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 overlay_features: []const Overlay.Feature,
                 color_config_epoch: u32,
                 color_config_at: ?std.Io.Timestamp,
+                palette_dirty: bool,
                 color_transition: ColorBlend.Spec,
             };
 
@@ -1532,6 +1563,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     state.terminal.scrollViewport(.bottom);
                 }
 
+                // A palette change set by a program (OSC 4) or a restore
+                // marks the terminal dirty and rebuilds every row; read it
+                // before beginUpdate clears it (RenderCounters).
+                const palette_dirty = state.terminal.flags.dirty.palette;
+
                 // The terminal this frame draws: the live terminal, or its
                 // reflow preview while that is current. Input, selection,
                 // search and the scrollbar stay on the live terminal.
@@ -1546,6 +1582,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.alloc,
                     drawn,
                 );
+
+                // A config color change does not mark the terminal dirty:
+                // the cells keep color references (ColorBlend), so only
+                // the color table needs the new palette. Copy it from the
+                // live terminal here (the render state copies it only on a
+                // full redraw).
+                if (state.color_config_epoch != self.color_config_epoch) {
+                    self.terminal_state.colors.palette = state.terminal.colors.palette.current;
+                }
 
                 // If our terminal state is dirty at all we need to redo
                 // the viewport search.
@@ -1650,6 +1695,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .scrollbar = scrollbar,
                     .overlay_features = overlay_features,
                     .color_config_epoch = state.color_config_epoch,
+                    .palette_dirty = palette_dirty,
                     .color_config_at = state.color_config_at,
                     .color_transition = state.color_transition,
                 };
@@ -1754,13 +1800,29 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         else
                             null;
                     const config_change = terminal_change orelse self.color_config_changed_at;
+
+                    // Two cell decisions read color values, not
+                    // references: padding extension (`rowNeverExtendBg`)
+                    // and a bold true color that equals the foreground
+                    // (`fgPaint`). When they apply, a color change still
+                    // rebuilds the rows.
+                    if (!ColorBlend.tablesEql(&table, &self.color_blend.to) and
+                        (self.config.padding_color == .extend or
+                            (if (self.config.bold_color) |b| b == .color else false)))
+                    {
+                        self.markDirty();
+                        if (self.full_rebuild_cause == .none) self.full_rebuild_cause = .config;
+                    }
                     self.color_config_changed_at = null;
                     self.color_config_epoch = critical.color_config_epoch;
                     self.color_blend.setTarget(&table, config_change, critical.color_transition);
                 }
 
                 // Build our GPU cells
-                _ = self.counters.cell_rebuilds.fetchAdd(1, .monotonic);
+                _ = self.counters.frame_updates.fetchAdd(1, .monotonic);
+                const cause = self.full_rebuild_cause;
+                self.full_rebuild_cause = .none;
+                defer self.countRebuild(cause, critical.palette_dirty);
                 self.rebuildCells(
                     critical.preedit,
                     renderer.cursorStyle(&self.terminal_state, .{
@@ -2317,20 +2379,25 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // We always redo the font shaper in case font features changed. We
             // could check to see if there was an actual config change but this is
             // easier and rare enough to not cause performance issues.
-            {
+            // The cells hold color references (ColorBlend), so a change
+            // of colors alone keeps every cell: the frame update moves the
+            // color table. Only a change of what cells hold (cells_key)
+            // redoes the shaper and rebuilds every row.
+            const cells_changed = self.config.cells_key != config.cells_key;
+            if (cells_changed) {
                 var font_shaper = try font.Shaper.init(self.alloc, .{
                     .features = config.font_features.items,
                 });
                 errdefer font_shaper.deinit();
                 self.font_shaper.deinit();
                 self.font_shaper = font_shaper;
-            }
 
-            // We also need to reset the shaper cache so shaper info
-            // from the previous font isn't reused for the new font.
-            const font_shaper_cache = font.ShaperCache.init();
-            self.font_shaper_cache.deinit(self.alloc);
-            self.font_shaper_cache = font_shaper_cache;
+                // We also need to reset the shaper cache so shaper info
+                // from the previous font isn't reused for the new font.
+                const font_shaper_cache = font.ShaperCache.init();
+                self.font_shaper_cache.deinit(self.alloc);
+                self.font_shaper_cache = font_shaper_cache;
+            }
 
             // Set our new minimum contrast
             self.uniforms.min_contrast = config.min_contrast;
@@ -2372,7 +2439,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             if (bg_image_config_changed) self.updateBgImageBuffer();
 
             // Reset our viewport to force a rebuild, in case of a font change.
-            self.markDirty();
+            if (cells_changed) {
+                self.markDirty();
+                if (self.full_rebuild_cause == .none) self.full_rebuild_cause = .config;
+            }
 
             const blending_changed = old_blending != config.blending;
 
@@ -2773,6 +2843,20 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// This requires the draw mutex.
         ///
         /// Dirty state on terminal state won't be reset by this.
+        /// Counts the rows the last rebuildCells built and, for a full
+        /// rebuild, its cause (RenderCounters).
+        fn countRebuild(self: *Self, cause: RebuildCause, palette_dirty: bool) void {
+            if (self.rebuilt_rows == 0) return;
+            _ = self.counters.cell_rebuilds.fetchAdd(1, .monotonic);
+            if (!self.rebuilt_full) return;
+            const counter = switch (cause) {
+                .font => &self.counters.full_font,
+                .config => &self.counters.full_config,
+                .none => if (palette_dirty) &self.counters.full_palette else &self.counters.full_other,
+            };
+            _ = counter.fetchAdd(1, .monotonic);
+        }
+
         /// The colors of every cell color source (`ColorBlend.Table`) for
         /// the current terminal colors and config.
         fn colorTable(self: *const Self, table: *ColorBlend.Table) void {
@@ -2822,6 +2906,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             const rebuild = state.dirty == .full or grid_size_diff;
+            self.rebuilt_full = rebuild;
+            self.rebuilt_rows = 0;
             if (rebuild) {
                 // If we are doing a full rebuild, then we clear the entire cell buffer.
                 self.cells.reset();
@@ -2906,6 +2992,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     // Clear the cells if the row is dirty
                     self.cells.clear(y);
                 }
+
+                self.rebuilt_rows += 1;
 
                 // Unmark the dirty state in our render state.
                 dirty.* = false;
@@ -3944,3 +4032,43 @@ fn underlinePaint(
         .rgb => |rgb| ColorBlend.Paint.rgbOnly(rgb),
     };
 }
+
+/// `DerivedConfig.cells_key`: what the cells hold apart from colors.
+fn cellsKey(
+    config: *const configpkg.Config,
+    font_styles: font.CodepointResolver.StyleStatus,
+) u64 {
+    var h = std.hash.Wyhash.init(0);
+    for (config.@"font-feature".list.items) |f| {
+        h.update(f);
+        h.update(&.{0});
+    }
+    std.hash.autoHash(&h, font_styles.values);
+    std.hash.autoHash(&h, config.@"font-thicken");
+    std.hash.autoHash(&h, config.@"font-thicken-strength");
+    std.hash.autoHash(&h, config.@"font-shaping-break");
+    std.hash.autoHash(&h, config.@"background-opacity-cells");
+    std.hash.autoHash(&h, @as(u64, @bitCast(@as(f64, config.@"background-opacity"))));
+    std.hash.autoHash(&h, @as(u64, @bitCast(@as(f64, config.@"faint-opacity"))));
+    std.hash.autoHash(&h, config.@"window-padding-color");
+    // Which config colors follow a cell's colors: the variant, not the
+    // color (a color is a table entry).
+    inline for (.{
+        "cursor-color",         "cursor-text",
+        "selection-background", "selection-foreground",
+        "search-background",    "search-foreground",
+        "search-selected-background", "search-selected-foreground",
+    }) |name| {
+        const value: ?configpkg.Config.TerminalColor = @field(config, name);
+        std.hash.autoHash(&h, if (value) |v| @as(u8, @intFromEnum(std.meta.activeTag(v))) + 1 else @as(u8, 0));
+    }
+    std.hash.autoHash(&h, if (config.@"bold-color") |b| @as(u8, @intFromEnum(std.meta.activeTag(b))) + 1 else @as(u8, 0));
+    for (config.link.links.items) |l| {
+        h.update(l.regex);
+        h.update(&.{0});
+        std.hash.autoHash(&h, std.meta.activeTag(l.highlight));
+        std.hash.autoHash(&h, std.meta.activeTag(l.action));
+    }
+    return h.final();
+}
+

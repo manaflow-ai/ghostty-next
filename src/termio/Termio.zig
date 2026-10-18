@@ -627,7 +627,9 @@ pub fn changeConfig(self: *Termio, td: *ThreadData, config: *DerivedConfig) !voi
         log.warn("error changing default palette, using built-in default err={}", .{err});
         self.terminal.colors.palette.resetDefault(self.alloc);
     };
-    self.terminal.flags.dirty.palette = true;
+    // No terminal dirty flag: the renderer's cells keep color references,
+    // so it copies the new palette into its color table on the epoch
+    // below and rebuilds no cells (renderer/ColorBlend.zig).
 
     // The renderer blends this color change with the surface's color
     // transition (renderer/ColorBlend.zig).

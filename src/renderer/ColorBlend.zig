@@ -281,7 +281,7 @@ fn shownAt(self: *const ColorBlend, now: std.Io.Timestamp, out: *Table) void {
     }
 }
 
-fn tablesEql(a: *const Table, b: *const Table) bool {
+pub fn tablesEql(a: *const Table, b: *const Table) bool {
     for (a, b) |x, y| if (!x.eql(y)) return false;
     return true;
 }
