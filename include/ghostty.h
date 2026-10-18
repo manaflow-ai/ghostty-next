@@ -1446,10 +1446,13 @@ GHOSTTY_API bool ghostty_surface_set_grid(ghostty_surface_t,
 // runs (the prompt is kept, not cleared for a redraw). The live terminal
 // is not changed; output, snapshots and set_grid apply to it as before,
 // and the next frame redraws the preview from it. When the owner's grid
-// equals the view's grid the live terminal is drawn again, with the same
-// visible rows. The live terminal is drawn, clipped or padded, while the
-// alternate screen is active, Kitty images are on the screen or the
-// viewport is scrolled into history. Default false. Main thread.
+// equals the view's grid the live terminal is drawn again; its rows equal
+// the preview's except prompt rows that the owner cleared for its shell
+// to redraw. The preview draws no selection, search highlights or Kitty
+// images; mouse hit tests use the live grid. The live terminal is drawn,
+// clipped or padded, while the alternate screen is active, Kitty images
+// are on the screen or the viewport is scrolled into history. Default
+// false. Main thread.
 GHOSTTY_API void ghostty_surface_set_reflow_preview(ghostty_surface_t, bool);
 // The grid of the terminal the renderer's last frame update drew: the
 // reflow preview's or the live terminal's. Returns false before the first

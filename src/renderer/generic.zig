@@ -1487,8 +1487,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
 
                 // The terminal this frame draws: the live terminal, or its
-                // reflow preview while that is current. Input, selection and
-                // search stay on the live terminal.
+                // reflow preview while that is current. Input, selection,
+                // search and the scrollbar stay on the live terminal.
                 const drawn = self.reflow_preview.source(state.terminal, fit);
 
                 // Begin the update of our terminal state. Work that
@@ -1512,7 +1512,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // naturally limits the number of calls to this method (it
                 // can be expensive) and also makes it so we don't need another
                 // cross-thread mailbox message within the IO path.
-                const scrollbar = drawn.screens.active.pages.scrollbar();
+                const scrollbar = state.terminal.screens.active.pages.scrollbar();
 
                 // Get our preedit state
                 const preedit: ?renderer.State.Preedit = preedit: {

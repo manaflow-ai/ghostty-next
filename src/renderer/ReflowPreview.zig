@@ -8,13 +8,19 @@
 //! of the live terminal's renderable state and newest history, reflowed
 //! with the same `Terminal.resize` that the owner runs. The live terminal
 //! is never changed. When the owner's grid reaches the view's grid, the
-//! live terminal shows the same rows and the preview ends.
+//! live terminal is drawn again.
 //!
 //! The preview is rebuilt at most once per frame, only when the view's
 //! grid or the live terminal changed. The live terminal's dirty state is
-//! read by a second render state (`watch`), so the work under the
-//! terminal lock grows with the screen and the copied rows, never with
-//! the history. The reflow runs without the lock.
+//! read by a second render state (`watch`). Under the terminal lock the
+//! work grows with the screen and the copied rows, never with the
+//! history; the reflow runs without the lock.
+//!
+//! What the preview cannot predict: the owner clears a prompt that its
+//! shell redraws after the resize, while the preview keeps and reflows
+//! it, so prompt rows can differ until the shell's redraw arrives.
+//! Selection, search highlights and Kitty images are not drawn on the
+//! preview; mouse hit tests use the live grid.
 //!
 //! No preview (the live terminal is drawn, clipped or padded): the
 //! alternate screen (a full-screen program redraws itself), Kitty images
@@ -31,9 +37,8 @@ const Terminal = terminalpkg.Terminal;
 
 const log = std.log.scoped(.reflow_preview);
 
-/// History rows copied above the screen, beyond what a reflow to the
-/// target grid can pull into the screen: covers a logical line cut at
-/// the top of the copy.
+/// History rows copied beyond what a reflow to the target grid can pull
+/// into the screen: covers a logical line that starts above the copy.
 const margin_rows = 64;
 
 /// The reflowed copy, owned by the renderer thread. Null while the live
@@ -46,8 +51,14 @@ grid: renderer.GridSize = .{},
 /// The live terminal's dirty state since the preview was built.
 watch: terminalpkg.RenderState = .empty,
 
-/// True when the last frame drew the preview.
-drawn: bool = false,
+/// The watch consumed the live terminal's dirty flags since the live
+/// terminal was last drawn: drawing it again needs a full rebuild.
+live_flags_consumed: bool = false,
+
+/// The last frame's `wanted` result and fit grid: a frame with the same
+/// fit grid, no preview and no want skips the terminal lock.
+wanted_last: bool = false,
+fit_last: renderer.GridSize = .{},
 
 /// The grid of the terminal the last frame drew (the preview's or the live
 /// terminal's), `cols << 16 | rows`; 0 before the first frame. Any thread
@@ -73,8 +84,9 @@ pub fn wanted(live: *const Terminal, fit: renderer.GridSize) bool {
 }
 
 /// Bring the preview up to date for this frame. Takes the terminal lock
-/// for the change check and the copy only. On any failure the preview
-/// ends and the live terminal is drawn.
+/// (demand-aware, like the frame update) for the change check and the
+/// copy only. On any failure the preview ends and the live terminal is
+/// drawn.
 pub fn update(
     self: *ReflowPreview,
     alloc: Allocator,
@@ -82,10 +94,20 @@ pub fn update(
     enabled: bool,
     fit: renderer.GridSize,
 ) void {
-    if (!enabled and self.terminal == null) return;
+    if (self.terminal == null) {
+        if (!enabled) return;
+        if (!self.wanted_last and
+            self.fit_last.columns == fit.columns and
+            self.fit_last.rows == fit.rows) return;
+    }
+
     var copy: Terminal = copy: {
-        state.mutex.lockUncancelable(global.io());
-        defer state.mutex.unlock(global.io());
+        state.lockDemand(global.io());
+        defer state.unlockDemand(global.io());
+
+        // Frames are held (synchronized output, a restore between its
+        // swaps): the terminal is not in a state to copy.
+        if (!state.renderable()) return;
 
         if (!enabled or !wanted(state.terminal, fit)) {
             self.end(alloc);
@@ -97,7 +119,9 @@ pub fn update(
             self.grid.rows != fit.rows;
 
         // The watch consumes the live terminal's dirty flags while the
-        // preview is drawn; `end` makes the live render state rebuild.
+        // preview is drawn; `source` makes the live render state rebuild
+        // when the live terminal is drawn again.
+        self.live_flags_consumed = true;
         self.watch.beginUpdate(alloc, state.terminal) catch {
             self.end(alloc);
             return;
@@ -123,9 +147,11 @@ pub fn update(
     }) catch |err| {
         log.warn("reflow preview resize failed err={}", .{err});
         copy.deinit(alloc);
-        state.mutex.lockUncancelable(global.io());
-        defer state.mutex.unlock(global.io());
-        self.end(alloc);
+        // Only the renderer thread uses the preview terminal; the watch
+        // is reset at the next `end` under the lock.
+        if (self.terminal) |*old| old.deinit(alloc);
+        self.terminal = null;
+        self.grid = .{};
         return;
     };
     copy.flags.dirty.clear = true;
@@ -136,20 +162,25 @@ pub fn update(
 }
 
 /// The terminal to draw this frame: the preview while it is current for
-/// `live` and `fit`, else `live`. Caller holds the terminal lock. A
-/// change of source makes the drawn terminal fully dirty.
+/// `live` and `fit`, else `live`. Caller holds the terminal lock. Drawing
+/// the live terminal after the watch consumed its dirty flags rebuilds
+/// it fully.
 pub fn source(
     self: *ReflowPreview,
     live: *Terminal,
     fit: renderer.GridSize,
 ) *Terminal {
-    const use = self.terminal != null and
+    const want = wanted(live, fit);
+    self.wanted_last = want;
+    self.fit_last = fit;
+    const use = want and self.terminal != null and
         self.grid.columns == fit.columns and
-        self.grid.rows == fit.rows and
-        wanted(live, fit);
-    defer self.drawn = use;
+        self.grid.rows == fit.rows;
     const t: *Terminal = if (use) &self.terminal.? else live;
-    if (use != self.drawn) t.flags.dirty.clear = true;
+    if (!use and self.live_flags_consumed) {
+        live.flags.dirty.clear = true;
+        self.live_flags_consumed = false;
+    }
     self.drawn_grid.store(@as(u32, t.cols) << 16 | t.rows, .release);
     return t;
 }
@@ -191,20 +222,37 @@ fn snapshot(alloc: Allocator, live: *const Terminal, fit: renderer.GridSize) !Te
     defer decoded.deinit(alloc);
     var copy = decoded.toOwned();
     errdefer copy.deinit(alloc);
+    // Not in GHOSTSNP v1; the reflow must pull history as the owner does.
+    copy.flags.resize_pull_scrollback = live.flags.resize_pull_scrollback;
 
-    // Rows of the new screen come from at most ceil(new cols / old cols)
-    // old rows each (one logical line), so this many old rows above the
-    // screen fill any reflow to `fit`, including rows a taller grid pulls
-    // from history.
+    // A new row starts anywhere in an old row and spans at most
+    // ceil(new cols / old cols) + 1 old rows of one logical line, so this
+    // many old rows above the screen fill any reflow to `fit`, including
+    // rows a taller grid pulls from history.
     const widen = std.math.divCeil(usize, fit.columns, live.cols) catch 1;
-    const need = @as(usize, fit.rows) * @max(widen, 1) + margin_rows;
-    copy.setScrollbackMaxLines(need);
+    const need = @as(usize, fit.rows) * (widen + 1) + margin_rows;
+
+    // prependHistoryFrom copies whole source pages, newest first, and
+    // stops at the first page over the line limit: the limit is the
+    // history that the newest pages reaching `need` rows hold.
+    const src = &live.screens.get(.primary).?.pages;
     const primary = copy.screens.get(.primary).?;
     const seam = primary.pages.total_rows - primary.pages.rows;
-    _ = try primary.pages.prependHistoryFrom(
-        alloc,
-        &live.screens.get(.primary).?.pages,
-        seam,
-    );
+    const src_history = src.total_rows - src.rows;
+    var rows: usize = 0;
+    if (src_history > seam) {
+        var it = src.pageIterator(
+            .left_up,
+            .{ .screen = .{} },
+            .{ .screen = .{ .y = @intCast(src_history - seam - 1) } },
+        );
+        while (it.next()) |chunk| {
+            rows += chunk.end - chunk.start;
+            if (rows >= need) break;
+        }
+    }
+    copy.setScrollbackMaxBytes(null);
+    copy.setScrollbackMaxLines(seam + rows);
+    _ = try primary.pages.prependHistoryFrom(alloc, src, seam);
     return copy;
 }
