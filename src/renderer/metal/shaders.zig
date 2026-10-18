@@ -7,6 +7,7 @@ const global = @import("../../global.zig");
 
 const mtl = @import("api.zig");
 const Pipeline = @import("Pipeline.zig");
+const ColorBlend = @import("../ColorBlend.zig");
 
 const log = std.log.scoped(.metal);
 
@@ -260,6 +261,11 @@ pub const Uniforms = extern struct {
         host_paints_background: bool align(1) = false,
     },
 
+    /// The colors shown in this frame for every cell color source
+    /// (`ColorBlend`): the palette, then the default and config colors.
+    /// A theme change blends this table; the cells keep their sources.
+    palette: ColorBlend.ShaderTable align(4) = @splat(.{ 0, 0, 0, 255 }),
+
     const PaddingExtend = packed struct(u8) {
         left: bool = false,
         right: bool = false,
@@ -282,6 +288,10 @@ pub const CellText = extern struct {
         is_cursor_glyph: bool = false,
         _padding: u6 = 0,
     } align(1) = .{},
+    /// Where `color` comes from (`ColorBlend.Ref`): the shaders draw
+    /// `Uniforms.palette[color_ref]`, or `color` for `ColorBlend.direct`.
+    /// Uses the two bytes that were padding.
+    color_ref: ColorBlend.Ref align(2) = ColorBlend.direct,
 
     pub const Atlas = enum(u8) {
         grayscale = 0,
@@ -296,7 +306,15 @@ pub const CellText = extern struct {
 };
 
 /// This is a single parameter for the cell bg shader.
-pub const CellBg = [4]u8;
+pub const CellBg = extern struct {
+    color: [4]u8 align(4),
+    /// Where `color` comes from (`ColorBlend.Ref`); see `CellText`.
+    ref: ColorBlend.Ref align(2) = ColorBlend.direct,
+    _padding: u16 align(2) = 0,
+
+    /// No background: the surface background shows through.
+    pub const empty: CellBg = .{ .color = .{ 0, 0, 0, 0 } };
+};
 
 /// Single parameter for the image shader. See shader for field details.
 pub const Image = extern struct {

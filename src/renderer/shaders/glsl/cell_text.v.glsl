@@ -21,6 +21,9 @@ layout(location = 5) in uint atlas;
 // Misc glyph properties.
 layout(location = 6) in uint glyph_bools;
 
+// Where the color comes from (resolve_color).
+layout(location = 7) in uint color_ref;
+
 // Values `atlas` can take.
 const uint ATLAS_GRAYSCALE = 0u;
 const uint ATLAS_COLOR = 1u;
@@ -37,7 +40,8 @@ out CellTextVertexOut {
 } out_data;
 
 layout(binding = 1, std430) readonly buffer bg_cells {
-    uint bg_colors[];
+    // x: the packed 4u8 color, y: its source (low 16 bits; CellBg).
+    uvec2 bg_colors[];
 };
 
 void main() {
@@ -114,10 +118,13 @@ void main() {
 
     // Get our color. We always fetch a linearized version to
     // make it easier to handle minimum contrast calculations.
-    out_data.color = load_color(color, true);
+    out_data.color = load_color(resolve_color(color, color_ref), true);
     // Get the BG color
     out_data.bg_color = load_color(
-            unpack4u8(bg_colors[grid_pos.y * grid_size.x + grid_pos.x]),
+            resolve_color(
+                unpack4u8(bg_colors[grid_pos.y * grid_size.x + grid_pos.x].x),
+                bg_colors[grid_pos.y * grid_size.x + grid_pos.x].y & 0xFFFFu
+            ),
             true
         );
     // Blend it with the global bg color

@@ -11,6 +11,9 @@
 //----------------------------------------------------------------------------//
 // Global Uniforms
 //----------------------------------------------------------------------------//
+// Entries in the palette table (ColorBlend.slot_count).
+#define PALETTE_SLOTS 268u
+
 layout(binding = 1, std140) uniform Globals {
     uniform mat4 projection_matrix;
     uniform vec2 screen_size;
@@ -23,6 +26,9 @@ layout(binding = 1, std140) uniform Globals {
     uniform uint cursor_color_packed_4u8;
     uniform uint bg_color_packed_4u8;
     uniform uint bools;
+    // The colors shown in this frame for every cell color source
+    // (ColorBlend.zig), four packed 4u8 colors per element.
+    uniform uvec4 palette_packed_4u8[PALETTE_SLOTS / 4];
 };
 
 // Bools
@@ -50,6 +56,15 @@ uvec4 unpack4u8(uint packed_value) {
         uint(packed_value >> 16) & uint(0xFF),
         uint(packed_value >> 24) & uint(0xFF)
     );
+}
+
+// The color a cell draws: its table entry as shown in this frame, with
+// the cell's own alpha, or, for a ref past the table (0xFFFF, a true
+// color), its own color.
+uvec4 resolve_color(uvec4 color, uint ref) {
+    if (ref >= PALETTE_SLOTS) return color;
+    uvec4 entry = unpack4u8(palette_packed_4u8[ref / 4u][ref % 4u]);
+    return uvec4(entry.rgb, color.a);
 }
 
 uvec2 unpack2u16(uint packed_value) {

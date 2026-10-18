@@ -9,6 +9,7 @@ const Inspector = @import("../inspector/main.zig").Inspector;
 const terminalpkg = @import("../terminal/main.zig");
 const inputpkg = @import("../input.zig");
 const renderer = @import("../renderer.zig");
+const ColorBlend = @import("ColorBlend.zig");
 
 /// The mutex that must be held while reading any of the data in the
 /// members of this state. Note that the state itself is NOT protected
@@ -32,6 +33,21 @@ hold_frames: bool = false,
 /// it each frame before it takes `mutex`.
 reflow_preview: std.atomic.Value(bool) = .init(false),
 
+
+/// Bumped by every config change that sets the terminal's colors
+/// (`Termio.changeConfig`): the renderer blends that change with
+/// `color_transition` (`ColorBlend`). Protected by `mutex`.
+color_config_epoch: u32 = 0,
+
+/// When the last such change was made: its blend runs on this clock, so a
+/// surface that draws it later (it was hidden) shows the blend where the
+/// rest of the window shows it, or its end. Protected by `mutex`.
+color_config_at: ?std.Io.Timestamp = null,
+
+/// How a config color change animates
+/// (`ghostty_surface_set_color_transition`); instant by default.
+/// Protected by `mutex`.
+color_transition: ColorBlend.Spec = .instant,
 
 /// The embedder's link filter (`ghostty_surface_set_link_filter`), if any.
 /// Protected by `mutex`.

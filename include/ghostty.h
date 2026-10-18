@@ -700,6 +700,38 @@ typedef struct {
   uint64_t generation;
 } ghostty_surface_grid_s;
 
+// The most curve samples a ghostty_color_transition_s carries.
+#define GHOSTTY_COLOR_TRANSITION_MAX_SAMPLES 64
+
+// Where a color transition mixes two colors.
+typedef enum {
+  GHOSTTY_COLOR_TRANSITION_OKLAB = 0,
+  GHOSTTY_COLOR_TRANSITION_SRGB = 1,
+} ghostty_color_transition_space_e;
+
+// How a surface's colors animate when a config change sets them, see
+// ghostty_surface_set_color_transition.
+typedef struct {
+  // Seconds; 0 or less is instant.
+  double duration;
+  ghostty_color_transition_space_e space;
+  // Curve progress at sample_count evenly spaced time fractions, from 0
+  // (the first sample) to 1 (the last). Fewer than 2 samples: linear.
+  // At most GHOSTTY_COLOR_TRANSITION_MAX_SAMPLES are read.
+  uint32_t sample_count;
+  float samples[GHOSTTY_COLOR_TRANSITION_MAX_SAMPLES];
+} ghostty_color_transition_s;
+
+// Renderer frame counters, see ghostty_surface_render_counters.
+typedef struct {
+  // Frames drawn.
+  uint64_t frames;
+  // Frame updates that rebuilt cells (any number of rows).
+  uint64_t cell_rebuilds;
+  // Frames drawn while a color transition ran.
+  uint64_t blend_frames;
+} ghostty_surface_render_counters_s;
+
 // Config types
 
 // config.Path
@@ -1467,6 +1499,23 @@ GHOSTTY_API uint64_t ghostty_surface_foreground_pid(ghostty_surface_t);
 GHOSTTY_API ghostty_string_s ghostty_surface_tty_name(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_set_color_scheme(ghostty_surface_t,
                                                      ghostty_color_scheme_e);
+// How the surface's colors animate when a config change sets them
+// (ghostty_surface_update_config, ghostty_app_update_config,
+// ghostty_surface_set_color_scheme): the palette, the default
+// foreground, background and cursor colors, and the selection, search,
+// cursor text and bold colors of the config. Each frame of a transition
+// changes only a table of colors the shaders look up: no cell is rebuilt.
+// A change during a transition starts from the colors on screen. A color
+// a program sets (OSC 4, 10, 11, 12) and a true color (direct RGB) in a
+// cell switch at once. Set it before the config call; null or a duration
+// of 0 is instant (the default). Main thread.
+GHOSTTY_API void ghostty_surface_set_color_transition(
+    ghostty_surface_t,
+    const ghostty_color_transition_s*);
+// The renderer's frame counters since the surface started. Any thread
+// (diagnostics).
+GHOSTTY_API ghostty_surface_render_counters_s ghostty_surface_render_counters(
+    ghostty_surface_t);
 GHOSTTY_API ghostty_input_mods_e ghostty_surface_key_translation_mods(ghostty_surface_t,
                                                                          ghostty_input_mods_e);
 GHOSTTY_API bool ghostty_surface_key(ghostty_surface_t, ghostty_input_key_s);

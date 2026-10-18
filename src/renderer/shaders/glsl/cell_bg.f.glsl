@@ -7,7 +7,8 @@ layout(origin_upper_left) in vec4 gl_FragCoord;
 layout(location = 0) out vec4 out_FragColor;
 
 layout(binding = 1, std430) readonly buffer bg_cells {
-    uint cells[];
+    // x: the packed 4u8 color, y: its source (low 16 bits; CellBg).
+    uvec2 cells[];
 };
 
 vec4 cell_bg() {
@@ -49,7 +50,10 @@ vec4 cell_bg() {
 
     // Load the color for the cell.
     vec4 cell_color = load_color(
-            unpack4u8(cells[grid_pos.y * grid_size.x + grid_pos.x]),
+            resolve_color(
+                unpack4u8(cells[grid_pos.y * grid_size.x + grid_pos.x].x),
+                cells[grid_pos.y * grid_size.x + grid_pos.x].y & 0xFFFFu
+            ),
             use_linear_blending
         );
 
