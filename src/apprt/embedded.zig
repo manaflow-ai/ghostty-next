@@ -467,6 +467,14 @@ pub const Surface = struct {
     cursor_pos: apprt.CursorPos,
     inspector: ?*Inspector = null,
 
+    /// macOS: the renderer's target follows `size` (the embedder's
+    /// `ghostty_surface_set_size`), not the view's bounds. See
+    /// `ghostty_surface_set_host_sized`.
+    host_sized: bool = false,
+    /// The embedder called ghostty_surface_set_size at least once; until
+    /// then `size` is a placeholder a host-sized target must not use.
+    size_reported: bool = false,
+
     /// Who owns the terminal byte stream. See Options.io_mode.
     io_mode: apprt.SurfaceIoMode = .exec,
     io_write_cb: ?termio.Manual.WriteCallback = null,
@@ -1091,6 +1099,8 @@ pub const Surface = struct {
     /// iOS: the renderer's layer is a sublayer of the embedder's view and
     /// does not follow its bounds, so the surface keeps it at the size the
     /// embedder reported. See `Metal.setHostedLayerSize`.
+    /// macOS: a host-sized surface's target follows the reported size
+    /// (`Metal.setHostDrawableSize`).
     fn syncHostedLayer(self: *Surface) void {
         if (comptime builtin.os.tag == .ios) {
             self.core_surface.renderer.api.setHostedLayerSize(
@@ -1099,6 +1109,20 @@ pub const Surface = struct {
                 self.content_scale.x,
             );
         }
+        if (comptime builtin.os.tag == .macos and
+            @hasDecl(@TypeOf(self.core_surface.renderer.api), "setHostDrawableSize"))
+        {
+            self.core_surface.renderer.api.setHostDrawableSize(
+                self.host_sized and self.size_reported,
+                self.size.width,
+                self.size.height,
+            );
+        }
+    }
+
+    pub fn setHostSized(self: *Surface, enabled: bool) void {
+        self.host_sized = enabled;
+        self.syncHostedLayer();
     }
 
     pub fn updateSize(self: *Surface, width: u32, height: u32) void {
@@ -1106,7 +1130,15 @@ pub const Surface = struct {
         // if the size did not actually change (SwiftUI). We check
         // that the size actually changed from what we last recorded
         // since resizes are expensive.
-        if (self.size.width == width and self.size.height == height) return;
+        if (self.size.width == width and self.size.height == height) {
+            // The first report may equal the placeholder size.
+            if (!self.size_reported) {
+                self.size_reported = true;
+                self.syncHostedLayer();
+            }
+            return;
+        }
+        self.size_reported = true;
 
         self.size = .{
             .width = width,
@@ -2155,6 +2187,90 @@ pub const CAPI = struct {
 
     export fn ghostty_surface_set_size(surface: *Surface, w: u32, h: u32) void {
         surface.updateSize(w, h);
+    }
+
+    /// macOS: the render target follows ghostty_surface_set_size, not the
+    /// view's bounds. See ghostty.h.
+    export fn ghostty_surface_set_host_sized(surface: *Surface, enabled: bool) void {
+        surface.setHostSized(enabled);
+    }
+
+    /// Draw a reflow preview while the locked grid does not fit the view.
+    /// See ghostty.h.
+    export fn ghostty_surface_set_reflow_preview(surface: *Surface, enabled: bool) void {
+        surface.core_surface.setReflowPreview(enabled);
+    }
+
+    /// The C layout of `renderer.ColorBlend.Spec` (ghostty.h).
+    pub const ColorTransition = extern struct {
+        duration: f64,
+        space: c_int,
+        sample_count: u32,
+        samples: [renderer.ColorBlend.max_samples]f32,
+    };
+
+    /// How the colors animate when a config change sets them. See
+    /// ghostty.h.
+    export fn ghostty_surface_set_color_transition(
+        surface: *Surface,
+        transition: ?*const ColorTransition,
+    ) void {
+        const t = transition orelse {
+            surface.core_surface.setColorTransition(.instant);
+            return;
+        };
+        var spec: renderer.ColorBlend.Spec = .instant;
+        if (std.math.isFinite(t.duration) and t.duration > 0) {
+            spec.duration_ns = @intFromFloat(@min(t.duration, 60.0) * std.time.ns_per_s);
+        }
+        spec.space = if (t.space == 1) .srgb else .oklab;
+        const count: usize = @min(t.sample_count, renderer.ColorBlend.max_samples);
+        spec.sample_count = @intCast(count);
+        for (0..count) |i| {
+            const v = t.samples[i];
+            spec.samples[i] = if (std.math.isFinite(v)) v else 1;
+        }
+        surface.core_surface.setColorTransition(spec);
+    }
+
+    /// The C layout of the renderer's frame counters (ghostty.h).
+    pub const RenderCounters = extern struct {
+        frames: u64,
+        cell_rebuilds: u64,
+        blend_frames: u64,
+        frame_updates: u64,
+        full_palette: u64,
+        full_config: u64,
+        full_font: u64,
+        full_other: u64,
+        full_swap: u64,
+        full_resize: u64,
+    };
+
+    /// The renderer's frame counters. See ghostty.h.
+    export fn ghostty_surface_render_counters(surface: *Surface) RenderCounters {
+        const c = &surface.core_surface.renderer.counters;
+        return .{
+            .frames = c.frames.load(.monotonic),
+            .cell_rebuilds = c.cell_rebuilds.load(.monotonic),
+            .blend_frames = c.blend_frames.load(.monotonic),
+            .frame_updates = c.frame_updates.load(.monotonic),
+            .full_palette = c.full_palette.load(.monotonic),
+            .full_config = c.full_config.load(.monotonic),
+            .full_font = c.full_font.load(.monotonic),
+            .full_other = c.full_other.load(.monotonic),
+            .full_swap = c.full_swap.load(.monotonic),
+            .full_resize = c.full_resize.load(.monotonic),
+        };
+    }
+
+    /// The grid of the terminal the last frame drew. See ghostty.h.
+    export fn ghostty_surface_drawn_grid(surface: *Surface, cols: *u16, rows: *u16) bool {
+        const packed_grid = surface.core_surface.renderer.reflow_preview.drawn_grid.load(.acquire);
+        if (packed_grid == 0) return false;
+        cols.* = @intCast(packed_grid >> 16);
+        rows.* = @intCast(packed_grid & 0xFFFF);
+        return true;
     }
 
     /// Lock the terminal grid of a manual surface to the grid of the

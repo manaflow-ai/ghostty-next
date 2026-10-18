@@ -35,6 +35,7 @@ pub fn init() !IOSurfaceLayer {
 
     layer.setInstanceVariable("display_cb", .{ .value = null });
     layer.setInstanceVariable("display_ctx", .{ .value = null });
+    layer.setInstanceVariable("host_size", .{ .value = null });
 
     return .{ .layer = layer };
 }
@@ -73,6 +74,22 @@ pub fn detachFromHostIfDisplayCallbackOwned(
             @ptrCast(&block),
         );
     }
+}
+
+/// Records the host-set target size (`Metal.setHostDrawableSize`, packed
+/// width << 32 | height; 0 when the target follows the bounds), which
+/// `setSurfaceCallback` checks frames against. Main thread.
+pub fn setHostSize(self: *IOSurfaceLayer, value: u64) void {
+    // Stored shifted left by 3 so the object-typed ivar holds an 8-aligned
+    // pointer value (safe builds check the alignment of @ptrFromInt). The
+    // ivar is never retained or released (no ARC layout on this class).
+    const stored: usize = @intCast(value << 3);
+    self.layer.setInstanceVariable("host_size", .{ .value = @ptrFromInt(stored) });
+}
+
+/// The value `setHostSize` stored.
+fn hostSize(layer: objc.Object) u64 {
+    return @as(u64, @intFromPtr(layer.getInstanceVariable("host_size").value)) >> 3;
 }
 
 /// Sets the layer's `contents` to the provided IOSurface.
@@ -157,10 +174,13 @@ fn setSurfaceCallback(
     // asynchronously drawn frames can sometimes finish just after
     // a synchronously drawn frame during a resize, and if we don't
     // discard the improperly sized surface it creates jank.
+    // A host-sized layer expects the host's size, not its bounds (which
+    // move ahead of it during a drag).
+    const host = hostSize(layer);
     const bounds = layer.getProperty(macos.graphics.Rect, "bounds");
     const scale = layer.getProperty(f64, "contentsScale");
-    const width: usize = @intFromFloat(bounds.size.width * scale);
-    const height: usize = @intFromFloat(bounds.size.height * scale);
+    const width: usize = if (host != 0) @intCast(host >> 32) else @intFromFloat(bounds.size.width * scale);
+    const height: usize = if (host != 0) @intCast(host & 0xffff_ffff) else @intFromFloat(bounds.size.height * scale);
     if (width != surface.getWidth() or height != surface.getHeight()) {
         log.debug(
             "setSurfaceCallback(): surface is wrong size for layer, discarding. surface = {d}x{d}, layer = {d}x{d}",
@@ -201,6 +221,7 @@ fn getSubclass() error{ObjCFailed}!objc.Class {
 
     if (!subclass.addIvar("display_cb")) return error.ObjCFailed;
     if (!subclass.addIvar("display_ctx")) return error.ObjCFailed;
+    if (!subclass.addIvar("host_size")) return error.ObjCFailed;
 
     subclass.replaceMethod("display", struct {
         fn display(target: objc.c.id, sel: objc.c.SEL) callconv(.c) void {

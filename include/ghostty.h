@@ -700,6 +700,51 @@ typedef struct {
   uint64_t generation;
 } ghostty_surface_grid_s;
 
+// The most curve samples a ghostty_color_transition_s carries.
+#define GHOSTTY_COLOR_TRANSITION_MAX_SAMPLES 64
+
+// Where a color transition mixes two colors.
+typedef enum {
+  GHOSTTY_COLOR_TRANSITION_OKLAB = 0,
+  GHOSTTY_COLOR_TRANSITION_SRGB = 1,
+} ghostty_color_transition_space_e;
+
+// How a surface's colors animate when a config change sets them, see
+// ghostty_surface_set_color_transition.
+typedef struct {
+  // Seconds; 0 or less is instant.
+  double duration;
+  ghostty_color_transition_space_e space;
+  // Curve progress at sample_count evenly spaced time fractions, from 0
+  // (the first sample) to 1 (the last). Fewer than 2 samples: linear.
+  // At most GHOSTTY_COLOR_TRANSITION_MAX_SAMPLES are read.
+  uint32_t sample_count;
+  float samples[GHOSTTY_COLOR_TRANSITION_MAX_SAMPLES];
+} ghostty_color_transition_s;
+
+// Renderer frame counters, see ghostty_surface_render_counters.
+typedef struct {
+  // Frames drawn.
+  uint64_t frames;
+  // Frame updates that rebuilt at least one row of cells.
+  uint64_t cell_rebuilds;
+  // Frames drawn while a color transition ran.
+  uint64_t blend_frames;
+  // Frame updates, whether or not they rebuilt cells.
+  uint64_t frame_updates;
+  // Full rebuilds (every row) by cause: the terminal's palette changed
+  // (OSC 4, a snapshot restore), the config changed what cells hold (not
+  // only colors), a new font grid, anything else (resize, screen clear).
+  uint64_t full_palette;
+  uint64_t full_config;
+  uint64_t full_font;
+  uint64_t full_other;
+  // Full rebuilds because the drawn terminal changed (a snapshot restore
+  // swapped it, the reflow preview started or ended), or its grid size.
+  uint64_t full_swap;
+  uint64_t full_resize;
+} ghostty_surface_render_counters_s;
+
 // Config types
 
 // config.Path
@@ -1395,6 +1440,17 @@ GHOSTTY_API void ghostty_surface_set_link_filter(ghostty_surface_t,
                                                  ghostty_surface_link_filter_cb,
                                                  void* userdata);
 GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t);
+// macOS: with enabled true the renderer draws at the pixel size of the last
+// ghostty_surface_set_size, not at the view's bounds. While the view's
+// bounds change and the embedder holds its size (a divider drag), nothing
+// is drawn or allocated: the layer keeps the last frame at its top-left
+// corner (clip the view to keep it inside), and new output still draws at the
+// held size. Each new size draws one synchronous frame at the next display
+// pass. Until the first ghostty_surface_set_size the target follows the
+// bounds.
+// Default false (the target follows the bounds). No effect on iOS, where the
+// target always follows ghostty_surface_set_size. Main thread.
+GHOSTTY_API void ghostty_surface_set_host_sized(ghostty_surface_t, bool);
 GHOSTTY_API ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
 // Fills the grid metrics. Returns false while a resize of an unlocked grid
 // is in flight; with a host-locked grid (ghostty_surface_set_grid) the
@@ -1428,6 +1484,27 @@ GHOSTTY_API bool ghostty_surface_set_grid(ghostty_surface_t,
                                           uint16_t cols,
                                           uint16_t rows,
                                           uint64_t generation);
+// With enabled true, a MANUAL_MIRROR surface whose locked grid does not
+// fit the view (the owner has not answered a resize yet) draws a reflow
+// preview: a copy of its renderable state and newest history, reflowed to
+// the grid that fits the view with the same Terminal.resize the owner
+// runs (the prompt is kept, not cleared for a redraw). The live terminal
+// is not changed; output, snapshots and set_grid apply to it as before,
+// and the next frame redraws the preview from it. When the owner's grid
+// equals the view's grid the live terminal is drawn again; its rows equal
+// the preview's except prompt rows that the owner cleared for its shell
+// to redraw. The preview draws no selection, search highlights or Kitty
+// images; mouse hit tests use the live grid. The live terminal is drawn,
+// clipped or padded, while the alternate screen is active, Kitty images
+// are on the screen or the viewport is scrolled into history. Default
+// false. Main thread.
+GHOSTTY_API void ghostty_surface_set_reflow_preview(ghostty_surface_t, bool);
+// The grid of the terminal the renderer's last frame update drew: the
+// reflow preview's or the live terminal's. Returns false before the first
+// frame. Any thread (diagnostics).
+GHOSTTY_API bool ghostty_surface_drawn_grid(ghostty_surface_t,
+                                            uint16_t* cols,
+                                            uint16_t* rows);
 // The terminal's current grid and its lock. Any thread may call it,
 // except from io_write_cb (it takes the terminal lock).
 GHOSTTY_API ghostty_surface_grid_s ghostty_surface_grid(ghostty_surface_t);
@@ -1435,6 +1512,23 @@ GHOSTTY_API uint64_t ghostty_surface_foreground_pid(ghostty_surface_t);
 GHOSTTY_API ghostty_string_s ghostty_surface_tty_name(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_set_color_scheme(ghostty_surface_t,
                                                      ghostty_color_scheme_e);
+// How the surface's colors animate when a config change sets them
+// (ghostty_surface_update_config, ghostty_app_update_config,
+// ghostty_surface_set_color_scheme): the palette, the default
+// foreground, background and cursor colors, and the selection, search,
+// cursor text and bold colors of the config. Each frame of a transition
+// changes only a table of colors the shaders look up: no cell is rebuilt.
+// A change during a transition starts from the colors on screen. A color
+// a program sets (OSC 4, 10, 11, 12) and a true color (direct RGB) in a
+// cell switch at once. Set it before the config call; null or a duration
+// of 0 is instant (the default). Main thread.
+GHOSTTY_API void ghostty_surface_set_color_transition(
+    ghostty_surface_t,
+    const ghostty_color_transition_s*);
+// The renderer's frame counters since the surface started. Any thread
+// (diagnostics).
+GHOSTTY_API ghostty_surface_render_counters_s ghostty_surface_render_counters(
+    ghostty_surface_t);
 GHOSTTY_API ghostty_input_mods_e ghostty_surface_key_translation_mods(ghostty_surface_t,
                                                                          ghostty_input_mods_e);
 GHOSTTY_API bool ghostty_surface_key(ghostty_surface_t, ghostty_input_key_s);

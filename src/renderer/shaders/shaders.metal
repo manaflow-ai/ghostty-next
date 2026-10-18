@@ -9,6 +9,9 @@ enum Padding : uint8_t {
   EXTEND_DOWN = 8u,
 };
 
+// Entries in Uniforms.palette (ColorBlend.slot_count).
+#define PALETTE_SLOTS 268
+
 struct Uniforms {
   float4x4 projection_matrix;
   float2 screen_size;
@@ -25,6 +28,25 @@ struct Uniforms {
   bool use_linear_blending;
   bool use_linear_correction;
   bool host_paints_background;
+  // The colors shown in this frame for every cell color source
+  // (ColorBlend.zig): 256 palette entries, then the default and config
+  // colors. A theme change blends this table, not the cells.
+  uchar4 palette[PALETTE_SLOTS];
+};
+
+// The color a cell draws: its table entry as shown in this frame, with
+// the cell's own alpha, or, for a ref past the table (0xFFFF, a true
+// color), its own color.
+uchar4 resolve_color(uchar4 color, ushort ref, constant Uniforms& uniforms) {
+  if (ref >= PALETTE_SLOTS) return color;
+  return uchar4(uniforms.palette[ref].rgb, color.a);
+}
+
+// One cell's background (CellBg in metal/shaders.zig).
+struct CellBg {
+  uchar4 color;
+  ushort ref;
+  ushort padding;
 };
 
 //-------------------------------------------------------------------
@@ -452,7 +474,7 @@ fragment float4 bg_image_fragment(
 fragment float4 cell_bg_fragment(
   FullScreenVertexOut in [[stage_in]],
   constant Uniforms& uniforms [[buffer(1)]],
-  constant uchar4 *cells [[buffer(2)]]
+  constant CellBg *cells [[buffer(2)]]
 ) {
   int2 grid_pos = int2(floor((in.position.xy - uniforms.grid_padding.wx) / uniforms.cell_size));
 
@@ -489,7 +511,8 @@ fragment float4 cell_bg_fragment(
   }
 
   // Load the color for the cell.
-  uchar4 cell_color = cells[grid_pos.y * uniforms.grid_size.x + grid_pos.x];
+  CellBg cell = cells[grid_pos.y * uniforms.grid_size.x + grid_pos.x];
+  uchar4 cell_color = resolve_color(cell.color, cell.ref, uniforms);
 
   // Convert the color and return it.
   //
@@ -544,6 +567,9 @@ struct CellTextVertexIn {
 
   // Misc properties of the glyph.
   uint8_t bools [[attribute(6)]];
+
+  // Where the color comes from (resolve_color).
+  ushort color_ref [[attribute(7)]];
 };
 
 struct CellTextVertexOut {
@@ -558,7 +584,7 @@ vertex CellTextVertexOut cell_text_vertex(
   uint vid [[vertex_id]],
   CellTextVertexIn in [[stage_in]],
   constant Uniforms& uniforms [[buffer(1)]],
-  constant uchar4 *bg_colors [[buffer(2)]]
+  constant CellBg *bg_colors [[buffer(2)]]
 ) {
   // Convert the grid x, y into world space x, y by accounting for cell size
   float2 cell_pos = uniforms.cell_size * float2(in.grid_pos);
@@ -629,14 +655,15 @@ vertex CellTextVertexOut cell_text_vertex(
   // Get our color. We always fetch a linearized version to
   // make it easier to handle minimum contrast calculations.
   out.color = load_color(
-    in.color,
+    resolve_color(in.color, in.color_ref, uniforms),
     uniforms.use_display_p3,
     true
   );
 
   // Get the BG color
+  CellBg cell_bg = bg_colors[in.grid_pos.y * uniforms.grid_size.x + in.grid_pos.x];
   out.bg_color = load_color(
-    bg_colors[in.grid_pos.y * uniforms.grid_size.x + in.grid_pos.x],
+    resolve_color(cell_bg.color, cell_bg.ref, uniforms),
     uniforms.use_display_p3,
     true
   );

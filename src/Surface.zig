@@ -81,6 +81,9 @@ rt_surface: *apprt.runtime.Surface,
 
 /// The font structures
 font_grid_key: font.SharedGridSet.Key,
+/// The grid of `font_grid_key`, the one the renderer draws with: a config
+/// change that resolves to the same grid sends no new grid (setFontSize).
+font_grid: *font.SharedGrid,
 font_size: font.face.DesiredSize,
 font_metrics: font.Metrics,
 
@@ -717,6 +720,7 @@ pub fn init(
         .rt_app = rt_app,
         .rt_surface = rt_surface,
         .font_grid_key = font_grid_key,
+        .font_grid = font_grid,
         .font_size = font_size,
         .font_size_adjusted = false,
         .font_metrics = font_grid.metrics,
@@ -2814,6 +2818,19 @@ pub fn setFontSize(self: *Surface, size: font.face.DesiredSize) !void {
     );
     errdefer self.app.font_grid_set.deref(font_grid_key);
 
+    // The same grid (a config change that changed no font, such as a theme
+    // change): the renderer keeps its grid, its atlas and its cells. The
+    // cell size still applies, as before (padding balance, the terminal
+    // resize, the initial size).
+    if (font_grid == self.font_grid) {
+        self.app.font_grid_set.deref(font_grid_key);
+        try self.setCellSize(.{
+            .width = font_grid.metrics.cell_width,
+            .height = font_grid.metrics.cell_height,
+        });
+        return;
+    }
+
     // Set our cell size
     try self.setCellSize(.{
         .width = font_grid.metrics.cell_width,
@@ -2833,6 +2850,7 @@ pub fn setFontSize(self: *Surface, size: font.face.DesiredSize) !void {
 
     // Once we've sent the key we can replace our key
     self.font_grid_key = font_grid_key;
+    self.font_grid = font_grid;
     self.font_metrics = font_grid.metrics;
 
     // Schedule render which also drains our mailbox
@@ -4757,6 +4775,21 @@ pub fn setLinkFilter(self: *Surface, filter: ?rendererpkg.LinkFilter) void {
         self.renderer_state.terminal.screens.active.dirty.hyperlink_hover = true;
     }
     self.queueRender() catch |err| log.warn("error queueing render after link filter change err={}", .{err});
+}
+
+/// Draw a reflow preview while the host-locked grid does not fit the
+/// view (`renderer.ReflowPreview`). See ghostty.h.
+pub fn setReflowPreview(self: *Surface, enabled: bool) void {
+    if (self.renderer_state.reflow_preview.swap(enabled, .acq_rel) == enabled) return;
+    self.queueRender() catch |err| log.warn("error queueing render after reflow preview change err={}", .{err});
+}
+
+/// How the colors animate when a config change sets them
+/// (`renderer.ColorBlend`). See ghostty.h.
+pub fn setColorTransition(self: *Surface, spec: rendererpkg.ColorBlend.Spec) void {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    self.renderer_state.color_transition = spec;
 }
 
 fn linkAtPos(

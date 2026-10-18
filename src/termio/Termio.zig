@@ -630,7 +630,14 @@ pub fn changeConfig(self: *Termio, td: *ThreadData, config: *DerivedConfig) !voi
         log.warn("error changing default palette, using built-in default err={}", .{err});
         self.terminal.colors.palette.resetDefault(self.alloc);
     };
-    self.terminal.flags.dirty.palette = true;
+    // No terminal dirty flag: the renderer's cells keep color references,
+    // so it copies the new palette into its color table on the epoch
+    // below and rebuilds no cells (renderer/ColorBlend.zig).
+
+    // The renderer blends this color change with the surface's color
+    // transition (renderer/ColorBlend.zig).
+    self.renderer_state.color_config_epoch +%= 1;
+    self.renderer_state.color_config_at = .now(global.io(), .awake);
 
     // Update all our other colors
     self.terminal.colors.background.default = config.background.toTerminalRGB();
@@ -1255,7 +1262,15 @@ fn applyLocalPolicyLocked(self: *Termio, t: *terminalpkg.Terminal) void {
         log.warn("error applying the default palette after a snapshot restore, using built-in default err={}", .{err});
         t.colors.palette.resetDefault(self.alloc);
     };
-    t.flags.dirty.palette = true;
+    // The restored terminal is drawn again in full anyway (new screens);
+    // a palette mark is needed only when its colors differ from the
+    // terminal it replaces.
+    for (t.colors.palette.current, self.terminal.colors.palette.current) |a, b| {
+        if (!a.eql(b)) {
+            t.flags.dirty.palette = true;
+            break;
+        }
+    }
     t.colors.background.default = self.config.background.toTerminalRGB();
     t.colors.foreground.default = self.config.foreground.toTerminalRGB();
     t.colors.cursor.default = cursor: {

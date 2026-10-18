@@ -19,6 +19,33 @@ const constraintWidth = cellpkg.constraintWidth;
 const isCovering = cellpkg.isCovering;
 const rowNeverExtendBg = @import("row.zig").neverExtendBg;
 const Overlay = @import("Overlay.zig");
+const ReflowPreview = @import("ReflowPreview.zig");
+const ColorBlend = @import("ColorBlend.zig");
+
+/// Why a frame update rebuilds every row (RenderCounters).
+const RebuildCause = enum { none, config, font };
+
+/// A renderer's frame diagnostics (`ghostty_surface_render_counters`).
+pub const RenderCounters = struct {
+    frames: std.atomic.Value(u64) = .init(0),
+    /// Frame updates (`updateFrame`), whether or not they rebuilt cells.
+    frame_updates: std.atomic.Value(u64) = .init(0),
+    /// Frame updates that rebuilt at least one row of cells.
+    cell_rebuilds: std.atomic.Value(u64) = .init(0),
+    blend_frames: std.atomic.Value(u64) = .init(0),
+    /// Full rebuilds by cause: the terminal's palette changed (OSC 4 or a
+    /// snapshot restore), the renderer's config changed what cells hold,
+    /// a new font grid, anything else (a resize, a screen clear, ...).
+    full_palette: std.atomic.Value(u64) = .init(0),
+    full_config: std.atomic.Value(u64) = .init(0),
+    full_font: std.atomic.Value(u64) = .init(0),
+    full_other: std.atomic.Value(u64) = .init(0),
+    /// The drawn terminal changed: a snapshot restore swapped the live
+    /// terminal, or the reflow preview started or ended.
+    full_swap: std.atomic.Value(u64) = .init(0),
+    /// The drawn terminal's grid changed size.
+    full_resize: std.atomic.Value(u64) = .init(0),
+};
 const imagepkg = @import("image.zig");
 const ImageState = imagepkg.State;
 const shadertoy = @import("shadertoy.zig");
@@ -265,6 +292,58 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// 15 minutes at 120Hz) to prevent wasted memory buildup from
         /// a large screen.
         terminal_state_frame_count: usize = 0,
+
+        /// What a host-locked mirror draws while its grid does not fit
+        /// the view yet (`renderer.State.reflow_preview`).
+        reflow_preview: ReflowPreview = .{},
+
+        /// The colors the cells are built with and their running theme
+        /// blend (`ColorBlend`). Written by updateFrame and read by
+        /// drawFrame, both under `draw_mutex`.
+        color_blend: ColorBlend = .{},
+
+        /// The `renderer.State.color_config_epoch` the last frame update
+        /// saw: a new value means the terminal's colors came from a
+        /// config change, so the change blends.
+        color_config_epoch: u32 = 0,
+
+        /// Set by changeConfig to its time: the next frame update's color
+        /// change came from the config (the renderer's own config colors:
+        /// selection, cursor text, search, bold) and blends from then.
+        color_config_changed_at: ?std.Io.Timestamp = null,
+
+        /// Why the next frame update rebuilds every row (RenderCounters):
+        /// set by changeConfig and setFontGrid when they mark the cells
+        /// dirty. Written and read under `draw_mutex`.
+        full_rebuild_cause: RebuildCause = .none,
+
+        /// Rows the last `rebuildCells` built, and whether it built all.
+        rebuilt_rows: usize = 0,
+        rebuilt_full: bool = false,
+
+        /// The terminal the last frame update drew and the live
+        /// terminal's screen generation then (RenderCounters full_swap).
+        last_drawn: ?*const terminal.Terminal = null,
+        last_live_generation: usize = 0,
+
+        /// A key of each row's content as the cells were last built from
+        /// it (rowKey). When only the drawn terminal changed (a restore,
+        /// the reflow preview starting or ending) at the same grid, colors
+        /// and font, rows whose key did not change keep their cells.
+        row_keys: std.ArrayListUnmanaged(u64) = .empty,
+        /// The last rebuildCells drew a preedit or hovered links, which
+        /// the row keys do not cover: the next one keeps no rows.
+        last_unkeyed_overlay: bool = false,
+
+        /// The source of the block cursor's text color
+        /// (`Uniforms.cursor_color`), resolved each frame from the shown
+        /// table.
+        cursor_text_paint: ColorBlend.Paint = .{ .rgb = .{}, .ref = ColorBlend.direct },
+
+        /// Frame diagnostics (`ghostty_surface_render_counters`): frames
+        /// drawn, cell rebuilds, and frames drawn while a color blend
+        /// ran. Atomic: any thread may read them.
+        counters: RenderCounters = .{},
 
         /// Our overlay state, if any.
         overlay: ?Overlay = null,
@@ -629,6 +708,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             bg_image_fit: configpkg.BackgroundImageFit,
             bg_image_repeat: bool,
             links: link.Set,
+            /// A hash of every config value that changes what the cells
+            /// hold, apart from colors (the cells keep color references,
+            /// ColorBlend): fonts and shaping, cell alphas, padding,
+            /// which config colors follow a cell, links. changeConfig
+            /// rebuilds the cells only when it changes.
+            cells_key: u64,
             vsync: bool,
             colorspace: configpkg.Config.WindowColorspace,
             blending: configpkg.Config.AlphaBlending,
@@ -704,6 +789,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .bg_image_fit = config.@"background-image-fit",
                     .bg_image_repeat = config.@"background-image-repeat",
                     .links = links,
+                    .cells_key = cellsKey(config, font_styles),
                     .vsync = config.@"window-vsync",
                     .colorspace = config.@"window-colorspace",
                     .blending = config.@"alpha-blending",
@@ -863,6 +949,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             if (self.overlay) |*overlay| overlay.deinit(self.alloc);
             self.terminal_state.deinit(self.alloc);
+            self.reflow_preview.deinit(self.alloc);
             if (self.search_selected_match) |*m| m.arena.deinit();
             if (self.search_matches) |*m| m.arena.deinit();
 
@@ -876,6 +963,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             self.cells.deinit(self.alloc);
+            self.row_keys.deinit(self.alloc);
 
             self.font_shaper.deinit();
             self.font_shaper_cache.deinit(self.alloc);
@@ -1162,6 +1250,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 break :kitty @max(next -| now_ms, draw_interval_ms);
             };
 
+            // A theme color blend redraws every frame until it ends: draw
+            // only, the cells stay (ColorBlend).
+            if (self.color_blend.isRunning()) {
+                if (kitty_delay) |k| {
+                    if (k <= draw_interval_ms) return .{ .delay_ms = k, .kind = .update };
+                }
+                return .{ .delay_ms = draw_interval_ms, .kind = .draw };
+            }
+
             // An update wake includes a draw, so it wins ties.
             if (kitty_delay) |k| {
                 if (shader_delay == null or k <= shader_delay.?) {
@@ -1377,10 +1474,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Update relevant uniforms
             self.updateFontGridUniforms();
 
+            // The padding uniforms read the grid metrics: a resize that
+            // arrived before this grid computed them with the old cell.
+            self.updateScreenSizeUniforms();
+
             // Force a full rebuild, because cached rows may still reference
             // an outdated atlas from the old grid and this can cause garbage
             // to be rendered.
             self.markDirty();
+            self.full_rebuild_cause = .font;
         }
 
         /// Update uniforms that are based on the font grid.
@@ -1417,6 +1519,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
             self.terminal_state_frame_count += 1;
 
+            // A host-locked mirror whose grid does not fit the view yet
+            // draws its reflow preview: rebuilt here, at most once per
+            // frame, with the terminal lock held only for the copy.
+            const fit = self.size.grid();
+            const reflow_preview = state.reflow_preview.load(.acquire);
+            self.reflow_preview.update(self.alloc, state, reflow_preview, fit);
+
             // Create an arena for all our temporary allocations while rebuilding
             var arena = ArenaAllocator.init(self.alloc);
             defer arena.deinit();
@@ -1430,6 +1539,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 preedit: ?renderer.State.Preedit,
                 scrollbar: terminal.Scrollbar,
                 overlay_features: []const Overlay.Feature,
+                color_config_epoch: u32,
+                color_config_at: ?std.Io.Timestamp,
+                palette_dirty: bool,
+                swapped: bool,
+                resized: bool,
+                color_transition: ColorBlend.Spec,
             };
 
             // Update all our data as tightly as possible within the mutex.
@@ -1474,6 +1589,26 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     state.terminal.scrollViewport(.bottom);
                 }
 
+                // A palette change set by a program (OSC 4) or a restore
+                // marks the terminal dirty and rebuilds every row; read it
+                // before beginUpdate clears it (RenderCounters).
+                const palette_dirty = state.terminal.flags.dirty.palette;
+
+                // The terminal this frame draws: the live terminal, or its
+                // reflow preview while that is current. Input, selection,
+                // search and the scrollbar stay on the live terminal.
+                const drawn = self.reflow_preview.source(self.alloc, reflow_preview, state.terminal, fit);
+
+                // Rebuild causes (RenderCounters): another drawn terminal
+                // (a restore swaps the live one and advances its screen
+                // generation; the preview starts or ends), or a new grid.
+                const live_generation = state.terminal.screens.generation(state.terminal.screens.active_key);
+                const swapped = (if (self.last_drawn) |last| last != drawn else true) or
+                    self.last_live_generation != live_generation;
+                self.last_drawn = drawn;
+                self.last_live_generation = live_generation;
+                const resized = drawn.rows != self.terminal_state.rows or drawn.cols != self.terminal_state.cols;
+
                 // Begin the update of our terminal state. Work that
                 // doesn't require terminal access (e.g. style
                 // denormalization) is deferred to the endUpdate call
@@ -1481,8 +1616,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // hold time as short as possible.
                 try self.terminal_state.beginUpdate(
                     self.alloc,
-                    state.terminal,
+                    drawn,
                 );
+
+                // A config color change does not mark the terminal dirty:
+                // the cells keep color references (ColorBlend), so only
+                // the color table needs the new palette. Copy it from the
+                // live terminal here (the render state copies it only on a
+                // full redraw).
+                if (state.color_config_epoch != self.color_config_epoch) {
+                    self.terminal_state.colors.palette = state.terminal.colors.palette.current;
+                }
 
                 // If our terminal state is dirty at all we need to redo
                 // the viewport search.
@@ -1511,7 +1655,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // advancing a frame marks the image state dirty.
                 self.kitty_animation_next_ms = next: {
                     // Likely case: we have no kitty images, so do nothing.
-                    const storage = &state.terminal.screens.active.kitty_images;
+                    const storage = &drawn.screens.active.kitty_images;
                     if (storage.images.count() == 0) break :next null;
 
                     const now: std.Io.Timestamp = .now(global.io(), .awake);
@@ -1537,14 +1681,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // If we have any virtual references, we must also rebuild our
                 // kitty state on every frame because any cell change can move
                 // an image.
-                if (self.images.kittyRequiresUpdate(state.terminal)) {
+                if (self.images.kittyRequiresUpdate(drawn)) {
                     // We need to grab the draw mutex since this updates
                     // our image state that drawFrame uses.
                     self.draw_mutex.lockUncancelable(global.io());
                     defer self.draw_mutex.unlock(global.io());
                     self.images.kittyUpdate(
                         self.alloc,
-                        state.terminal,
+                        drawn,
                         .{
                             .width = self.grid_metrics.cell_width,
                             .height = self.grid_metrics.cell_height,
@@ -1586,6 +1730,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .preedit = preedit,
                     .scrollbar = scrollbar,
                     .overlay_features = overlay_features,
+                    .color_config_epoch = state.color_config_epoch,
+                    .palette_dirty = palette_dirty,
+                    .swapped = swapped,
+                    .resized = resized,
+                    .color_config_at = state.color_config_at,
+                    .color_transition = state.color_transition,
                 };
             };
 
@@ -1676,8 +1826,57 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.draw_mutex.lockUncancelable(global.io());
                 defer self.draw_mutex.unlock(global.io());
 
+                // A config color change this update (custom shader uniforms).
+                var colors_from_config = false;
+
+                // The colors the cells are built with. A change that came
+                // from the config blends from the colors on screen; any
+                // other change shows at once (ColorBlend).
+                {
+                    var table: ColorBlend.Table = undefined;
+                    self.colorTable(&table);
+                    const terminal_change: ?std.Io.Timestamp =
+                        if (critical.color_config_epoch != self.color_config_epoch)
+                            critical.color_config_at
+                        else
+                            null;
+                    colors_from_config = terminal_change != null or self.color_config_changed_at != null;
+                    const config_change = terminal_change orelse self.color_config_changed_at;
+
+                    // Two cell decisions read color values, not
+                    // references: padding extension (`rowNeverExtendBg`)
+                    // and a bold true color that equals the foreground
+                    // (`fgPaint`). When they apply, a color change still
+                    // rebuilds the rows.
+                    const old = &self.color_blend.to;
+                    const fg_changed = !table[ColorBlend.Slot.foreground].eql(old[ColorBlend.Slot.foreground]);
+                    const padding_changed = fg_changed or
+                        !table[ColorBlend.Slot.background].eql(old[ColorBlend.Slot.background]) or
+                        palette: {
+                            for (table[0..256], old[0..256]) |a, b| if (!a.eql(b)) break :palette true;
+                            break :palette false;
+                        };
+                    const bold_reads_fg = if (self.config.bold_color) |b| b == .color else false;
+                    if ((self.config.padding_color == .extend and padding_changed) or
+                        (bold_reads_fg and fg_changed))
+                    {
+                        self.markDirty();
+                        if (self.full_rebuild_cause == .none) self.full_rebuild_cause = .config;
+                    }
+                    self.color_config_changed_at = null;
+                    self.color_config_epoch = critical.color_config_epoch;
+                    self.color_blend.setTarget(&table, config_change, critical.color_transition);
+                }
+
                 // Build our GPU cells
+                _ = self.counters.frame_updates.fetchAdd(1, .monotonic);
+                const cause = self.full_rebuild_cause;
+                self.full_rebuild_cause = .none;
+                defer self.countRebuild(cause, critical);
                 self.rebuildCells(
+                    // Only the drawn terminal changed: keep the rows whose
+                    // content is the same (row_keys).
+                    cause == .none and critical.swapped and !critical.resized and !critical.palette_dirty,
                     critical.preedit,
                     renderer.cursorStyle(&self.terminal_state, .{
                         .preedit = critical.preedit != null,
@@ -1740,8 +1939,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     log.warn("error updating overlay images err={}", .{err});
                 };
 
-                // Update custom shader uniforms that depend on terminal state.
-                self.updateCustomShaderUniformsFromState();
+                // Update custom shader uniforms that depend on terminal
+                // state (or on a config color change, which marks no row).
+                self.updateCustomShaderUniformsFromState(colors_from_config);
             }
 
             // Start the display link now that the rebuilt frame is ready.
@@ -1910,6 +2110,22 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // Update per-frame custom shader uniforms.
             try self.updateCustomShaderUniformsForFrame();
+
+            // The colors this frame shows: a running theme blend moves
+            // only this table (ColorBlend), never the cells.
+            if (self.color_blend.has_colors) {
+                const blending = self.color_blend.isRunning();
+                self.color_blend.shown(&self.uniforms.palette);
+                const bg = self.uniforms.palette[ColorBlend.Slot.background];
+                self.uniforms.bg_color = .{ bg[0], bg[1], bg[2], self.uniforms.bg_color[3] };
+                const cursor_text = self.cursor_text_paint;
+                self.uniforms.cursor_color = if (cursor_text.ref == ColorBlend.direct)
+                    .{ cursor_text.rgb.r, cursor_text.rgb.g, cursor_text.rgb.b, 255 }
+                else
+                    self.uniforms.palette[cursor_text.ref];
+                _ = self.counters.frames.fetchAdd(1, .monotonic);
+                if (blending) _ = self.counters.blend_frames.fetchAdd(1, .monotonic);
+            }
 
             // Setup our frame data
             try frame.uniforms.sync(&.{self.uniforms});
@@ -2217,23 +2433,32 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // We always redo the font shaper in case font features changed. We
             // could check to see if there was an actual config change but this is
             // easier and rare enough to not cause performance issues.
-            {
+            // The cells hold color references (ColorBlend), so a change
+            // of colors alone keeps every cell: the frame update moves the
+            // color table. Only a change of what cells hold (cells_key)
+            // redoes the shaper and rebuilds every row.
+            const cells_changed = self.config.cells_key != config.cells_key;
+            if (cells_changed) {
                 var font_shaper = try font.Shaper.init(self.alloc, .{
                     .features = config.font_features.items,
                 });
                 errdefer font_shaper.deinit();
                 self.font_shaper.deinit();
                 self.font_shaper = font_shaper;
-            }
 
-            // We also need to reset the shaper cache so shaper info
-            // from the previous font isn't reused for the new font.
-            const font_shaper_cache = font.ShaperCache.init();
-            self.font_shaper_cache.deinit(self.alloc);
-            self.font_shaper_cache = font_shaper_cache;
+                // We also need to reset the shaper cache so shaper info
+                // from the previous font isn't reused for the new font.
+                const font_shaper_cache = font.ShaperCache.init();
+                self.font_shaper_cache.deinit(self.alloc);
+                self.font_shaper_cache = font_shaper_cache;
+            }
 
             // Set our new minimum contrast
             self.uniforms.min_contrast = config.min_contrast;
+
+            // The next frame update's color change came from the config:
+            // it blends (ColorBlend).
+            self.color_config_changed_at = .now(global.io(), .awake);
 
             // Set our new color space and blending
             self.uniforms.bools.use_display_p3 = config.colorspace == .@"display-p3";
@@ -2268,7 +2493,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             if (bg_image_config_changed) self.updateBgImageBuffer();
 
             // Reset our viewport to force a rebuild, in case of a font change.
-            self.markDirty();
+            if (cells_changed) {
+                self.markDirty();
+                if (self.full_rebuild_cause == .none) self.full_rebuild_cause = .config;
+            }
 
             const blending_changed = old_blending != config.blending;
 
@@ -2295,7 +2523,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.draw_mutex.lockUncancelable(global.io());
             defer self.draw_mutex.unlock(global.io());
 
+            // The cell size comes from the font grid (setFontGrid), not
+            // from a resize: on a font size change the surface's resize
+            // (new cell size) can arrive before the new grid, and a frame
+            // between them would lay out the new grid with the old glyphs
+            // and rebuild every row a second time. The new grid brings its
+            // cell size, so the font change is one rebuild.
+            const cell = self.size.cell;
             self.size = size;
+            self.size.cell = cell;
             self.updateScreenSizeUniforms();
 
             // Some graphics APIs need to manually update their viewport,
@@ -2382,12 +2618,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Update custom shader uniforms that depend on terminal state.
         ///
         /// This should be called in `updateFrame` when terminal state changes.
-        fn updateCustomShaderUniformsFromState(self: *Self) void {
+        fn updateCustomShaderUniformsFromState(self: *Self, colors_changed: bool) void {
             // We only need to do this if we have custom shaders.
             if (!self.has_custom_shaders) return;
 
-            // Only update when terminal state is dirty.
-            if (self.terminal_state.dirty == .false) return;
+            // Only update when terminal state is dirty or a config color
+            // change moved the colors.
+            if (self.terminal_state.dirty == .false and !colors_changed) return;
 
             const uniforms: *shadertoy.Uniforms = &self.custom_shader_uniforms;
             const colors: *const terminal.RenderState.Colors = &self.terminal_state.colors;
@@ -2662,6 +2899,52 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             cp_offset: usize,
         };
 
+        /// Counts the rows the last rebuildCells built and, for a full
+        /// rebuild, its cause (RenderCounters).
+        fn countRebuild(self: *Self, cause: RebuildCause, critical: anytype) void {
+            if (self.rebuilt_rows == 0) return;
+            _ = self.counters.cell_rebuilds.fetchAdd(1, .monotonic);
+            if (!self.rebuilt_full) return;
+            const counter = switch (cause) {
+                .font => &self.counters.full_font,
+                .config => &self.counters.full_config,
+                .none => if (critical.swapped)
+                    &self.counters.full_swap
+                else if (critical.resized)
+                    &self.counters.full_resize
+                else if (critical.palette_dirty)
+                    &self.counters.full_palette
+                else
+                    &self.counters.full_other,
+            };
+            _ = counter.fetchAdd(1, .monotonic);
+        }
+
+        /// The colors of every cell color source (`ColorBlend.Table`) for
+        /// the current terminal colors and config.
+        fn colorTable(self: *const Self, table: *ColorBlend.Table) void {
+            const colors = &self.terminal_state.colors;
+            const fg = colors.foreground;
+            const bg = colors.background;
+            for (colors.palette, 0..) |c, i| table[i] = c;
+            table[ColorBlend.Slot.foreground] = fg;
+            table[ColorBlend.Slot.background] = bg;
+            table[ColorBlend.Slot.cursor] = colors.cursor orelse
+                configColor(self.config.cursor_color) orelse fg;
+            table[ColorBlend.Slot.cursor_text] = configColor(self.config.cursor_text) orelse bg;
+            table[ColorBlend.Slot.selection_background] = configColor(self.config.selection_background) orelse fg;
+            table[ColorBlend.Slot.selection_foreground] = configColor(self.config.selection_foreground) orelse bg;
+            table[ColorBlend.Slot.search_background] = configColor(self.config.search_background) orelse fg;
+            table[ColorBlend.Slot.search_foreground] = configColor(self.config.search_foreground) orelse bg;
+            table[ColorBlend.Slot.search_selected_background] = configColor(self.config.search_selected_background) orelse fg;
+            table[ColorBlend.Slot.search_selected_foreground] = configColor(self.config.search_selected_foreground) orelse bg;
+            table[ColorBlend.Slot.bold] = if (self.config.bold_color) |b| switch (b) {
+                .color => |c| c,
+                .bright => fg,
+            } else fg;
+            for (ColorBlend.Slot.bold + 1..ColorBlend.slot_count) |i| table[i] = fg;
+        }
+
         /// Convert the terminal state to GPU cells stored in CPU memory. These
         /// are then synced to the GPU in the next frame. This only updates CPU
         /// memory and doesn't touch the GPU.
@@ -2671,11 +2954,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Dirty state on terminal state won't be reset by this.
         fn rebuildCells(
             self: *Self,
+            same_rows_keep: bool,
             preedit: ?renderer.State.Preedit,
             cursor_style_: ?renderer.CursorStyle,
             links: *const terminal.RenderState.CellSet,
         ) Allocator.Error!void {
             const state: *terminal.RenderState = &self.terminal_state;
+            self.rebuilt_rows = 0;
+            self.rebuilt_full = false;
 
             const grid_size_diff =
                 self.cells.size.rows != state.rows or
@@ -2692,7 +2978,23 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.uniforms.grid_size = .{ new_size.columns, new_size.rows };
             }
 
-            const rebuild = state.dirty == .full or grid_size_diff;
+            // Rows keep their cells when only the drawn terminal changed
+            // and their content key is the same; otherwise a full rebuild
+            // builds every row.
+            // A preedit or hovered links (now or in the last build) are not
+            // in the row keys: no row is kept then.
+            const overlay = preedit != null or links.count() > 0;
+            const keyed = state.dirty == .full and same_rows_keep and !grid_size_diff and
+                !overlay and !self.last_unkeyed_overlay and self.row_keys.items.len == state.rows;
+            self.last_unkeyed_overlay = overlay;
+            if (self.row_keys.items.len != state.rows) {
+                self.row_keys.resize(self.alloc, state.rows) catch {
+                    self.row_keys.clearRetainingCapacity();
+                };
+                @memset(self.row_keys.items, 0);
+            }
+            const rebuild = (state.dirty == .full or grid_size_diff) and !keyed;
+            self.rebuilt_full = rebuild;
             if (rebuild) {
                 // If we are doing a full rebuild, then we clear the entire cell buffer.
                 self.cells.reset();
@@ -2770,13 +3072,38 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             ) |y_usize, row, *cells, *dirty, selection, *highlights| {
                 const y: terminal.size.CellCountInt = @intCast(y_usize);
 
-                if (!rebuild) {
-                    // Only rebuild if we are doing a full rebuild or this row is dirty.
-                    if (!dirty.*) continue;
-
-                    // Clear the cells if the row is dirty
+                // Shaping breaks at the cursor, so the cursor's column is
+                // part of its row's key.
+                const cursor_x: ?terminal.size.CellCountInt = if (state.cursor.viewport) |vp|
+                    (if (vp.y == y_usize) vp.x else null)
+                else
+                    null;
+                if (keyed) {
+                    // A new drawn terminal: every row is marked, but a row
+                    // whose content is the same keeps its cells.
+                    const key = rowKey(row, cells, selection, highlights, cursor_x);
+                    if (self.row_keys.items[y_usize] == key) {
+                        dirty.* = false;
+                        continue;
+                    }
                     self.cells.clear(y);
+                    self.row_keys.items[y_usize] = key;
+                } else {
+                    if (!rebuild) {
+                        // Only rebuild if we are doing a full rebuild or this row is dirty.
+                        if (!dirty.*) continue;
+
+                        // Clear the cells if the row is dirty
+                        self.cells.clear(y);
+                    }
+                    if (y_usize < self.row_keys.items.len) {
+                        // A preedit row draws more than its content.
+                        const preedit_row = if (preedit_range) |r| r.y == y else false;
+                        self.row_keys.items[y_usize] = if (preedit_row) 0 else rowKey(row, cells, selection, highlights, cursor_x);
+                    }
                 }
+
+                self.rebuilt_rows += 1;
 
                 // Unmark the dirty state in our render state.
                 dirty.* = false;
@@ -2796,6 +3123,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     // trying to finish it out.
                     log.warn("error building row y={} err={}", .{ y, err });
                     self.cells.clear(y);
+                    if (y_usize < self.row_keys.items.len) self.row_keys.items[y_usize] = 0;
                 };
             }
 
@@ -2828,27 +3156,27 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // we don't render a cursor.
                 const style = cursor_style_ orelse break :cursor;
 
-                // Determine the cursor color.
-                const cursor_color = cursor_color: {
+                // Determine the cursor color, and its source: the cursor
+                // slot holds the OSC 12 color or the configured one
+                // (ColorBlend table, colorTable).
+                const table = &self.color_blend.to;
+                const cursor_color: ColorBlend.Paint = cursor_color: {
                     // If an explicit cursor color was set by OSC 12, use that.
-                    if (state.colors.cursor) |v| break :cursor_color v;
+                    if (state.colors.cursor != null) break :cursor_color ColorBlend.Paint.entry(table, ColorBlend.Slot.cursor);
 
                     // Use our configured color if specified
                     if (self.config.cursor_color) |v| switch (v) {
-                        .color => |color| break :cursor_color color.toTerminalRGB(),
+                        .color => break :cursor_color ColorBlend.Paint.entry(table, ColorBlend.Slot.cursor),
 
                         inline .@"cell-foreground",
                         .@"cell-background",
                         => |_, tag| {
-                            const fg_style = cursor_style.fg(.{
-                                .default = state.colors.foreground,
-                                .palette = &state.colors.palette,
-                                .bold = self.config.bold_color,
-                            });
-                            const bg_style = cursor_style.bg(
+                            const fg_style = fgPaint(cursor_style, table, self.config.bold_color);
+                            const bg_style = bgPaint(
+                                cursor_style,
                                 &state.cursor.cell,
-                                &state.colors.palette,
-                            ) orelse state.colors.background;
+                                table,
+                            ) orelse ColorBlend.Paint.entry(table, ColorBlend.Slot.background);
 
                             break :cursor_color switch (tag) {
                                 .color => unreachable,
@@ -2864,7 +3192,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         },
                     };
 
-                    break :cursor_color state.colors.foreground;
+                    break :cursor_color ColorBlend.Paint.entry(table, ColorBlend.Slot.foreground);
                 };
 
                 self.addCursor(
@@ -2893,23 +3221,20 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         .wide, .spacer_tail => true,
                     };
 
-                    const uniform_color = if (self.config.cursor_text) |txt| blk: {
+                    const uniform_color: ColorBlend.Paint = if (self.config.cursor_text) |txt| blk: {
                         // If cursor-text is set, then compute the correct color.
                         // Otherwise, use the background color.
                         if (txt == .color) {
                             // Use the color set by cursor-text, if any.
-                            break :blk txt.color.toTerminalRGB();
+                            break :blk ColorBlend.Paint.entry(table, ColorBlend.Slot.cursor_text);
                         }
 
-                        const fg_style = cursor_style.fg(.{
-                            .default = state.colors.foreground,
-                            .palette = &state.colors.palette,
-                            .bold = self.config.bold_color,
-                        });
-                        const bg_style = cursor_style.bg(
+                        const fg_style = fgPaint(cursor_style, table, self.config.bold_color);
+                        const bg_style = bgPaint(
+                            cursor_style,
                             &state.cursor.cell,
-                            &state.colors.palette,
-                        ) orelse state.colors.background;
+                            table,
+                        ) orelse ColorBlend.Paint.entry(table, ColorBlend.Slot.background);
 
                         break :blk switch (txt) {
                             // If the cell is reversed, use the opposite cell color instead.
@@ -2923,14 +3248,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                                 bg_style,
                             else => unreachable,
                         };
-                    } else state.colors.background;
+                    } else ColorBlend.Paint.entry(table, ColorBlend.Slot.background);
 
-                    self.uniforms.cursor_color = .{
-                        uniform_color.r,
-                        uniform_color.g,
-                        uniform_color.b,
-                        255,
-                    };
+                    // Drawn from the shown table each frame (drawFrame).
+                    self.cursor_text_paint = uniform_color;
                 }
             }
 
@@ -2942,7 +3263,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.addPreeditCell(
                         cp,
                         .{ .x = x, .y = range.y },
-                        state.colors.foreground,
+                        ColorBlend.Paint.entry(&self.color_blend.to, ColorBlend.Slot.foreground),
                     ) catch |err| {
                         log.warn("error building preedit cell, will be invalid x={} y={}, err={}", .{
                             x,
@@ -3144,16 +3465,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 // The `_style` suffixed values are the colors based on
                 // the cell style (SGR), before applying any additional
-                // configuration, inversions, selections, etc.
-                const bg_style = style.bg(
-                    cell,
-                    &state.colors.palette,
-                );
-                const fg_style = style.fg(.{
-                    .default = state.colors.foreground,
-                    .palette = &state.colors.palette,
-                    .bold = self.config.bold_color,
-                });
+                // configuration, inversions, selections, etc. Each color
+                // keeps its source (ColorBlend.Paint) so a theme change
+                // blends it on the GPU.
+                const table = &self.color_blend.to;
+                const bg_style = bgPaint(style, cell, table);
+                const fg_style = fgPaint(style, table, self.config.bold_color);
 
                 // The final background color for the cell.
                 const bg = switch (selected) {
@@ -3163,19 +3480,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     // If no configuration, then our selection background
                     // is our foreground color.
                     .selection => if (self.config.selection_background) |v| switch (v) {
-                        .color => |color| color.toTerminalRGB(),
+                        .color => ColorBlend.Paint.entry(table, ColorBlend.Slot.selection_background),
                         .@"cell-foreground" => if (style.flags.inverse) bg_style else fg_style,
                         .@"cell-background" => if (style.flags.inverse) fg_style else bg_style,
-                    } else state.colors.foreground,
+                    } else ColorBlend.Paint.entry(table, ColorBlend.Slot.foreground),
 
                     .search => switch (self.config.search_background) {
-                        .color => |color| color.toTerminalRGB(),
+                        .color => ColorBlend.Paint.entry(table, ColorBlend.Slot.search_background),
                         .@"cell-foreground" => if (style.flags.inverse) bg_style else fg_style,
                         .@"cell-background" => if (style.flags.inverse) fg_style else bg_style,
                     },
 
                     .search_selected => switch (self.config.search_selected_background) {
-                        .color => |color| color.toTerminalRGB(),
+                        .color => ColorBlend.Paint.entry(table, ColorBlend.Slot.search_selected_background),
                         .@"cell-foreground" => if (style.flags.inverse) bg_style else fg_style,
                         .@"cell-background" => if (style.flags.inverse) fg_style else bg_style,
                     },
@@ -3199,7 +3516,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 const fg = fg: {
                     // Our happy-path non-selection background color
                     // is our style or our configured defaults.
-                    const final_bg = bg_style orelse state.colors.background;
+                    const final_bg = bg_style orelse ColorBlend.Paint.entry(table, ColorBlend.Slot.background);
 
                     // Whether we need to use the bg color as our fg color:
                     // - Cell is selected, inverted, and set to cell-foreground
@@ -3207,19 +3524,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     // - Cell is inverted and not selected
                     break :fg switch (selected) {
                         .selection => if (self.config.selection_foreground) |v| switch (v) {
-                            .color => |color| color.toTerminalRGB(),
+                            .color => ColorBlend.Paint.entry(table, ColorBlend.Slot.selection_foreground),
                             .@"cell-foreground" => if (style.flags.inverse) final_bg else fg_style,
                             .@"cell-background" => if (style.flags.inverse) fg_style else final_bg,
-                        } else state.colors.background,
+                        } else ColorBlend.Paint.entry(table, ColorBlend.Slot.background),
 
                         .search => switch (self.config.search_foreground) {
-                            .color => |color| color.toTerminalRGB(),
+                            .color => ColorBlend.Paint.entry(table, ColorBlend.Slot.search_foreground),
                             .@"cell-foreground" => if (style.flags.inverse) final_bg else fg_style,
                             .@"cell-background" => if (style.flags.inverse) fg_style else final_bg,
                         },
 
                         .search_selected => switch (self.config.search_selected_foreground) {
-                            .color => |color| color.toTerminalRGB(),
+                            .color => ColorBlend.Paint.entry(table, ColorBlend.Slot.search_selected_foreground),
                             .@"cell-foreground" => if (style.flags.inverse) final_bg else fg_style,
                             .@"cell-background" => if (style.flags.inverse) fg_style else final_bg,
                         },
@@ -3236,7 +3553,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 // Set the cell's background color.
                 {
-                    const rgb = bg orelse state.colors.background;
+                    const paint = bg orelse ColorBlend.Paint.entry(table, ColorBlend.Slot.background);
 
                     // Determine our background alpha. If we have transparency configured
                     // then this is dynamic depending on some situations. This is all
@@ -3268,7 +3585,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     };
 
                     self.cells.bgCell(y, x).* = .{
-                        rgb.r, rgb.g, rgb.b, bg_alpha,
+                        .color = .{ paint.rgb.r, paint.rgb.g, paint.rgb.b, bg_alpha },
+                        .ref = paint.ref,
                     };
                 }
 
@@ -3307,7 +3625,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     @intCast(x),
                     @intCast(y),
                     underline,
-                    style.underlineColor(&state.colors.palette) orelse fg,
+                    underlinePaint(style, table) orelse fg,
                     alpha,
                 ) catch |err| {
                     log.warn(
@@ -3418,7 +3736,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             x: terminal.size.CellCountInt,
             y: terminal.size.CellCountInt,
             style: terminal.Attribute.Underline,
-            color: terminal.color.RGB,
+            paint: ColorBlend.Paint,
             alpha: u8,
         ) !void {
             const sprite: font.Sprite = switch (style) {
@@ -3443,7 +3761,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             try self.cells.add(self.alloc, .underline, .{
                 .atlas = .grayscale,
                 .grid_pos = .{ @intCast(x), @intCast(y) },
-                .color = .{ color.r, color.g, color.b, alpha },
+                .color = .{ paint.rgb.r, paint.rgb.g, paint.rgb.b, alpha },
+                .color_ref = paint.ref,
                 .glyph_pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
                 .glyph_size = .{ render.glyph.width, render.glyph.height },
                 .bearings = .{
@@ -3458,7 +3777,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self: *Self,
             x: terminal.size.CellCountInt,
             y: terminal.size.CellCountInt,
-            color: terminal.color.RGB,
+            paint: ColorBlend.Paint,
             alpha: u8,
         ) !void {
             const render = try self.font_grid.renderGlyph(
@@ -3474,7 +3793,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             try self.cells.add(self.alloc, .overline, .{
                 .atlas = .grayscale,
                 .grid_pos = .{ @intCast(x), @intCast(y) },
-                .color = .{ color.r, color.g, color.b, alpha },
+                .color = .{ paint.rgb.r, paint.rgb.g, paint.rgb.b, alpha },
+                .color_ref = paint.ref,
                 .glyph_pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
                 .glyph_size = .{ render.glyph.width, render.glyph.height },
                 .bearings = .{
@@ -3489,7 +3809,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self: *Self,
             x: terminal.size.CellCountInt,
             y: terminal.size.CellCountInt,
-            color: terminal.color.RGB,
+            paint: ColorBlend.Paint,
             alpha: u8,
         ) !void {
             const render = try self.font_grid.renderGlyph(
@@ -3505,7 +3825,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             try self.cells.add(self.alloc, .strikethrough, .{
                 .atlas = .grayscale,
                 .grid_pos = .{ @intCast(x), @intCast(y) },
-                .color = .{ color.r, color.g, color.b, alpha },
+                .color = .{ paint.rgb.r, paint.rgb.g, paint.rgb.b, alpha },
+                .color_ref = paint.ref,
                 .glyph_pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
                 .glyph_size = .{ render.glyph.width, render.glyph.height },
                 .bearings = .{
@@ -3524,7 +3845,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             cell_raws: []const terminal.page.Cell,
             shaper_cell: font.shape.Cell,
             shaper_run: font.shape.TextRun,
-            color: terminal.color.RGB,
+            paint: ColorBlend.Paint,
             alpha: u8,
         ) !void {
             const cell = cell_raws[x];
@@ -3568,7 +3889,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 },
                 .bools = .{ .no_min_contrast = noMinContrast(cp) },
                 .grid_pos = .{ @intCast(x), @intCast(y) },
-                .color = .{ color.r, color.g, color.b, alpha },
+                .color = .{ paint.rgb.r, paint.rgb.g, paint.rgb.b, alpha },
+                .color_ref = paint.ref,
                 .glyph_pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
                 .glyph_size = .{ render.glyph.width, render.glyph.height },
                 .bearings = .{
@@ -3582,7 +3904,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self: *Self,
             cursor_state: *const terminal.RenderState.Cursor,
             cursor_style: renderer.CursorStyle,
-            cursor_color: terminal.color.RGB,
+            cursor_paint: ColorBlend.Paint,
         ) void {
             const cursor_vp = cursor_state.viewport orelse return;
 
@@ -3657,7 +3979,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 .atlas = .grayscale,
                 .bools = .{ .is_cursor_glyph = true },
                 .grid_pos = .{ x, cursor_vp.y },
-                .color = .{ cursor_color.r, cursor_color.g, cursor_color.b, alpha },
+                .color = .{ cursor_paint.rgb.r, cursor_paint.rgb.g, cursor_paint.rgb.b, alpha },
+                .color_ref = cursor_paint.ref,
                 .glyph_pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
                 .glyph_size = .{ render.glyph.width, render.glyph.height },
                 .bearings = .{
@@ -3671,7 +3994,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self: *Self,
             cp: renderer.State.Preedit.Codepoint,
             coord: terminal.Coordinate,
-            screen_fg: terminal.color.RGB,
+            screen_fg: ColorBlend.Paint,
         ) !void {
             // Render the glyph for our preedit text
             const render_ = self.font_grid.renderCodepoint(
@@ -3697,7 +4020,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             try self.cells.add(self.alloc, .text, .{
                 .atlas = .grayscale,
                 .grid_pos = .{ @intCast(coord.x), @intCast(coord.y) },
-                .color = .{ screen_fg.r, screen_fg.g, screen_fg.b, 255 },
+                .color = .{ screen_fg.rgb.r, screen_fg.rgb.g, screen_fg.rgb.b, 255 },
+                .color_ref = screen_fg.ref,
                 .glyph_pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
                 .glyph_size = .{ render.glyph.width, render.glyph.height },
                 .bearings = .{
@@ -3732,4 +4056,165 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             try texture.replaceRegion(0, 0, atlas.size, atlas.size, atlas.data);
         }
     };
+}
+
+/// The RGB of a config color that names one (`.color`), else null.
+fn configColor(v: ?configpkg.Config.TerminalColor) ?terminal.color.RGB {
+    const c = v orelse return null;
+    return switch (c) {
+        .color => |color| color.toTerminalRGB(),
+        else => null,
+    };
+}
+
+// `terminal.Style.bg`, `fg` and `underlineColor` with the source of each
+// color kept (`ColorBlend.Paint`), so a theme change blends it.
+
+fn bgPaint(
+    style: terminal.Style,
+    cell: *const terminal.page.Cell,
+    table: *const ColorBlend.Table,
+) ?ColorBlend.Paint {
+    return switch (cell.content_tag) {
+        .bg_color_palette => ColorBlend.Paint.entry(table, cell.content.color_palette.data),
+        .bg_color_rgb => rgb: {
+            const rgb = cell.content.color_rgb;
+            break :rgb ColorBlend.Paint.rgbOnly(.{ .r = rgb.r, .g = rgb.g, .b = rgb.b });
+        },
+
+        else => switch (style.bg_color) {
+            .none => null,
+            .palette => |idx| ColorBlend.Paint.entry(table, idx),
+            .rgb => |rgb| ColorBlend.Paint.rgbOnly(rgb),
+        },
+    };
+}
+
+fn fgPaint(
+    style: terminal.Style,
+    table: *const ColorBlend.Table,
+    bold: ?terminal.Style.BoldColor,
+) ColorBlend.Paint {
+    return switch (style.fg_color) {
+        .none => default: {
+            if (style.flags.bold) {
+                if (bold) |b| switch (b) {
+                    .bright => {},
+                    .color => break :default ColorBlend.Paint.entry(table, ColorBlend.Slot.bold),
+                };
+            }
+
+            break :default ColorBlend.Paint.entry(table, ColorBlend.Slot.foreground);
+        },
+
+        .palette => |idx| palette: {
+            if (style.flags.bold) {
+                if (bold) |_| {
+                    const bright_offset = @intFromEnum(terminal.color.Name.bright_black);
+                    if (idx < bright_offset) {
+                        break :palette ColorBlend.Paint.entry(table, @as(ColorBlend.Ref, idx) + bright_offset);
+                    }
+                }
+            }
+
+            break :palette ColorBlend.Paint.entry(table, idx);
+        },
+
+        .rgb => |rgb| rgb: {
+            if (style.flags.bold and rgb.eql(table[ColorBlend.Slot.foreground])) {
+                if (bold) |b| switch (b) {
+                    .color => break :rgb ColorBlend.Paint.entry(table, ColorBlend.Slot.bold),
+                    .bright => {},
+                };
+            }
+
+            break :rgb ColorBlend.Paint.rgbOnly(rgb);
+        },
+    };
+}
+
+fn underlinePaint(
+    style: terminal.Style,
+    table: *const ColorBlend.Table,
+) ?ColorBlend.Paint {
+    return switch (style.underline_color) {
+        .none => null,
+        .palette => |idx| ColorBlend.Paint.entry(table, idx),
+        .rgb => |rgb| ColorBlend.Paint.rgbOnly(rgb),
+    };
+}
+
+/// `DerivedConfig.cells_key`: what the cells hold apart from colors.
+fn cellsKey(
+    config: *const configpkg.Config,
+    font_styles: font.CodepointResolver.StyleStatus,
+) u64 {
+    var h = std.hash.Wyhash.init(0);
+    for (config.@"font-feature".list.items) |f| {
+        h.update(f);
+        h.update(&.{0});
+    }
+    std.hash.autoHash(&h, font_styles.values);
+    std.hash.autoHash(&h, config.@"font-thicken");
+    std.hash.autoHash(&h, config.@"font-thicken-strength");
+    std.hash.autoHash(&h, config.@"font-shaping-break");
+    std.hash.autoHash(&h, config.@"background-opacity-cells");
+    std.hash.autoHash(&h, @as(u64, @bitCast(@as(f64, config.@"background-opacity"))));
+    std.hash.autoHash(&h, @as(u64, @bitCast(@as(f64, config.@"faint-opacity"))));
+    std.hash.autoHash(&h, config.@"window-padding-color");
+    // Which config colors follow a cell's colors: the variant, not the
+    // color (a color is a table entry).
+    inline for (.{
+        "cursor-color",         "cursor-text",
+        "selection-background", "selection-foreground",
+        "search-background",    "search-foreground",
+        "search-selected-background", "search-selected-foreground",
+    }) |name| {
+        const value: ?configpkg.Config.TerminalColor = @field(config, name);
+        std.hash.autoHash(&h, if (value) |v| @as(u8, @intFromEnum(std.meta.activeTag(v))) + 1 else @as(u8, 0));
+    }
+    std.hash.autoHash(&h, if (config.@"bold-color") |b| @as(u8, @intFromEnum(std.meta.activeTag(b))) + 1 else @as(u8, 0));
+    for (config.link.links.items) |l| {
+        h.update(l.regex);
+        h.update(&.{0});
+        std.hash.autoHash(&h, l.highlight);
+        std.hash.autoHash(&h, std.meta.activeTag(l.action));
+    }
+    return h.final();
+}
+
+/// A key of one row's content as rebuildRow draws it: each cell (without
+/// its page-relative style id), its style, its grapheme, and the row's
+/// selection and highlights. Equal keys build equal cells (colors are
+/// table references, the font and config are the same).
+fn rowKey(
+    row: terminal.page.Row,
+    cells: *const std.MultiArrayList(terminal.RenderState.Cell),
+    selection: anytype,
+    highlights: anytype,
+    cursor_x: ?terminal.size.CellCountInt,
+) u64 {
+    var h = std.hash.Wyhash.init(0x6b657973);
+    const slice = cells.slice();
+    const raws = slice.items(.raw);
+    const styles = slice.items(.style);
+    const graphemes = slice.items(.grapheme);
+    std.hash.autoHash(&h, raws.len);
+    // Padding extension reads the row's prompt flag.
+    std.hash.autoHash(&h, row.semantic_prompt);
+    for (raws, styles, graphemes) |raw, style, grapheme| {
+        var cell = raw;
+        const styled = cell.hasStyling();
+        cell.style_id = 0;
+        std.hash.autoHash(&h, @as(u64, @bitCast(cell)));
+        if (styled) std.hash.autoHash(&h, style);
+        if (cell.content_tag == .codepoint_grapheme) {
+            std.hash.autoHash(&h, grapheme.len);
+            h.update(std.mem.sliceAsBytes(grapheme));
+        }
+    }
+    std.hash.autoHash(&h, selection);
+    std.hash.autoHash(&h, cursor_x);
+    for (highlights.items) |hl| std.hash.autoHash(&h, hl);
+    return h.final();
 }

@@ -53,6 +53,12 @@ blending: configpkg.Config.AlphaBlending,
 /// We start an AutoreleasePool before `drawFrame` and end it afterwards.
 autorelease_pool: ?*objc.AutoreleasePool = null,
 
+/// macOS, opt-in (`ghostty_surface_set_host_sized`): the render target's
+/// pixel size, packed width << 32 | height, as the embedder last set it
+/// with `ghostty_surface_set_size`. 0 follows the layer's bounds (default).
+/// Written on the main thread, read by `surfaceSize` on any thread.
+host_size: std.atomic.Value(u64) = .init(0),
+
 pub fn init(
     alloc: Allocator,
     device: *const Device,
@@ -176,6 +182,30 @@ pub fn setHostedLayerSize(
     });
 }
 
+/// macOS only: make the render target follow the size the embedder sets
+/// (`ghostty_surface_set_size`) instead of the layer's bounds, or follow the
+/// bounds again with `enabled` false. Main thread.
+///
+/// While a host-sized view's bounds change and the embedder holds its size
+/// (a divider drag), nothing is drawn or allocated: the layer keeps showing
+/// the last frame from its top-left corner (`contentsGravity`; the embedder
+/// clips the view), and new output still draws at the held size. A new size draws
+/// one synchronous frame at the next display pass, as a bounds change does
+/// for a surface that follows its layer.
+pub fn setHostDrawableSize(self: *Metal, enabled: bool, width_px: u32, height_px: u32) void {
+    if (comptime builtin.os.tag != .macos) return;
+    const max = self.device.max_texture_size;
+    const value: u64 = if (enabled and width_px > 0 and height_px > 0)
+        (@as(u64, @min(width_px, max)) << 32) | @min(height_px, max)
+    else
+        0;
+    if (self.host_size.swap(value, .acq_rel) == value) return;
+    self.layer.setHostSize(value);
+    self.layer.layer.setProperty("needsDisplayOnBoundsChange", value == 0);
+    // One synchronous frame at the new target size (or at the bounds again).
+    self.layer.layer.msgSend(void, objc.sel("setNeedsDisplay"), .{});
+}
+
 /// iOS only: detach the IOSurfaceLayer from the embedder's view before
 /// the renderer's memory is freed.
 ///
@@ -249,6 +279,14 @@ pub fn initShaders(
 
 /// Get the current size of the runtime surface.
 pub fn surfaceSize(self: *const Metal) !struct { width: u32, height: u32 } {
+    // A host-sized surface draws at the size the embedder set: while its
+    // view's bounds change (a pane drag) the target and the shown frame stay.
+    const host = self.host_size.load(.acquire);
+    if (host != 0) return .{
+        .width = @truncate(host >> 32),
+        .height = @truncate(host),
+    };
+
     const bounds = self.layer.layer.getProperty(graphics.Rect, "bounds");
     const scale = self.layer.layer.getProperty(f64, "contentsScale");
 
