@@ -1474,6 +1474,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Update relevant uniforms
             self.updateFontGridUniforms();
 
+            // The padding uniforms read the grid metrics: a resize that
+            // arrived before this grid computed them with the old cell.
+            self.updateScreenSizeUniforms();
+
             // Force a full rebuild, because cached rows may still reference
             // an outdated atlas from the old grid and this can cause garbage
             // to be rendered.
