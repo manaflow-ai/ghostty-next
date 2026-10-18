@@ -60,6 +60,10 @@ live_flags_consumed: bool = false,
 wanted_last: bool = false,
 fit_last: renderer.GridSize = .{},
 
+/// The fit grid of the last failed build in `source`: not retried under
+/// the lock until the fit grid changes (`update` retries off the lock).
+failed_fit: renderer.GridSize = .{},
+
 /// The grid of the terminal the last frame drew (the preview's or the live
 /// terminal's), `cols << 16 | rows`; 0 before the first frame. Any thread
 /// reads it (`ghostty_surface_drawn_grid`).
@@ -137,14 +141,7 @@ pub fn update(
         };
     };
 
-    // The owner's prompt redraw comes as output after its own resize;
-    // the preview keeps the prompt it has instead of clearing it.
-    copy.flags.shell_redraws_prompt = .false;
-    copy.resize(alloc, .{
-        .cols = fit.columns,
-        .rows = fit.rows,
-        .reflow = true,
-    }) catch |err| {
+    reflow(alloc, &copy, fit) catch |err| {
         log.warn("reflow preview resize failed err={}", .{err});
         copy.deinit(alloc);
         // Only the renderer thread uses the preview terminal; the watch
@@ -154,7 +151,6 @@ pub fn update(
         self.grid = .{};
         return;
     };
-    copy.flags.dirty.clear = true;
 
     if (self.terminal) |*old| old.deinit(alloc);
     self.terminal = copy;
@@ -165,17 +161,31 @@ pub fn update(
 /// `live` and `fit`, else `live`. Caller holds the terminal lock. Drawing
 /// the live terminal after the watch consumed its dirty flags rebuilds
 /// it fully.
+///
+/// `update` builds the preview off the lock when the fit grid changed.
+/// A want that starts with the same fit grid (back at the bottom, the
+/// last image gone, the alternate screen left, the owner moved the grid)
+/// is built here under the lock, so no frame waits for the next one.
 pub fn source(
     self: *ReflowPreview,
+    alloc: Allocator,
+    enabled: bool,
     live: *Terminal,
     fit: renderer.GridSize,
 ) *Terminal {
-    const want = wanted(live, fit);
+    const want = enabled and wanted(live, fit);
     self.wanted_last = want;
     self.fit_last = fit;
-    const use = want and self.terminal != null and
+    var current = self.terminal != null and
         self.grid.columns == fit.columns and
         self.grid.rows == fit.rows;
+    if (want and !current and
+        !(self.failed_fit.columns == fit.columns and self.failed_fit.rows == fit.rows))
+    {
+        current = self.buildLocked(alloc, live, fit);
+        if (!current) self.failed_fit = fit;
+    }
+    const use = want and current;
     const t: *Terminal = if (use) &self.terminal.? else live;
     if (!use and self.live_flags_consumed) {
         live.flags.dirty.clear = true;
@@ -183,6 +193,35 @@ pub fn source(
     }
     self.drawn_grid.store(@as(u32, t.cols) << 16 | t.rows, .release);
     return t;
+}
+
+/// Build the preview under the terminal lock. False on a failure.
+fn buildLocked(self: *ReflowPreview, alloc: Allocator, live: *const Terminal, fit: renderer.GridSize) bool {
+    var copy = snapshot(alloc, live, fit) catch |err| {
+        log.warn("reflow preview copy failed err={}", .{err});
+        return false;
+    };
+    reflow(alloc, &copy, fit) catch |err| {
+        log.warn("reflow preview resize failed err={}", .{err});
+        copy.deinit(alloc);
+        return false;
+    };
+    if (self.terminal) |*old| old.deinit(alloc);
+    self.terminal = copy;
+    self.grid = fit;
+    return true;
+}
+
+/// Reflow `copy` to `fit` as the owner's resize does, keeping the prompt:
+/// the owner's prompt redraw comes as output after its own resize.
+fn reflow(alloc: Allocator, copy: *Terminal, fit: renderer.GridSize) !void {
+    copy.flags.shell_redraws_prompt = .false;
+    try copy.resize(alloc, .{
+        .cols = fit.columns,
+        .rows = fit.rows,
+        .reflow = true,
+    });
+    copy.flags.dirty.clear = true;
 }
 
 /// Drop the preview. Caller holds the terminal lock.

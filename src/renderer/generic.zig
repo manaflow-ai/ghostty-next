@@ -1427,7 +1427,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // draws its reflow preview: rebuilt here, at most once per
             // frame, with the terminal lock held only for the copy.
             const fit = self.size.grid();
-            self.reflow_preview.update(self.alloc, state, state.reflow_preview.load(.acquire), fit);
+            const reflow_preview = state.reflow_preview.load(.acquire);
+            self.reflow_preview.update(self.alloc, state, reflow_preview, fit);
 
             // Create an arena for all our temporary allocations while rebuilding
             var arena = ArenaAllocator.init(self.alloc);
@@ -1489,7 +1490,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // The terminal this frame draws: the live terminal, or its
                 // reflow preview while that is current. Input, selection,
                 // search and the scrollbar stay on the live terminal.
-                const drawn = self.reflow_preview.source(state.terminal, fit);
+                const drawn = self.reflow_preview.source(self.alloc, reflow_preview, state.terminal, fit);
 
                 // Begin the update of our terminal state. Work that
                 // doesn't require terminal access (e.g. style
