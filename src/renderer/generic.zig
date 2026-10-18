@@ -40,6 +40,11 @@ pub const RenderCounters = struct {
     full_config: std.atomic.Value(u64) = .init(0),
     full_font: std.atomic.Value(u64) = .init(0),
     full_other: std.atomic.Value(u64) = .init(0),
+    /// The drawn terminal changed: a snapshot restore swapped the live
+    /// terminal, or the reflow preview started or ended.
+    full_swap: std.atomic.Value(u64) = .init(0),
+    /// The drawn terminal's grid changed size.
+    full_resize: std.atomic.Value(u64) = .init(0),
 };
 const imagepkg = @import("image.zig");
 const ImageState = imagepkg.State;
@@ -315,6 +320,20 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Rows the last `rebuildCells` built, and whether it built all.
         rebuilt_rows: usize = 0,
         rebuilt_full: bool = false,
+
+        /// The terminal the last frame update drew and the live
+        /// terminal's screen generation then (RenderCounters full_swap).
+        last_drawn: ?*const terminal.Terminal = null,
+        last_live_generation: usize = 0,
+
+        /// A key of each row's content as the cells were last built from
+        /// it (rowKey). When only the drawn terminal changed (a restore,
+        /// the reflow preview starting or ending) at the same grid, colors
+        /// and font, rows whose key did not change keep their cells.
+        row_keys: std.ArrayListUnmanaged(u64) = .empty,
+        /// The last rebuildCells drew a preedit or hovered links, which
+        /// the row keys do not cover: the next one keeps no rows.
+        last_unkeyed_overlay: bool = false,
 
         /// The source of the block cursor's text color
         /// (`Uniforms.cursor_color`), resolved each frame from the shown
@@ -944,6 +963,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             self.cells.deinit(self.alloc);
+            self.row_keys.deinit(self.alloc);
 
             self.font_shaper.deinit();
             self.font_shaper_cache.deinit(self.alloc);
@@ -1518,6 +1538,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 color_config_epoch: u32,
                 color_config_at: ?std.Io.Timestamp,
                 palette_dirty: bool,
+                swapped: bool,
+                resized: bool,
                 color_transition: ColorBlend.Spec,
             };
 
@@ -1572,6 +1594,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // reflow preview while that is current. Input, selection,
                 // search and the scrollbar stay on the live terminal.
                 const drawn = self.reflow_preview.source(self.alloc, reflow_preview, state.terminal, fit);
+
+                // Rebuild causes (RenderCounters): another drawn terminal
+                // (a restore swaps the live one and advances its screen
+                // generation; the preview starts or ends), or a new grid.
+                const live_generation = state.terminal.screens.generation(state.terminal.screens.active_key);
+                const swapped = (if (self.last_drawn) |last| last != drawn else true) or
+                    self.last_live_generation != live_generation;
+                self.last_drawn = drawn;
+                self.last_live_generation = live_generation;
+                const resized = drawn.rows != self.terminal_state.rows or drawn.cols != self.terminal_state.cols;
 
                 // Begin the update of our terminal state. Work that
                 // doesn't require terminal access (e.g. style
@@ -1696,6 +1728,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .overlay_features = overlay_features,
                     .color_config_epoch = state.color_config_epoch,
                     .palette_dirty = palette_dirty,
+                    .swapped = swapped,
+                    .resized = resized,
                     .color_config_at = state.color_config_at,
                     .color_transition = state.color_transition,
                 };
@@ -1834,8 +1868,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 _ = self.counters.frame_updates.fetchAdd(1, .monotonic);
                 const cause = self.full_rebuild_cause;
                 self.full_rebuild_cause = .none;
-                defer self.countRebuild(cause, critical.palette_dirty);
+                defer self.countRebuild(cause, critical);
                 self.rebuildCells(
+                    // Only the drawn terminal changed: keep the rows whose
+                    // content is the same (row_keys).
+                    cause == .none and critical.swapped and !critical.resized and !critical.palette_dirty,
                     critical.preedit,
                     renderer.cursorStyle(&self.terminal_state, .{
                         .preedit = critical.preedit != null,
@@ -2852,14 +2889,21 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         /// Counts the rows the last rebuildCells built and, for a full
         /// rebuild, its cause (RenderCounters).
-        fn countRebuild(self: *Self, cause: RebuildCause, palette_dirty: bool) void {
+        fn countRebuild(self: *Self, cause: RebuildCause, critical: anytype) void {
             if (self.rebuilt_rows == 0) return;
             _ = self.counters.cell_rebuilds.fetchAdd(1, .monotonic);
             if (!self.rebuilt_full) return;
             const counter = switch (cause) {
                 .font => &self.counters.full_font,
                 .config => &self.counters.full_config,
-                .none => if (palette_dirty) &self.counters.full_palette else &self.counters.full_other,
+                .none => if (critical.swapped)
+                    &self.counters.full_swap
+                else if (critical.resized)
+                    &self.counters.full_resize
+                else if (critical.palette_dirty)
+                    &self.counters.full_palette
+                else
+                    &self.counters.full_other,
             };
             _ = counter.fetchAdd(1, .monotonic);
         }
@@ -2898,6 +2942,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Dirty state on terminal state won't be reset by this.
         fn rebuildCells(
             self: *Self,
+            same_rows_keep: bool,
             preedit: ?renderer.State.Preedit,
             cursor_style_: ?renderer.CursorStyle,
             links: *const terminal.RenderState.CellSet,
@@ -2921,7 +2966,22 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.uniforms.grid_size = .{ new_size.columns, new_size.rows };
             }
 
-            const rebuild = state.dirty == .full or grid_size_diff;
+            // Rows keep their cells when only the drawn terminal changed
+            // and their content key is the same; otherwise a full rebuild
+            // builds every row.
+            // A preedit or hovered links (now or in the last build) are not
+            // in the row keys: no row is kept then.
+            const overlay = preedit != null or links.count() > 0;
+            const keyed = state.dirty == .full and same_rows_keep and !grid_size_diff and
+                !overlay and !self.last_unkeyed_overlay and self.row_keys.items.len == state.rows;
+            self.last_unkeyed_overlay = overlay;
+            if (self.row_keys.items.len != state.rows) {
+                self.row_keys.resize(self.alloc, state.rows) catch {
+                    self.row_keys.clearRetainingCapacity();
+                };
+                @memset(self.row_keys.items, 0);
+            }
+            const rebuild = (state.dirty == .full or grid_size_diff) and !keyed;
             self.rebuilt_full = rebuild;
             if (rebuild) {
                 // If we are doing a full rebuild, then we clear the entire cell buffer.
@@ -3000,12 +3060,35 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             ) |y_usize, row, *cells, *dirty, selection, *highlights| {
                 const y: terminal.size.CellCountInt = @intCast(y_usize);
 
-                if (!rebuild) {
-                    // Only rebuild if we are doing a full rebuild or this row is dirty.
-                    if (!dirty.*) continue;
-
-                    // Clear the cells if the row is dirty
+                // Shaping breaks at the cursor, so the cursor's column is
+                // part of its row's key.
+                const cursor_x: ?terminal.size.CellCountInt = if (state.cursor.viewport) |vp|
+                    (if (vp.y == y_usize) vp.x else null)
+                else
+                    null;
+                if (keyed) {
+                    // A new drawn terminal: every row is marked, but a row
+                    // whose content is the same keeps its cells.
+                    const key = rowKey(row, cells, selection, highlights, cursor_x);
+                    if (self.row_keys.items[y_usize] == key) {
+                        dirty.* = false;
+                        continue;
+                    }
                     self.cells.clear(y);
+                    self.row_keys.items[y_usize] = key;
+                } else {
+                    if (!rebuild) {
+                        // Only rebuild if we are doing a full rebuild or this row is dirty.
+                        if (!dirty.*) continue;
+
+                        // Clear the cells if the row is dirty
+                        self.cells.clear(y);
+                    }
+                    if (y_usize < self.row_keys.items.len) {
+                        // A preedit row draws more than its content.
+                        const preedit_row = if (preedit_range) |r| r.y == y else false;
+                        self.row_keys.items[y_usize] = if (preedit_row) 0 else rowKey(row, cells, selection, highlights, cursor_x);
+                    }
                 }
 
                 self.rebuilt_rows += 1;
@@ -3028,6 +3111,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     // trying to finish it out.
                     log.warn("error building row y={} err={}", .{ y, err });
                     self.cells.clear(y);
+                    if (y_usize < self.row_keys.items.len) self.row_keys.items[y_usize] = 0;
                 };
             }
 
@@ -4087,3 +4171,38 @@ fn cellsKey(
     return h.final();
 }
 
+/// A key of one row's content as rebuildRow draws it: each cell (without
+/// its page-relative style id), its style, its grapheme, and the row's
+/// selection and highlights. Equal keys build equal cells (colors are
+/// table references, the font and config are the same).
+fn rowKey(
+    row: terminal.page.Row,
+    cells: *const std.MultiArrayList(terminal.RenderState.Cell),
+    selection: anytype,
+    highlights: anytype,
+    cursor_x: ?terminal.size.CellCountInt,
+) u64 {
+    var h = std.hash.Wyhash.init(0x6b657973);
+    const slice = cells.slice();
+    const raws = slice.items(.raw);
+    const styles = slice.items(.style);
+    const graphemes = slice.items(.grapheme);
+    std.hash.autoHash(&h, raws.len);
+    // Padding extension reads the row's prompt flag.
+    std.hash.autoHash(&h, row.semantic_prompt);
+    for (raws, styles, graphemes) |raw, style, grapheme| {
+        var cell = raw;
+        const styled = cell.hasStyling();
+        cell.style_id = 0;
+        std.hash.autoHash(&h, @as(u64, @bitCast(cell)));
+        if (styled) std.hash.autoHash(&h, style);
+        if (cell.content_tag == .codepoint_grapheme) {
+            std.hash.autoHash(&h, grapheme.len);
+            h.update(std.mem.sliceAsBytes(grapheme));
+        }
+    }
+    std.hash.autoHash(&h, selection);
+    std.hash.autoHash(&h, cursor_x);
+    for (highlights.items) |hl| std.hash.autoHash(&h, hl);
+    return h.final();
+}

@@ -739,6 +739,10 @@ typedef struct {
   uint64_t full_config;
   uint64_t full_font;
   uint64_t full_other;
+  // Full rebuilds because the drawn terminal changed (a snapshot restore
+  // swapped it, the reflow preview started or ended), or its grid size.
+  uint64_t full_swap;
+  uint64_t full_resize;
 } ghostty_surface_render_counters_s;
 
 // Config types
