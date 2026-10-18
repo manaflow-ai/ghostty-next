@@ -51,6 +51,10 @@ grid: renderer.GridSize = .{},
 /// The live terminal's dirty state since the preview was built.
 watch: terminalpkg.RenderState = .empty,
 
+/// The `State.color_config_epoch` of the last copy: a config color change
+/// copies the live terminal again.
+color_config_epoch: u32 = 0,
+
 /// The watch consumed the live terminal's dirty flags since the live
 /// terminal was last drawn: drawing it again needs a full rebuild.
 live_flags_consumed: bool = false,
@@ -130,7 +134,12 @@ pub fn update(
             self.end(alloc);
             return;
         };
-        const live_changed = self.watch.dirty != .false;
+        // A config color change sets no dirty flag (the live cells keep
+        // color references, ColorBlend): copy again so the preview has
+        // the new colors.
+        const colors_changed = state.color_config_epoch != self.color_config_epoch;
+        self.color_config_epoch = state.color_config_epoch;
+        const live_changed = self.watch.dirty != .false or colors_changed;
         self.watch.endUpdate();
         if (!grid_changed and !live_changed) return;
 

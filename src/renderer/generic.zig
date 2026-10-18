@@ -1788,6 +1788,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.draw_mutex.lockUncancelable(global.io());
                 defer self.draw_mutex.unlock(global.io());
 
+                // A config color change this update (custom shader uniforms).
+                var colors_from_config = false;
+
                 // The colors the cells are built with. A change that came
                 // from the config blends from the colors on screen; any
                 // other change shows at once (ColorBlend).
@@ -1799,6 +1802,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             critical.color_config_at
                         else
                             null;
+                    colors_from_config = terminal_change != null or self.color_config_changed_at != null;
                     const config_change = terminal_change orelse self.color_config_changed_at;
 
                     // Two cell decisions read color values, not
@@ -1806,9 +1810,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     // and a bold true color that equals the foreground
                     // (`fgPaint`). When they apply, a color change still
                     // rebuilds the rows.
-                    if (!ColorBlend.tablesEql(&table, &self.color_blend.to) and
-                        (self.config.padding_color == .extend or
-                            (if (self.config.bold_color) |b| b == .color else false)))
+                    const old = &self.color_blend.to;
+                    const fg_changed = !table[ColorBlend.Slot.foreground].eql(old[ColorBlend.Slot.foreground]);
+                    const padding_changed = fg_changed or
+                        !table[ColorBlend.Slot.background].eql(old[ColorBlend.Slot.background]) or
+                        !std.mem.eql(terminal.color.RGB, table[0..256], old[0..256]);
+                    const bold_reads_fg = if (self.config.bold_color) |b| b == .color else false;
+                    if ((self.config.padding_color == .extend and padding_changed) or
+                        (bold_reads_fg and fg_changed))
                     {
                         self.markDirty();
                         if (self.full_rebuild_cause == .none) self.full_rebuild_cause = .config;
@@ -1886,8 +1895,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     log.warn("error updating overlay images err={}", .{err});
                 };
 
-                // Update custom shader uniforms that depend on terminal state.
-                self.updateCustomShaderUniformsFromState();
+                // Update custom shader uniforms that depend on terminal
+                // state (or on a config color change, which marks no row).
+                self.updateCustomShaderUniformsFromState(colors_from_config);
             }
 
             // Start the display link now that the rebuilt frame is ready.
@@ -2556,12 +2566,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Update custom shader uniforms that depend on terminal state.
         ///
         /// This should be called in `updateFrame` when terminal state changes.
-        fn updateCustomShaderUniformsFromState(self: *Self) void {
+        fn updateCustomShaderUniformsFromState(self: *Self, colors_changed: bool) void {
             // We only need to do this if we have custom shaders.
             if (!self.has_custom_shaders) return;
 
-            // Only update when terminal state is dirty.
-            if (self.terminal_state.dirty == .false) return;
+            // Only update when terminal state is dirty or a config color
+            // change moved the colors.
+            if (self.terminal_state.dirty == .false and !colors_changed) return;
 
             const uniforms: *shadertoy.Uniforms = &self.custom_shader_uniforms;
             const colors: *const terminal.RenderState.Colors = &self.terminal_state.colors;
@@ -2836,13 +2847,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             cp_offset: usize,
         };
 
-        /// Convert the terminal state to GPU cells stored in CPU memory. These
-        /// are then synced to the GPU in the next frame. This only updates CPU
-        /// memory and doesn't touch the GPU.
-        ///
-        /// This requires the draw mutex.
-        ///
-        /// Dirty state on terminal state won't be reset by this.
         /// Counts the rows the last rebuildCells built and, for a full
         /// rebuild, its cause (RenderCounters).
         fn countRebuild(self: *Self, cause: RebuildCause, palette_dirty: bool) void {
@@ -2882,6 +2886,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             for (ColorBlend.Slot.bold + 1..ColorBlend.slot_count) |i| table[i] = fg;
         }
 
+        /// Convert the terminal state to GPU cells stored in CPU memory. These
+        /// are then synced to the GPU in the next frame. This only updates CPU
+        /// memory and doesn't touch the GPU.
+        ///
+        /// This requires the draw mutex.
+        ///
+        /// Dirty state on terminal state won't be reset by this.
         fn rebuildCells(
             self: *Self,
             preedit: ?renderer.State.Preedit,
@@ -2889,6 +2900,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             links: *const terminal.RenderState.CellSet,
         ) Allocator.Error!void {
             const state: *terminal.RenderState = &self.terminal_state;
+            self.rebuilt_rows = 0;
+            self.rebuilt_full = false;
 
             const grid_size_diff =
                 self.cells.size.rows != state.rows or
@@ -2907,7 +2920,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             const rebuild = state.dirty == .full or grid_size_diff;
             self.rebuilt_full = rebuild;
-            self.rebuilt_rows = 0;
             if (rebuild) {
                 // If we are doing a full rebuild, then we clear the entire cell buffer.
                 self.cells.reset();
@@ -4066,7 +4078,7 @@ fn cellsKey(
     for (config.link.links.items) |l| {
         h.update(l.regex);
         h.update(&.{0});
-        std.hash.autoHash(&h, std.meta.activeTag(l.highlight));
+        std.hash.autoHash(&h, l.highlight);
         std.hash.autoHash(&h, std.meta.activeTag(l.action));
     }
     return h.final();

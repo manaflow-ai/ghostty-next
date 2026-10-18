@@ -2818,9 +2818,15 @@ pub fn setFontSize(self: *Surface, size: font.face.DesiredSize) !void {
     errdefer self.app.font_grid_set.deref(font_grid_key);
 
     // The same grid (a config change that changed no font, such as a theme
-    // change): the renderer keeps its grid, its atlas and its cells.
+    // change): the renderer keeps its grid, its atlas and its cells. The
+    // cell size still applies, as before (padding balance, the terminal
+    // resize, the initial size).
     if (font_grid == self.font_grid) {
         self.app.font_grid_set.deref(font_grid_key);
+        try self.setCellSize(.{
+            .width = font_grid.metrics.cell_width,
+            .height = font_grid.metrics.cell_height,
+        });
         return;
     }
 
