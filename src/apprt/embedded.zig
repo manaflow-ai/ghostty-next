@@ -2195,6 +2195,21 @@ pub const CAPI = struct {
         surface.setHostSized(enabled);
     }
 
+    /// Draw a reflow preview while the locked grid does not fit the view.
+    /// See ghostty.h.
+    export fn ghostty_surface_set_reflow_preview(surface: *Surface, enabled: bool) void {
+        surface.core_surface.setReflowPreview(enabled);
+    }
+
+    /// The grid of the terminal the last frame drew. See ghostty.h.
+    export fn ghostty_surface_drawn_grid(surface: *Surface, cols: *u16, rows: *u16) bool {
+        const packed_grid = surface.core_surface.renderer.reflow_preview.drawn_grid.load(.acquire);
+        if (packed_grid == 0) return false;
+        cols.* = @intCast(packed_grid >> 16);
+        rows.* = @intCast(packed_grid & 0xFFFF);
+        return true;
+    }
+
     /// Lock the terminal grid of a manual surface to the grid of the
     /// terminal core that owns its byte stream. See ghostty.h.
     export fn ghostty_surface_set_grid(

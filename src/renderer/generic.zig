@@ -19,6 +19,7 @@ const constraintWidth = cellpkg.constraintWidth;
 const isCovering = cellpkg.isCovering;
 const rowNeverExtendBg = @import("row.zig").neverExtendBg;
 const Overlay = @import("Overlay.zig");
+const ReflowPreview = @import("ReflowPreview.zig");
 const imagepkg = @import("image.zig");
 const ImageState = imagepkg.State;
 const shadertoy = @import("shadertoy.zig");
@@ -265,6 +266,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// 15 minutes at 120Hz) to prevent wasted memory buildup from
         /// a large screen.
         terminal_state_frame_count: usize = 0,
+
+        /// What a host-locked mirror draws while its grid does not fit
+        /// the view yet (`renderer.State.reflow_preview`).
+        reflow_preview: ReflowPreview = .{},
 
         /// Our overlay state, if any.
         overlay: ?Overlay = null,
@@ -863,6 +868,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             if (self.overlay) |*overlay| overlay.deinit(self.alloc);
             self.terminal_state.deinit(self.alloc);
+            self.reflow_preview.deinit(self.alloc);
             if (self.search_selected_match) |*m| m.arena.deinit();
             if (self.search_matches) |*m| m.arena.deinit();
 
@@ -1417,6 +1423,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
             self.terminal_state_frame_count += 1;
 
+            // A host-locked mirror whose grid does not fit the view yet
+            // draws its reflow preview: rebuilt here, at most once per
+            // frame, with the terminal lock held only for the copy.
+            const fit = self.size.grid();
+            const reflow_preview = state.reflow_preview.load(.acquire);
+            self.reflow_preview.update(self.alloc, state, reflow_preview, fit);
+
             // Create an arena for all our temporary allocations while rebuilding
             var arena = ArenaAllocator.init(self.alloc);
             defer arena.deinit();
@@ -1474,6 +1487,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     state.terminal.scrollViewport(.bottom);
                 }
 
+                // The terminal this frame draws: the live terminal, or its
+                // reflow preview while that is current. Input, selection,
+                // search and the scrollbar stay on the live terminal.
+                const drawn = self.reflow_preview.source(self.alloc, reflow_preview, state.terminal, fit);
+
                 // Begin the update of our terminal state. Work that
                 // doesn't require terminal access (e.g. style
                 // denormalization) is deferred to the endUpdate call
@@ -1481,7 +1499,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // hold time as short as possible.
                 try self.terminal_state.beginUpdate(
                     self.alloc,
-                    state.terminal,
+                    drawn,
                 );
 
                 // If our terminal state is dirty at all we need to redo
@@ -1511,7 +1529,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // advancing a frame marks the image state dirty.
                 self.kitty_animation_next_ms = next: {
                     // Likely case: we have no kitty images, so do nothing.
-                    const storage = &state.terminal.screens.active.kitty_images;
+                    const storage = &drawn.screens.active.kitty_images;
                     if (storage.images.count() == 0) break :next null;
 
                     const now: std.Io.Timestamp = .now(global.io(), .awake);
@@ -1537,14 +1555,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // If we have any virtual references, we must also rebuild our
                 // kitty state on every frame because any cell change can move
                 // an image.
-                if (self.images.kittyRequiresUpdate(state.terminal)) {
+                if (self.images.kittyRequiresUpdate(drawn)) {
                     // We need to grab the draw mutex since this updates
                     // our image state that drawFrame uses.
                     self.draw_mutex.lockUncancelable(global.io());
                     defer self.draw_mutex.unlock(global.io());
                     self.images.kittyUpdate(
                         self.alloc,
-                        state.terminal,
+                        drawn,
                         .{
                             .width = self.grid_metrics.cell_width,
                             .height = self.grid_metrics.cell_height,
