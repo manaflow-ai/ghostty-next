@@ -4758,6 +4758,13 @@ pub fn setLinkFilter(self: *Surface, filter: ?rendererpkg.LinkFilter) void {
     self.queueRender() catch |err| log.warn("error queueing render after link filter change err={}", .{err});
 }
 
+/// Draw a reflow preview while the host-locked grid does not fit the
+/// view (`renderer.ReflowPreview`). See ghostty.h.
+pub fn setReflowPreview(self: *Surface, enabled: bool) void {
+    if (self.renderer_state.reflow_preview.swap(enabled, .acq_rel) == enabled) return;
+    self.queueRender() catch |err| log.warn("error queueing render after reflow preview change err={}", .{err});
+}
+
 fn linkAtPos(
     self: *Surface,
     pos: apprt.CursorPos,

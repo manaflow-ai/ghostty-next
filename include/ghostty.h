@@ -1439,6 +1439,18 @@ GHOSTTY_API bool ghostty_surface_set_grid(ghostty_surface_t,
                                           uint16_t cols,
                                           uint16_t rows,
                                           uint64_t generation);
+// With enabled true, a MANUAL_MIRROR surface whose locked grid does not
+// fit the view (the owner has not answered a resize yet) draws a reflow
+// preview: a copy of its renderable state and newest history, reflowed to
+// the grid that fits the view with the same Terminal.resize the owner
+// runs (the prompt is kept, not cleared for a redraw). The live terminal
+// is not changed; output, snapshots and set_grid apply to it as before,
+// and the next frame redraws the preview from it. When the owner's grid
+// equals the view's grid the live terminal is drawn again, with the same
+// visible rows. The live terminal is drawn, clipped or padded, while the
+// alternate screen is active, Kitty images are on the screen or the
+// viewport is scrolled into history. Default false. Main thread.
+GHOSTTY_API void ghostty_surface_set_reflow_preview(ghostty_surface_t, bool);
 // The terminal's current grid and its lock. Any thread may call it,
 // except from io_write_cb (it takes the terminal lock).
 GHOSTTY_API ghostty_surface_grid_s ghostty_surface_grid(ghostty_surface_t);

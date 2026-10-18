@@ -26,6 +26,12 @@ terminal: *terminalpkg.Terminal,
 /// `mutex`.
 hold_frames: bool = false,
 
+/// Draw a reflow preview (`ReflowPreview`) while the terminal's grid,
+/// locked to its owner's (`ghostty_surface_set_grid`), does not fit the
+/// view: `ghostty_surface_set_reflow_preview`. Atomic: the renderer reads
+/// it each frame before it takes `mutex`.
+reflow_preview: std.atomic.Value(bool) = .init(false),
+
 
 /// The embedder's link filter (`ghostty_surface_set_link_filter`), if any.
 /// Protected by `mutex`.

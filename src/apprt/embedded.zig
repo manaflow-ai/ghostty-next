@@ -2195,6 +2195,12 @@ pub const CAPI = struct {
         surface.setHostSized(enabled);
     }
 
+    /// Draw a reflow preview while the locked grid does not fit the view.
+    /// See ghostty.h.
+    export fn ghostty_surface_set_reflow_preview(surface: *Surface, enabled: bool) void {
+        surface.core_surface.setReflowPreview(enabled);
+    }
+
     /// Lock the terminal grid of a manual surface to the grid of the
     /// terminal core that owns its byte stream. See ghostty.h.
     export fn ghostty_surface_set_grid(
