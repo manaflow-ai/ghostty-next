@@ -114,9 +114,23 @@ from_c: [slot_count][3]f32 = std.mem.zeroes([slot_count][3]f32),
 to_c: [slot_count][3]f32 = std.mem.zeroes([slot_count][3]f32),
 /// False until the first frame update: its colors show at once.
 has_colors: bool = false,
+/// False until a frame was drawn: with nothing on screen to blend from, a
+/// change shows at once.
+drawn: bool = false,
 /// The running blend: its curve and start. Null start: no blend.
+/// Written only by `setTarget` (the renderer thread).
 spec: Spec = .instant,
 start: ?std.Io.Timestamp = null,
+/// A frame at or after the blend's end was drawn: the end colors are on
+/// screen, so the renderer stops drawing. Atomic: a draw on the main
+/// thread sets it; `isRunning` reads it on the renderer thread.
+end_drawn: std.atomic.Value(bool) = .init(true),
+
+/// Config changes this close to the running blend's start are the same
+/// change (one config call reaches the terminal and the renderer in two
+/// frame updates): they join that blend instead of starting the curve
+/// again.
+const same_change_ns = 50 * std.time.ns_per_ms;
 
 /// Sets the colors the cells are built with. `config_change`: the change
 /// came from the config at that time, so it blends with `spec` from the
@@ -138,7 +152,25 @@ pub fn setTarget(
     }
 
     const now: std.Io.Timestamp = .now(global.io(), .awake);
-    if (config_change != null and spec.duration_ns > 0 and !tablesEql(new, &self.to)) {
+    if (config_change != null and self.drawn and spec.duration_ns > 0 and !tablesEql(new, &self.to)) {
+        const joins = joins: {
+            const start = self.start orelse break :joins false;
+            if (!self.isRunningAt(now)) break :joins false;
+            const apart: i128 = start.durationTo(config_change.?).nanoseconds;
+            break :joins @abs(apart) < same_change_ns;
+        };
+        if (joins) {
+            // The second half of the same change: its entries join the
+            // running blend, on its clock, from where they were.
+            for (0..slot_count) |i| {
+                if (new[i].eql(self.to[i])) continue;
+                self.to[i] = new[i];
+                self.to_c[i] = components(new[i], self.spec.space);
+            }
+            self.end_drawn.store(false, .release);
+            return;
+        }
+
         // Retarget from the colors on screen now.
         var on_screen: Table = undefined;
         self.shownAt(now, &on_screen);
@@ -146,6 +178,7 @@ pub fn setTarget(
         self.to = new.*;
         self.spec = spec;
         self.start = config_change;
+        self.end_drawn.store(false, .release);
         for (0..slot_count) |i| {
             self.from_c[i] = components(self.from[i], spec.space);
             self.to_c[i] = components(self.to[i], spec.space);
@@ -171,10 +204,11 @@ pub fn setTarget(
     }
 }
 
-/// True while a blend runs: the renderer keeps drawing frames.
+/// True until a frame at or after the blend's end was drawn: the renderer
+/// keeps drawing frames, the last one with the end colors.
 pub fn isRunning(self: *const ColorBlend) bool {
     if (self.start == null) return false;
-    return self.isRunningAt(.now(global.io(), .awake));
+    return !self.end_drawn.load(.acquire);
 }
 
 fn isRunningAt(self: *const ColorBlend, now: std.Io.Timestamp) bool {
@@ -183,11 +217,14 @@ fn isRunningAt(self: *const ColorBlend, now: std.Io.Timestamp) bool {
     return elapsed < self.spec.duration_ns;
 }
 
-/// The table shown in a frame drawn now.
-pub fn shown(self: *const ColorBlend, out: *ShaderTable) void {
+/// The table shown in a frame drawn now; marks the colors as on screen.
+pub fn shown(self: *ColorBlend, out: *ShaderTable) void {
+    self.drawn = true;
+    const now: std.Io.Timestamp = .now(global.io(), .awake);
     var table: Table = undefined;
-    self.shownAt(.now(global.io(), .awake), &table);
+    self.shownAt(now, &table);
     for (table, out) |c, *o| o.* = .{ c.r, c.g, c.b, 255 };
+    if (self.start != null and !self.isRunningAt(now)) self.end_drawn.store(true, .release);
 }
 
 fn shownAt(self: *const ColorBlend, now: std.Io.Timestamp, out: *Table) void {

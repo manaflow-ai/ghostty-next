@@ -1997,7 +1997,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // The colors this frame shows: a running theme blend moves
             // only this table (ColorBlend), never the cells.
-            {
+            if (self.color_blend.has_colors) {
                 const blending = self.color_blend.isRunning();
                 self.color_blend.shown(&self.uniforms.palette);
                 const bg = self.uniforms.palette[ColorBlend.Slot.background];
