@@ -49,10 +49,15 @@ watch: terminalpkg.RenderState = .empty,
 /// True when the last frame drew the preview.
 drawn: bool = false,
 
+/// The grid of the terminal the last frame drew (the preview's or the live
+/// terminal's), `cols << 16 | rows`; 0 before the first frame. Any thread
+/// reads it (`ghostty_surface_drawn_grid`).
+drawn_grid: std.atomic.Value(u32) = .init(0),
+
 pub fn deinit(self: *ReflowPreview, alloc: Allocator) void {
     if (self.terminal) |*t| t.deinit(alloc);
     self.watch.deinit(alloc);
-    self.* = .{};
+    self.* = undefined;
 }
 
 /// Whether `live` needs a preview to fill `fit`. Caller holds the
@@ -143,13 +148,10 @@ pub fn source(
         self.grid.rows == fit.rows and
         wanted(live, fit);
     defer self.drawn = use;
-    if (use) {
-        const t = &self.terminal.?;
-        if (!self.drawn) t.flags.dirty.clear = true;
-        return t;
-    }
-    if (self.drawn) live.flags.dirty.clear = true;
-    return live;
+    const t: *Terminal = if (use) &self.terminal.? else live;
+    if (use != self.drawn) t.flags.dirty.clear = true;
+    self.drawn_grid.store(@as(u32, t.cols) << 16 | t.rows, .release);
+    return t;
 }
 
 /// Drop the preview. Caller holds the terminal lock.

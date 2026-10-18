@@ -1451,6 +1451,12 @@ GHOSTTY_API bool ghostty_surface_set_grid(ghostty_surface_t,
 // alternate screen is active, Kitty images are on the screen or the
 // viewport is scrolled into history. Default false. Main thread.
 GHOSTTY_API void ghostty_surface_set_reflow_preview(ghostty_surface_t, bool);
+// The grid of the terminal the renderer's last frame update drew: the
+// reflow preview's or the live terminal's. Returns false before the first
+// frame. Any thread (diagnostics).
+GHOSTTY_API bool ghostty_surface_drawn_grid(ghostty_surface_t,
+                                            uint16_t* cols,
+                                            uint16_t* rows);
 // The terminal's current grid and its lock. Any thread may call it,
 // except from io_write_cb (it takes the terminal lock).
 GHOSTTY_API ghostty_surface_grid_s ghostty_surface_grid(ghostty_surface_t);
