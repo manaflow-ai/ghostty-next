@@ -2519,7 +2519,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.draw_mutex.lockUncancelable(global.io());
             defer self.draw_mutex.unlock(global.io());
 
+            // The cell size comes from the font grid (setFontGrid), not
+            // from a resize: on a font size change the surface's resize
+            // (new cell size) can arrive before the new grid, and a frame
+            // between them would lay out the new grid with the old glyphs
+            // and rebuild every row a second time. The new grid brings its
+            // cell size, so the font change is one rebuild.
+            const cell = self.size.cell;
             self.size = size;
+            self.size.cell = cell;
             self.updateScreenSizeUniforms();
 
             // Some graphics APIs need to manually update their viewport,
