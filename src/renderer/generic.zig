@@ -331,6 +331,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// the reflow preview starting or ending) at the same grid, colors
         /// and font, rows whose key did not change keep their cells.
         row_keys: std.ArrayListUnmanaged(u64) = .empty,
+        /// The last rebuildCells drew a preedit or hovered links, which
+        /// the row keys do not cover: the next one keeps no rows.
+        last_unkeyed_overlay: bool = false,
 
         /// The source of the block cursor's text color
         /// (`Uniforms.cursor_color`), resolved each frame from the shown
@@ -2966,8 +2969,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Rows keep their cells when only the drawn terminal changed
             // and their content key is the same; otherwise a full rebuild
             // builds every row.
+            // A preedit or hovered links (now or in the last build) are not
+            // in the row keys: no row is kept then.
+            const overlay = preedit != null or links.count() > 0;
             const keyed = state.dirty == .full and same_rows_keep and !grid_size_diff and
-                preedit == null and self.row_keys.items.len == state.rows;
+                !overlay and !self.last_unkeyed_overlay and self.row_keys.items.len == state.rows;
+            self.last_unkeyed_overlay = overlay;
             if (self.row_keys.items.len != state.rows) {
                 self.row_keys.resize(self.alloc, state.rows) catch {
                     self.row_keys.clearRetainingCapacity();
@@ -3062,7 +3069,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 if (keyed) {
                     // A new drawn terminal: every row is marked, but a row
                     // whose content is the same keeps its cells.
-                    const key = rowKey(cells, selection, highlights, cursor_x);
+                    const key = rowKey(row, cells, selection, highlights, cursor_x);
                     if (self.row_keys.items[y_usize] == key) {
                         dirty.* = false;
                         continue;
@@ -3077,8 +3084,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         // Clear the cells if the row is dirty
                         self.cells.clear(y);
                     }
-                    if (y_usize < self.row_keys.items.len)
-                        self.row_keys.items[y_usize] = rowKey(cells, selection, highlights, cursor_x);
+                    if (y_usize < self.row_keys.items.len) {
+                        // A preedit row draws more than its content.
+                        const preedit_row = if (preedit_range) |r| r.y == y else false;
+                        self.row_keys.items[y_usize] = if (preedit_row) 0 else rowKey(row, cells, selection, highlights, cursor_x);
+                    }
                 }
 
                 self.rebuilt_rows += 1;
@@ -3101,6 +3111,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     // trying to finish it out.
                     log.warn("error building row y={} err={}", .{ y, err });
                     self.cells.clear(y);
+                    if (y_usize < self.row_keys.items.len) self.row_keys.items[y_usize] = 0;
                 };
             }
 
@@ -4165,6 +4176,7 @@ fn cellsKey(
 /// selection and highlights. Equal keys build equal cells (colors are
 /// table references, the font and config are the same).
 fn rowKey(
+    row: terminal.page.Row,
     cells: *const std.MultiArrayList(terminal.RenderState.Cell),
     selection: anytype,
     highlights: anytype,
@@ -4176,13 +4188,18 @@ fn rowKey(
     const styles = slice.items(.style);
     const graphemes = slice.items(.grapheme);
     std.hash.autoHash(&h, raws.len);
+    // Padding extension reads the row's prompt flag.
+    std.hash.autoHash(&h, row.semantic_prompt);
     for (raws, styles, graphemes) |raw, style, grapheme| {
         var cell = raw;
         const styled = cell.hasStyling();
         cell.style_id = 0;
         std.hash.autoHash(&h, @as(u64, @bitCast(cell)));
         if (styled) std.hash.autoHash(&h, style);
-        if (cell.content_tag == .codepoint_grapheme) h.update(std.mem.sliceAsBytes(grapheme));
+        if (cell.content_tag == .codepoint_grapheme) {
+            std.hash.autoHash(&h, grapheme.len);
+            h.update(std.mem.sliceAsBytes(grapheme));
+        }
     }
     std.hash.autoHash(&h, selection);
     std.hash.autoHash(&h, cursor_x);

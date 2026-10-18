@@ -1254,11 +1254,12 @@ fn applyLocalPolicyLocked(self: *Termio, t: *terminalpkg.Terminal) void {
     // The restored terminal is drawn again in full anyway (new screens);
     // a palette mark is needed only when its colors differ from the
     // terminal it replaces.
-    if (!std.mem.eql(
-        u8,
-        std.mem.asBytes(&t.colors.palette.current),
-        std.mem.asBytes(&self.terminal.colors.palette.current),
-    )) t.flags.dirty.palette = true;
+    for (t.colors.palette.current, self.terminal.colors.palette.current) |a, b| {
+        if (!a.eql(b)) {
+            t.flags.dirty.palette = true;
+            break;
+        }
+    }
     t.colors.background.default = self.config.background.toTerminalRGB();
     t.colors.foreground.default = self.config.foreground.toTerminalRGB();
     t.colors.cursor.default = cursor: {
