@@ -52,13 +52,11 @@ pub const IOSurface = opaque {
     }
 
     pub fn deinit(self: *IOSurface) void {
-        // We mark it purgeable so that it is immediately unloaded, so that we
-        // don't have to wait for CoreFoundation garbage collection to trigger.
-        _ = c.IOSurfaceSetPurgeable(
-            @ptrCast(self),
-            c.kIOSurfacePurgeableEmpty,
-            null,
-        );
+        // A plain release: the last owner frees the pages. The embedder may
+        // still hold the surface (the presented frame stays the layer's
+        // contents while the surface is hidden, and cmux keeps an evicted
+        // terminal's last frame to show it again), so its pixels must not be
+        // emptied here.
         foundation.CFRelease(self);
     }
 
