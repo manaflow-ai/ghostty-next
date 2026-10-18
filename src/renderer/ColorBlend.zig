@@ -161,11 +161,25 @@ pub fn setTarget(
         };
         if (joins) {
             // The second half of the same change: its entries join the
-            // running blend, on its clock, from where they were.
+            // running blend on its clock, from the colors on screen. The
+            // start of a joining entry is set so that the running curve
+            // passes through its shown color now and then reaches the new
+            // color: no step at the join.
+            var on_screen: Table = undefined;
+            self.shownAt(now, &on_screen);
+            const p: f32 = @floatCast(self.progressAt(now));
             for (0..slot_count) |i| {
                 if (new[i].eql(self.to[i])) continue;
+                const shown_c = components(on_screen[i], self.spec.space);
+                const to_c = components(new[i], self.spec.space);
                 self.to[i] = new[i];
-                self.to_c[i] = components(new[i], self.spec.space);
+                self.to_c[i] = to_c;
+                self.from[i] = on_screen[i];
+                if (p >= 1) {
+                    self.from_c[i] = to_c;
+                    continue;
+                }
+                for (0..3) |k| self.from_c[i][k] = (shown_c[k] - p * to_c[k]) / (1 - p);
             }
             self.end_drawn.store(false, .release);
             return;
@@ -227,19 +241,22 @@ pub fn shown(self: *ColorBlend, out: *ShaderTable) void {
     if (self.start != null and !self.isRunningAt(now)) self.end_drawn.store(true, .release);
 }
 
-fn shownAt(self: *const ColorBlend, now: std.Io.Timestamp, out: *Table) void {
-    const start = self.start orelse {
-        out.* = self.to;
-        return;
-    };
+/// The running curve's progress at `now`: 1 when no blend runs or it ended.
+fn progressAt(self: *const ColorBlend, now: std.Io.Timestamp) f64 {
+    const start = self.start orelse return 1;
     const elapsed: i128 = start.durationTo(now).nanoseconds;
-    if (elapsed >= self.spec.duration_ns) {
+    if (elapsed >= self.spec.duration_ns) return 1;
+    const fraction: f64 = @as(f64, @floatFromInt(@max(elapsed, 0))) /
+        @as(f64, @floatFromInt(self.spec.duration_ns));
+    return self.spec.progress(fraction);
+}
+
+fn shownAt(self: *const ColorBlend, now: std.Io.Timestamp, out: *Table) void {
+    if (self.start == null) {
         out.* = self.to;
         return;
     }
-    const fraction: f64 = @as(f64, @floatFromInt(@max(elapsed, 0))) /
-        @as(f64, @floatFromInt(self.spec.duration_ns));
-    const p = self.spec.progress(fraction);
+    const p = self.progressAt(now);
     if (p <= 0) {
         out.* = self.from;
         return;
