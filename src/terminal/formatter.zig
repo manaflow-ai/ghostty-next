@@ -565,7 +565,22 @@ pub const TerminalFormatter = struct {
         screen_formatter.content = .none;
         screen_formatter.extra = self.extra.screen;
         screen_formatter.cursor_origin = self.cursorOrigin();
+        screen_formatter.saved_cursor_ctx = self.savedCursorCtx();
         try screen_formatter.format(writer);
+    }
+
+    /// What the screen formatter needs to replay the saved cursor (DECSC).
+    fn savedCursorCtx(self: TerminalFormatter) ScreenFormatter.SavedCursorCtx {
+        if (self.opts.emit != .vt) return .{};
+        if (!self.extra.screen.cursor or !self.extra.modes or !self.extra.scrolling_region) return .{};
+        const region = &self.terminal.scrolling_region;
+        const horizontal = self.terminal.modes.get(.enable_left_and_right_margin);
+        return .{
+            .emit = true,
+            .origin_mode = self.terminal.modes.get(.origin),
+            .top = region.top,
+            .left = if (horizontal) region.left else 0,
+        };
     }
 
     /// The origin the consumer resolves the screen cursor CUP against
@@ -584,6 +599,53 @@ pub const TerminalFormatter = struct {
         };
     }
 };
+
+/// Writes the designations and invocations that turn a consumer's default
+/// charset state into `charset`. Default slots (UTF-8) and the default
+/// invocations (GL = G0, GR = G2) are not written.
+fn writeCharsetState(writer: *std.Io.Writer, charset: *const Screen.CharsetState) !void {
+    // Emit G0-G3 designations
+    for (std.enums.values(charsets.Slots)) |slot| {
+        const cs = charset.charsets.get(slot);
+        if (cs != .utf8) { // Only emit non-default charsets
+            const intermediate: u8 = switch (slot) {
+                .G0 => '(',
+                .G1 => ')',
+                .G2 => '*',
+                .G3 => '+',
+            };
+            const final: u8 = switch (cs) {
+                .ascii => 'B',
+                .british => 'A',
+                .dec_special => '0',
+                else => continue,
+            };
+            try writer.print("\x1b{c}{c}", .{ intermediate, final });
+        }
+    }
+
+    // Emit GL invocation if not G0
+    if (charset.gl != .G0) {
+        const seq = switch (charset.gl) {
+            .G0 => unreachable,
+            .G1 => "\x0e", // SO - Shift Out
+            .G2 => "\x1bn", // LS2
+            .G3 => "\x1bo", // LS3
+        };
+        try writer.print("{s}", .{seq});
+    }
+
+    // Emit GR invocation if not G2
+    if (charset.gr != .G2) {
+        const seq = switch (charset.gr) {
+            .G0 => unreachable, // GR can't be G0
+            .G1 => "\x1b~", // LS1R
+            .G2 => unreachable,
+            .G3 => "\x1b|", // LS3R
+        };
+        try writer.print("{s}", .{seq});
+    }
+}
 
 /// Whether tabstop serialization returns the cursor with CUP home (the
 /// Ghostty app) or with a carriage return (libghostty-vt). See the tabstop
@@ -625,6 +687,20 @@ pub const ScreenFormatter = struct {
     /// rather than using DECSC/DECRC as scratch storage, which would
     /// overwrite the consumer's saved cursor. Zero means absolute.
     cursor_origin: CursorOrigin = .{},
+
+    /// Terminal state the saved-cursor (DECSC) emission needs: whether to
+    /// emit it, the consumer's origin mode (DECOM) once modes are replayed,
+    /// and the margins CUP resolves against while origin mode is on. Only a
+    /// TerminalFormatter that replays modes and the scrolling region sets
+    /// `emit`, because restoring a saved origin mode depends on both.
+    saved_cursor_ctx: SavedCursorCtx = .{},
+
+    pub const SavedCursorCtx = struct {
+        emit: bool = false,
+        origin_mode: bool = false,
+        top: size.CellCountInt = 0,
+        left: size.CellCountInt = 0,
+    };
 
     pub const CursorOrigin = struct {
         top: size.CellCountInt = 0,
@@ -747,6 +823,58 @@ pub const ScreenFormatter = struct {
             .html => return,
         }
 
+        // Replay the saved cursor (DECSC) first: put the consumer's cursor,
+        // pen, protection, charsets and origin mode where the source saved
+        // them, save with ESC 7, then undo what the later extras do not set.
+        // The current cursor and state below are emitted afterwards.
+        if (self.extra.cursor and self.saved_cursor_ctx.emit) saved: {
+            const sc = self.screen.saved_cursor orelse break :saved;
+            const ctx = self.saved_cursor_ctx;
+            if (sc.origin != ctx.origin_mode) {
+                try writer.print("\x1b[?6{c}", .{@as(u8, if (sc.origin) 'h' else 'l')});
+            }
+            const top: size.CellCountInt = if (sc.origin) ctx.top else 0;
+            const left: size.CellCountInt = if (sc.origin) ctx.left else 0;
+            const edge = sc.x == self.screen.pages.cols - 1;
+            const pin = if (sc.pending_wrap and edge)
+                self.screen.pages.pin(.{ .active = .{ .x = sc.x, .y = sc.y } })
+            else
+                null;
+            if (pin) |p| {
+                // A pending wrap only comes from printing the edge cell:
+                // reprint it, as for the current cursor below.
+                const cell = p.rowAndCell().cell;
+                const start_x = switch (cell.wide) {
+                    .spacer_tail => sc.x - 1,
+                    .narrow, .wide, .spacer_head => sc.x,
+                };
+                try writer.print("\x1b[{d};{d}H", .{ (sc.y -| top) + 1, (start_x -| left) + 1 });
+                var cell_formatter: PageFormatter = .init(p.node.page(), self.opts);
+                cell_formatter.start_x = start_x;
+                cell_formatter.end_x = sc.x;
+                cell_formatter.start_y = p.y;
+                cell_formatter.end_y = p.y;
+                try cell_formatter.format(writer);
+            } else {
+                try writer.print("\x1b[{d};{d}H", .{ (sc.y -| top) + 1, (sc.x -| left) + 1 });
+            }
+            try writer.print("{f}", .{sc.style.formatterVt()});
+            if (sc.protected) try writer.print("\x1b[1\"q", .{});
+            try writeCharsetState(writer, &sc.charset);
+            try writer.writeAll("\x1b7");
+            // Undo what the extras below assume is at its default. A
+            // designation of a non-UTF-8 charset cannot be undone, but the
+            // current charsets below re-designate every non-default slot,
+            // and a slot left at UTF-8 after one was designated is not
+            // reachable without a reset that also clears the saved cursor.
+            if (sc.protected) try writer.print("\x1b[0\"q", .{});
+            if (sc.charset.gl != .G0) try writer.writeAll("\x0f");
+            if (sc.charset.gr != .G2) try writer.writeAll("\x1b}");
+            if (sc.origin != ctx.origin_mode) {
+                try writer.print("\x1b[?6{c}", .{@as(u8, if (ctx.origin_mode) 'h' else 'l')});
+            }
+        }
+
         // Emit cursor position before the other extras because restoring a
         // pending wrap requires reprinting the cell at the right edge. That
         // print uses and changes active screen state, so the requested style,
@@ -831,51 +959,7 @@ pub const ScreenFormatter = struct {
         }
 
         // Emit character set designations and invocations
-        if (self.extra.charsets) {
-            const charset = &self.screen.charset;
-
-            // Emit G0-G3 designations
-            for (std.enums.values(charsets.Slots)) |slot| {
-                const cs = charset.charsets.get(slot);
-                if (cs != .utf8) { // Only emit non-default charsets
-                    const intermediate: u8 = switch (slot) {
-                        .G0 => '(',
-                        .G1 => ')',
-                        .G2 => '*',
-                        .G3 => '+',
-                    };
-                    const final: u8 = switch (cs) {
-                        .ascii => 'B',
-                        .british => 'A',
-                        .dec_special => '0',
-                        else => continue,
-                    };
-                    try writer.print("\x1b{c}{c}", .{ intermediate, final });
-                }
-            }
-
-            // Emit GL invocation if not G0
-            if (charset.gl != .G0) {
-                const seq = switch (charset.gl) {
-                    .G0 => unreachable,
-                    .G1 => "\x0e", // SO - Shift Out
-                    .G2 => "\x1bn", // LS2
-                    .G3 => "\x1bo", // LS3
-                };
-                try writer.print("{s}", .{seq});
-            }
-
-            // Emit GR invocation if not G2
-            if (charset.gr != .G2) {
-                const seq = switch (charset.gr) {
-                    .G0 => unreachable, // GR can't be G0
-                    .G1 => "\x1b~", // LS1R
-                    .G2 => unreachable,
-                    .G3 => "\x1b|", // LS3R
-                };
-                try writer.print("{s}", .{seq});
-            }
-        }
+        if (self.extra.charsets) try writeCharsetState(writer, &self.screen.charset);
 
         // If we have a pin_map, we need to count how many bytes the extras
         // will emit so we can map them all to the same pin. We do this by
