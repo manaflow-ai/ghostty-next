@@ -504,6 +504,24 @@ pub const TerminalFormatter = struct {
         screen_formatter.pin_map = self.pin_map;
         try screen_formatter.format(writer);
 
+        // The saved cursor goes after the contents and before the margins:
+        // the consumer's margins are still the full screen, so its CUP is
+        // absolute, as DECRC's restore is.
+        if (self.opts.emit == .vt) {
+            try self.writeSavedCursor(writer);
+            // Map the saved-cursor bytes like the other extras.
+            if (self.pin_map) |*m| {
+                var discarding: std.Io.Writer.Discarding = .init(&.{});
+                try self.writeSavedCursor(&discarding.writer);
+                if (discarding.count > 0) m.map.append(
+                    m.alloc,
+                    m.map.getLastOrNull() orelse
+                        self.terminal.screens.active.pages.getTopLeft(.screen),
+                    std.math.cast(usize, discarding.count) orelse return error.WriteFailed,
+                ) catch return error.WriteFailed;
+            }
+        }
+
         // Extra terminal state to emit after the screen contents so that
         // it doesn't impact the emitted contents.
         if (self.opts.emit == .vt) {
@@ -565,22 +583,70 @@ pub const TerminalFormatter = struct {
         screen_formatter.content = .none;
         screen_formatter.extra = self.extra.screen;
         screen_formatter.cursor_origin = self.cursorOrigin();
-        screen_formatter.saved_cursor_ctx = self.savedCursorCtx();
         try screen_formatter.format(writer);
     }
 
-    /// What the screen formatter needs to replay the saved cursor (DECSC).
-    fn savedCursorCtx(self: TerminalFormatter) ScreenFormatter.SavedCursorCtx {
-        if (self.opts.emit != .vt) return .{};
-        if (!self.extra.screen.cursor or !self.extra.modes or !self.extra.scrolling_region) return .{};
-        const region = &self.terminal.scrolling_region;
-        const horizontal = self.terminal.modes.get(.enable_left_and_right_margin);
-        return .{
-            .emit = true,
-            .origin_mode = self.terminal.modes.get(.origin),
-            .top = region.top,
-            .left = if (horizontal) region.left else 0,
-        };
+    /// Replays the active screen's saved cursor (DECSC): the consumer's
+    /// cursor, pen, protection, charsets and origin mode are set as the
+    /// source saved them, ESC 7 saves them, and what the later extras assume
+    /// is at its default is undone. Runs only when those extras (cursor,
+    /// style, protection, charsets, modes, scrolling region) are replayed,
+    /// since they reset the consumer's current state afterwards.
+    ///
+    /// Not replayed: the inactive screen's saved cursor (each screen keeps
+    /// its own), and charset slots back at UTF-8 after a designation, which
+    /// need a reset that also clears the saved cursor.
+    fn writeSavedCursor(self: TerminalFormatter, writer: *std.Io.Writer) !void {
+        const screen = self.terminal.screens.active;
+        const sc = screen.saved_cursor orelse return;
+        const e = self.extra.screen;
+        if (!e.cursor or !e.style or !e.protection or !e.charsets) return;
+        if (!self.extra.modes or !self.extra.scrolling_region) return;
+        const origin_now = self.terminal.modes.get(.origin);
+        if (sc.origin != origin_now) {
+            try writer.print("\x1b[?6{c}", .{@as(u8, if (sc.origin) 'h' else 'l')});
+        }
+        // A pending wrap only comes from printing the edge cell: reprint it
+        // (or a blank, erased again below) so ESC 7 saves the wrap flag.
+        var erase_edge = false;
+        const edge = sc.x == screen.pages.cols - 1;
+        const pin = if (sc.pending_wrap and edge)
+            screen.pages.pin(.{ .active = .{ .x = sc.x, .y = sc.y } })
+        else
+            null;
+        if (pin) |p| {
+            const cell = p.rowAndCell().cell;
+            if (!cell.hasText() and cell.style_id == 0) {
+                try writer.print("\x1b[{d};{d}H\x1b[0m ", .{ sc.y + 1, sc.x + 1 });
+                erase_edge = true;
+            } else {
+                const start_x = switch (cell.wide) {
+                    .spacer_tail => sc.x - 1,
+                    .narrow, .wide, .spacer_head => sc.x,
+                };
+                try writer.print("\x1b[{d};{d}H", .{ sc.y + 1, start_x + 1 });
+                var cell_formatter: PageFormatter = .init(p.node.page(), self.opts);
+                cell_formatter.start_x = start_x;
+                cell_formatter.end_x = sc.x;
+                cell_formatter.start_y = p.y;
+                cell_formatter.end_y = p.y;
+                try cell_formatter.format(writer);
+            }
+        } else {
+            try writer.print("\x1b[{d};{d}H", .{ sc.y + 1, sc.x + 1 });
+        }
+        try writer.print("{f}", .{sc.style.formatterVt()});
+        const iso = screen.protected_mode == .iso;
+        if (sc.protected) try writer.writeAll(if (iso) "\x1bV" else "\x1b[1\"q");
+        try writeCharsetState(writer, &sc.charset);
+        try writer.writeAll("\x1b7");
+        if (sc.protected) try writer.writeAll(if (iso) "\x1bW" else "\x1b[0\"q");
+        if (sc.charset.gl != .G0) try writer.writeAll("\x0f");
+        if (sc.charset.gr != .G2) try writer.writeAll("\x1b}");
+        if (erase_edge) try writer.writeAll("\x1b[0m\x1b[X");
+        if (sc.origin != origin_now) {
+            try writer.print("\x1b[?6{c}", .{@as(u8, if (origin_now) 'h' else 'l')});
+        }
     }
 
     /// The origin the consumer resolves the screen cursor CUP against
@@ -688,19 +754,6 @@ pub const ScreenFormatter = struct {
     /// overwrite the consumer's saved cursor. Zero means absolute.
     cursor_origin: CursorOrigin = .{},
 
-    /// Terminal state the saved-cursor (DECSC) emission needs: whether to
-    /// emit it, the consumer's origin mode (DECOM) once modes are replayed,
-    /// and the margins CUP resolves against while origin mode is on. Only a
-    /// TerminalFormatter that replays modes and the scrolling region sets
-    /// `emit`, because restoring a saved origin mode depends on both.
-    saved_cursor_ctx: SavedCursorCtx = .{},
-
-    pub const SavedCursorCtx = struct {
-        emit: bool = false,
-        origin_mode: bool = false,
-        top: size.CellCountInt = 0,
-        left: size.CellCountInt = 0,
-    };
 
     pub const CursorOrigin = struct {
         top: size.CellCountInt = 0,
@@ -821,58 +874,6 @@ pub const ScreenFormatter = struct {
             // HTML doesn't preserve any screen state because it has
             // nothing to do with rendering.
             .html => return,
-        }
-
-        // Replay the saved cursor (DECSC) first: put the consumer's cursor,
-        // pen, protection, charsets and origin mode where the source saved
-        // them, save with ESC 7, then undo what the later extras do not set.
-        // The current cursor and state below are emitted afterwards.
-        if (self.extra.cursor and self.saved_cursor_ctx.emit) saved: {
-            const sc = self.screen.saved_cursor orelse break :saved;
-            const ctx = self.saved_cursor_ctx;
-            if (sc.origin != ctx.origin_mode) {
-                try writer.print("\x1b[?6{c}", .{@as(u8, if (sc.origin) 'h' else 'l')});
-            }
-            const top: size.CellCountInt = if (sc.origin) ctx.top else 0;
-            const left: size.CellCountInt = if (sc.origin) ctx.left else 0;
-            const edge = sc.x == self.screen.pages.cols - 1;
-            const pin = if (sc.pending_wrap and edge)
-                self.screen.pages.pin(.{ .active = .{ .x = sc.x, .y = sc.y } })
-            else
-                null;
-            if (pin) |p| {
-                // A pending wrap only comes from printing the edge cell:
-                // reprint it, as for the current cursor below.
-                const cell = p.rowAndCell().cell;
-                const start_x = switch (cell.wide) {
-                    .spacer_tail => sc.x - 1,
-                    .narrow, .wide, .spacer_head => sc.x,
-                };
-                try writer.print("\x1b[{d};{d}H", .{ (sc.y -| top) + 1, (start_x -| left) + 1 });
-                var cell_formatter: PageFormatter = .init(p.node.page(), self.opts);
-                cell_formatter.start_x = start_x;
-                cell_formatter.end_x = sc.x;
-                cell_formatter.start_y = p.y;
-                cell_formatter.end_y = p.y;
-                try cell_formatter.format(writer);
-            } else {
-                try writer.print("\x1b[{d};{d}H", .{ (sc.y -| top) + 1, (sc.x -| left) + 1 });
-            }
-            try writer.print("{f}", .{sc.style.formatterVt()});
-            if (sc.protected) try writer.print("\x1b[1\"q", .{});
-            try writeCharsetState(writer, &sc.charset);
-            try writer.writeAll("\x1b7");
-            // Undo what the extras below assume is at its default. A
-            // designation of a non-UTF-8 charset cannot be undone, but the
-            // current charsets below re-designate every non-default slot,
-            // and a slot left at UTF-8 after one was designated is not
-            // reachable without a reset that also clears the saved cursor.
-            if (sc.protected) try writer.print("\x1b[0\"q", .{});
-            if (sc.charset.gl != .G0) try writer.writeAll("\x0f");
-            if (sc.charset.gr != .G2) try writer.writeAll("\x1b}");
-            if (sc.origin != ctx.origin_mode) {
-                try writer.print("\x1b[?6{c}", .{@as(u8, if (ctx.origin_mode) 'h' else 'l')});
-            }
         }
 
         // Emit cursor position before the other extras because restoring a
