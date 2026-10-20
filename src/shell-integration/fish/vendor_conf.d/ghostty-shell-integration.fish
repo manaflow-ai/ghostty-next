@@ -67,9 +67,9 @@ function __ghostty_setup --on-event fish_prompt -d "Setup ghostty integration"
 
     # Our OSC133A (prompt start) sequence. If we're using Fish >= 4.1
     # then it supports click_events so we enable that.
-    set -g __ghostty_prompt_start_mark "\e]133;A\a"
+    set -g __ghostty_prompt_start_mark "\e]133;A;redraw=1\a"
     if test "$fish_major" -gt 4; or test "$fish_major" -eq 4 -a "$fish_minor" -ge 1
-        set -g __ghostty_prompt_start_mark "\e]133;A;click_events=1\a"
+        set -g __ghostty_prompt_start_mark "\e]133;A;redraw=1;click_events=1\a"
     end
 
     if string match -q 'cursor*' -- $features

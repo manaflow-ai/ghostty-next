@@ -123,6 +123,13 @@ local scrollback window limit for restored snapshots.
 The next upstream sync must keep these behaviors, or change them in a
 reviewed commit that says why.
 
+- zsh and fish prompt marks carry `redraw=1` (`133;A;redraw=1`), as the
+  bash script's carry `redraw=last`. Upstream's zsh and fish scripts send
+  no `redraw=` because the Ghostty app defaults to redraw. Why:
+  libghostty-vt defaults to no redraw (an embedder may run shells without
+  the integration), and cmux's PTY daemon injects these scripts into
+  libghostty-vt terminals; without the option a narrowing resize left the
+  prompt's first row behind (cmux#21341). The app is unchanged.
 - Scrollback viewport across snapshot restores (MANUAL modes): a restore
   keeps the viewer's scrolled-back viewport on the rows it showed, and
   keeps viewport moves made while a local-history restore runs. Upstream
