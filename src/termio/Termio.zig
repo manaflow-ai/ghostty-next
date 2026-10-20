@@ -2213,6 +2213,25 @@ const TestOwner = struct {
         return .{ try self.encodeReady(.ground), terminalpkg.history_digest.terminal(&self.t) };
     }
 
+    /// The owner's history after a READY (HISTORY manifests, pages,
+    /// FINISH), as the host sends it in chunks.
+    fn encodeHistory(self: *TestOwner) ![]u8 {
+        const alloc = std.testing.allocator;
+        const snapshot = terminalpkg.snapshot;
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        errdefer out.deinit();
+        {
+            var stream: snapshot.record.Writer = .init(alloc, &out.writer);
+            defer stream.deinit();
+            try snapshot.history.encode(self.t.screens.get(.primary).?, .primary, &stream);
+            if (self.t.screens.get(.alternate)) |alternate| {
+                try snapshot.history.encode(alternate, .alternate, &stream);
+            }
+            try snapshot.checkpoint.encode(.finish, &stream);
+        }
+        return try out.toOwnedSlice();
+    }
+
     /// The owner's READY prefix, with the given unfinished sequence as
     /// its continuation.
     fn encodeReady(self: *TestOwner, continuation: terminalpkg.snapshot.Continuation) ![]u8 {
@@ -3382,7 +3401,10 @@ test "manual: no frame shows the READY terminal between the two swaps" {
                 test_between_swaps = &struct {
                     fn hook(t: *Termio) void {
                         testRecordBetweenFrame(t);
-                        t.scrollViewport(.{ .delta = -3 });
+                        // A jump changes the live terminal outside the
+                        // byte stream (a scroll is kept instead: see
+                        // "keeps a scroll made between the swaps").
+                        t.jumpToPrompt(-1) catch {};
                     }
                 }.hook;
                 defer test_between_swaps = null;
@@ -3433,11 +3455,11 @@ test "manual: snapshot local history restore does not undo a change between the 
             const ready, const digest = try owner.resizeAndEncode(25, 10);
             defer alloc.free(ready);
 
-            // The main thread scrolls the live READY terminal between the
-            // two swaps.
+            // The main thread jumps the live READY terminal to a prompt
+            // between the two swaps.
             test_between_swaps = &struct {
                 fn hook(t: *Termio) void {
-                    t.scrollViewport(.{ .delta = -3 });
+                    t.jumpToPrompt(-1) catch {};
                 }
             }.hook;
             defer test_between_swaps = null;
@@ -3446,6 +3468,297 @@ test "manual: snapshot local history restore does not undo a change between the 
                 try io.restoreSnapshotLocalHistory(ready, digest),
             );
             try testing.expectEqual(try testReadyHistoryRows(ready), testHistoryRows(&io.terminal));
+        }
+    }.run;
+    try testManualTermio(true, body);
+}
+
+/// The conformance reference for the viewport tests: a plain libghostty-vt
+/// terminal that parses the same bytes and takes the same resizes and
+/// scrolls directly, as a Ghostty surface with its own pty does. A mirror
+/// must show what it shows, whatever snapshots it restored on the way.
+const TestReference = struct {
+    t: terminalpkg.Terminal,
+    stream: terminalpkg.TerminalStream,
+
+    fn init(self: *TestReference, io: *Termio, owner: *TestOwner) !void {
+        const alloc = std.testing.allocator;
+        self.t = try .init(global.io(), alloc, .{
+            .cols = owner.t.cols,
+            .rows = owner.t.rows,
+            .max_scrollback_bytes = io.config.scrollback_limit_bytes,
+        });
+        errdefer self.t.deinit(alloc);
+        self.t.flags.shell_redraws_prompt = owner.t.flags.shell_redraws_prompt;
+        self.t.modes.set(.grapheme_cluster, owner.t.modes.get(.grapheme_cluster));
+        self.t.modes.set(.wraparound, owner.t.modes.get(.wraparound));
+        self.stream = self.t.vtStream();
+    }
+
+    fn deinit(self: *TestReference) void {
+        self.stream.deinit();
+        self.t.deinit(std.testing.allocator);
+    }
+
+    fn resize(self: *TestReference, cols: u16, rows: u16) !void {
+        try self.t.resize(std.testing.allocator, .{ .cols = cols, .rows = rows });
+    }
+};
+
+/// Feed the same bytes to the viewer, the owner and the reference.
+fn testFeedAll(io: *Termio, owner: *TestOwner, ref: *TestReference, bytes: []const u8) void {
+    testFeedBoth(io, owner, bytes);
+    ref.stream.nextSlice(bytes);
+}
+
+/// `testFeedLines` for all three.
+fn testFeedLinesAll(io: *Termio, owner: *TestOwner, ref: *TestReference, first: usize, count: usize) !void {
+    var buf: [160]u8 = undefined;
+    for (first..first + count) |i| {
+        const line = if (i % 3 == 0)
+            try std.fmt.bufPrint(&buf, "\x1b[1mline {d:0>4}\x1b[m " ++ ("abcdefghij" ** 6) ++ "\r\n", .{i})
+        else
+            try std.fmt.bufPrint(&buf, "\x1b[3{d}mline {d:0>4}\x1b[m short\r\n", .{ i % 8, i });
+        testFeedAll(io, owner, ref, line);
+    }
+}
+
+/// The primary viewport as plain text, one row per line.
+fn testViewportText(t: *terminalpkg.Terminal) ![]const u8 {
+    const alloc = std.testing.allocator;
+    const primary = t.screens.get(.primary).?;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try primary.dumpString(&out.writer, .{
+        .tl = primary.pages.pin(.{ .viewport = .{} }).?,
+        .br = primary.pages.pin(.{ .viewport = .{ .x = t.cols - 1, .y = t.rows - 1 } }).?,
+        .unwrap = false,
+    });
+    return try out.toOwnedSlice();
+}
+
+/// The viewer shows the reference's viewport: the same rows, and the
+/// same place in the scrollback (the scroller reads this).
+fn testExpectSameViewport(io: *Termio, ref: *terminalpkg.Terminal) !void {
+    const alloc = std.testing.allocator;
+    const want = try testViewportText(ref);
+    defer alloc.free(want);
+    const got = try testViewportText(&io.terminal);
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings(want, got);
+    const want_bar = ref.screens.get(.primary).?.pages.scrollbar();
+    const got_bar = io.terminal.screens.get(.primary).?.pages.scrollbar();
+    try std.testing.expectEqual(want_bar.total - want_bar.offset, got_bar.total - got_bar.offset);
+    try std.testing.expectEqual(
+        ref.screens.get(.primary).?.pages.viewport == .active,
+        io.terminal.screens.get(.primary).?.pages.viewport == .active,
+    );
+}
+
+test "manual: snapshot local history restore keeps a scrolled-back viewport" {
+    const body = struct {
+        fn run(io: *Termio, sink: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            const alloc = testing.allocator;
+
+            try testing.expect(io.setGrid(40, 10, 1));
+            var owner: TestOwner = undefined;
+            try owner.init(io, 40, 10, null);
+            defer owner.deinit();
+            var ref: TestReference = undefined;
+            try ref.init(io, &owner);
+            defer ref.deinit();
+            try testFeedLinesAll(io, &owner, &ref, 0, 3000);
+
+            // The person reads the scrollback, well above the READY's
+            // own history rows.
+            io.scrollViewport(.{ .delta = -500 });
+            ref.t.scrollViewport(.{ .delta = -500 });
+            try testExpectSameViewport(io, &ref.t);
+
+            // Narrower, wider, and back: each resize reaches the viewer as
+            // a local-history READY; the viewport stays on the same rows.
+            for ([_][2]u16{ .{ 25, 10 }, .{ 70, 14 }, .{ 40, 10 } }) |size| {
+                const ready, const digest = try owner.resizeAndEncode(size[0], size[1]);
+                defer alloc.free(ready);
+                try ref.resize(size[0], size[1]);
+                try testing.expectEqual(
+                    LocalHistoryResult.restored,
+                    try io.restoreSnapshotLocalHistory(ready, digest),
+                );
+                try testExpectSamePrimary(io, &owner);
+                try testExpectSameViewport(io, &ref.t);
+            }
+
+            // Output while scrolled back keeps the viewport on its rows.
+            try testFeedLinesAll(io, &owner, &ref, 3000, 50);
+            try testExpectSameViewport(io, &ref.t);
+            try sink.expect("");
+        }
+    }.run;
+    try testManualTermio(true, body);
+}
+
+test "manual: snapshot local history restore follows the bottom when not scrolled back" {
+    const body = struct {
+        fn run(io: *Termio, _: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            const alloc = testing.allocator;
+
+            try testing.expect(io.setGrid(40, 10, 1));
+            var owner: TestOwner = undefined;
+            try owner.init(io, 40, 10, null);
+            defer owner.deinit();
+            var ref: TestReference = undefined;
+            try ref.init(io, &owner);
+            defer ref.deinit();
+            try testFeedLinesAll(io, &owner, &ref, 0, 3000);
+
+            const ready, const digest = try owner.resizeAndEncode(25, 10);
+            defer alloc.free(ready);
+            try ref.resize(25, 10);
+            try testing.expectEqual(
+                LocalHistoryResult.restored,
+                try io.restoreSnapshotLocalHistory(ready, digest),
+            );
+            try testExpectSameViewport(io, &ref.t);
+            try testing.expect(io.terminal.screens.get(.primary).?.pages.viewport == .active);
+        }
+    }.run;
+    try testManualTermio(true, body);
+}
+
+test "manual: snapshot local history restore keeps a scroll made between the swaps" {
+    const body = struct {
+        fn run(io: *Termio, _: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            const alloc = testing.allocator;
+
+            try testing.expect(io.setGrid(40, 10, 1));
+            var owner: TestOwner = undefined;
+            try owner.init(io, 40, 10, null);
+            defer owner.deinit();
+            var ref: TestReference = undefined;
+            try ref.init(io, &owner);
+            defer ref.deinit();
+            try testFeedLinesAll(io, &owner, &ref, 0, 3000);
+            io.scrollViewport(.{ .delta = -500 });
+            ref.t.scrollViewport(.{ .delta = -500 });
+
+            const ready, const digest = try owner.resizeAndEncode(25, 10);
+            defer alloc.free(ready);
+            try ref.resize(25, 10);
+
+            // The person keeps scrolling while the restore runs (frames
+            // are held, so they still see the old terminal): the scroll
+            // is kept, and the restore is not thrown away for it.
+            test_between_swaps = &struct {
+                fn hook(t: *Termio) void {
+                    t.scrollViewport(.{ .delta = -7 });
+                }
+            }.hook;
+            defer test_between_swaps = null;
+            try testing.expectEqual(
+                LocalHistoryResult.restored,
+                try io.restoreSnapshotLocalHistory(ready, digest),
+            );
+            ref.t.scrollViewport(.{ .delta = -7 });
+            try testExpectSamePrimary(io, &owner);
+            try testExpectSameViewport(io, &ref.t);
+        }
+    }.run;
+    try testManualTermio(true, body);
+}
+
+test "manual: snapshot READY and history restore keeps a scrolled-back viewport" {
+    const body = struct {
+        fn run(io: *Termio, sink: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            const alloc = testing.allocator;
+
+            try testing.expect(io.setGrid(40, 10, 1));
+            var owner: TestOwner = undefined;
+            try owner.init(io, 40, 10, null);
+            defer owner.deinit();
+            var ref: TestReference = undefined;
+            try ref.init(io, &owner);
+            defer ref.deinit();
+            try testFeedLinesAll(io, &owner, &ref, 0, 3000);
+            io.scrollViewport(.{ .delta = -500 });
+            ref.t.scrollViewport(.{ .delta = -500 });
+
+            // The viewer fell behind (or asked again): the owner sends a
+            // READY, then its history in chunks, with live output between
+            // the chunks.
+            const ready = try owner.encodeReady(.ground);
+            defer alloc.free(ready);
+            const history = try owner.encodeHistory();
+            defer alloc.free(history);
+            try io.restoreSnapshot(ready, .ready);
+            var rest = history;
+            var line: usize = 3000;
+            while (rest.len > 0) {
+                const n = @min(rest.len, 4093);
+                try io.restoreSnapshot(rest[0..n], .history);
+                rest = rest[n..];
+                try testFeedLinesAll(io, &owner, &ref, line, 2);
+                line += 2;
+            }
+            try testing.expect(io.snapshot_restore == null);
+            try testExpectSamePrimary(io, &owner);
+            try testExpectSameViewport(io, &ref.t);
+
+            // A scroll of the person's own wins over the kept place.
+            io.scrollViewport(.{ .bottom = {} });
+            ref.t.scrollViewport(.{ .bottom = {} });
+            try io.restoreSnapshot(ready, .ready);
+            try io.restoreSnapshot(history, .history);
+            try testing.expect(io.terminal.screens.get(.primary).?.pages.viewport == .active);
+            try sink.expect("");
+        }
+    }.run;
+    try testManualTermio(true, body);
+}
+
+test "manual: snapshot local history mismatch keeps the viewport for the next READY" {
+    const body = struct {
+        fn run(io: *Termio, _: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            const alloc = testing.allocator;
+
+            try testing.expect(io.setGrid(40, 10, 1));
+            var owner: TestOwner = undefined;
+            try owner.init(io, 40, 10, null);
+            defer owner.deinit();
+            var ref: TestReference = undefined;
+            try ref.init(io, &owner);
+            defer ref.deinit();
+            try testFeedLinesAll(io, &owner, &ref, 0, 3000);
+            io.scrollViewport(.{ .delta = -500 });
+            ref.t.scrollViewport(.{ .delta = -500 });
+
+            // A short line only the owner (and the reference) got: the
+            // local history no longer matches.
+            owner.stream.nextSlice("a frame the viewer never got\r\n");
+            ref.stream.nextSlice("a frame the viewer never got\r\n");
+            const ready, const digest = try owner.resizeAndEncode(25, 10);
+            defer alloc.free(ready);
+            try ref.resize(25, 10);
+            try testing.expectEqual(
+                LocalHistoryResult.mismatch,
+                try io.restoreSnapshotLocalHistory(ready, digest),
+            );
+
+            // The IO asks for READY + history; once it is in, the person
+            // is back on the rows they read.
+            const full = try owner.encodeReady(.ground);
+            defer alloc.free(full);
+            const history = try owner.encodeHistory();
+            defer alloc.free(history);
+            try io.restoreSnapshot(full, .ready);
+            try io.restoreSnapshot(history, .history);
+            try testExpectSamePrimary(io, &owner);
+            try testExpectSameViewport(io, &ref.t);
         }
     }.run;
     try testManualTermio(true, body);
