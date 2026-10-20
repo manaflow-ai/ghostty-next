@@ -84,11 +84,25 @@ snapshot_restore: ?SnapshotRestore = null,
 
 /// Advanced, under `renderer_state.mutex`, by every main-thread action
 /// that changes the live terminal outside the byte stream (clear screen,
-/// resize, set grid, viewport scroll, jump to prompt, the reset action),
-/// so a local history restore does not replace the terminal over such a
-/// change (see `restoreSnapshotLocalHistory`).
+/// resize, set grid, jump to prompt, the reset action), so a local history
+/// restore does not replace the terminal over such a change (see
+/// `restoreSnapshotLocalHistory`). A viewport scroll changes no content
+/// and is not one: the restore keeps it (`local_restore_scroll`).
 live_epoch: u64 = 0,
 
+/// Where the person reads the primary scrollback while the history of a
+/// restored READY is still arriving, or null. Every snapshot restore
+/// replaces the terminal, and a snapshot carries no viewport, so the
+/// mirror keeps the viewer's place itself, the way a Ghostty surface with
+/// its own pty keeps it across a resize. Read and written under
+/// `renderer_state.mutex`.
+viewport_keep: ?ViewportKeep = null,
+
+/// The viewport moves made while a local history restore runs between its
+/// two swaps (frames are held, so the person still sees the old terminal),
+/// applied to the restored terminal; null while no such restore runs.
+/// Read and written under `renderer_state.mutex`.
+local_restore_scroll: ?PendingScroll = null,
 
 /// Last time the cursor was reset. This is used to prevent message
 /// flooding with cursor resets.
@@ -121,6 +135,103 @@ const SnapshotRestore = struct {
     /// Bytes received after that record: the start of an incomplete one.
     pending: std.ArrayListUnmanaged(u8) = .empty,
 };
+
+/// The viewer's place in the primary scrollback across a READY restore
+/// whose history arrives later (`viewport_keep`).
+const ViewportKeep = struct {
+    /// The viewport's first row, counted from the top of the primary
+    /// screen, once every history row is in. Rows the mirror missed are
+    /// the newest ones, at the bottom, so the rows above the viewport are
+    /// the same on the owner.
+    row: usize,
+
+    /// Rows from the bottom of the primary screen to the viewport's first
+    /// row: the place shown while history is still arriving above.
+    from_bottom: usize,
+
+    /// The last placement left the viewport following the active area
+    /// (no history yet). Otherwise a viewport found following it was
+    /// moved there since (output that erased the display), and the keep
+    /// is dropped.
+    placed_active: bool = false,
+};
+
+/// Viewport moves since a local history restore swapped in its READY
+/// terminal (`local_restore_scroll`).
+const PendingScroll = struct {
+    /// The last move to an absolute place (top, bottom, a row), if any.
+    base: ?terminalpkg.Terminal.ScrollViewport = null,
+
+    /// Rows moved after `base` (up is negative).
+    delta: isize = 0,
+
+    fn add(self: *PendingScroll, scroll: terminalpkg.Terminal.ScrollViewport) void {
+        switch (scroll) {
+            .delta => |rows| self.delta +|= rows,
+            else => {
+                self.base = scroll;
+                self.delta = 0;
+            },
+        }
+    }
+
+    fn apply(self: PendingScroll, t: *terminalpkg.Terminal) void {
+        if (self.base) |base| t.scrollViewport(base);
+        if (self.delta != 0) t.scrollViewport(.{ .delta = self.delta });
+    }
+
+    /// `keep` after these moves, in the row space of the old terminal
+    /// (`total` rows, `rows` of them on screen), for a terminal whose
+    /// history is still to come. Null: follow the active area.
+    fn adjust(self: PendingScroll, keep: ?ViewportKeep, total: usize, rows: usize) ?ViewportKeep {
+        const last = total -| rows;
+        var place = keep;
+        if (self.base) |base| {
+            place = switch (base) {
+                .bottom => null,
+                .top => .{ .row = 0, .from_bottom = total },
+                .row => |row| .{ .row = @min(row, last), .from_bottom = total - @min(row, last) },
+                .delta => unreachable,
+            };
+        }
+        if (self.delta == 0) return place;
+        if (place == null and self.delta > 0) return null;
+        var p: ViewportKeep = place orelse .{ .row = last, .from_bottom = total - last };
+        const n = @abs(self.delta);
+        if (self.delta < 0) {
+            p.row -|= n;
+            p.from_bottom = @min(p.from_bottom +| n, total);
+        } else {
+            p.row +|= n;
+            if (p.row >= last) return null;
+            p.from_bottom -|= n;
+        }
+        return p;
+    }
+};
+
+/// The primary screen's viewport as a ``ViewportKeep``, or null when it
+/// follows the active area (or the alternate screen is shown).
+fn primaryViewport(t: *terminalpkg.Terminal) ?ViewportKeep {
+    if (t.screens.active_key != .primary) return null;
+    const pages = &t.screens.get(.primary).?.pages;
+    if (pages.viewport == .active) return null;
+    const bar = pages.scrollbar();
+    return .{ .row = bar.offset, .from_bottom = bar.total - bar.offset };
+}
+
+/// Show `keep.from_bottom` rows above the bottom of `t`'s primary screen,
+/// as near as its history allows (history still arriving above).
+fn placePrimaryFromBottom(t: *terminalpkg.Terminal, keep: *ViewportKeep) void {
+    const screen = t.screens.get(.primary).?;
+    const total = screen.pages.scrollbar().total;
+    if (keep.from_bottom >= total) {
+        screen.scroll(.{ .top = {} });
+    } else {
+        screen.scroll(.{ .row = total - keep.from_bottom });
+    }
+    keep.placed_active = screen.pages.viewport == .active;
+}
 
 /// The state we need to keep around only until we enter the IO
 /// thread. Then we can throw it all away.
@@ -912,7 +1023,12 @@ fn replaceTerminal(
             else => {},
         }
 
+        // The place the person reads: a place kept from an earlier
+        // restore whose history did not arrive, else the live one.
+        const keep = self.keptViewportLocked() orelse primaryViewport(&self.terminal);
         old = self.swapTerminalLocked(new, decoded.continuation);
+        self.viewport_keep = keep;
+        self.placeKeptViewportLocked();
     }
 
     // The old terminal is unreachable now; free it off the lock.
@@ -1060,9 +1176,22 @@ pub fn restoreSnapshotLocalHistory(
     var old: terminalpkg.Terminal = undefined;
     var limit_bytes: ?usize = undefined;
     var limit_lines: ?usize = undefined;
+    // The place the person reads, kept on the restored terminal: a place
+    // kept from an earlier restore whose history did not arrive, else the
+    // old terminal's viewport (after its reflow below).
+    var keep: ?ViewportKeep = null;
+    var prior_keep = false;
+    // The live terminal changed outside the byte stream between the swaps.
+    var live_changed = false;
     const live: LiveTerminalState = live: {
         self.renderer_state.mutex.lockUncancelable(global.io());
         defer self.renderer_state.mutex.unlock(global.io());
+        if (self.keptViewportLocked()) |kept| {
+            keep = kept;
+            prior_keep = true;
+        }
+        self.viewport_keep = null;
+        self.local_restore_scroll = .{};
         self.prepareRestoredTerminalLocked(&new);
         old = self.swapTerminalLocked(new, decoded.continuation);
         // No frame may show this READY terminal without the local history
@@ -1082,6 +1211,19 @@ pub fn restoreSnapshotLocalHistory(
         self.renderer_state.mutex.lockUncancelable(global.io());
         defer self.renderer_state.mutex.unlock(global.io());
         self.renderer_state.hold_frames = false;
+        // Not restored: the READY terminal (or a terminal changed between
+        // the swaps) stays without the local history. The place is kept
+        // for the READY + history the IO asks for next, with the moves
+        // made meanwhile; the person's own change of the live terminal
+        // wins.
+        if (self.local_restore_scroll) |pending| {
+            self.local_restore_scroll = null;
+            if (!live_changed) {
+                const was = &old.screens.get(.primary).?.pages;
+                self.viewport_keep = pending.adjust(keep, was.scrollbar().total, was.rows);
+                self.placeKeptViewportLocked();
+            }
+        }
         self.terminal.flags.dirty.clear = true;
         self.terminal_stream.handler.queueRender() catch {};
     }
@@ -1096,10 +1238,14 @@ pub fn restoreSnapshotLocalHistory(
     };
     old.flags.shell_redraws_prompt = owner_redraw;
     old.modes.set(.wraparound, owner_wraparound);
+    if (!prior_keep) keep = primaryViewport(&old);
     old.resize(self.alloc, .{ .cols = cols, .rows = rows, .reflow = true }) catch |err| {
         log.warn("local history resize failed err={}", .{err});
         return .mismatch;
     };
+    // The reflow moved the viewport with its rows, as a Ghostty surface's
+    // own resize does.
+    if (!prior_keep) keep = primaryViewport(&old);
     const old_pages = &old.screens.get(.primary).?.pages;
     if (!terminalpkg.history_digest.matches(
         terminalpkg.history_digest.pagesAtSeam(old_pages, seam),
@@ -1156,10 +1302,20 @@ pub fn restoreSnapshotLocalHistory(
     {
         self.renderer_state.mutex.lockUncancelable(global.io());
         defer self.renderer_state.mutex.unlock(global.io());
-        if (!std.meta.eql(self.liveStateLocked(), live)) return .mismatch;
+        if (!std.meta.eql(self.liveStateLocked(), live)) {
+            live_changed = true;
+            return .mismatch;
+        }
         self.prepareRestoredTerminalLocked(&full);
         ready_terminal = self.swapTerminalLocked(full, again.continuation);
         full_owned = false;
+
+        // Every history row is in: the person sees the rows they read,
+        // then the moves they made while the restore ran.
+        const pending = self.local_restore_scroll orelse PendingScroll{};
+        self.local_restore_scroll = null;
+        if (keep) |kept| self.terminal.screens.get(.primary).?.scroll(.{ .row = kept.row });
+        pending.apply(&self.terminal);
     }
     ready_terminal.deinit(self.alloc);
     return .restored;
@@ -1205,6 +1361,33 @@ fn liveStateLocked(self: *Termio) LiveTerminalState {
         .primary_selection = primary.selection != null,
         .active_selection = self.terminal.screens.active.selection != null,
     };
+}
+
+/// `viewport_keep` unless the viewport was moved to follow the active
+/// area since it was placed (then it is dropped). Caller must hold
+/// `renderer_state.mutex`.
+fn keptViewportLocked(self: *Termio) ?ViewportKeep {
+    const keep = self.viewport_keep orelse return null;
+    const pages = &self.terminal.screens.get(.primary).?.pages;
+    if (pages.viewport == .active and !keep.placed_active) {
+        self.viewport_keep = null;
+        return null;
+    }
+    return keep;
+}
+
+/// Place the live terminal's viewport at `viewport_keep` while history
+/// arrives. Caller must hold `renderer_state.mutex`.
+fn placeKeptViewportLocked(self: *Termio) void {
+    if (self.viewport_keep) |*keep| placePrimaryFromBottom(&self.terminal, keep);
+}
+
+/// The history is complete: the kept row is the viewport's first row.
+/// Caller must hold `renderer_state.mutex`.
+fn finishKeptViewportLocked(self: *Termio) void {
+    const keep = self.keptViewportLocked() orelse return;
+    self.viewport_keep = null;
+    self.terminal.screens.get(.primary).?.scroll(.{ .row = keep.row });
 }
 
 const LiveTerminalState = struct {
@@ -1341,7 +1524,12 @@ fn applySnapshotHistory(self: *Termio, bytes: []const u8) !void {
         const progress = progress: {
             self.renderer_state.mutex.lockUncancelable(global.io());
             defer self.renderer_state.mutex.unlock(global.io());
-            break :progress restore.decoder.next(self.alloc, &self.terminal);
+            _ = self.keptViewportLocked();
+            const step = restore.decoder.next(self.alloc, &self.terminal);
+            if (step) |page| {
+                if (page == null) self.finishKeptViewportLocked() else self.placeKeptViewportLocked();
+            } else |_| {}
+            break :progress step;
         } catch |err| switch (err) {
             error.EndOfStream => {
                 // One step reads at most two HISTORY manifests and a
@@ -1568,7 +1756,20 @@ pub fn scrollViewport(
 ) void {
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
-    self.live_epoch +%= 1;
+    self.scrollViewportLocked(scroll);
+}
+
+/// Scroll the viewport for the person (the wheel, keys, a binding, the
+/// scroller): every viewport move a person makes comes through here, so a
+/// snapshot restore keeps it (`viewport_keep`, `local_restore_scroll`).
+/// Caller must hold `renderer_state.mutex`.
+pub fn scrollViewportLocked(
+    self: *Termio,
+    scroll: terminalpkg.Terminal.ScrollViewport,
+) void {
+    // The person's own move wins over a place kept for them.
+    self.viewport_keep = null;
+    if (self.local_restore_scroll) |*pending| pending.add(scroll);
     self.terminal.scrollViewport(scroll);
 }
 
@@ -3664,6 +3865,47 @@ test "manual: snapshot local history restore keeps a scroll made between the swa
             );
             ref.t.scrollViewport(.{ .delta = -7 });
             try testExpectSamePrimary(io, &owner);
+            try testExpectSameViewport(io, &ref.t);
+        }
+    }.run;
+    try testManualTermio(true, body);
+}
+
+test "manual: snapshot local history restore keeps a wheel scroll made between the swaps" {
+    const body = struct {
+        fn run(io: *Termio, _: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            const alloc = testing.allocator;
+
+            try testing.expect(io.setGrid(40, 10, 1));
+            var owner: TestOwner = undefined;
+            try owner.init(io, 40, 10, null);
+            defer owner.deinit();
+            var ref: TestReference = undefined;
+            try ref.init(io, &owner);
+            defer ref.deinit();
+            try testFeedLinesAll(io, &owner, &ref, 0, 3000);
+
+            const ready, const digest = try owner.resizeAndEncode(25, 10);
+            defer alloc.free(ready);
+            try ref.resize(25, 10);
+
+            // The wheel and the scroller (Surface) move the viewport under
+            // the terminal lock, through scrollViewportLocked.
+            test_between_swaps = &struct {
+                fn hook(t: *Termio) void {
+                    t.renderer_state.mutex.lockUncancelable(global.io());
+                    defer t.renderer_state.mutex.unlock(global.io());
+                    t.scrollViewportLocked(.{ .delta = -40 });
+                    t.scrollViewportLocked(.{ .delta = 4 });
+                }
+            }.hook;
+            defer test_between_swaps = null;
+            try testing.expectEqual(
+                LocalHistoryResult.restored,
+                try io.restoreSnapshotLocalHistory(ready, digest),
+            );
+            ref.t.scrollViewport(.{ .delta = -36 });
             try testExpectSameViewport(io, &ref.t);
         }
     }.run;

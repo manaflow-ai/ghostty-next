@@ -318,7 +318,6 @@ test "font size action event preserves semantic mutation" {
     );
 }
 
-
 /// The search state for the surface.
 const Search = struct {
     state: terminal.search.Thread,
@@ -3259,7 +3258,7 @@ pub fn keyCallback(
             try self.setSelection(null);
         }
 
-        if (self.config.scroll_to_bottom.keystroke) self.io.terminal.scrollViewport(.bottom);
+        if (self.config.scroll_to_bottom.keystroke) self.io.scrollViewportLocked(.bottom);
 
         try self.queueRender();
     }
@@ -3753,7 +3752,7 @@ pub fn textInputCallback(self: *Surface, text: []const u8) !void {
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
     if (self.config.selection_clear_on_typing) try self.setSelection(null);
-    if (self.config.scroll_to_bottom.keystroke) self.io.terminal.scrollViewport(.bottom);
+    if (self.config.scroll_to_bottom.keystroke) self.io.scrollViewportLocked(.bottom);
     try self.queueRender();
 }
 
@@ -4079,7 +4078,7 @@ pub fn scrollCallback(
             // Modify our viewport, this requires a lock since it affects
             // rendering. We have to switch signs here because our delta
             // is negative down but our viewport is positive down.
-            self.io.terminal.scrollViewport(.{ .delta = y.delta * -1 });
+            self.io.scrollViewportLocked(.{ .delta = y.delta * -1 });
         }
     }
 
@@ -5257,7 +5256,7 @@ pub fn posToViewport(self: Surface, xpos: f64, ypos: f64) terminal.point.Coordin
 ///
 /// Precondition: the render_state mutex must be held.
 fn scrollToBottom(self: *Surface) !void {
-    self.io.terminal.scrollViewport(.{ .bottom = {} });
+    self.io.scrollViewportLocked(.{ .bottom = {} });
     try self.queueRender();
 }
 
@@ -5777,8 +5776,9 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             {
                 self.renderer_state.mutex.lockUncancelable(global.io());
                 defer self.renderer_state.mutex.unlock(global.io());
-                const t: *terminal.Terminal = self.renderer_state.terminal;
-                t.screens.active.scroll(.{ .row = n });
+                // Through Termio, like every viewport move a person makes,
+                // so a snapshot restore keeps it.
+                self.io.scrollViewportLocked(.{ .row = n });
             }
 
             try self.queueRender();
