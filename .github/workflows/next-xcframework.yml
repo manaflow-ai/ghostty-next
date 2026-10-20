@@ -127,6 +127,7 @@ jobs:
           zig build test-lib-vt \
             -Dtest-filter="Terminal: OSC133" \
             -Dtest-filter="Terminal: narrowing a multi-line prompt" \
+            -Dtest-filter="set shell redraws prompt" \
             -Dtest-filter="PageList resize reflow" \
             -Dtest-filter="Screen: resize" \
             -Dtest-filter="Terminal vt restores cursor" \

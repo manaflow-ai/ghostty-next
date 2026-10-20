@@ -1346,6 +1346,7 @@ pub const Option = enum(c_int) {
     // Upstream value is 46 (collides with kitty_image_id_cursors); see
     // GHOSTTY_TERMINAL_OPT_PROGRAM_STATUS in terminal.h.
     program_status = 47,
+    shell_redraws_prompt = 48,
 
     /// Input type expected for setting the option.
     pub fn InType(comptime self: Option) type {
@@ -1382,6 +1383,7 @@ pub const Option = enum(c_int) {
             .glyph_protocol,
             .title_report,
             .resize_pull_scrollback,
+            .shell_redraws_prompt,
             => ?*const bool,
             .kitty_image_medium_temp_file => ?*const lib.String,
             .apc_max_bytes,
@@ -1663,6 +1665,8 @@ fn setTyped(
             if (value) |ptr| ptr.* else kitty_clipboard.max_write_size,
         .resize_pull_scrollback => wrapper.terminal.flags.resize_pull_scrollback =
             if (value) |ptr| ptr.* else true,
+        .shell_redraws_prompt => wrapper.terminal.flags.shell_redraws_prompt =
+            if (value) |ptr| (if (ptr.*) .true else .false) else .false,
         .mode, .mode_default => {
             const config = (value orelse return .invalid_value).*;
             const mode = config.toMode() orelse return .invalid_value;
@@ -7986,4 +7990,30 @@ test "Kitty automatic image ID cursors cover both screens" {
         get(collision, .kitty_image_id_cursors, @ptrCast(&state)),
     );
     try testing.expectEqual(@as(u32, kitty_default_image_id + 1), state.next.primary);
+}
+
+test "set shell redraws prompt" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        10,
+        4,
+    ));
+    defer free(t);
+
+    // The C API default: a prompt without redraw= is not cleared.
+    try testing.expect(t.?.terminal.flags.shell_redraws_prompt == .false);
+
+    const on = true;
+    try testing.expectEqual(Result.success, set(t, .shell_redraws_prompt, &on));
+    try testing.expect(t.?.terminal.flags.shell_redraws_prompt == .true);
+
+    const off = false;
+    try testing.expectEqual(Result.success, set(t, .shell_redraws_prompt, &off));
+    try testing.expect(t.?.terminal.flags.shell_redraws_prompt == .false);
+
+    try testing.expectEqual(Result.success, set(t, .shell_redraws_prompt, &on));
+    try testing.expectEqual(Result.success, set(t, .shell_redraws_prompt, null));
+    try testing.expect(t.?.terminal.flags.shell_redraws_prompt == .false);
 }

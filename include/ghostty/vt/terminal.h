@@ -2496,6 +2496,23 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Input type: GhosttyTerminalProgramStatusFn
    */
   GHOSTTY_TERMINAL_OPT_PROGRAM_STATUS = 47,
+
+  /**
+   * Whether the shell redraws its prompt after a resize, as if each
+   * OSC 133;A carried redraw=1. When true, a resize clears the prompt the
+   * cursor is in (from its first row) so the shell's redraw replaces it.
+   * A prompt's own redraw= option still overrides this.
+   *
+   * libghostty-vt defaults to false because an embedder may not install
+   * Ghostty's shell integration. An embedder that does (the zsh and fish
+   * scripts send no redraw= option) sets this to true to match the
+   * Ghostty app. A full reset (RIS) restores Ghostty's default of true.
+   *
+   * A NULL value pointer resets to false.
+   *
+   * Input type: bool*
+   */
+  GHOSTTY_TERMINAL_OPT_SHELL_REDRAWS_PROMPT = 48,
   GHOSTTY_TERMINAL_OPT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalOption;
 
