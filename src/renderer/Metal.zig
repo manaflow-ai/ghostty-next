@@ -245,6 +245,10 @@ pub fn setHostDrawableSize(self: *Metal, enabled: bool, width_px: u32, height_px
         0;
     if (self.host_size.swap(value, .acq_rel) == value) return;
     self.host_size_set_at = .now(global.io(), .awake);
+    // A fresh frame kept from an earlier size is not this size's frame,
+    // even when the sizes are equal (a drag back): only a frame published
+    // after this call may be presented for it.
+    self.dropFresh();
     self.layer.setHostSize(value);
     self.layer.layer.setProperty("needsDisplayOnBoundsChange", value == 0);
     // One synchronous frame at the new target size (or at the bounds again).
@@ -398,6 +402,19 @@ fn publishFresh(self: *Metal, surface: *IOSurface) void {
     if (old) |o| o.release();
     _ = self.fresh.seq.fetchAdd(1, .release);
     io.futexWake(@TypeOf(self.fresh.seq), &self.fresh.seq, std.math.maxInt(u32));
+}
+
+/// Releases the kept fresh frame, if any. Main thread.
+fn dropFresh(self: *Metal) void {
+    const io = global.io();
+    const old = old: {
+        self.fresh.mutex.lockUncancelable(io);
+        defer self.fresh.mutex.unlock(io);
+        const old = self.fresh.surface;
+        self.fresh.surface = null;
+        break :old old;
+    };
+    if (old) |o| o.release();
 }
 
 /// The fresh frame if it has `width` x `height` pixels (retained; the caller
