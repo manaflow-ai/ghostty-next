@@ -3641,6 +3641,60 @@ test "manual: no frame shows the READY terminal between the two swaps" {
     try testManualTermio(true, body);
 }
 
+test "manual: a local history restore at the bottom draws the READY terminal between the swaps" {
+    const body = struct {
+        fn run(io: *Termio, sink: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            const alloc = testing.allocator;
+
+            try testing.expect(io.setGrid(40, 10, 1));
+            var owner: TestOwner = undefined;
+            try owner.init(io, 40, 10, null);
+            defer owner.deinit();
+            try testFeedLines(io, &owner, 0, 3000);
+
+            // At the bottom with no images: frames keep drawing while the
+            // history reflows (the READY terminal is the reflowed screen),
+            // and the restore keeps the history.
+            {
+                const ready, const digest = try owner.resizeAndEncode(25, 10);
+                defer alloc.free(ready);
+                test_between_frame = .{};
+                test_between_swaps = &testRecordBetweenFrame;
+                defer test_between_swaps = null;
+                try testing.expectEqual(
+                    LocalHistoryResult.restored,
+                    try io.restoreSnapshotLocalHistory(ready, digest),
+                );
+                try testing.expect(test_between_frame.seen);
+                try testing.expect(test_between_frame.renderable);
+                try testExpectSamePrimary(io, &owner);
+            }
+
+            // Scrolled into the history: the READY terminal lacks the rows
+            // shown, so frames are held between the swaps.
+            {
+                io.renderer_state.mutex.lockUncancelable(global.io());
+                io.terminal.screens.get(.primary).?.scroll(.{ .delta_row = -20 });
+                io.renderer_state.mutex.unlock(global.io());
+                const ready, const digest = try owner.resizeAndEncode(30, 10);
+                defer alloc.free(ready);
+                test_between_frame = .{};
+                test_between_swaps = &testRecordBetweenFrame;
+                defer test_between_swaps = null;
+                try testing.expectEqual(
+                    LocalHistoryResult.restored,
+                    try io.restoreSnapshotLocalHistory(ready, digest),
+                );
+                try testing.expect(test_between_frame.seen);
+                try testing.expect(!test_between_frame.renderable);
+            }
+            try sink.expect("");
+        }
+    }.run;
+    try testManualTermio(true, body);
+}
+
 test "manual: snapshot local history restore does not undo a change between the swaps" {
     const body = struct {
         fn run(io: *Termio, _: *TestSink, _: bool) !void {
