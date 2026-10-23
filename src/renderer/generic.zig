@@ -112,6 +112,12 @@ const log = std.log.scoped(.generic_renderer);
 ///                     in case that the frame needs to be composited with
 ///                     UI elements by the graphical toolkit manually.
 ///
+/// A screen size as one value (width << 32 | height), for comparing the
+/// size cells were built for with the size a frame draws at.
+fn packScreen(screen: renderer.ScreenSize) u64 {
+    return (@as(u64, screen.width) << 32) | screen.height;
+}
+
 pub fn Renderer(comptime GraphicsAPI: type) type {
     return struct {
         const Self = @This();
@@ -203,6 +209,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// to determine if any possible changes have been made to the
         /// cells for the draw call.
         cells_rebuilt: bool = false,
+
+        /// The screen size (packed width << 32 | height) the cells were
+        /// last built for. Under `draw_mutex`.
+        cells_screen: u64 = 0,
 
         /// The current GPU uniform values.
         uniforms: shaderpkg.Uniforms,
@@ -1310,6 +1320,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Must be called on the render thread.
         pub fn setVisible(self: *Self, visible: bool) void {
             self.visible = visible;
+            if (@hasDecl(GraphicsAPI, "setVisibleHint")) self.api.setVisibleHint(visible);
             self.syncDisplayLink(null, null);
 
             // When we're hidden, release our GPU resources, but never
@@ -1891,6 +1902,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     comptime assert(@TypeOf(err) == error{OutOfMemory});
                     log.warn("error rebuilding GPU cells err={}", .{err});
                 };
+                // The screen size these cells were laid out for (the grid
+                // that fits it, the reflow preview's too): a frame drawn at
+                // another size shows them clipped or padded.
+                self.cells_screen = packScreen(self.size.screen);
 
                 // The scrollbar is only emitted during draws so we also
                 // check the scrollbar cache here and update if needed.
@@ -2155,6 +2170,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 defer self.font_grid.lock.unlockShared(global.io());
                 frame.color_modified = self.font_grid.atlas_color.modified.load(.monotonic);
                 try self.syncAtlasTexture(&self.font_grid.atlas_color, &frame.color);
+            }
+
+            // Whether this frame shows the cells built for its size (macOS
+            // host-sized display passes present only those).
+            if (@hasField(GraphicsAPI.Target, "cells_fresh")) {
+                frame.target.cells_fresh = self.cells_screen == packScreen(self.size.screen);
             }
 
             // Get a frame context from the graphics API.

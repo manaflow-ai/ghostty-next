@@ -1192,12 +1192,21 @@ pub fn restoreSnapshotLocalHistory(
         }
         self.viewport_keep = null;
         self.local_restore_scroll = .{};
+        // Whether a frame of the READY terminal alone would show less than
+        // the person sees now: a viewport in the history (READY carries only
+        // the newest history rows) or Kitty images (they move over at step
+        // 3). Otherwise the READY terminal shows exactly the reflowed screen
+        // at the new grid, so frames keep drawing while the history reflows
+        // off the lock: a resize never freezes the terminal for the length
+        // of a whole-scrollback reflow.
+        const hold = keep != null or primaryViewport(&self.terminal) != null or
+            terminalHasKittyImages(&self.terminal);
         self.prepareRestoredTerminalLocked(&new);
         old = self.swapTerminalLocked(new, decoded.continuation);
-        // No frame may show this READY terminal without the local history
-        // and images: frames are held until step 4 or the mismatch result
+        // Frames that would show the READY terminal without the local
+        // history and images are held until step 4 or the mismatch result
         // (released by the defer below, in every outcome).
-        self.renderer_state.hold_frames = true;
+        self.renderer_state.hold_frames = hold;
         // The config is read under the lock; step 3 needs the limits.
         limit_bytes = self.config.scrollback_limit_bytes;
         limit_lines = self.config.scrollback_limit_lines;
@@ -1366,6 +1375,17 @@ fn liveStateLocked(self: *Termio) LiveTerminalState {
 /// `viewport_keep` unless the viewport was moved to follow the active
 /// area since it was placed (then it is dropped). Caller must hold
 /// `renderer_state.mutex`.
+/// Whether any screen of `t` holds a Kitty image.
+fn terminalHasKittyImages(t: *terminalpkg.Terminal) bool {
+    if (comptime !terminalpkg.options.kitty_graphics) return false;
+    const ScreenKey = @TypeOf(t.screens.active_key);
+    for (std.enums.values(ScreenKey)) |key| {
+        const screen = t.screens.get(key) orelse continue;
+        if (screen.kitty_images.images.count() > 0) return true;
+    }
+    return false;
+}
+
 fn keptViewportLocked(self: *Termio) ?ViewportKeep {
     const keep = self.viewport_keep orelse return null;
     const pages = &self.terminal.screens.get(.primary).?.pages;

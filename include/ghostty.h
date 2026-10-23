@@ -743,6 +743,15 @@ typedef struct {
   // swapped it, the reflow preview started or ended), or its grid size.
   uint64_t full_swap;
   uint64_t full_resize;
+  // macOS host-sized surfaces (ghostty_surface_set_host_sized), per display
+  // pass of a new size: frames the main thread drew itself (the first frame,
+  // or a surface that is not host-sized), frames the renderer thread drew at
+  // the new size with cells rebuilt for it and the pass presented in its
+  // transaction, and passes that kept the last frame because that frame was
+  // not ready within 4 ms of the size change (it lands at the next pass).
+  uint64_t host_main_draws;
+  uint64_t host_fresh_presents;
+  uint64_t host_late_presents;
 } ghostty_surface_render_counters_s;
 
 // Config types
@@ -1445,9 +1454,13 @@ GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t)
 // bounds change and the embedder holds its size (a divider drag), nothing
 // is drawn or allocated: the layer keeps the last frame at its top-left
 // corner (clip the view to keep it inside), and new output still draws at the
-// held size. Each new size draws one synchronous frame at the next display
-// pass. Until the first ghostty_surface_set_size the target follows the
-// bounds.
+// held size. Each new size draws at once on the renderer thread, with the
+// cells rebuilt for it (the reflow preview included); the next display pass
+// presents that frame in its Core Animation transaction, waiting for it at
+// most 4 ms after the size was set, and otherwise keeps the last frame (the
+// new one lands at the following pass). The main thread draws only the first
+// frame. A hidden surface's display pass draws nothing. Until the first
+// ghostty_surface_set_size the target follows the bounds.
 // Default false (the target follows the bounds). No effect on iOS, where the
 // target always follows ghostty_surface_set_size. Main thread.
 GHOSTTY_API void ghostty_surface_set_host_sized(ghostty_surface_t, bool);
