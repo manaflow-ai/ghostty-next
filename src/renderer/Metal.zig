@@ -97,6 +97,10 @@ pub const HostFrameCounters = struct {
 };
 
 const FreshFrame = struct {
+    /// Bumped by every host size change; a frame publishes only when the
+    /// generation it began drawing under is still current (A->B->A: a late
+    /// frame of the first A is not presented for the second).
+    generation: std.atomic.Value(u64) = .init(0),
     /// A host size changed and its frame was not taken yet: only then does a
     /// completed frame publish itself (no retain, lock or wake per frame at rest).
     armed: std.atomic.Value(bool) = .init(false),
@@ -262,6 +266,7 @@ pub fn setHostDrawableSize(self: *Metal, enabled: bool, width_px: u32, height_px
     // even when the sizes are equal (a drag back): only a frame published
     // after this call may be presented for it.
     self.dropFresh();
+    _ = self.fresh.generation.fetchAdd(1, .acq_rel);
     self.fresh.armed.store(value != 0, .release);
     self.layer.setHostSize(value);
     self.layer.layer.setProperty("needsDisplayOnBoundsChange", value == 0);
@@ -397,6 +402,7 @@ pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
     } else {
         if (comptime builtin.os.tag == .macos) {
             if (target.cells_fresh and self.fresh.armed.load(.acquire) and
+                target.size_generation == self.fresh.generation.load(.acquire) and
                 self.host_size.load(.acquire) != 0) self.publishFresh(target.surface);
         }
         try self.layer.setSurface(target.surface);
@@ -460,7 +466,6 @@ pub fn presentHostSized(self: *Metal) bool {
     // Hidden: nothing to draw now (the renderer draws when shown again),
     // and drawing here would rebuild the released swap chain.
     if (!self.visible_hint.load(.acquire)) return true;
-    const held = self.frames_held.load(.acquire);
     const width: usize = @intCast(host >> 32);
     const height: usize = @intCast(host & 0xffff_ffff);
     const shown = self.layer.layer.getProperty(?*anyopaque, "contents") orelse return false;
@@ -481,7 +486,9 @@ pub fn presentHostSized(self: *Metal) bool {
             _ = self.counters.fresh_presents.fetchAdd(1, .monotonic);
             return true;
         }
-        if (held) break;
+        // Read each time: a hold (synchronized output, a restore) or a hide that starts while
+        // this pass waits wakes it (setFramesHeld / setVisibleHint), and no frame can come then.
+        if (self.frames_held.load(.acquire) or !self.visible_hint.load(.acquire)) break;
         const now: std.Io.Timestamp = .now(io, .awake);
         const waited: i96 = set_at.durationTo(now).nanoseconds;
         if (waited >= host_frame_wait_ns) break;
@@ -499,16 +506,31 @@ pub fn presentHostSized(self: *Metal) bool {
     return true;
 }
 
+/// The host size generation a frame drawn now belongs to (Target.size_generation).
+pub fn sizeGeneration(self: *const Metal) u64 {
+    return self.fresh.generation.load(.acquire);
+}
+
 /// Frame updates are held or resumed (`frames_held`). Renderer thread.
 pub fn setFramesHeld(self: *Metal, held: bool) void {
-    self.frames_held.store(held, .release);
+    if (self.frames_held.swap(held, .acq_rel) == held) return;
+    if (held) self.wakePresent();
+}
+
+/// Wakes a display pass waiting for a fresh frame, so it re-reads the hold and visibility.
+fn wakePresent(self: *Metal) void {
+    _ = self.fresh.seq.fetchAdd(1, .release);
+    global.io().futexWake(@TypeOf(self.fresh.seq), &self.fresh.seq, std.math.maxInt(u32));
 }
 
 /// The renderer started or stopped drawing (`setVisible`). Renderer thread.
 pub fn setVisibleHint(self: *Metal, visible: bool) void {
     self.visible_hint.store(visible, .release);
     // A hidden surface holds no frame for a present that cannot come.
-    if (!visible) self.dropFresh();
+    if (!visible) {
+        self.dropFresh();
+        self.wakePresent();
+    }
 }
 
 /// Returns the options to use when constructing buffers.

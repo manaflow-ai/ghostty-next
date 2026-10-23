@@ -46,6 +46,10 @@ height: usize,
 /// pass of a new size, `Metal.presentHostSized`). Set before each draw.
 cells_fresh: bool = false,
 
+/// The host size generation (`Metal.sizeGeneration`) when this frame's draw
+/// began: a frame publishes for a display pass only in its own generation.
+size_generation: u64 = 0,
+
 pub fn init(opts: Options) !Self {
     // We set our surface's color space to Display P3.
     // This allows us to have "Apple-style" alpha blending,

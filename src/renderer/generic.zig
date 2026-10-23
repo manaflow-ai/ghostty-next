@@ -2179,6 +2179,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             if (@hasField(GraphicsAPI.Target, "cells_fresh")) {
                 frame.target.cells_fresh = self.cells_screen == packScreen(self.size.screen);
             }
+            if (@hasField(GraphicsAPI.Target, "size_generation")) {
+                frame.target.size_generation = self.api.sizeGeneration();
+            }
 
             // Get a frame context from the graphics API.
             var frame_ctx = try self.api.beginFrame(self, &frame.target);

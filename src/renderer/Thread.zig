@@ -627,6 +627,11 @@ fn renderCallback(
     const now = drawsNow(paced, resized, t.flags.drawn_since_tick, t.flags.last_tick_drew);
     t.drawFrame(now);
     if (now and paced) t.flags.drawn_since_tick = true;
+    // A stopped link starts fresh when it runs again: no stale interval state.
+    if (!paced) {
+        t.flags.drawn_since_tick = false;
+        t.flags.last_tick_drew = false;
+    }
 
     // Schedule the next animation wake, if the renderer needs one.
     t.armAnimationTimer();
