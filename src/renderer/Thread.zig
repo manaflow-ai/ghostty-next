@@ -104,6 +104,13 @@ flags: packed struct {
     /// pass waiting for the frame at the new size gets it in its own
     /// transaction (Metal.presentHostSized).
     resized: bool = false,
+
+    /// A frame was drawn since the last display-link tick (or the link
+    /// started). While the link runs, the first update of each refresh
+    /// interval draws at once and later ones wait for the tick: an echo
+    /// shows up to a refresh sooner, and no interval gets more than one
+    /// early frame.
+    drawn_since_tick: bool = false,
 } = .{},
 
 pub const DerivedConfig = struct {
@@ -552,6 +559,7 @@ fn drawNowCallback(
     // Draw immediately
     const t = self_.?;
     t.drawFrame(true);
+    t.flags.drawn_since_tick = false;
 
     return .rearm;
 }
@@ -610,7 +618,9 @@ fn renderCallback(
     // display pass of the new size waits for this frame.
     const resized = t.flags.resized;
     t.flags.resized = false;
-    t.drawFrame(!paced or resized);
+    const now = drawsNow(paced, resized, t.flags.drawn_since_tick);
+    t.drawFrame(now);
+    if (now and paced) t.flags.drawn_since_tick = true;
 
     // Schedule the next animation wake, if the renderer needs one.
     t.armAnimationTimer();
@@ -723,6 +733,21 @@ fn cursorTimerCallback(
         cursorTimerCallback,
     );
     return .disarm;
+}
+
+/// Whether a frame update draws at once rather than at the next
+/// display-link tick: the link is stopped (the first frame after idle), a
+/// resize waits for it, or no frame was drawn yet in this refresh interval.
+fn drawsNow(paced: bool, resized: bool, drawn_since_tick: bool) bool {
+    return !paced or resized or !drawn_since_tick;
+}
+
+test "renderer thread: one early frame per refresh interval while the link runs" {
+    const testing = std.testing;
+    try testing.expect(drawsNow(false, false, true));
+    try testing.expect(drawsNow(true, true, true));
+    try testing.expect(drawsNow(true, false, false));
+    try testing.expect(!drawsNow(true, false, true));
 }
 
 /// Whether a cursor blink tick can change the frame of `state` (the
