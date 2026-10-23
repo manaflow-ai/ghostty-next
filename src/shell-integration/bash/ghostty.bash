@@ -216,12 +216,25 @@ function __ghostty_preexec() {
 }
 
 if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )); then
-  __ghostty_preexec_hook() {
-    builtin local cmd
-    cmd=$(LC_ALL=C HISTTIMEFORMAT='' builtin history 1)
-    cmd="${cmd#*[[:digit:]][* ] }"  # remove leading history number
-    [[ -n "$cmd" ]] && __ghostty_preexec "$cmd"
-  }
+  if (( BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 3) )); then
+    # Bash 5.3: ${ cmd; } runs in this shell, so reading the last history
+    # entry forks nothing. eval keeps older bash from parsing the syntax.
+    # No LC_ALL=C here: in ${ } a temporary LC_ALL applies to this shell
+    # and would switch the locale twice per command.
+    builtin eval '__ghostty_preexec_hook() {
+      builtin local cmd
+      cmd=${ HISTTIMEFORMAT= builtin history 1; }
+      cmd="${cmd#*[[:digit:]][* ] }"
+      [[ -n "$cmd" ]] && __ghostty_preexec "$cmd"
+    }'
+  else
+    __ghostty_preexec_hook() {
+      builtin local cmd
+      cmd=$(LC_ALL=C HISTTIMEFORMAT='' builtin history 1)
+      cmd="${cmd#*[[:digit:]][* ] }"  # remove leading history number
+      [[ -n "$cmd" ]] && __ghostty_preexec "$cmd"
+    }
+  fi
 
   # Bash 5.1+ restores the command status for each PROMPT_COMMAND array entry.
   # Scalar values need to save and restore it before existing commands run.
@@ -263,7 +276,7 @@ if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )
       else
         PROMPT_COMMAND="__ghostty_hook 2>/dev/null"
       fi
-    elif [[ $(builtin declare -p PROMPT_COMMAND 2>/dev/null) == "declare -a"* ]]; then
+    elif [[ ${PROMPT_COMMAND@a} == *a* ]]; then
       PROMPT_COMMAND+=("__ghostty_hook 2>/dev/null")
     else
       PROMPT_COMMAND='__ghostty_status=$?;if builtin declare -F __ghostty_restore_status >/dev/null;then __ghostty_restore_status "$__ghostty_status";else (exit "$__ghostty_status");fi;'"${PROMPT_COMMAND}"
