@@ -511,6 +511,20 @@ pub fn sizeGeneration(self: *const Metal) u64 {
     return self.fresh.generation.load(.acquire);
 }
 
+/// The surface was shown or hidden (`ghostty_surface_set_occlusion`, main
+/// thread). Shown: a frame at the host size is due now (it was resized while
+/// hidden, or its last frame was purged), so the present is armed for a frame
+/// drawn from here on and its deadline starts now, not at the last resize.
+pub fn setShownFromMain(self: *Metal, visible: bool) void {
+    if (visible and self.host_size.load(.acquire) != 0) {
+        self.dropFresh();
+        _ = self.fresh.generation.fetchAdd(1, .acq_rel);
+        self.fresh.armed.store(true, .release);
+        self.host_size_set_at = .now(global.io(), .awake);
+    }
+    self.setVisibleHint(visible);
+}
+
 /// Frame updates are held or resumed (`frames_held`). Renderer thread.
 pub fn setFramesHeld(self: *Metal, held: bool) void {
     if (self.frames_held.swap(held, .acq_rel) == held) return;
