@@ -1923,7 +1923,13 @@ fn processOutputLocked(self: *Termio, buf: []const u8) void {
     self.applyPendingSizeLocked();
 
     // Schedule a render. We can call this first because we have the lock.
-    self.terminal_stream.handler.queueRender() catch unreachable;
+    // A hidden renderer with its compression timer armed needs no wake
+    // (renderer.State.output_wakes); it rebuilds everything when shown.
+    if (self.renderer_state.output_wakes.load(.acquire)) {
+        self.terminal_stream.handler.queueRender() catch unreachable;
+    } else {
+        _ = self.renderer_state.output_wakes_skipped.fetchAdd(1, .monotonic);
+    }
 
     // Whenever a character is typed, we ensure the cursor is in the
     // non-blink state so it is rendered if visible. If we're under
@@ -3828,6 +3834,24 @@ test "manual: a mirror's pixel-only resize keeps the terminal and never waits fo
             try testing.expectEqual(@as(u32, 520), io.size.screen.width);
             try testing.expect(io.terminal.modes.get(.synchronized_output));
             try sink.expect("");
+        }
+    }.run;
+    try testManualTermio(true, body);
+}
+
+test "manual: output does not wake a renderer that asked for no output wakes" {
+    const body = struct {
+        fn run(io: *Termio, _: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            io.processOutput("visible\r\n");
+            try testing.expectEqual(@as(u64, 0), io.renderer_state.output_wakes_skipped.load(.monotonic));
+            // A hidden renderer whose compression timer tracks output.
+            io.renderer_state.output_wakes.store(false, .release);
+            io.processOutput("hidden 1\r\n");
+            io.processOutput("hidden 2\r\n");
+            try testing.expectEqual(@as(u64, 2), io.renderer_state.output_wakes_skipped.load(.monotonic));
+            // Still parsed: the renderer rebuilds from it when shown.
+            try testing.expect(io.terminal.screens.active.cursor.y >= 3);
         }
     }.run;
     try testManualTermio(true, body);
