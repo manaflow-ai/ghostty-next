@@ -1483,6 +1483,11 @@ GHOSTTY_API void ghostty_surface_set_host_sized(ghostty_surface_t, bool);
 // (ghostty_surface_set_occlusion true) counts as a size change: call it in
 // that turn too, and its frame is waited for from the reveal. Main thread.
 GHOSTTY_API bool ghostty_surface_present_host_frame(ghostty_surface_t);
+// ghostty_surface_present_host_frame without waiting: presents the frame at
+// the host size only if the renderer thread already drew it, otherwise keeps
+// the last frame (counted in host_late_presents) and the new frame lands when
+// it completes. Never blocks the main thread.
+GHOSTTY_API bool ghostty_surface_present_host_frame_ready(ghostty_surface_t);
 GHOSTTY_API ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
 // Fills the grid metrics. Returns false while a resize of an unlocked grid
 // is in flight; with a host-locked grid (ghostty_surface_set_grid) the

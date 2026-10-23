@@ -461,6 +461,12 @@ fn takeFresh(self: *Metal, width: usize, height: usize) ?*IOSurface {
 /// new size. Returns false when the display pass should draw itself: not
 /// host-sized, or nothing presented yet (the first frame).
 pub fn presentHostSized(self: *Metal) bool {
+    return self.presentHostSizedWait(true);
+}
+
+/// `presentHostSized`; with `wait` false it never blocks: it presents the fresh frame only if the
+/// renderer already published it, and otherwise keeps the last frame (counted late).
+pub fn presentHostSizedWait(self: *Metal, wait: bool) bool {
     const host = self.host_size.load(.acquire);
     if (host == 0) return false;
     // Hidden: nothing to draw now (the renderer draws when shown again),
@@ -488,7 +494,7 @@ pub fn presentHostSized(self: *Metal) bool {
         }
         // Read each time: a hold (synchronized output, a restore) or a hide that starts while
         // this pass waits wakes it (setFramesHeld / setVisibleHint), and no frame can come then.
-        if (self.frames_held.load(.acquire) or !self.visible_hint.load(.acquire)) break;
+        if (!wait or self.frames_held.load(.acquire) or !self.visible_hint.load(.acquire)) break;
         const now: std.Io.Timestamp = .now(io, .awake);
         const waited: i96 = set_at.durationTo(now).nanoseconds;
         if (waited >= host_frame_wait_ns) break;

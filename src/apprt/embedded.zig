@@ -2195,6 +2195,16 @@ pub const CAPI = struct {
         surface.setHostSized(enabled);
     }
 
+    /// The same present without waiting: the frame at the host size only if
+    /// it is already drawn. See ghostty.h.
+    export fn ghostty_surface_present_host_frame_ready(surface: *Surface) bool {
+        if (comptime builtin.os.tag != .macos) return false;
+        const api = &surface.core_surface.renderer.api;
+        if (comptime !@hasDecl(@TypeOf(api.*), "presentHostSizedWait")) return false;
+        _ = api.counters.present_calls.fetchAdd(1, .monotonic);
+        return api.presentHostSizedWait(false);
+    }
+
     /// Present the frame at the host size in the caller's Core Animation
     /// transaction. See ghostty.h.
     export fn ghostty_surface_present_host_frame(surface: *Surface) bool {
