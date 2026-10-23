@@ -88,6 +88,9 @@ counters: HostFrameCounters = .{},
 
 pub const HostFrameCounters = struct {
     display_passes: std.atomic.Value(u64) = .init(0),
+    /// `ghostty_surface_present_host_frame` calls (the embedder's own
+    /// pre-commit hook, for a layer whose display pass does not run).
+    present_calls: std.atomic.Value(u64) = .init(0),
     main_draws: std.atomic.Value(u64) = .init(0),
     fresh_presents: std.atomic.Value(u64) = .init(0),
     late: std.atomic.Value(u64) = .init(0),
@@ -445,7 +448,7 @@ fn takeFresh(self: *Metal, width: usize, height: usize) ?*IOSurface {
 /// the previous size, so a frame drawn here would show the old text at the
 /// new size. Returns false when the display pass should draw itself: not
 /// host-sized, or nothing presented yet (the first frame).
-fn presentHostSized(self: *Metal) bool {
+pub fn presentHostSized(self: *Metal) bool {
     const host = self.host_size.load(.acquire);
     if (host == 0) return false;
     // Hidden: nothing to draw now (the renderer draws when shown again),

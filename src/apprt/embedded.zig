@@ -2195,6 +2195,16 @@ pub const CAPI = struct {
         surface.setHostSized(enabled);
     }
 
+    /// Present the frame at the host size in the caller's Core Animation
+    /// transaction. See ghostty.h.
+    export fn ghostty_surface_present_host_frame(surface: *Surface) bool {
+        if (comptime builtin.os.tag != .macos) return false;
+        const api = &surface.core_surface.renderer.api;
+        if (comptime !@hasDecl(@TypeOf(api.*), "presentHostSized")) return false;
+        _ = api.counters.present_calls.fetchAdd(1, .monotonic);
+        return api.presentHostSized();
+    }
+
     /// Draw a reflow preview while the locked grid does not fit the view.
     /// See ghostty.h.
     export fn ghostty_surface_set_reflow_preview(surface: *Surface, enabled: bool) void {
@@ -2246,6 +2256,7 @@ pub const CAPI = struct {
         full_swap: u64,
         full_resize: u64,
         host_display_passes: u64,
+        host_present_calls: u64,
         host_main_draws: u64,
         host_fresh_presents: u64,
         host_late_presents: u64,
@@ -2266,6 +2277,7 @@ pub const CAPI = struct {
             .full_swap = c.full_swap.load(.monotonic),
             .full_resize = c.full_resize.load(.monotonic),
             .host_display_passes = hostCounter(surface, "display_passes"),
+            .host_present_calls = hostCounter(surface, "present_calls"),
             .host_main_draws = hostCounter(surface, "main_draws"),
             .host_fresh_presents = hostCounter(surface, "fresh_presents"),
             .host_late_presents = hostCounter(surface, "late"),

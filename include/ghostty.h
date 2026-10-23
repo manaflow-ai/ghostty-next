@@ -751,6 +751,8 @@ typedef struct {
   // transaction, and passes that kept the last frame because that frame was
   // not ready within 4 ms of the size change (it lands at the next pass).
   uint64_t host_display_passes;
+  // ghostty_surface_present_host_frame calls.
+  uint64_t host_present_calls;
   uint64_t host_main_draws;
   uint64_t host_fresh_presents;
   uint64_t host_late_presents;
@@ -1466,6 +1468,17 @@ GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t)
 // Default false (the target follows the bounds). No effect on iOS, where the
 // target always follows ghostty_surface_set_size. Main thread.
 GHOSTTY_API void ghostty_surface_set_host_sized(ghostty_surface_t, bool);
+// macOS, host-sized surfaces: present the frame the renderer thread draws
+// for the last ghostty_surface_set_size (cells rebuilt at that size) in the
+// caller's Core Animation transaction, waiting for it at most 4 ms after the
+// size was set; otherwise keep the last frame (the new one lands later).
+// For an embedder whose layer gets no display pass for a size change: call
+// it once per size change, after every surface of the transaction got its
+// size (so their renderers build in parallel) and before the commit, e.g. in
+// a run-loop observer ahead of Core Animation's. Returns false when there is
+// nothing to present this way (not host-sized, nothing shown yet, iOS); true
+// otherwise. Never draws on the calling thread. Main thread.
+GHOSTTY_API bool ghostty_surface_present_host_frame(ghostty_surface_t);
 GHOSTTY_API ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
 // Fills the grid metrics. Returns false while a resize of an unlocked grid
 // is in flight; with a host-locked grid (ghostty_surface_set_grid) the
