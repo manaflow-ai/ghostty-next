@@ -41,6 +41,11 @@ width: usize,
 /// Current height of this target.
 height: usize,
 
+/// The frame drawn into this target last had cells built at this target's
+/// size (macOS host-sized surfaces present only such frames in a display
+/// pass of a new size, `Metal.presentHostSized`). Set before each draw.
+cells_fresh: bool = false,
+
 pub fn init(opts: Options) !Self {
     // We set our surface's color space to Display P3.
     // This allows us to have "Apple-style" alpha blending,

@@ -2245,6 +2245,9 @@ pub const CAPI = struct {
         full_other: u64,
         full_swap: u64,
         full_resize: u64,
+        host_main_draws: u64,
+        host_fresh_presents: u64,
+        host_late_presents: u64,
     };
 
     /// The renderer's frame counters. See ghostty.h.
@@ -2261,7 +2264,16 @@ pub const CAPI = struct {
             .full_other = c.full_other.load(.monotonic),
             .full_swap = c.full_swap.load(.monotonic),
             .full_resize = c.full_resize.load(.monotonic),
+            .host_main_draws = hostCounter(surface, "main_draws"),
+            .host_fresh_presents = hostCounter(surface, "fresh_presents"),
+            .host_late_presents = hostCounter(surface, "late"),
         };
+    }
+
+    fn hostCounter(surface: *Surface, comptime name: []const u8) u64 {
+        const api = &surface.core_surface.renderer.api;
+        if (comptime !@hasField(@TypeOf(api.*), "counters")) return 0;
+        return @field(api.counters, name).load(.monotonic);
     }
 
     /// The grid of the terminal the last frame drew. See ghostty.h.

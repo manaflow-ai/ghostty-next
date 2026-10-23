@@ -98,6 +98,12 @@ flags: packed struct {
     /// This is true when the view is focused. This defaults to true
     /// and it is up to the apprt to set the correct value.
     focused: bool = true,
+
+    /// A resize arrived since the last frame update: the next frame draws
+    /// at once, not at the next display-link tick, so a host-sized display
+    /// pass waiting for the frame at the new size gets it in its own
+    /// transaction (Metal.presentHostSized).
+    resized: bool = false,
 } = .{},
 
 pub const DerivedConfig = struct {
@@ -401,7 +407,10 @@ fn drainMailbox(self: *Thread) !void {
 
             .presentation_health => |v| self.renderer.setPresentationHealth(v),
 
-            .resize => |v| self.renderer.setScreenSize(v),
+            .resize => |v| {
+                self.renderer.setScreenSize(v);
+                self.flags.resized = true;
+            },
 
             .change_config => |config| {
                 defer config.alloc.destroy(config.thread);
@@ -584,8 +593,11 @@ fn renderCallback(
     // a vsync-deferred draw would hold the first frame after idle (a
     // keystroke's echo) until the next refresh: up to a full interval,
     // 16.7 ms at 60 Hz. Draw that frame now; frames that follow while the
-    // link runs stay paced to the display.
-    t.drawFrame(!paced);
+    // link runs stay paced to the display. A resize draws now too: the
+    // display pass of the new size waits for this frame.
+    const resized = t.flags.resized;
+    t.flags.resized = false;
+    t.drawFrame(!paced or resized);
 
     // Schedule the next animation wake, if the renderer needs one.
     t.armAnimationTimer();

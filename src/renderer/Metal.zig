@@ -14,6 +14,8 @@ const configpkg = @import("../config.zig");
 const rendererpkg = @import("../renderer.zig");
 const Renderer = rendererpkg.GenericRenderer(Metal);
 const shadertoy = @import("shadertoy.zig");
+const global = @import("../global.zig");
+const IOSurface = macos.iosurface.IOSurface;
 
 const mtl = @import("metal/api.zig");
 const IOSurfaceLayer = @import("metal/IOSurfaceLayer.zig");
@@ -58,6 +60,47 @@ autorelease_pool: ?*objc.AutoreleasePool = null,
 /// with `ghostty_surface_set_size`. 0 follows the layer's bounds (default).
 /// Written on the main thread, read by `surfaceSize` on any thread.
 host_size: std.atomic.Value(u64) = .init(0),
+
+/// macOS host-sized surfaces: the newest frame the renderer thread drew with
+/// cells built at that frame's size (`Target.cells_fresh`), for the display
+/// pass of a new host size to present in the same Core Animation transaction
+/// as the view's new bounds (`presentHostSized`).
+fresh: FreshFrame = .{},
+
+/// Whether the renderer draws (its last `setVisible`). Written on the
+/// renderer thread, read by the display pass on the main thread: a hidden
+/// surface's display pass draws nothing.
+visible_hint: std.atomic.Value(bool) = .init(true),
+
+/// When the host size last changed (`setHostDrawableSize`). Main thread.
+host_size_set_at: ?std.Io.Timestamp = null,
+
+/// Frames drawn by the display pass on the main thread (the fallback) and
+/// display passes of a new host size that kept the last frame because no
+/// fresh frame came within `host_frame_wait_ns` (render counters).
+counters: HostFrameCounters = .{},
+
+pub const HostFrameCounters = struct {
+    main_draws: std.atomic.Value(u64) = .init(0),
+    fresh_presents: std.atomic.Value(u64) = .init(0),
+    late: std.atomic.Value(u64) = .init(0),
+};
+
+const FreshFrame = struct {
+    mutex: std.Io.Mutex = .init,
+    /// Retained; null after a take or before the first fresh frame.
+    surface: ?*IOSurface = null,
+    /// Bumped on each publish; the display pass waits on it (futex).
+    seq: std.atomic.Value(u32) = .init(0),
+};
+
+/// How long after a new host size the display pass waits for the renderer
+/// thread's frame at that size. The renderer thread starts it when the size
+/// is set (during layout), so the wait overlaps layout and the other
+/// surfaces' builds: the main thread waits for the slowest surface once,
+/// not for each surface's draw in turn. Past it the layer keeps its last
+/// frame (top-left, clipped), and the late frame lands at the next pass.
+const host_frame_wait_ns = 4 * std.time.ns_per_ms;
 
 pub fn init(
     alloc: Allocator,
@@ -144,6 +187,7 @@ pub fn init(
 
 pub fn deinit(self: *Metal) void {
     self.queue.release();
+    if (self.fresh.surface) |surface| surface.release();
 
     // The MTLDevice is app-scoped and destroyed
     // by the render device, not by us.
@@ -200,6 +244,7 @@ pub fn setHostDrawableSize(self: *Metal, enabled: bool, width_px: u32, height_px
     else
         0;
     if (self.host_size.swap(value, .acq_rel) == value) return;
+    self.host_size_set_at = .now(global.io(), .awake);
     self.layer.setHostSize(value);
     self.layer.layer.setProperty("needsDisplayOnBoundsChange", value == 0);
     // One synchronous frame at the new target size (or at the bounds again).
@@ -235,6 +280,10 @@ pub fn loopEnter(self: *Metal) void {
 }
 
 fn displayCallback(renderer: *Renderer) align(8) void {
+    if (comptime builtin.os.tag == .macos) {
+        if (renderer.api.presentHostSized()) return;
+    }
+    _ = renderer.api.counters.main_draws.fetchAdd(1, .monotonic);
     renderer.drawFrame(true) catch |err| {
         log.warn("Error drawing frame in display callback, err={}", .{err});
     };
@@ -327,8 +376,96 @@ pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
     if (sync) {
         self.layer.setSurfaceSync(target.surface);
     } else {
+        if (comptime builtin.os.tag == .macos) {
+            if (target.cells_fresh and self.host_size.load(.acquire) != 0) self.publishFresh(target.surface);
+        }
         try self.layer.setSurface(target.surface);
     }
+}
+
+/// Keeps `surface` as the newest fresh frame and wakes a display pass that
+/// waits for it. GPU completion thread.
+fn publishFresh(self: *Metal, surface: *IOSurface) void {
+    const io = global.io();
+    surface.retain();
+    const old = old: {
+        self.fresh.mutex.lockUncancelable(io);
+        defer self.fresh.mutex.unlock(io);
+        const old = self.fresh.surface;
+        self.fresh.surface = surface;
+        break :old old;
+    };
+    if (old) |o| o.release();
+    _ = self.fresh.seq.fetchAdd(1, .release);
+    io.futexWake(@TypeOf(self.fresh.seq), &self.fresh.seq, std.math.maxInt(u32));
+}
+
+/// The fresh frame if it has `width` x `height` pixels (retained; the caller
+/// releases it). A fresh frame of another size stays for its own pass.
+fn takeFresh(self: *Metal, width: usize, height: usize) ?*IOSurface {
+    const io = global.io();
+    self.fresh.mutex.lockUncancelable(io);
+    defer self.fresh.mutex.unlock(io);
+    const surface = self.fresh.surface orelse return null;
+    if (surface.getWidth() != width or surface.getHeight() != height) return null;
+    self.fresh.surface = null;
+    return surface;
+}
+
+/// The display pass of a host-sized surface (main thread): present the
+/// renderer thread's frame at the host size, drawn with cells rebuilt for
+/// that size (the text reflowed to the new grid, the reflow preview
+/// included), in this Core Animation transaction. Never draws on the main
+/// thread: the cells the main thread could draw with are the ones built for
+/// the previous size, so a frame drawn here would show the old text at the
+/// new size. Returns false when the display pass should draw itself: not
+/// host-sized, or nothing presented yet (the first frame).
+fn presentHostSized(self: *Metal) bool {
+    const host = self.host_size.load(.acquire);
+    if (host == 0) return false;
+    // Hidden: nothing to draw now (the renderer draws when shown again),
+    // and drawing here would rebuild the released swap chain.
+    if (!self.visible_hint.load(.acquire)) return true;
+    const width: usize = @intCast(host >> 32);
+    const height: usize = @intCast(host & 0xffff_ffff);
+    const shown = self.layer.layer.getProperty(?*anyopaque, "contents") orelse return false;
+    const shown_surface: *IOSurface = @ptrCast(shown);
+    if (shown_surface.getWidth() == width and shown_surface.getHeight() == height) {
+        // The renderer thread's frame at this size already landed.
+        if (self.takeFresh(width, height)) |surface| surface.release();
+        return true;
+    }
+
+    const io = global.io();
+    const set_at = self.host_size_set_at orelse std.Io.Timestamp.now(io, .awake);
+    while (true) {
+        const seq = self.fresh.seq.load(.acquire);
+        if (self.takeFresh(width, height)) |surface| {
+            defer surface.release();
+            self.layer.setSurfaceSync(surface);
+            _ = self.counters.fresh_presents.fetchAdd(1, .monotonic);
+            return true;
+        }
+        const now: std.Io.Timestamp = .now(io, .awake);
+        const waited: i96 = set_at.durationTo(now).nanoseconds;
+        if (waited >= host_frame_wait_ns) break;
+        const remaining: u64 = @intCast(@as(i96, host_frame_wait_ns) - waited);
+        io.futexWaitTimeout(
+            @TypeOf(self.fresh.seq),
+            &self.fresh.seq,
+            .init(seq),
+            .{ .duration = .{ .raw = .fromNanoseconds(remaining), .clock = .awake } },
+        ) catch {};
+    }
+    // Late: keep the last frame; the renderer thread's frame at this size
+    // lands through `setSurface` when it completes.
+    _ = self.counters.late.fetchAdd(1, .monotonic);
+    return true;
+}
+
+/// The renderer started or stopped drawing (`setVisible`). Renderer thread.
+pub fn setVisibleHint(self: *Metal, visible: bool) void {
+    self.visible_hint.store(visible, .release);
 }
 
 /// Returns the options to use when constructing buffers.
