@@ -102,6 +102,7 @@ jobs:
             -Dtest-filter="ghostty.h surface grid" \
             -Dtest-filter="ghostty.h SurfaceSnapshotPhase" \
             -Dtest-filter="renderer mailbox: " \
+            -Dtest-filter="renderer thread: " \
             -Dtest-filter="renderCellMap link filter" \
             -Dtest-filter="StringMap match text" \
             -Dtest-filter="loadString " \

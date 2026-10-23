@@ -707,7 +707,12 @@ fn cursorTimerCallback(
     };
 
     t.flags.cursor_blink_visible = !t.flags.cursor_blink_visible;
-    t.wakeup.notify() catch {};
+    // A tick changes pixels only when the cursor blinks and shows: a hidden
+    // cursor (DECTCEM off, as agent TUIs keep it) or a steady one draws the
+    // same frame, so the tick wakes nothing (no frame update, no draw). The
+    // renderer thread owns `terminal_state`; the next update after output
+    // that turns blinking on picks the ticks up again.
+    if (blinkTickDraws(&t.renderer.terminal_state)) t.wakeup.notify() catch {};
 
     t.cursor_h.run(
         &t.loop,
@@ -718,6 +723,25 @@ fn cursorTimerCallback(
         cursorTimerCallback,
     );
     return .disarm;
+}
+
+/// Whether a cursor blink tick can change the frame of `state` (the
+/// renderer's last frame update): the cursor blinks and is visible.
+fn blinkTickDraws(state: *const terminalpkg.RenderState) bool {
+    return state.cursor.blinking and state.cursor.visible;
+}
+
+test "renderer thread: a blink tick draws only a visible blinking cursor" {
+    const testing = std.testing;
+    var state: terminalpkg.RenderState = .empty;
+    state.cursor.blinking = true;
+    state.cursor.visible = true;
+    try testing.expect(blinkTickDraws(&state));
+    state.cursor.visible = false;
+    try testing.expect(!blinkTickDraws(&state));
+    state.cursor.visible = true;
+    state.cursor.blinking = false;
+    try testing.expect(!blinkTickDraws(&state));
 }
 
 fn cursorCancelCallback(
