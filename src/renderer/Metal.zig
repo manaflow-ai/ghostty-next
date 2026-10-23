@@ -72,6 +72,12 @@ fresh: FreshFrame = .{},
 /// surface's display pass draws nothing.
 visible_hint: std.atomic.Value(bool) = .init(true),
 
+/// The renderer skips frame updates (synchronized output, a restore's
+/// frame hold): no fresh frame can come, so a display pass of a new size
+/// keeps the last frame at once instead of waiting for one. Renderer
+/// thread writes, main thread reads.
+frames_held: std.atomic.Value(bool) = .init(false),
+
 /// When the host size last changed (`setHostDrawableSize`). Main thread.
 host_size_set_at: ?std.Io.Timestamp = null,
 
@@ -443,6 +449,7 @@ fn presentHostSized(self: *Metal) bool {
     // Hidden: nothing to draw now (the renderer draws when shown again),
     // and drawing here would rebuild the released swap chain.
     if (!self.visible_hint.load(.acquire)) return true;
+    const held = self.frames_held.load(.acquire);
     const width: usize = @intCast(host >> 32);
     const height: usize = @intCast(host & 0xffff_ffff);
     const shown = self.layer.layer.getProperty(?*anyopaque, "contents") orelse return false;
@@ -463,6 +470,7 @@ fn presentHostSized(self: *Metal) bool {
             _ = self.counters.fresh_presents.fetchAdd(1, .monotonic);
             return true;
         }
+        if (held) break;
         const now: std.Io.Timestamp = .now(io, .awake);
         const waited: i96 = set_at.durationTo(now).nanoseconds;
         if (waited >= host_frame_wait_ns) break;
@@ -478,6 +486,11 @@ fn presentHostSized(self: *Metal) bool {
     // lands through `setSurface` when it completes.
     _ = self.counters.late.fetchAdd(1, .monotonic);
     return true;
+}
+
+/// Frame updates are held or resumed (`frames_held`). Renderer thread.
+pub fn setFramesHeld(self: *Metal, held: bool) void {
+    self.frames_held.store(held, .release);
 }
 
 /// The renderer started or stopped drawing (`setVisible`). Renderer thread.

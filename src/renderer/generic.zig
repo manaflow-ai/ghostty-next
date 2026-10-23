@@ -1577,8 +1577,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // all rendering.
                 if (!state.renderable()) {
                     log.debug("frames held, skipping render", .{});
+                    if (@hasDecl(GraphicsAPI, "setFramesHeld")) self.api.setFramesHeld(true);
                     return;
                 }
+                if (@hasDecl(GraphicsAPI, "setFramesHeld")) self.api.setFramesHeld(false);
 
                 // If scroll-to-bottom on output is enabled, check if the final line
                 // changed by comparing the bottom-right pin. If the node pointer or
