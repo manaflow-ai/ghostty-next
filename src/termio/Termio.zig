@@ -78,6 +78,17 @@ suppress_terminal_responses: bool,
 /// Read and written under `renderer_state.mutex`.
 grid_lock: ?GridLock = null,
 
+/// Whether `grid_lock` is set: written with it under the terminal lock,
+/// read without it by a mirror's `resize` (its pixel-only fast path).
+grid_locked: std.atomic.Value(bool) = .init(false),
+
+/// A mirror's pixel-only resize that found the terminal lock held (the
+/// output queue parsing a chunk): applied by the next holder of the lock
+/// (`applyPendingSizeLocked`), so a resize on the main thread never waits
+/// behind output.
+pending_size: PendingSize = .{},
+
+
 /// A snapshot whose history is still arriving after its READY prefix
 /// was restored (see `restoreSnapshot`). Only the output queue uses it.
 snapshot_restore: ?SnapshotRestore = null,
@@ -808,6 +819,35 @@ pub fn resize(
     // Update the size of our pty. A manual backend has none.
     try self.backend.resize(size.grid(), size.terminal());
 
+    // A mirror with a locked grid: a resize changes only the pixel size,
+    // which nothing in the terminal reads (the owner answers size reports)
+    // unless the cell size changed with it (a font size change). The
+    // terminal is left alone: no reflow, no live-terminal change (a local
+    // history restore keeps going), and synchronized output (mode 2026)
+    // stays as the program set it: a pane drag no longer cuts a TUI's
+    // update in half every frame. The main thread does not wait for the
+    // lock behind a chunk being parsed.
+    if (self.suppress_terminal_responses and self.grid_locked.load(.acquire)) pixels: {
+        if (self.renderer_state.mutex.tryLock()) {
+            defer self.renderer_state.mutex.unlock(global.io());
+            self.applyPendingSizeLocked();
+            if (!cellEql(self.size.cell, size.cell)) {
+                // Fall through to the full path below (it takes the lock).
+                break :pixels;
+            }
+            self.size = size;
+        } else {
+            const io = global.io();
+            self.pending_size.mutex.lockUncancelable(io);
+            defer self.pending_size.mutex.unlock(io);
+            self.pending_size.value = size;
+            self.pending_size.set.store(true, .release);
+        }
+        _ = self.renderer_mailbox.push(global.io(), .{ .resize = size }, .{ .forever = {} });
+        self.renderer_wakeup.notify() catch {};
+        return;
+    }
+
     // Enter the critical area that we want to keep small
     {
         self.renderer_state.mutex.lockUncancelable(global.io());
@@ -842,6 +882,45 @@ pub fn resize(
     // Mail the renderer so that it can update the GPU and re-render
     _ = self.renderer_mailbox.push(global.io(), .{ .resize = size }, .{ .forever = {} });
     self.renderer_wakeup.notify() catch {};
+}
+
+const PendingSize = struct {
+    mutex: std.Io.Mutex = .init,
+    value: ?renderer.Size = null,
+    set: std.atomic.Value(bool) = .init(false),
+};
+
+fn cellEql(a: renderer.CellSize, b: renderer.CellSize) bool {
+    return a.width == b.width and a.height == b.height;
+}
+
+/// Applies a pixel-only size a mirror's resize left for the lock holder.
+/// A pending size whose cell size differs (a font change while the lock
+/// was held) resizes the terminal's cell size too. Caller must hold
+/// `renderer_state.mutex`.
+fn applyPendingSizeLocked(self: *Termio) void {
+    if (!self.pending_size.set.load(.acquire)) return;
+    const io = global.io();
+    const size = size: {
+        self.pending_size.mutex.lockUncancelable(io);
+        defer self.pending_size.mutex.unlock(io);
+        self.pending_size.set.store(false, .release);
+        const value = self.pending_size.value orelse return;
+        self.pending_size.value = null;
+        break :size value;
+    };
+    const cell_changed = !cellEql(self.size.cell, size.cell);
+    self.size = size;
+    if (cell_changed) {
+        self.live_epoch +%= 1;
+        const grid_size = self.gridSizeLocked();
+        self.terminal.resize(self.alloc, .{
+            .cols = grid_size.columns,
+            .rows = grid_size.rows,
+            .cell_size_px = .{ .width = size.cell.width, .height = size.cell.height },
+            .reflow = !self.suppress_terminal_responses,
+        }) catch |err| log.warn("pending resize failed err={}", .{err});
+    }
 }
 
 /// The grid the terminal has: the locked grid, or what fits the view.
@@ -881,6 +960,7 @@ pub fn setGrid(
         if (self.grid_lock) |current| {
             if (generation < current.generation) return false;
         }
+        self.applyPendingSizeLocked();
         self.live_epoch +%= 1;
 
         if (self.terminal.cols != cols or self.terminal.rows != rows) {
@@ -903,6 +983,7 @@ pub fn setGrid(
             .rows = rows,
             .generation = generation,
         };
+        self.grid_locked.store(true, .release);
 
         if (self.terminal.modes.get(.in_band_size_reports)) {
             var td = self.manualThreadData();
@@ -1839,6 +1920,8 @@ pub fn processOutput(self: *Termio, buf: []const u8) void {
 
 /// Process output from readdata but the lock is already held.
 fn processOutputLocked(self: *Termio, buf: []const u8) void {
+    self.applyPendingSizeLocked();
+
     // Schedule a render. We can call this first because we have the lock.
     self.terminal_stream.handler.queueRender() catch unreachable;
 
