@@ -97,6 +97,9 @@ pub const HostFrameCounters = struct {
 };
 
 const FreshFrame = struct {
+    /// A host size changed and its frame was not taken yet: only then does a
+    /// completed frame publish itself (no retain, lock or wake per frame at rest).
+    armed: std.atomic.Value(bool) = .init(false),
     mutex: std.Io.Mutex = .init,
     /// Retained; null after a take or before the first fresh frame.
     surface: ?*IOSurface = null,
@@ -259,6 +262,7 @@ pub fn setHostDrawableSize(self: *Metal, enabled: bool, width_px: u32, height_px
     // even when the sizes are equal (a drag back): only a frame published
     // after this call may be presented for it.
     self.dropFresh();
+    self.fresh.armed.store(value != 0, .release);
     self.layer.setHostSize(value);
     self.layer.layer.setProperty("needsDisplayOnBoundsChange", value == 0);
     // One synchronous frame at the new target size (or at the bounds again).
@@ -392,7 +396,8 @@ pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
         self.layer.setSurfaceSync(target.surface);
     } else {
         if (comptime builtin.os.tag == .macos) {
-            if (target.cells_fresh and self.host_size.load(.acquire) != 0) self.publishFresh(target.surface);
+            if (target.cells_fresh and self.fresh.armed.load(.acquire) and
+                self.host_size.load(.acquire) != 0) self.publishFresh(target.surface);
         }
         try self.layer.setSurface(target.surface);
     }
@@ -437,6 +442,7 @@ fn takeFresh(self: *Metal, width: usize, height: usize) ?*IOSurface {
     const surface = self.fresh.surface orelse return null;
     if (surface.getWidth() != width or surface.getHeight() != height) return null;
     self.fresh.surface = null;
+    self.fresh.armed.store(false, .release);
     return surface;
 }
 
@@ -501,6 +507,8 @@ pub fn setFramesHeld(self: *Metal, held: bool) void {
 /// The renderer started or stopped drawing (`setVisible`). Renderer thread.
 pub fn setVisibleHint(self: *Metal, visible: bool) void {
     self.visible_hint.store(visible, .release);
+    // A hidden surface holds no frame for a present that cannot come.
+    if (!visible) self.dropFresh();
 }
 
 /// Returns the options to use when constructing buffers.
