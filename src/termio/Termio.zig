@@ -3780,6 +3780,33 @@ test "manual: a local history restore at the bottom draws the READY terminal bet
                 try testExpectSamePrimary(io, &owner);
             }
 
+            // At the bottom, but the person scrolls up between the swaps:
+            // frames are held from that scroll on.
+            {
+                const ready, const digest = try owner.resizeAndEncode(28, 10);
+                defer alloc.free(ready);
+                test_between_frame = .{};
+                test_between_swaps = &struct {
+                    fn hook(t: *Termio) void {
+                        t.renderer_state.mutex.lockUncancelable(global.io());
+                        t.scrollViewportLocked(.{ .delta = -5 });
+                        t.renderer_state.mutex.unlock(global.io());
+                        testRecordBetweenFrame(t);
+                    }
+                }.hook;
+                defer test_between_swaps = null;
+                _ = try io.restoreSnapshotLocalHistory(ready, digest);
+                try testing.expect(test_between_frame.seen);
+                try testing.expect(!test_between_frame.renderable);
+                io.renderer_state.mutex.lockUncancelable(global.io());
+                const after = io.renderer_state.renderable();
+                io.renderer_state.mutex.unlock(global.io());
+                try testing.expect(after);
+                io.renderer_state.mutex.lockUncancelable(global.io());
+                io.terminal.scrollViewport(.{ .bottom = {} });
+                io.renderer_state.mutex.unlock(global.io());
+            }
+
             // Scrolled into the history: the READY terminal lacks the rows
             // shown, so frames are held between the swaps.
             {
