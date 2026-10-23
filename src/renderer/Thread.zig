@@ -106,11 +106,15 @@ flags: packed struct {
     resized: bool = false,
 
     /// A frame was drawn since the last display-link tick (or the link
-    /// started). While the link runs, the first update of each refresh
-    /// interval draws at once and later ones wait for the tick: an echo
-    /// shows up to a refresh sooner, and no interval gets more than one
-    /// early frame.
+    /// started). While the link runs, an update draws at once only when
+    /// this is false and the last tick drew nothing (`last_tick_drew`): an
+    /// echo after a quiet interval shows up to a refresh sooner, and a
+    /// terminal that updates every interval (busy output) draws once per
+    /// tick, never an early frame plus a tick frame.
     drawn_since_tick: bool = false,
+
+    /// The last display-link tick drew a frame.
+    last_tick_drew: bool = false,
 } = .{},
 
 pub const DerivedConfig = struct {
@@ -558,7 +562,9 @@ fn drawNowCallback(
 
     // Draw immediately
     const t = self_.?;
+    const before = t.renderer.counters.frames.load(.monotonic);
     t.drawFrame(true);
+    t.flags.last_tick_drew = t.renderer.counters.frames.load(.monotonic) != before;
     t.flags.drawn_since_tick = false;
 
     return .rearm;
@@ -618,7 +624,7 @@ fn renderCallback(
     // display pass of the new size waits for this frame.
     const resized = t.flags.resized;
     t.flags.resized = false;
-    const now = drawsNow(paced, resized, t.flags.drawn_since_tick);
+    const now = drawsNow(paced, resized, t.flags.drawn_since_tick, t.flags.last_tick_drew);
     t.drawFrame(now);
     if (now and paced) t.flags.drawn_since_tick = true;
 
@@ -737,17 +743,21 @@ fn cursorTimerCallback(
 
 /// Whether a frame update draws at once rather than at the next
 /// display-link tick: the link is stopped (the first frame after idle), a
-/// resize waits for it, or no frame was drawn yet in this refresh interval.
-fn drawsNow(paced: bool, resized: bool, drawn_since_tick: bool) bool {
-    return !paced or resized or !drawn_since_tick;
+/// resize waits for it, or the update follows a quiet interval (the last
+/// tick drew nothing and nothing was drawn since).
+fn drawsNow(paced: bool, resized: bool, drawn_since_tick: bool, last_tick_drew: bool) bool {
+    return !paced or resized or (!drawn_since_tick and !last_tick_drew);
 }
 
-test "renderer thread: one early frame per refresh interval while the link runs" {
+test "renderer thread: an early frame only after a quiet interval while the link runs" {
     const testing = std.testing;
-    try testing.expect(drawsNow(false, false, true));
-    try testing.expect(drawsNow(true, true, true));
-    try testing.expect(drawsNow(true, false, false));
-    try testing.expect(!drawsNow(true, false, true));
+    try testing.expect(drawsNow(false, false, true, true));
+    try testing.expect(drawsNow(true, true, true, true));
+    // An echo after a tick that drew nothing.
+    try testing.expect(drawsNow(true, false, false, false));
+    // Busy output: the last tick drew, so this interval's update waits.
+    try testing.expect(!drawsNow(true, false, false, true));
+    try testing.expect(!drawsNow(true, false, true, false));
 }
 
 /// Whether a cursor blink tick can change the frame of `state` (the

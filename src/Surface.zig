@@ -3781,6 +3781,13 @@ pub fn occlusionCallback(self: *Surface, visible: bool) !void {
         } }, .unlocked);
     }
 
+    // The display pass and the embedder's pre-commit present read this on
+    // the main thread in the same turn (a reveal sets the size, then the
+    // occlusion): it must not wait for the renderer thread's mailbox.
+    if (comptime @hasDecl(@TypeOf(self.renderer.api), "setVisibleHint")) {
+        self.renderer.api.setVisibleHint(visible);
+    }
+
     _ = self.renderer_thread.mailbox.push(global.io(), .{
         .visible = visible,
     }, .{ .forever = {} });

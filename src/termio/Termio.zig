@@ -1870,7 +1870,15 @@ pub fn scrollViewportLocked(
 ) void {
     // The person's own move wins over a place kept for them.
     self.viewport_keep = null;
-    if (self.local_restore_scroll) |*pending| pending.add(scroll);
+    if (self.local_restore_scroll) |*pending| {
+        pending.add(scroll);
+        // Between a local history restore's swaps the live terminal is the
+        // READY one, with only its newest history rows: a frame of it
+        // scrolled up would show those, then jump at the second swap. Hold
+        // frames from here to the restore's result (released there in every
+        // outcome) when the restore did not already.
+        self.renderer_state.hold_frames = true;
+    }
     self.terminal.scrollViewport(scroll);
 }
 
