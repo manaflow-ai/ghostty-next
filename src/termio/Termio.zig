@@ -3715,6 +3715,41 @@ test "manual: a local history restore at the bottom draws the READY terminal bet
     try testManualTermio(true, body);
 }
 
+test "manual: a mirror's pixel-only resize keeps the terminal and never waits for the lock" {
+    const body = struct {
+        fn run(io: *Termio, sink: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            try testing.expect(io.setGrid(40, 10, 1));
+            io.processOutput("hello\x1b[?2026h");
+            const epoch = io.live_epoch;
+            var td = io.manualThreadData();
+
+            // A pane drag: new pixel sizes, same cell size. The program's
+            // synchronized update stays open and the live terminal is not
+            // changed (a local history restore would see no change).
+            var size = io.size;
+            size.screen = .{ .width = 640, .height = 400 };
+            try io.resize(&td, size);
+            try testing.expect(io.terminal.modes.get(.synchronized_output));
+            try testing.expectEqual(epoch, io.live_epoch);
+            try testing.expectEqual(@as(u32, 640), io.size.screen.width);
+            try testing.expectEqual(@as(u16, 40), io.terminal.cols);
+
+            // While the output queue holds the lock, the resize does not
+            // wait: the next holder applies it.
+            size.screen = .{ .width = 520, .height = 300 };
+            io.renderer_state.mutex.lockUncancelable(global.io());
+            try io.resize(&td, size);
+            io.renderer_state.mutex.unlock(global.io());
+            io.processOutput("x");
+            try testing.expectEqual(@as(u32, 520), io.size.screen.width);
+            try testing.expect(io.terminal.modes.get(.synchronized_output));
+            try sink.expect("");
+        }
+    }.run;
+    try testManualTermio(true, body);
+}
+
 test "manual: snapshot local history restore does not undo a change between the swaps" {
     const body = struct {
         fn run(io: *Termio, _: *TestSink, _: bool) !void {
