@@ -87,6 +87,7 @@ host_size_set_at: ?std.Io.Timestamp = null,
 counters: HostFrameCounters = .{},
 
 pub const HostFrameCounters = struct {
+    display_passes: std.atomic.Value(u64) = .init(0),
     main_draws: std.atomic.Value(u64) = .init(0),
     fresh_presents: std.atomic.Value(u64) = .init(0),
     late: std.atomic.Value(u64) = .init(0),
@@ -290,6 +291,7 @@ pub fn loopEnter(self: *Metal) void {
 }
 
 fn displayCallback(renderer: *Renderer) align(8) void {
+    _ = renderer.api.counters.display_passes.fetchAdd(1, .monotonic);
     if (comptime builtin.os.tag == .macos) {
         if (renderer.api.presentHostSized()) return;
     }

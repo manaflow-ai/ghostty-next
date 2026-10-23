@@ -743,12 +743,14 @@ typedef struct {
   // swapped it, the reflow preview started or ended), or its grid size.
   uint64_t full_swap;
   uint64_t full_resize;
-  // macOS host-sized surfaces (ghostty_surface_set_host_sized), per display
-  // pass of a new size: frames the main thread drew itself (the first frame,
+  // macOS: Core Animation display passes of the surface's layer. Host-sized
+  // surfaces (ghostty_surface_set_host_sized), per display pass of a new
+  // size: frames the main thread drew itself (the first frame,
   // or a surface that is not host-sized), frames the renderer thread drew at
   // the new size with cells rebuilt for it and the pass presented in its
   // transaction, and passes that kept the last frame because that frame was
   // not ready within 4 ms of the size change (it lands at the next pass).
+  uint64_t host_display_passes;
   uint64_t host_main_draws;
   uint64_t host_fresh_presents;
   uint64_t host_late_presents;
