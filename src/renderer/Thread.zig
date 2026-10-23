@@ -328,6 +328,7 @@ fn drainMailbox(self: *Thread) !void {
 
                 // Notify the renderer so it can update any state.
                 self.renderer.setVisible(v);
+                self.syncOutputWakes();
 
                 // Note that we're explicitly today not stopping any
                 // cursor timers, draw timers, etc. These things have very
@@ -452,6 +453,16 @@ fn drainMailbox(self: *Thread) !void {
     }
 }
 
+/// Whether output must wake this thread (renderer.State.output_wakes):
+/// always while visible; while hidden only until the compression timer is
+/// armed, since that timer then tracks output on its own. With compression
+/// off a hidden renderer needs no output wakes at all.
+fn syncOutputWakes(self: *Thread) void {
+    const needed = self.flags.visible or
+        (terminalpkg.compression_enabled and self.config.scrollback_compression and !self.compression.armed);
+    self.state.output_wakes.store(needed, .release);
+}
+
 fn changeConfig(self: *Thread, config: *const DerivedConfig) !void {
     // A newly enabled scheduler must reconsider existing history even when no
     // terminal activity occurred while compression was disabled.
@@ -464,6 +475,7 @@ fn changeConfig(self: *Thread, config: *const DerivedConfig) !void {
     }
 
     self.config = config.*;
+    self.syncOutputWakes();
 }
 
 /// Trigger a draw. This will not update frame data or anything, it will
@@ -504,6 +516,7 @@ fn wakeupCallback(
     // PageList mutations maintain their own compression dirty state. Checking
     // it here covers output, resize, and viewport scrolling uniformly.
     t.compression.wake(t);
+    t.syncOutputWakes();
 
     // The below is not used anymore but if we ever want to introduce
     // a configuration to introduce a delay to coalesce renders, we can
@@ -780,6 +793,9 @@ const Compression = struct {
     completion: xev.Completion = .{},
     reset_completion: xev.Completion = .{},
     activity: ?u64 = null,
+    /// The one-shot timer is scheduled (set by `schedule`, cleared when a
+    /// step finishes the work or the timer fails). Renderer thread only.
+    armed: bool = false,
 
     fn init() !Compression {
         return .{ .timer = try xev.Timer.init() };
@@ -820,6 +836,7 @@ const Compression = struct {
 
     /// Start the one-shot timer, or move its deadline if it is already active.
     fn schedule(self: *Compression, thread: *Thread, delay_ms: u64) void {
+        self.armed = true;
         self.timer.reset(
             &thread.loop,
             &self.completion,
@@ -837,18 +854,26 @@ const Compression = struct {
         _: *xev.Completion,
         result: xev.Timer.RunError!void,
     ) xev.CallbackAction {
+        const thread = thread_ orelse return .disarm;
         _ = result catch |err| switch (err) {
+            // A reset replaced this run; the new one is armed.
             error.Canceled => return .disarm,
             else => {
                 log.warn("error in compression timer err={}", .{err});
+                thread.compression.armed = false;
+                thread.syncOutputWakes();
                 return .disarm;
             },
         };
 
-        const thread = thread_ orelse return .disarm;
         const self = &thread.compression;
 
-        if (self.step(thread)) |delay| self.schedule(thread, delay);
+        if (self.step(thread)) |delay| {
+            self.schedule(thread, delay);
+        } else {
+            self.armed = false;
+            thread.syncOutputWakes();
+        }
         return .disarm;
     }
 

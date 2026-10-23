@@ -33,6 +33,17 @@ hold_frames: bool = false,
 /// it each frame before it takes `mutex`.
 reflow_preview: std.atomic.Value(bool) = .init(false),
 
+/// Whether terminal output must wake the renderer thread. False while the
+/// surface is hidden and its scrollback-compression timer is armed: that
+/// timer rechecks the terminal every 250 ms while output changes it, and a
+/// hidden renderer draws nothing, so a wake per output chunk (hundreds a
+/// second for a busy hidden terminal) did no work. Written by the renderer
+/// thread, read by the output queue (`Termio.processOutputLocked`).
+output_wakes: std.atomic.Value(bool) = .init(true),
+
+/// Output chunks that did not wake the renderer (`output_wakes` false).
+output_wakes_skipped: std.atomic.Value(u64) = .init(0),
+
 
 /// Bumped by every config change that sets the terminal's colors
 /// (`Termio.changeConfig`): the renderer blends that change with
