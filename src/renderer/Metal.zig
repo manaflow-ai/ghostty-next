@@ -81,6 +81,11 @@ frames_held: std.atomic.Value(bool) = .init(false),
 /// When the host size last changed (`setHostDrawableSize`). Main thread.
 host_size_set_at: ?std.Io.Timestamp = null,
 
+/// Numbers presented frames in completion order, so a frame the main thread
+/// presents late never replaces a newer one presented off main. GPU
+/// completion thread.
+present_seq: std.atomic.Value(u64) = .init(0),
+
 /// Frames drawn by the display pass on the main thread (the fallback) and
 /// display passes of a new host size that kept the last frame because no
 /// fresh frame came within `host_frame_wait_ns` (render counters).
@@ -88,6 +93,8 @@ counters: HostFrameCounters = .{},
 
 pub const HostFrameCounters = struct {
     display_passes: std.atomic.Value(u64) = .init(0),
+    /// Frames presented from the completion thread (content only, `setSurfaceOffMain`).
+    off_main_presents: std.atomic.Value(u64) = .init(0),
     /// `ghostty_surface_present_host_frame` calls (the embedder's own
     /// pre-commit hook, for a layer whose display pass does not run).
     present_calls: std.atomic.Value(u64) = .init(0),
@@ -405,7 +412,16 @@ pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
                 target.size_generation == self.fresh.generation.load(.acquire) and
                 self.host_size.load(.acquire) != 0) self.publishFresh(target.surface);
         }
-        try self.layer.setSurface(target.surface);
+        const seq = self.present_seq.fetchAdd(1, .monotonic) + 1;
+        // A content-only frame of a host-sized surface goes to the screen from
+        // this (completion) thread: a terminal echo does not wait for main.
+        if (comptime builtin.os.tag == .macos) {
+            if (self.host_size.load(.acquire) != 0 and self.layer.setSurfaceOffMain(target.surface, seq)) {
+                _ = self.counters.off_main_presents.fetchAdd(1, .monotonic);
+                return;
+            }
+        }
+        try self.layer.setSurface(target.surface, seq);
     }
 }
 

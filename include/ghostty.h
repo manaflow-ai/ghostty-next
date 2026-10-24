@@ -758,6 +758,10 @@ typedef struct {
   uint64_t host_main_draws;
   uint64_t host_fresh_presents;
   uint64_t host_late_presents;
+  // Content-only frames of a host-sized surface (the drawable size
+  // unchanged) that went to the screen from the renderer's GPU completion
+  // thread, in their own Core Animation transaction, without the main thread.
+  uint64_t host_off_main_presents;
 } ghostty_surface_render_counters_s;
 
 // Config types

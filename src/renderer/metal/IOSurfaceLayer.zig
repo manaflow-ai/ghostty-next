@@ -36,6 +36,7 @@ pub fn init() !IOSurfaceLayer {
     layer.setInstanceVariable("display_cb", .{ .value = null });
     layer.setInstanceVariable("display_ctx", .{ .value = null });
     layer.setInstanceVariable("host_size", .{ .value = null });
+    layer.setInstanceVariable("present_seq", .{ .value = null });
 
     return .{ .layer = layer };
 }
@@ -95,7 +96,7 @@ fn hostSize(layer: objc.Object) u64 {
 /// Sets the layer's `contents` to the provided IOSurface.
 ///
 /// Makes sure to do so on the main thread to avoid visual artifacts.
-pub inline fn setSurface(self: *IOSurfaceLayer, surface: *IOSurface) !void {
+pub inline fn setSurface(self: *IOSurfaceLayer, surface: *IOSurface, seq: u64) !void {
     // We retain the surface to make sure it's not GC'd
     // before we can set it as the contents of the layer.
     //
@@ -108,6 +109,7 @@ pub inline fn setSurface(self: *IOSurfaceLayer, surface: *IOSurface) !void {
     var block = SetSurfaceBlock.init(.{
         .layer = self.layer.value,
         .surface = surface,
+        .seq = seq,
     }, &setSurfaceCallback);
 
     // We check if we're on the main thread and run the block directly if so.
@@ -136,7 +138,48 @@ pub inline fn setSurfaceSync(self: *IOSurfaceLayer, surface: *IOSurface) void {
 const SetSurfaceBlock = objc.Block(struct {
     layer: objc.c.id,
     surface: *IOSurface,
+    seq: u64,
 }, .{}, void);
+
+/// Presents `surface`, a frame that changes only content, from the calling
+/// (GPU completion) thread in its own Core Animation transaction, without the
+/// main thread: a terminal echo reaches the screen while main is busy. Only
+/// when the frame has the host size (`setHostSize`, nonzero) and the layer
+/// already shows a frame of that size, so no geometry change of the main
+/// thread is pending for it, and only if no newer frame was presented
+/// (`seq`). Returns false, and changes nothing, otherwise: the caller then
+/// presents it through the main thread (`setSurface`).
+pub fn setSurfaceOffMain(self: *IOSurfaceLayer, surface: *IOSurface, seq: u64) bool {
+    const width = surface.getWidth();
+    const height = surface.getHeight();
+    const host = hostSize(self.layer);
+    if (host == 0 or (host >> 32) != width or (host & 0xffff_ffff) != height) return false;
+    const CATransaction = objc.getClass("CATransaction").?;
+    CATransaction.msgSend(void, objc.sel("begin"), .{});
+    defer CATransaction.msgSend(void, objc.sel("commit"), .{});
+    // The Core Animation lock orders this against `setSurfaceCallback` on main.
+    CATransaction.msgSend(void, objc.sel("lock"), .{});
+    defer CATransaction.msgSend(void, objc.sel("unlock"), .{});
+    const shown = self.layer.getProperty(?*anyopaque, "contents") orelse return false;
+    const shown_surface: *IOSurface = @ptrCast(shown);
+    if (shown_surface.getWidth() != width or shown_surface.getHeight() != height) return false;
+    if (seq <= presentSeq(self.layer)) return true;
+    setPresentSeq(self.layer, seq);
+    self.layer.setProperty("contents", surface);
+    return true;
+}
+
+/// The sequence number of the newest frame presented (`setSurface`,
+/// `setSurfaceOffMain`). Read and written under the Core Animation lock.
+fn presentSeq(layer: objc.Object) u64 {
+    return @as(u64, @intFromPtr(layer.getInstanceVariable("present_seq").value)) >> 3;
+}
+
+fn setPresentSeq(layer: objc.Object, seq: u64) void {
+    // Shifted like `setHostSize`: the object-typed ivar holds an 8-aligned value, never retained.
+    const stored: usize = @intCast(seq << 3);
+    layer.setInstanceVariable("present_seq", .{ .value = @ptrFromInt(stored) });
+}
 
 const DetachFromHostBlock = objc.Block(struct {
     layer: objc.c.id,
@@ -189,6 +232,13 @@ fn setSurfaceCallback(
         return;
     }
 
+    // A newer frame went to the screen off the main thread meanwhile
+    // (`setSurfaceOffMain`): this older one must not replace it.
+    const CATransaction = objc.getClass("CATransaction").?;
+    CATransaction.msgSend(void, objc.sel("lock"), .{});
+    defer CATransaction.msgSend(void, objc.sel("unlock"), .{});
+    if (block.seq != 0 and block.seq <= presentSeq(layer)) return;
+    if (block.seq != 0) setPresentSeq(layer, block.seq);
     layer.setProperty("contents", surface);
 }
 
@@ -222,6 +272,7 @@ fn getSubclass() error{ObjCFailed}!objc.Class {
     if (!subclass.addIvar("display_cb")) return error.ObjCFailed;
     if (!subclass.addIvar("display_ctx")) return error.ObjCFailed;
     if (!subclass.addIvar("host_size")) return error.ObjCFailed;
+    if (!subclass.addIvar("present_seq")) return error.ObjCFailed;
 
     subclass.replaceMethod("display", struct {
         fn display(target: objc.c.id, sel: objc.c.SEL) callconv(.c) void {

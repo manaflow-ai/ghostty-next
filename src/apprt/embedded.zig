@@ -2270,6 +2270,7 @@ pub const CAPI = struct {
         host_main_draws: u64,
         host_fresh_presents: u64,
         host_late_presents: u64,
+        host_off_main_presents: u64,
     };
 
     /// The renderer's frame counters. See ghostty.h.
@@ -2291,6 +2292,7 @@ pub const CAPI = struct {
             .host_main_draws = hostCounter(surface, "main_draws"),
             .host_fresh_presents = hostCounter(surface, "fresh_presents"),
             .host_late_presents = hostCounter(surface, "late"),
+            .host_off_main_presents = hostCounter(surface, "off_main_presents"),
         };
     }
 
