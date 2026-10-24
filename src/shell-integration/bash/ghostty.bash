@@ -228,9 +228,29 @@ if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )
       [[ -n "$cmd" ]] && __ghostty_preexec "$cmd"
     }'
   else
+    # Bash 4.4-5.2: the hook runs in PS0's command substitution (one fork).
+    # It reads the last history entry through a file in a directory only
+    # this user owns (XDG_RUNTIME_DIR, or TMPDIR as macOS sets it), not
+    # through a second command substitution, so it forks nothing more.
+    # Without such a directory it falls back to `$(...)`.
+    _ghostty_history_file=""
+    for _ghostty_dir in "${XDG_RUNTIME_DIR-}" "${TMPDIR-}"; do
+      if [[ -n "$_ghostty_dir" && -d "$_ghostty_dir" && -O "$_ghostty_dir" && -w "$_ghostty_dir" ]]; then
+        _ghostty_history_file="${_ghostty_dir%/}/ghostty-bash-history.$$"
+        break
+      fi
+    done
+    builtin unset _ghostty_dir
+
     __ghostty_preexec_hook() {
-      builtin local cmd
-      cmd=$(LC_ALL=C HISTTIMEFORMAT='' builtin history 1)
+      builtin local cmd=""
+      if [[ -n "$_ghostty_history_file" ]] &&
+        { LC_ALL=C HISTTIMEFORMAT='' builtin history 1 >|"$_ghostty_history_file"; } 2>/dev/null; then
+        IFS= builtin read -r -d '' cmd <"$_ghostty_history_file"
+        while [[ "$cmd" == *$'\n' ]]; do cmd="${cmd%$'\n'}"; done
+      else
+        cmd=$(LC_ALL=C HISTTIMEFORMAT='' builtin history 1)
+      fi
       cmd="${cmd#*[[:digit:]][* ] }"  # remove leading history number
       [[ -n "$cmd" ]] && __ghostty_preexec "$cmd"
     }
