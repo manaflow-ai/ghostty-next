@@ -18,12 +18,16 @@ pub const Metrics = extern struct {
     cell_height: f64,
     padding_left: f64,
     padding_top: f64,
+    /// The alternate screen is active (a full-screen program).
+    alternate_screen: bool,
 };
 
 pub const Options = struct {
     /// The session host locked the grid (ghostty_surface_set_grid), so
     /// the terminal grid need not match the view's pixel grid.
     grid_locked: bool = false,
+    /// The active screen is the alternate screen.
+    alternate_screen: bool = false,
 };
 
 /// The glyph lead and width of the cell at `pin`; a wide tail or a
@@ -98,6 +102,7 @@ pub fn compute(
         .cell_height = @as(f64, @floatFromInt(size.cell.height)) / scale.y,
         .padding_left = @as(f64, @floatFromInt(size.padding.left)) / scale.x,
         .padding_top = @as(f64, @floatFromInt(size.padding.top)) / scale.y,
+        .alternate_screen = options.alternate_screen,
     };
 }
 

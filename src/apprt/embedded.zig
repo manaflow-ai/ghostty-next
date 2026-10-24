@@ -2331,12 +2331,28 @@ pub const CAPI = struct {
         const locked = surface.core_surface.io.gridState().locked;
         surface.core_surface.renderer_state.mutex.lockUncancelable(global.io());
         defer surface.core_surface.renderer_state.mutex.unlock(global.io());
+        const screens = &surface.core_surface.renderer_state.terminal.screens;
         result.* = grid_metrics.compute(
             surface.core_surface.size,
             surface.content_scale,
-            surface.core_surface.renderer_state.terminal.screens.active,
-            .{ .grid_locked = locked },
+            screens.active,
+            .{ .grid_locked = locked, .alternate_screen = screens.active_key == .alternate },
         ) orelse return false;
+        return true;
+    }
+
+    /// The grid a view of width x height pixels fits, with the surface's
+    /// cell size and configured padding. See ghostty.h.
+    export fn ghostty_surface_fit_grid(
+        surface: *Surface,
+        width: u32,
+        height: u32,
+        cols: *u16,
+        rows: *u16,
+    ) bool {
+        const grid = surface.core_surface.fitGrid(.{ .width = width, .height = height }) orelse return false;
+        cols.* = std.math.cast(u16, grid.columns) orelse return false;
+        rows.* = std.math.cast(u16, grid.rows) orelse return false;
         return true;
     }
 

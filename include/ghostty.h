@@ -687,6 +687,8 @@ typedef struct {
   double cell_height;
   double padding_left;
   double padding_top;
+  // The alternate screen is active (a full-screen program).
+  bool alternate_screen;
 } ghostty_surface_grid_metrics_s;
 
 // The terminal grid of a surface, see ghostty_surface_grid.
@@ -1487,6 +1489,18 @@ GHOSTTY_API ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
 // metrics describe the locked grid. Takes the terminal lock briefly.
 GHOSTTY_API bool ghostty_surface_grid_metrics(ghostty_surface_t,
                                               ghostty_surface_grid_metrics_s*);
+// The grid a view of width x height pixels would fit, with the surface's
+// current cell size and configured window padding: the grid
+// ghostty_surface_set_size would give that size (ghostty_surface_size
+// columns and rows), without resizing anything. An embedder whose view
+// will take a size later (a layout animation's final frame) reports the
+// final grid to the PTY owner now. Returns false, and writes nothing,
+// before the font is loaded or when no whole cell fits. Main thread.
+GHOSTTY_API bool ghostty_surface_fit_grid(ghostty_surface_t,
+                                          uint32_t width,
+                                          uint32_t height,
+                                          uint16_t* cols,
+                                          uint16_t* rows);
 // Lock the terminal grid of a MANUAL or MANUAL_MIRROR surface to
 // cols x rows, the grid of the terminal core that owns the byte stream,
 // independent of the view's pixel size. Call it from the output queue

@@ -2933,6 +2933,42 @@ fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
     };
 }
 
+/// The grid a screen of `screen` pixels fits: the grid `resize` would
+/// give it, from the configured padding (balanced padding is computed
+/// after the grid, so it never changes it). Null for a zero cell or a
+/// screen with no whole cell. Main thread, like `resize`.
+pub fn fitGrid(self: *const Surface, screen: rendererpkg.ScreenSize) ?rendererpkg.GridSize {
+    if (self.size.cell.width == 0 or self.size.cell.height == 0) return null;
+    const content_scale = self.rt_surface.getContentScale() catch return null;
+    return fitGridSize(screen, self.size.cell, self.config.scaledPadding(
+        content_scale.x * font.face.default_dpi,
+        content_scale.y * font.face.default_dpi,
+    ));
+}
+
+fn fitGridSize(screen: rendererpkg.ScreenSize, cell: rendererpkg.CellSize, padding: rendererpkg.Padding) ?rendererpkg.GridSize {
+    const grid: rendererpkg.GridSize = .init(screen.subPadding(padding), cell);
+    if (grid.columns == 0 or grid.rows == 0) return null;
+    return grid;
+}
+
+test "fitGrid gives the grid resize gives the same screen" {
+    const testing = std.testing;
+    const cell: rendererpkg.CellSize = .{ .width = 10, .height = 20 };
+    const padding: rendererpkg.Padding = .{ .top = 4, .bottom = 6, .left = 3, .right = 7 };
+    const screen: rendererpkg.ScreenSize = .{ .width = 809, .height = 419 };
+    var size: rendererpkg.Size = .{ .screen = screen, .cell = cell, .padding = padding };
+    const fit = fitGridSize(screen, cell, padding).?;
+    try testing.expectEqual(size.grid(), fit);
+    try testing.expectEqual(@as(rendererpkg.GridSize.Unit, 79), fit.columns);
+    try testing.expectEqual(@as(rendererpkg.GridSize.Unit, 20), fit.rows);
+    // Balanced padding is computed after the grid and keeps it.
+    size.balancePadding(padding, .true);
+    try testing.expectEqual(size.grid(), fit);
+    // A screen smaller than one cell after padding fits no grid.
+    try testing.expect(fitGridSize(.{ .width = 19, .height = 419 }, cell, padding) == null);
+}
+
 /// Recalculate the balanced padding if needed.
 fn balancePaddingIfNeeded(self: *Surface) void {
     if (self.config.window_padding_balance == .false) return;
