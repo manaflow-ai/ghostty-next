@@ -3975,7 +3975,15 @@ test "manual: a handed-over wheel scroll follows the mode the terminal has when 
             try sink.expect("\x1b[A");
 
             // Mouse reporting (SGR) turned on instead: a wheel-down report.
-            io.processOutput("\x1b[?1049l\x1b[?1000h\x1b[?1006h");
+            // (Set on the terminal directly: the mode's escape also tells the
+            // surface's mailbox, which this harness has not.)
+            io.processOutput("\x1b[?1049l");
+            {
+                io.renderer_state.mutex.lockUncancelable(global.io());
+                defer io.renderer_state.mutex.unlock(global.io());
+                io.terminal.flags.mouse_event = .normal;
+                io.terminal.flags.mouse_format = .sgr;
+            }
             try sink.expect("");
             var down = wheel;
             down.delta_y = -1;
@@ -3984,7 +3992,12 @@ test "manual: a handed-over wheel scroll follows the mode the terminal has when 
             sink.out.clearRetainingCapacity();
 
             // Still plain: the viewport scrolls and nothing is written.
-            io.processOutput("\x1b[?1000l\x1b[?1006l");
+            {
+                io.renderer_state.mutex.lockUncancelable(global.io());
+                defer io.renderer_state.mutex.unlock(global.io());
+                io.terminal.flags.mouse_event = .none;
+                io.terminal.flags.mouse_format = .x10;
+            }
             for (0..40) |_| io.processOutput("line\r\n");
             var up = wheel;
             up.delta_y = 3;
