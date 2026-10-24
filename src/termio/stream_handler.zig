@@ -38,6 +38,7 @@ fn isReply(msg: termio.Message) bool {
         .crash,
         .change_config,
         .inspector,
+        .scroll_wheel,
         .resize,
         .clear_screen,
         .scroll_viewport,

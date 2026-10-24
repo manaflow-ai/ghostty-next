@@ -6,26 +6,26 @@ const termio = @import("../termio.zig");
 const input = @import("../input.zig");
 const MessageData = @import("../datastruct/main.zig").MessageData;
 
-/// A handed-over wheel scroll (``Message.scroll_wheel``). Carries what the
-/// main thread knew at the event: the vertical rows (positive up, as
-/// Surface's ScrollAmount), the modifiers, the pointer in surface pixels,
-/// whether a mouse button was held, and whether the config allows mouse
-/// reporting.
-pub const ScrollWheel = struct {
-    delta_y: isize,
-    x: f32,
-    y: f32,
-    mods: input.Mods,
-    any_button_pressed: bool,
-    mouse_reporting: bool,
-};
-
 /// The messages that can be sent to an IO thread.
 ///
 /// This is not a tiny structure (~40 bytes at the time of writing this comment),
 /// but the number of messages we send to the IO thread is also very small.
 /// At the current size we can queue 26,000 messages before consuming a MB of RAM.
 pub const Message = union(enum) {
+    /// A handed-over wheel scroll (``Message.scroll_wheel``). Carries what the
+    /// main thread knew at the event: the vertical rows (positive up, as
+    /// Surface's ScrollAmount), the modifiers, the pointer in surface pixels,
+    /// whether a mouse button was held, and whether the config allows mouse
+    /// reporting.
+    pub const ScrollWheel = struct {
+        delta_y: isize,
+        x: f32,
+        y: f32,
+        mods: input.Mods,
+        any_button_pressed: bool,
+        mouse_reporting: bool,
+    };
+
     /// Represents a write request. Magic number comes from the largest
     /// other union value. It can be upped if we add a larger union member
     /// in the future.
