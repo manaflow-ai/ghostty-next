@@ -41,6 +41,12 @@ reflow_preview: std.atomic.Value(bool) = .init(false),
 /// thread, read by the output queue (`Termio.processOutputLocked`).
 output_wakes: std.atomic.Value(bool) = .init(true),
 
+/// Whether a wheel event is a plain viewport scroll: no mouse reporting and no
+/// alternate-screen arrow-key scrolling. Published by the renderer at each
+/// frame update (under the terminal lock); the main thread reads it without
+/// the lock to hand a scroll to the termio thread when the lock is busy.
+scroll_plain: std.atomic.Value(bool) = .init(true),
+
 /// Output chunks that did not wake the renderer (`output_wakes` false).
 output_wakes_skipped: std.atomic.Value(u64) = .init(0),
 

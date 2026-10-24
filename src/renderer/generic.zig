@@ -1581,6 +1581,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     return;
                 }
                 if (@hasDecl(GraphicsAPI, "setFramesHeld")) self.api.setFramesHeld(false);
+                {
+                    const t = state.terminal;
+                    const alt_arrows = t.screens.active_key == .alternate and
+                        t.flags.mouse_event == .none and t.modes.get(.mouse_alternate_scroll);
+                    state.scroll_plain.store(t.flags.mouse_event == .none and !alt_arrows, .release);
+                }
 
                 // If scroll-to-bottom on output is enabled, check if the final line
                 // changed by comparing the bottom-right pin. If the node pointer or

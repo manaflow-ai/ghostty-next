@@ -4009,8 +4009,21 @@ pub fn scrollCallback(
 
     // log.info("SCROLL: delta_y={} delta_x={}", .{ y.delta, x.delta });
 
-    {
+    // While output is parsed under the terminal lock, the main thread must
+    // not wait for it per wheel event (a fling over a busy terminal dropped
+    // frames). A plain viewport scroll (what the renderer last saw: no mouse
+    // reporting, no alternate-screen arrows) goes to the termio thread, which
+    // applies it under the lock and redraws. A mode change in the chunk being
+    // parsed can misroute that one event; everything else waits as before.
+    if (!self.renderer_state.mutex.tryLock()) {
+        if (x.delta == 0 and self.renderer_state.scroll_plain.load(.acquire)) {
+            if (y.delta != 0) self.queueIo(.{ .scroll_viewport = .{ .delta = y.delta * -1 } }, .unlocked);
+            return;
+        }
         self.renderer_state.mutex.lockUncancelable(global.io());
+    }
+
+    {
         defer self.renderer_state.mutex.unlock(global.io());
 
         // If we have an active mouse reporting mode, clear the selection.

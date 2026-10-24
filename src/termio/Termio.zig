@@ -1855,9 +1855,14 @@ pub fn scrollViewport(
     self: *Termio,
     scroll: terminalpkg.Terminal.ScrollViewport,
 ) void {
-    self.renderer_state.mutex.lockUncancelable(global.io());
-    defer self.renderer_state.mutex.unlock(global.io());
-    self.scrollViewportLocked(scroll);
+    {
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+        self.scrollViewportLocked(scroll);
+    }
+    // The termio thread applies scrolls the main thread handed over while
+    // the lock was busy (Surface.scrollCallback): draw them.
+    self.renderer_wakeup.notify() catch {};
 }
 
 /// Scroll the viewport for the person (the wheel, keys, a binding, the
