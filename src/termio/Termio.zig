@@ -18,6 +18,7 @@ const global = @import("../global.zig");
 const xev = global.xev;
 const renderer = @import("../renderer.zig");
 const apprt = @import("../apprt.zig");
+const inputpkg = @import("../input.zig");
 const internal_os = @import("../os/main.zig");
 const windows = internal_os.windows;
 const configpkg = @import("../config.zig");
@@ -1885,6 +1886,60 @@ pub fn scrollViewportLocked(
         self.renderer_state.hold_frames = true;
     }
     self.terminal.scrollViewport(scroll);
+}
+
+/// Applies a wheel scroll the main thread handed over (``Message.scroll_wheel``)
+/// under the terminal lock, by the mode the terminal has now: the handoff
+/// decided on what the renderer last saw, and output parsed since may have
+/// turned on mouse reporting or alternate-screen arrow scrolling. Same
+/// encodings as Surface.scrollCallback.
+pub fn scrollWheel(self: *Termio, td: *ThreadData, w: termio.Message.ScrollWheel) void {
+    if (w.delta_y == 0) return;
+    {
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+        const t = &self.terminal;
+        const up = w.delta_y > 0;
+        const rows: usize = @intCast(@abs(w.delta_y));
+        if (t.screens.active_key == .alternate and t.flags.mouse_event == .none and
+            t.modes.get(.mouse_alternate_scroll))
+        {
+            t.screens.active.clearSelection();
+            const seq: []const u8 = if (t.modes.get(.cursor_keys))
+                (if (up) "\x1bOA" else "\x1bOB")
+            else
+                (if (up) "\x1b[A" else "\x1b[B");
+            const linefeed = t.modes.get(.linefeed);
+            for (0..rows) |_| self.queueWrite(td, seq, linefeed) catch |err| {
+                log.warn("handed-over wheel scroll write failed err={}", .{err});
+                return;
+            };
+        } else if (w.mouse_reporting and t.flags.mouse_event != .none) {
+            t.screens.active.clearSelection();
+            var opts: inputpkg.mouse_encode.Options = .fromTerminal(t, self.size);
+            opts.any_button_pressed = w.any_button_pressed;
+            const linefeed = t.modes.get(.linefeed);
+            for (0..rows) |_| {
+                var data: [64]u8 = undefined;
+                var writer: std.Io.Writer = .fixed(&data);
+                inputpkg.mouse_encode.encode(&writer, .{
+                    .button = if (up) .four else .five,
+                    .action = .press,
+                    .mods = w.mods,
+                    .pos = .{ .x = w.x, .y = w.y },
+                }, opts) catch return;
+                const written = writer.buffered();
+                if (written.len == 0) continue;
+                self.queueWrite(td, written, linefeed) catch |err| {
+                    log.warn("handed-over wheel report write failed err={}", .{err});
+                    return;
+                };
+            }
+        } else {
+            self.scrollViewportLocked(.{ .delta = w.delta_y * -1 });
+        }
+    }
+    self.renderer_wakeup.notify() catch {};
 }
 
 /// Jump the viewport to the prompt.
@@ -3895,6 +3950,52 @@ test "manual: output does not wake a renderer that asked for no output wakes" {
         }
     }.run;
     try testManualTermio(true, body);
+}
+
+test "manual: a handed-over wheel scroll follows the mode the terminal has when applied" {
+    const body = struct {
+        fn run(io: *Termio, sink: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            var td = io.manualThreadData();
+            const wheel = termio.Message.ScrollWheel{
+                .delta_y = 1,
+                .x = 5,
+                .y = 5,
+                .mods = .{},
+                .any_button_pressed = false,
+                .mouse_reporting = true,
+            };
+            try sink.expect("");
+
+            // The main thread saw a plain scroll; output parsed since turned on
+            // the alternate screen with alternate scroll: arrow keys, no scroll.
+            io.processOutput("\x1b[?1049h\x1b[?1007h");
+            try sink.expect("");
+            io.scrollWheel(&td, wheel);
+            try sink.expect("\x1b[A");
+
+            // Mouse reporting (SGR) turned on instead: a wheel-down report.
+            io.processOutput("\x1b[?1049l\x1b[?1000h\x1b[?1006h");
+            try sink.expect("");
+            var down = wheel;
+            down.delta_y = -1;
+            io.scrollWheel(&td, down);
+            try testing.expect(std.mem.startsWith(u8, sink.out.items, "\x1b[<65;"));
+            sink.out.clearRetainingCapacity();
+
+            // Still plain: the viewport scrolls and nothing is written.
+            io.processOutput("\x1b[?1000l\x1b[?1006l");
+            for (0..40) |_| io.processOutput("line\r\n");
+            var up = wheel;
+            up.delta_y = 3;
+            io.scrollWheel(&td, up);
+            try sink.expect("");
+            io.renderer_state.mutex.lockUncancelable(global.io());
+            defer io.renderer_state.mutex.unlock(global.io());
+            try testing.expect(io.terminal.screens.active.pages.viewport != .active);
+        }
+    }.run;
+    try testManualTermio(false, body);
 }
 
 test "manual: snapshot local history restore does not undo a change between the swaps" {

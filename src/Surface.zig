@@ -4017,7 +4017,21 @@ pub fn scrollCallback(
     // parsed can misroute that one event; everything else waits as before.
     if (!self.renderer_state.mutex.tryLock()) {
         if (x.delta == 0 and self.renderer_state.scroll_plain.load(.acquire)) {
-            if (y.delta != 0) self.queueIo(.{ .scroll_viewport = .{ .delta = y.delta * -1 } }, .unlocked);
+            if (y.delta != 0) {
+                const pos = try self.rt_surface.getCursorPos();
+                const pressed = pressed: {
+                    for (self.mouse.click_state) |state| if (state != .release) break :pressed true;
+                    break :pressed false;
+                };
+                self.queueIo(.{ .scroll_wheel = .{
+                    .delta_y = y.delta,
+                    .x = pos.x,
+                    .y = pos.y,
+                    .mods = self.mouse.mods,
+                    .any_button_pressed = pressed,
+                    .mouse_reporting = self.config.mouse_reporting,
+                } }, .unlocked);
+            }
             return;
         }
         self.renderer_state.mutex.lockUncancelable(global.io());

@@ -328,6 +328,7 @@ fn drainMailbox(
             .size_report => |v| try io.sizeReport(data, v),
             .clear_screen => |v| try io.clearScreen(data, v.history),
             .scroll_viewport => |v| io.scrollViewport(v),
+            .scroll_wheel => |v| io.scrollWheel(data, v),
             .selection_scroll => |v| {
                 if (v) {
                     self.startScrollTimer(cb);

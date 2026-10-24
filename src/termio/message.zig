@@ -3,7 +3,22 @@ const Allocator = std.mem.Allocator;
 const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
 const termio = @import("../termio.zig");
+const input = @import("../input.zig");
 const MessageData = @import("../datastruct/main.zig").MessageData;
+
+/// A handed-over wheel scroll (``Message.scroll_wheel``). Carries what the
+/// main thread knew at the event: the vertical rows (positive up, as
+/// Surface's ScrollAmount), the modifiers, the pointer in surface pixels,
+/// whether a mouse button was held, and whether the config allows mouse
+/// reporting.
+pub const ScrollWheel = struct {
+    delta_y: isize,
+    x: f32,
+    y: f32,
+    mods: input.Mods,
+    any_button_pressed: bool,
+    mouse_reporting: bool,
+};
 
 /// The messages that can be sent to an IO thread.
 ///
@@ -61,6 +76,12 @@ pub const Message = union(enum) {
 
     /// Scroll the viewport
     scroll_viewport: terminal.Terminal.ScrollViewport,
+
+    /// A wheel scroll the main thread handed over because the terminal lock
+    /// was busy (Surface.scrollCallback). Applied under the lock by the mode
+    /// the terminal has then (``Termio.scrollWheel``): a viewport scroll,
+    /// alternate-screen arrow keys, or mouse reports.
+    scroll_wheel: ScrollWheel,
 
     /// Selection scrolling. If this is set to true then the termio
     /// thread starts a timer that will trigger a `selection_scroll_tick`
