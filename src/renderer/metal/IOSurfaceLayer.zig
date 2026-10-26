@@ -36,6 +36,7 @@ pub fn init() !IOSurfaceLayer {
     layer.setInstanceVariable("display_cb", .{ .value = null });
     layer.setInstanceVariable("display_ctx", .{ .value = null });
     layer.setInstanceVariable("host_size", .{ .value = null });
+    layer.setInstanceVariable("overlay_gen", .{ .value = null });
 
     return .{ .layer = layer };
 }
@@ -80,16 +81,38 @@ pub fn detachFromHostIfDisplayCallbackOwned(
 /// width << 32 | height; 0 when the target follows the bounds), which
 /// `setSurfaceCallback` checks frames against. Main thread.
 pub fn setHostSize(self: *IOSurfaceLayer, value: u64) void {
-    // Stored shifted left by 3 so the object-typed ivar holds an 8-aligned
-    // pointer value (safe builds check the alignment of @ptrFromInt). The
-    // ivar is never retained or released (no ARC layout on this class).
-    const stored: usize = @intCast(value << 3);
-    self.layer.setInstanceVariable("host_size", .{ .value = @ptrFromInt(stored) });
+    setIntIvar(self.layer, "host_size", value);
 }
 
 /// The value `setHostSize` stored.
 fn hostSize(layer: objc.Object) u64 {
-    return @as(u64, @intFromPtr(layer.getInstanceVariable("host_size").value)) >> 3;
+    return intIvar(layer, "host_size");
+}
+
+/// The off-main present forms (`OffMainPresenter`): the generation of the
+/// main thread's last hide of the overlay layer. A reveal posted by the
+/// renderer shows the overlay again only in its own generation; the value
+/// lives on the layer so the reveal block never reads renderer memory.
+/// Main thread.
+pub fn setOverlayGeneration(layer: objc.Object, value: u64) void {
+    setIntIvar(layer, "overlay_gen", value);
+}
+
+/// The value `setOverlayGeneration` stored. Main thread.
+pub fn overlayGeneration(layer: objc.Object) u64 {
+    return intIvar(layer, "overlay_gen");
+}
+
+fn setIntIvar(layer: objc.Object, comptime name: [:0]const u8, value: u64) void {
+    // Stored shifted left by 3 so the object-typed ivar holds an 8-aligned
+    // pointer value (safe builds check the alignment of @ptrFromInt). The
+    // ivar is never retained or released (no ARC layout on this class).
+    const stored: usize = @intCast(value << 3);
+    layer.setInstanceVariable(name, .{ .value = @ptrFromInt(stored) });
+}
+
+fn intIvar(layer: objc.Object, comptime name: [:0]const u8) u64 {
+    return @as(u64, @intFromPtr(layer.getInstanceVariable(name).value)) >> 3;
 }
 
 /// Sets the layer's `contents` to the provided IOSurface.
@@ -222,6 +245,7 @@ fn getSubclass() error{ObjCFailed}!objc.Class {
     if (!subclass.addIvar("display_cb")) return error.ObjCFailed;
     if (!subclass.addIvar("display_ctx")) return error.ObjCFailed;
     if (!subclass.addIvar("host_size")) return error.ObjCFailed;
+    if (!subclass.addIvar("overlay_gen")) return error.ObjCFailed;
 
     subclass.replaceMethod("display", struct {
         fn display(target: objc.c.id, sel: objc.c.SEL) callconv(.c) void {

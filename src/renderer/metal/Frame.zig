@@ -12,6 +12,7 @@ const Target = @import("Target.zig");
 const RenderPass = @import("RenderPass.zig");
 
 const Health = @import("../../renderer.zig").Health;
+const OffMainPresenter = @import("OffMainPresenter.zig");
 
 const log = std.log.scoped(.metal);
 
@@ -48,6 +49,7 @@ pub fn begin(
             .renderer = renderer,
             .target = target,
             .sync = false,
+            .ticket = .{},
         },
         &bufferCompleted,
     );
@@ -60,6 +62,9 @@ const CompletionBlock = objc.Block(struct {
     renderer: *Renderer,
     target: *Target,
     sync: bool,
+    /// What the off-main present form encoded for this frame
+    /// (`Metal.encodePresent`); empty for a synchronous frame.
+    ticket: OffMainPresenter.Ticket = .{},
 }, .{
     objc.c.id, // MTLCommandBuffer
 }, void);
@@ -82,6 +87,7 @@ fn bufferCompleted(
         block.renderer.api.present(
             block.target.*,
             block.sync,
+            block.ticket,
         ) catch |err| {
             log.err("Failed to present render target: err={}", .{err});
         };
@@ -112,6 +118,8 @@ pub inline fn complete(self: *Self, sync: bool) void {
     // It will be copied when we add the handler, and then the
     // copy will be deallocated by the objc runtime on success.
     if (!sync) {
+        // Before the handler is added: the block is copied then.
+        self.block.ticket = self.block.renderer.api.encodePresent(self.buffer, self.block.target);
         self.buffer.msgSend(
             void,
             objc.sel("addCompletedHandler:"),

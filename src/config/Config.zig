@@ -3478,6 +3478,25 @@ keybind: Keybinds = .{},
 /// find false more visually appealing.
 @"macos-window-shadow": bool = true,
 
+/// How a macOS surface's renderer shows its frames. A measurement spike
+/// (cmux plans/cmux-next/rendering-DESIGN.md, "Spike 017"); the default
+/// keeps the shipped behavior.
+///
+///   * `main-contents` - each frame drawn on the renderer thread is set as
+///     the surface layer's `contents` on the main thread (one main-queue
+///     turn per frame).
+///   * `metal-layer` - each frame is copied into a `CAMetalLayer` drawable
+///     and presented from the renderer thread with
+///     `presentsWithTransaction = false` (no Core Animation transaction).
+///   * `layer-host` - each frame is committed by the renderer in its own
+///     `CAContext` and shown through a `CALayerHost` in the view.
+///
+/// In both off-main forms a frame drawn for a new size is still presented
+/// in the main thread's transaction (the resize pre-commit), and the main
+/// thread shows the off-main layer again after the renderer's next frame.
+/// Read when the surface is created.
+@"macos-present-form": MacPresentForm = .@"main-contents",
+
 /// If true, the macOS icon in the dock and app switcher will be hidden. This is
 /// mainly intended for those primarily using the quick-terminal mode.
 ///
@@ -9345,6 +9364,13 @@ pub const MacTitlebarProxyIcon = enum {
 pub const MacHidden = enum {
     never,
     always,
+};
+
+/// See macos-present-form
+pub const MacPresentForm = enum {
+    @"main-contents",
+    @"metal-layer",
+    @"layer-host",
 };
 
 /// See macos-icon

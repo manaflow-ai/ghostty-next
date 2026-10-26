@@ -730,6 +730,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             background_blur: configpkg.Config.BackgroundBlur,
             scroll_to_bottom_on_output: bool,
             custom_shader_animation: configpkg.CustomShaderAnimation,
+            present_form: configpkg.Config.MacPresentForm,
 
             pub fn init(
                 alloc_gpa: Allocator,
@@ -806,6 +807,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .background_blur = config.@"background-blur",
                     .scroll_to_bottom_on_output = config.@"scroll-to-bottom".output,
                     .custom_shader_animation = config.@"custom-shader-animation",
+                    .present_form = config.@"macos-present-form",
                     .arena = arena,
                 };
             }

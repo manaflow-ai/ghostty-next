@@ -19,6 +19,7 @@ const IOSurface = macos.iosurface.IOSurface;
 
 const mtl = @import("metal/api.zig");
 const IOSurfaceLayer = @import("metal/IOSurfaceLayer.zig");
+const OffMainPresenter = @import("metal/OffMainPresenter.zig");
 pub const Device = @import("metal/Device.zig");
 
 pub const GraphicsAPI = Metal;
@@ -42,6 +43,15 @@ pub const swap_chain_count = 3;
 const log = std.log.scoped(.metal);
 
 layer: IOSurfaceLayer,
+
+/// macOS, `macos-present-form` other than `main-contents`: the layer above
+/// `layer` that the renderer shows its frames in without the main thread
+/// (OffMainPresenter). Null: every frame goes through the main queue.
+offmain: ?OffMainPresenter = null,
+
+/// Frames that the renderer handed to the main queue (`setSurface`), in
+/// every present form: the main-thread turns that frames cost.
+main_hops: std.atomic.Value(u64) = .init(0),
 
 /// The shared render device.
 device: *const Device,
@@ -194,15 +204,45 @@ pub fn init(
     // This makes it so that our display callback will actually be called.
     layer.layer.setProperty("needsDisplayOnBoundsChange", true);
 
+    const offmain: ?OffMainPresenter = if (comptime builtin.os.tag == .macos) offmain: {
+        const form: OffMainPresenter.Form = switch (opts.config.present_form) {
+            .@"main-contents" => break :offmain null,
+            .@"metal-layer" => .metal_layer,
+            .@"layer-host" => .layer_host,
+        };
+        break :offmain OffMainPresenter.init(
+            form,
+            layer.layer,
+            mtl_device,
+            targetPixelFormat(opts.config.blending),
+            info.scaleFactor,
+        ) catch |err| {
+            log.warn("present form {s} unavailable, using main-contents err={}", .{ @tagName(form), err });
+            break :offmain null;
+        };
+    } else null;
+
     return .{
         .layer = layer,
+        .offmain = offmain,
         .device = device,
         .queue = queue,
         .blending = opts.config.blending,
     };
 }
 
+fn targetPixelFormat(blending: configpkg.Config.AlphaBlending) mtl.MTLPixelFormat {
+    // Using an `*_srgb` pixel format makes Metal gamma encode the pixels
+    // written to it *after* blending, which means we get linear alpha
+    // blending rather than gamma-incorrect blending.
+    return if (blending.isLinear()) .bgra8unorm_srgb else .bgra8unorm;
+}
+
 pub fn deinit(self: *Metal) void {
+    if (comptime builtin.os.tag == .macos) {
+        const main_hops = self.main_hops.load(.monotonic);
+        if (self.offmain) |*p| p.deinit(main_hops) else OffMainPresenter.logMainContents(main_hops);
+    }
     self.queue.release();
     if (self.fresh.surface) |surface| surface.release();
 
@@ -261,6 +301,7 @@ pub fn setHostDrawableSize(self: *Metal, enabled: bool, width_px: u32, height_px
     else
         0;
     if (self.host_size.swap(value, .acq_rel) == value) return;
+    if (value != 0) if (self.offmain) |*p| p.setAcceptSize(value);
     self.host_size_set_at = .now(global.io(), .awake);
     // A fresh frame kept from an earlier size is not this size's frame,
     // even when the sizes are equal (a drag back): only a frame published
@@ -382,30 +423,48 @@ pub fn surfaceSize(self: *const Metal) !struct { width: u32, height: u32 } {
 pub fn initTarget(self: *const Metal, width: usize, height: usize) !Target {
     return Target.init(.{
         .device = self.device.device,
-        // Using an `*_srgb` pixel format makes Metal gamma encode the pixels
-        // written to it *after* blending, which means we get linear alpha
-        // blending rather than gamma-incorrect blending.
-        .pixel_format = if (self.blending.isLinear())
-            .bgra8unorm_srgb
-        else
-            .bgra8unorm,
+        .pixel_format = targetPixelFormat(self.blending),
         .storage_mode = self.device.default_storage_mode,
         .width = width,
         .height = height,
     });
 }
 
-/// Present the provided target.
-pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
+/// Renderer thread, before the frame's command buffer commits: the
+/// off-main present form encodes what it needs (OffMainPresenter.encode).
+pub fn encodePresent(self: *Metal, buffer: objc.Object, target: *const Target) OffMainPresenter.Ticket {
+    if (comptime builtin.os.tag != .macos) return .{};
+    if (self.offmain) |*p| return p.encode(buffer, target.texture, target.width, target.height);
+    return .{};
+}
+
+/// Present the provided target. `sync`: on the main thread, in its
+/// transaction. Otherwise on the GPU completion thread, with the `ticket`
+/// that `encodePresent` returned for the frame.
+pub inline fn present(self: *Metal, target: Target, sync: bool, ticket: OffMainPresenter.Ticket) !void {
     if (sync) {
-        self.layer.setSurfaceSync(target.surface);
-    } else {
-        if (comptime builtin.os.tag == .macos) {
-            if (target.cells_fresh and self.fresh.armed.load(.acquire) and
-                target.size_generation == self.fresh.generation.load(.acquire) and
-                self.host_size.load(.acquire) != 0) self.publishFresh(target.surface);
+        self.presentOnMain(target.surface);
+        return;
+    }
+    if (comptime builtin.os.tag == .macos) {
+        if (target.cells_fresh and self.fresh.armed.load(.acquire) and
+            target.size_generation == self.fresh.generation.load(.acquire) and
+            self.host_size.load(.acquire) != 0) self.publishFresh(target.surface);
+        if (self.offmain) |*p| {
+            if (p.present(self.layer.layer, target.surface, ticket)) return;
         }
-        try self.layer.setSurface(target.surface);
+    }
+    _ = self.main_hops.fetchAdd(1, .monotonic);
+    try self.layer.setSurface(target.surface);
+}
+
+/// Sets `surface` as the layer's contents in the main thread's
+/// transaction; an off-main overlay hides in the same transaction until the
+/// renderer's next frame. Main thread.
+fn presentOnMain(self: *Metal, surface: *IOSurface) void {
+    self.layer.setSurfaceSync(surface);
+    if (comptime builtin.os.tag == .macos) {
+        if (self.offmain) |*p| p.mainPresented(self.layer.layer, surface.getWidth(), surface.getHeight());
     }
 }
 
@@ -468,9 +527,9 @@ pub fn presentHostSized(self: *Metal) bool {
     if (!self.visible_hint.load(.acquire)) return true;
     const width: usize = @intCast(host >> 32);
     const height: usize = @intCast(host & 0xffff_ffff);
-    const shown = self.layer.layer.getProperty(?*anyopaque, "contents") orelse return false;
-    const shown_surface: *IOSurface = @ptrCast(shown);
-    if (shown_surface.getWidth() == width and shown_surface.getHeight() == height) {
+    const shown = self.shownSize();
+    if (shown == 0) return false;
+    if (shown == OffMainPresenter.pack(width, height)) {
         // The renderer thread's frame at this size already landed.
         if (self.takeFresh(width, height)) |surface| surface.release();
         return true;
@@ -482,7 +541,7 @@ pub fn presentHostSized(self: *Metal) bool {
         const seq = self.fresh.seq.load(.acquire);
         if (self.takeFresh(width, height)) |surface| {
             defer surface.release();
-            self.layer.setSurfaceSync(surface);
+            self.presentOnMain(surface);
             _ = self.counters.fresh_presents.fetchAdd(1, .monotonic);
             return true;
         }
@@ -504,6 +563,14 @@ pub fn presentHostSized(self: *Metal) bool {
     // lands through `setSurface` when it completes.
     _ = self.counters.late.fetchAdd(1, .monotonic);
     return true;
+}
+
+/// The pixel size of the frame on screen, 0 before the first. Main thread.
+fn shownSize(self: *const Metal) u64 {
+    if (self.offmain) |*p| return p.shownSize(self.layer.layer);
+    const shown = self.layer.layer.getProperty(?*anyopaque, "contents") orelse return 0;
+    const surface: *IOSurface = @ptrCast(shown);
+    return OffMainPresenter.pack(surface.getWidth(), surface.getHeight());
 }
 
 /// The host size generation a frame drawn now belongs to (Target.size_generation).
