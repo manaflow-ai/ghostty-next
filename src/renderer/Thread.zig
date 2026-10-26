@@ -115,6 +115,12 @@ flags: packed struct {
 
     /// The last display-link tick drew a frame.
     last_tick_drew: bool = false,
+
+    /// Energy Saver is on (`ghostty_app_set_energy_saver`): animation
+    /// wakes wait at least 33 ms and compression steps run at utility
+    /// QoS. The surface sets it before the thread starts, the
+    /// `.energy_saver` message after.
+    energy_saver: bool = false,
 } = .{},
 
 pub const DerivedConfig = struct {
@@ -274,33 +280,60 @@ fn threadMain_(self: *Thread) !void {
 }
 
 fn setQosClass(self: *const Thread) void {
-    // Thread QoS classes are only relevant on macOS.
+    applyQosClass(qosClass(self.flags.visible, self.flags.focused));
+}
+
+/// Sets the running thread's QoS class. Thread QoS classes are only
+/// relevant on macOS.
+fn applyQosClass(class: internal_os.macos.QosClass) void {
     if (comptime !builtin.target.os.tag.isDarwin()) return;
-
-    const class: internal_os.macos.QosClass = class: {
-        // If we aren't visible (our view is fully occluded) then we
-        // always drop our rendering priority down because it's just
-        // mostly wasted work.
-        //
-        // The renderer itself should be doing this as well (for example
-        // Metal will stop our DisplayLink) but this also helps with
-        // general forced updates and CPU usage i.e. a rebuild cells call.
-        if (!self.flags.visible) break :class .utility;
-
-        // If we're not focused, but we're visible, then we set a higher
-        // than default priority because framerates still matter but it isn't
-        // as important as when we're focused.
-        if (!self.flags.focused) break :class .user_initiated;
-
-        // We are focused and visible, we are the definition of user interactive.
-        break :class .user_interactive;
-    };
 
     if (internal_os.macos.setQosClass(class)) {
         log.debug("thread QoS class set class={}", .{class});
     } else |err| {
         log.warn("error setting QoS class err={}", .{err});
     }
+}
+
+/// The renderer thread's QoS class for its view's state.
+fn qosClass(visible: bool, focused: bool) internal_os.macos.QosClass {
+    // If we aren't visible (our view is fully occluded) then we
+    // always drop our rendering priority down because it's just
+    // mostly wasted work.
+    //
+    // The renderer itself should be doing this as well (for example
+    // Metal will stop our DisplayLink) but this also helps with
+    // general forced updates and CPU usage i.e. a rebuild cells call.
+    if (!visible) return .utility;
+
+    // If we're not focused, but we're visible, then we set a higher
+    // than default priority because framerates still matter but it isn't
+    // as important as when we're focused.
+    if (!focused) return .user_initiated;
+
+    // We are focused and visible, we are the definition of user interactive.
+    return .user_interactive;
+}
+
+/// The QoS class a scrollback compression step runs at, or null to run
+/// it at the thread's own class. Under Energy Saver compression is
+/// deferrable maintenance, as Chrome runs it at
+/// `base::TaskPriority::BEST_EFFORT` (base/task/task_traits.h): utility,
+/// so it never competes with frames of a visible terminal.
+fn compressionQosClass(visible: bool, focused: bool, saver: bool) ?internal_os.macos.QosClass {
+    if (!saver) return null;
+    if (qosClass(visible, focused) == .utility) return null;
+    return .utility;
+}
+
+test "renderer thread: compression steps run at utility QoS under Energy Saver" {
+    const testing = std.testing;
+    try testing.expectEqual(@as(?internal_os.macos.QosClass, null), compressionQosClass(true, true, false));
+    try testing.expectEqual(@as(?internal_os.macos.QosClass, null), compressionQosClass(false, false, false));
+    try testing.expectEqual(@as(?internal_os.macos.QosClass, .utility), compressionQosClass(true, true, true));
+    try testing.expectEqual(@as(?internal_os.macos.QosClass, .utility), compressionQosClass(true, false, true));
+    // A hidden thread already runs at utility: no switch.
+    try testing.expectEqual(@as(?internal_os.macos.QosClass, null), compressionQosClass(false, true, true));
 }
 
 /// Drain the mailbox.
@@ -453,6 +486,15 @@ fn drainMailbox(self: *Thread) !void {
 
             .inspector => |v| {
                 self.flags.has_inspector = v;
+            },
+
+            .energy_saver => |v| saver: {
+                if (self.flags.energy_saver == v) break :saver;
+                self.flags.energy_saver = v;
+                self.renderer.setEnergySaver(v);
+
+                // The animation floor changed: re-arm for the new one.
+                self.armAnimationTimer();
             },
 
             .macos_display_id => |v| {
@@ -683,6 +725,10 @@ fn animationTimerCallback(
     // Animations pause entirely while we're invisible; the .visible
     // mailbox message re-arms us when we can be seen again.
     if (!t.flags.visible) return .disarm;
+
+    // Under Energy Saver the display link does not pace animations: this
+    // wake asks for the frame (a running link draws it on its next tick).
+    t.renderer.markAnimationFrameDue();
 
     switch (t.animation_wake) {
         // Frame data must be updated (a Kitty animation frame is
@@ -932,7 +978,16 @@ const Compression = struct {
 
         const self = &thread.compression;
 
-        if (self.step(thread)) |delay| {
+        const step_qos = compressionQosClass(
+            thread.flags.visible,
+            thread.flags.focused,
+            thread.flags.energy_saver,
+        );
+        if (step_qos) |class| applyQosClass(class);
+        const next = self.step(thread);
+        if (step_qos != null) thread.setQosClass();
+
+        if (next) |delay| {
             self.schedule(thread, delay);
         } else {
             self.armed = false;

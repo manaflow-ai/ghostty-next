@@ -68,6 +68,10 @@ last_notification_digest: u64 = 0,
 /// to the app-level config and as a default for new surfaces.
 config_conditional_state: configpkg.ConditionalState,
 
+/// Energy Saver is on (`ghostty_app_set_energy_saver`). Surfaces made
+/// while it is on start under it.
+energy_saver: bool = false,
+
 /// Set to false once we've created at least one surface. This
 /// never goes true again. This can be used by surfaces to determine
 /// if they are the first surface.
@@ -349,6 +353,16 @@ pub fn focusEvent(self: *App, focused: bool) void {
 
     log.debug("focus event focused={}", .{focused});
     self.focused = focused;
+}
+
+/// Turn Energy Saver on or off for every surface: their animation wakes
+/// wait at least 33 ms and their scrollback compression runs at utility
+/// QoS (renderer.Thread). Main thread only; only a change reaches the
+/// surfaces.
+pub fn energySaverEvent(self: *App, on: bool) void {
+    if (self.energy_saver == on) return;
+    self.energy_saver = on;
+    for (self.surfaces.items) |surface| surface.core().energySaverCallback(on);
 }
 
 /// Handle a key event at the app-scope. If this key event is used,

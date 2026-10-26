@@ -67,6 +67,12 @@ pub const Message = union(enum) {
     /// The macOS display ID has changed for the window.
     macos_display_id: u32,
 
+    /// Energy Saver turned on or off (`ghostty_app_set_energy_saver`):
+    /// shader and Kitty animation wakes wait at least 33 ms and are not
+    /// display-paced, and scrollback compression steps run at utility
+    /// QoS. Sent only on a change.
+    energy_saver: bool,
+
     /// Updates the health of the current presentation state.
     ///
     /// If unhealthy, then somehow the apprt failed to present frames from
