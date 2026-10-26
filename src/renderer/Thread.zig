@@ -205,6 +205,15 @@ pub fn deinit(self: *Thread) void {
     self.mailbox.destroy(self.alloc);
 }
 
+/// An external vsync tick (`ghostty_surface_vsync`): the same `draw_now`
+/// a display link of our own would notify. Any thread, while the thread
+/// is not deinitialized.
+pub fn vsync(self: *Thread) void {
+    self.draw_now.notify() catch |err| {
+        log.err("error notifying draw_now err={}", .{err});
+    };
+}
+
 /// The main entrypoint for the thread.
 pub fn threadMain(self: *Thread) void {
     // Call child function so we can use errors...
@@ -283,7 +292,8 @@ fn setQosClass(self: *const Thread) void {
         // mostly wasted work.
         //
         // The renderer itself should be doing this as well (for example
-        // Metal will stop our DisplayLink) but this also helps with
+        // it stops its DisplayLink, or asks an external vsync for no more
+        // ticks) but this also helps with
         // general forced updates and CPU usage i.e. a rebuild cells call.
         if (!self.flags.visible) break :class .utility;
 

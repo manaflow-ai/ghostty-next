@@ -15,6 +15,7 @@ const global = @import("../global.zig");
 const input = @import("../input.zig");
 const internal_os = @import("../os/main.zig");
 const renderer = @import("../renderer.zig");
+const vsync = @import("../renderer/vsync.zig");
 const terminal = @import("../terminal/main.zig");
 const grid_metrics = @import("grid_metrics.zig");
 const keyboard_selection = @import("keyboard_selection.zig");
@@ -480,6 +481,10 @@ pub const Surface = struct {
     io_write_cb: ?termio.Manual.WriteCallback = null,
     io_write_userdata: ?*anyopaque = null,
 
+    /// Set when the embedder paces the renderer (Options.vsync_external).
+    /// The renderer copies it once, when it is made; it never changes.
+    vsync_external: ?vsync.External = null,
+
     /// Font binding callback, run on the GUI thread. Belongs to this exact
     /// surface; child surfaces never inherit it.
     font_size_action_cb: ?FontSizeActionCallback = null,
@@ -544,6 +549,20 @@ pub const Surface = struct {
 
         /// Passed as the first argument of io_write_cb.
         io_write_userdata: ?*anyopaque = null,
+
+        /// External vsync: the renderer makes no display link of its own;
+        /// vsync_wanted_cb says when it wants ticks and the embedder
+        /// delivers them with ghostty_surface_vsync. Requires
+        /// vsync_wanted_cb. See ghostty_surface_vsync_wanted_cb in
+        /// ghostty.h for the threading contract. Surfaces Ghostty asks the
+        /// embedder to create do not inherit it.
+        vsync_external: bool = false,
+
+        /// Called when the renderer starts or stops wanting vsync ticks.
+        vsync_wanted_cb: ?vsync.WantedCallback = null,
+
+        /// Passed as the first argument of vsync_wanted_cb.
+        vsync_userdata: ?*anyopaque = null,
     };
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
@@ -564,6 +583,10 @@ pub const Surface = struct {
             ) orelse return error.InvalidIoMode,
             .io_write_cb = opts.io_write_cb,
             .io_write_userdata = opts.io_write_userdata,
+            .vsync_external = if (opts.vsync_external) .{
+                .wanted_cb = opts.vsync_wanted_cb orelse return error.MissingVsyncWantedCallback,
+                .userdata = opts.vsync_userdata,
+            } else null,
         };
 
         // Add ourselves to the list of surfaces on the app.
@@ -1354,8 +1377,8 @@ pub const Surface = struct {
     }
 };
 
-// The IO fields extend ghostty_surface_config_s. ghostty.h must match;
-// the "ghostty.h surface config IO fields" test in apprt/structs.zig
+// The IO and vsync fields extend ghostty_surface_config_s. ghostty.h must
+// match; the "ghostty.h surface config IO fields" test in apprt/structs.zig
 // checks the header side of the same layout.
 comptime {
     if (@sizeOf(usize) == 8) {
@@ -1364,8 +1387,11 @@ comptime {
             @offsetOf(O, "io_mode") != 88 or
             @offsetOf(O, "io_write_cb") != 96 or
             @offsetOf(O, "io_write_userdata") != 104 or
-            @sizeOf(O) != 112)
-            @compileError("Surface.Options IO fields must match ghostty_surface_config_s");
+            @offsetOf(O, "vsync_external") != 112 or
+            @offsetOf(O, "vsync_wanted_cb") != 120 or
+            @offsetOf(O, "vsync_userdata") != 128 or
+            @sizeOf(O) != 136)
+            @compileError("Surface.Options IO and vsync fields must match ghostty_surface_config_s");
     }
 }
 
@@ -2417,6 +2443,13 @@ pub const CAPI = struct {
     /// Update the occlusion state of a surface.
     export fn ghostty_surface_set_occlusion(surface: *Surface, visible: bool) void {
         surface.occlusionCallback(visible);
+    }
+
+    /// External vsync: one refresh of the surface's display. Any thread.
+    /// See ghostty.h.
+    export fn ghostty_surface_vsync(surface: *Surface) void {
+        if (surface.vsync_external == null) return;
+        surface.core_surface.renderer_thread.vsync();
     }
 
     /// Filter the mods if necessary. This handles settings such as

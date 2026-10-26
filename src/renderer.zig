@@ -69,4 +69,5 @@ test {
     _ = Thread;
     _ = State;
     _ = @import("renderer/mailbox.zig");
+    _ = @import("renderer/vsync.zig");
 }
