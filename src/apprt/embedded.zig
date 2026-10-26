@@ -19,6 +19,7 @@ const terminal = @import("../terminal/main.zig");
 const grid_metrics = @import("grid_metrics.zig");
 const keyboard_selection = @import("keyboard_selection.zig");
 const termio = @import("../termio.zig");
+const trace_hook = @import("../trace_hook.zig");
 const CoreApp = @import("../App.zig");
 const CoreInspector = @import("../inspector/main.zig").Inspector;
 const CoreSurface = @import("../Surface.zig");
@@ -480,6 +481,9 @@ pub const Surface = struct {
     io_write_cb: ?termio.Manual.WriteCallback = null,
     io_write_userdata: ?*anyopaque = null,
 
+    /// ghostty_surface_trace_id: names this surface in trace hook events.
+    trace_id: u64,
+
     /// Font binding callback, run on the GUI thread. Belongs to this exact
     /// surface; child surfaces never inherit it.
     font_size_action_cb: ?FontSizeActionCallback = null,
@@ -564,6 +568,7 @@ pub const Surface = struct {
             ) orelse return error.InvalidIoMode,
             .io_write_cb = opts.io_write_cb,
             .io_write_userdata = opts.io_write_userdata,
+            .trace_id = trace_hook.newSurfaceId(),
         };
 
         // Add ourselves to the list of surfaces on the app.
@@ -1308,11 +1313,19 @@ pub const Surface = struct {
         return switch (self.io_mode) {
             .exec => null,
             .manual, .manual_mirror => .{
-                .write_cb = self.io_write_cb,
-                .write_userdata = self.io_write_userdata,
+                .write_cb = if (self.io_write_cb != null) &ioWriteTraced else null,
+                .write_userdata = @constCast(self),
                 .mirror = self.io_mode == .manual_mirror,
             },
         };
+    }
+
+    /// The manual backend's write callback: reports the write to the trace
+    /// hook, then passes it to the embedder's io_write_cb.
+    fn ioWriteTraced(userdata: ?*anyopaque, ptr: [*]const u8, len: usize) callconv(.c) void {
+        const self: *const Surface = @ptrCast(@alignCast(userdata.?));
+        trace_hook.emit(.io_write, self.trace_id, len);
+        self.io_write_cb.?(self.io_write_userdata, ptr, len);
     }
 
     pub fn defaultTermioEnv(self: *const Surface) !std.process.Environ.Map {
@@ -1970,7 +1983,17 @@ pub const CAPI = struct {
     }
 
     export fn ghostty_surface_free(ptr: *Surface) void {
+        const trace_id = ptr.trace_id;
         ptr.app.closeSurface(ptr);
+        trace_hook.emit(.surface_destroy, trace_id, 0);
+    }
+
+    export fn ghostty_surface_trace_id(surface: *const Surface) u64 {
+        return surface.trace_id;
+    }
+
+    export fn ghostty_set_trace_hook(hook: ?*const trace_hook.Hook) void {
+        trace_hook.install(hook);
     }
 
     /// Returns the userdata associated with the surface.

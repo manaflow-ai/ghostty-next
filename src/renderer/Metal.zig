@@ -15,6 +15,7 @@ const rendererpkg = @import("../renderer.zig");
 const Renderer = rendererpkg.GenericRenderer(Metal);
 const shadertoy = @import("shadertoy.zig");
 const global = @import("../global.zig");
+const trace_hook = @import("../trace_hook.zig");
 const IOSurface = macos.iosurface.IOSurface;
 
 const mtl = @import("metal/api.zig");
@@ -54,6 +55,14 @@ blending: configpkg.Config.AlphaBlending,
 
 /// We start an AutoreleasePool before `drawFrame` and end it afterwards.
 autorelease_pool: ?*objc.AutoreleasePool = null,
+
+/// Frames committed to the GPU, which number them for the trace hook
+/// (`Target.trace_frame`). Under the draw mutex, like every draw.
+trace_frames: u64 = 0,
+
+/// The frame the current draw committed (its trace number), or 0.
+/// Under the draw mutex.
+trace_draw_frame: u64 = 0,
 
 /// macOS, opt-in (`ghostty_surface_set_host_sized`): the render target's
 /// pixel size, packed width << 32 | height, as the embedder last set it
@@ -114,6 +123,8 @@ const FreshFrame = struct {
     mutex: std.Io.Mutex = .init,
     /// Retained; null after a take or before the first fresh frame.
     surface: ?*IOSurface = null,
+    /// `surface`'s trace number (`Target.trace_frame`).
+    trace_frame: u64 = 0,
     /// Bumped on each publish; the display pass waits on it (futex).
     seq: std.atomic.Value(u32) = .init(0),
 };
@@ -164,7 +175,7 @@ pub fn init(
     // Create an IOSurfaceLayer which we can assign to the view to make
     // it in to a "layer-hosting view", so that we can manually control
     // the layer contents.
-    var layer = try IOSurfaceLayer.init();
+    var layer = try IOSurfaceLayer.init(opts.rt_surface.trace_id);
     errdefer layer.release();
 
     // Add our layer to the view.
@@ -326,6 +337,8 @@ fn displayCallback(renderer: *Renderer) align(8) void {
 pub fn drawFrameStart(self: *Metal) void {
     assert(self.autorelease_pool == null);
     self.autorelease_pool = .init();
+    self.trace_draw_frame = 0;
+    trace_hook.emit(.frame_begin, self.layer.trace_surface, self.trace_frames + 1);
 }
 
 /// Actions taken after `drawFrame` is done.
@@ -335,6 +348,7 @@ pub fn drawFrameEnd(self: *Metal) void {
     assert(self.autorelease_pool != null);
     self.autorelease_pool.?.deinit();
     self.autorelease_pool = null;
+    trace_hook.emit(.frame_end, self.layer.trace_surface, self.trace_draw_frame);
 }
 
 pub fn initShaders(
@@ -405,29 +419,29 @@ pub fn initTarget(self: *const Metal, width: usize, height: usize) !Target {
 /// Present the provided target.
 pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
     if (sync) {
-        self.layer.setSurfaceSync(target.surface);
+        self.layer.setSurfaceSync(target.surface, target.trace_frame);
     } else {
         if (comptime builtin.os.tag == .macos) {
             if (target.cells_fresh and self.fresh.armed.load(.acquire) and
                 target.size_generation == self.fresh.generation.load(.acquire) and
-                self.host_size.load(.acquire) != 0) self.publishFresh(target.surface);
+                self.host_size.load(.acquire) != 0) self.publishFresh(target.surface, target.trace_frame);
         }
         const seq = self.present_seq.fetchAdd(1, .monotonic) + 1;
         // A content-only frame of a host-sized surface goes to the screen from
         // this (completion) thread: a terminal echo does not wait for main.
         if (comptime builtin.os.tag == .macos) {
-            if (self.host_size.load(.acquire) != 0 and self.layer.setSurfaceOffMain(target.surface, seq)) {
+            if (self.host_size.load(.acquire) != 0 and self.layer.setSurfaceOffMain(target.surface, seq, target.trace_frame)) {
                 _ = self.counters.off_main_presents.fetchAdd(1, .monotonic);
                 return;
             }
         }
-        try self.layer.setSurface(target.surface, seq);
+        try self.layer.setSurface(target.surface, seq, target.trace_frame);
     }
 }
 
-/// Keeps `surface` as the newest fresh frame and wakes a display pass that
-/// waits for it. GPU completion thread.
-fn publishFresh(self: *Metal, surface: *IOSurface) void {
+/// Keeps `surface` (trace number `frame`) as the newest fresh frame and
+/// wakes a display pass that waits for it. GPU completion thread.
+fn publishFresh(self: *Metal, surface: *IOSurface, frame: u64) void {
     const io = global.io();
     surface.retain();
     const old = old: {
@@ -435,6 +449,7 @@ fn publishFresh(self: *Metal, surface: *IOSurface) void {
         defer self.fresh.mutex.unlock(io);
         const old = self.fresh.surface;
         self.fresh.surface = surface;
+        self.fresh.trace_frame = frame;
         break :old old;
     };
     if (old) |o| o.release();
@@ -455,9 +470,11 @@ fn dropFresh(self: *Metal) void {
     if (old) |o| o.release();
 }
 
-/// The fresh frame if it has `width` x `height` pixels (retained; the caller
-/// releases it). A fresh frame of another size stays for its own pass.
-fn takeFresh(self: *Metal, width: usize, height: usize) ?*IOSurface {
+const TakenFrame = struct { surface: *IOSurface, trace_frame: u64 };
+
+/// The fresh frame if it has `width` x `height` pixels (its surface retained;
+/// the caller releases it). A fresh frame of another size stays for its own pass.
+fn takeFresh(self: *Metal, width: usize, height: usize) ?TakenFrame {
     const io = global.io();
     self.fresh.mutex.lockUncancelable(io);
     defer self.fresh.mutex.unlock(io);
@@ -465,7 +482,7 @@ fn takeFresh(self: *Metal, width: usize, height: usize) ?*IOSurface {
     if (surface.getWidth() != width or surface.getHeight() != height) return null;
     self.fresh.surface = null;
     self.fresh.armed.store(false, .release);
-    return surface;
+    return .{ .surface = surface, .trace_frame = self.fresh.trace_frame };
 }
 
 /// The display pass of a host-sized surface (main thread): present the
@@ -494,7 +511,7 @@ pub fn presentHostSizedWait(self: *Metal, wait: bool) bool {
     const shown_surface: *IOSurface = @ptrCast(shown);
     if (shown_surface.getWidth() == width and shown_surface.getHeight() == height) {
         // The renderer thread's frame at this size already landed.
-        if (self.takeFresh(width, height)) |surface| surface.release();
+        if (self.takeFresh(width, height)) |taken| taken.surface.release();
         return true;
     }
 
@@ -502,9 +519,9 @@ pub fn presentHostSizedWait(self: *Metal, wait: bool) bool {
     const set_at = self.host_size_set_at orelse std.Io.Timestamp.now(io, .awake);
     while (true) {
         const seq = self.fresh.seq.load(.acquire);
-        if (self.takeFresh(width, height)) |surface| {
-            defer surface.release();
-            self.layer.setSurfaceSync(surface);
+        if (self.takeFresh(width, height)) |taken| {
+            defer taken.surface.release();
+            self.layer.setSurfaceSync(taken.surface, taken.trace_frame);
             _ = self.counters.fresh_presents.fetchAdd(1, .monotonic);
             return true;
         }
@@ -701,14 +718,18 @@ pub fn initAtlasTexture(
     );
 }
 
-/// Begin a frame.
+/// Begin a frame. It is committed when the returned frame completes, so it
+/// gets the next trace number here.
 pub inline fn beginFrame(
-    self: *const Metal,
+    self: *Metal,
     /// Once the frame has been completed, the `frameCompleted` method
     /// on the renderer is called with the health status of the frame.
     renderer: *Renderer,
     /// The target is presented via the provided renderer's API when completed.
     target: *Target,
 ) !Frame {
+    self.trace_frames += 1;
+    self.trace_draw_frame = self.trace_frames;
+    target.trace_frame = self.trace_frames;
     return try Frame.begin(.{ .queue = self.queue }, renderer, target);
 }
