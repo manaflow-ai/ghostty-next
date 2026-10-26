@@ -63,6 +63,15 @@ cursor_h: xev.Timer,
 cursor_c: xev.Completion = .{},
 cursor_c_cancel: xev.Completion = .{},
 
+/// Retries a GPU residency release that found frames in flight.
+residency_h: xev.Timer,
+residency_c: xev.Completion = .{},
+residency_c_cancel: xev.Completion = .{},
+
+/// The GPU residency this thread applied (`renderer.residency` holds the
+/// embedder's latest request).
+residency: rendererpkg.Residency.Applied = .{},
+
 /// Incremental scrollback compression scheduling.
 compression: Compression = undefined,
 
@@ -98,6 +107,11 @@ flags: packed struct {
     /// This is true when the view is focused. This defaults to true
     /// and it is up to the apprt to set the correct value.
     focused: bool = true,
+
+    /// The surface holds GPU resources (`ghostty_surface_set_gpu_resident`).
+    /// While false the thread parks: no frame updates, draws, cursor
+    /// blink, display link or animation wakes, and output does not wake it.
+    gpu_resident: bool = true,
 
     /// A resize arrived since the last frame update: the next frame draws
     /// at once, not at the next display-link tick, so a host-sized display
@@ -161,6 +175,10 @@ pub fn init(
     var cursor_timer = try xev.Timer.init();
     errdefer cursor_timer.deinit();
 
+    // Retries for a GPU residency release
+    var residency_timer = try xev.Timer.init();
+    errdefer residency_timer.deinit();
+
     // The mailbox for messaging this thread
     var mailbox = try Mailbox.create(alloc);
     errdefer mailbox.destroy(alloc);
@@ -174,6 +192,7 @@ pub fn init(
         .render_h = render_h,
         .draw_now = draw_now,
         .cursor_h = cursor_timer,
+        .residency_h = residency_timer,
         .surface = surface,
         .renderer = renderer_impl,
         .state = state,
@@ -197,6 +216,7 @@ pub fn deinit(self: *Thread) void {
     self.render_h.deinit();
     self.draw_now.deinit();
     self.cursor_h.deinit();
+    self.residency_h.deinit();
     if (comptime terminalpkg.compression_enabled)
         self.compression.deinit();
     self.loop.deinit();
@@ -285,7 +305,7 @@ fn setQosClass(self: *const Thread) void {
         // The renderer itself should be doing this as well (for example
         // Metal will stop our DisplayLink) but this also helps with
         // general forced updates and CPU usage i.e. a rebuild cells call.
-        if (!self.flags.visible) break :class .utility;
+        if (!drawsFrames(self.flags.visible, self.flags.gpu_resident)) break :class .utility;
 
         // If we're not focused, but we're visible, then we set a higher
         // than default priority because framerates still matter but it isn't
@@ -366,36 +386,12 @@ fn drainMailbox(self: *Thread) !void {
                 // the animation timer for the new state.
                 self.armAnimationTimer();
 
-                if (!v) {
-                    // If we're not focused, then we stop the cursor blink
-                    if (self.cursor_c.state() == .active and
-                        self.cursor_c_cancel.state() == .dead)
-                    {
-                        self.cursor_h.cancel(
-                            &self.loop,
-                            &self.cursor_c,
-                            &self.cursor_c_cancel,
-                            void,
-                            null,
-                            cursorCancelCallback,
-                        );
-                    }
-                } else {
-                    // If we're focused, we immediately show the cursor again
-                    // and then restart the timer.
-                    if (self.cursor_c.state() != .active) {
-                        self.flags.cursor_blink_visible = true;
-                        self.cursor_h.run(
-                            &self.loop,
-                            &self.cursor_c,
-                            cursorBlinkInterval(),
-                            Thread,
-                            self,
-                            cursorTimerCallback,
-                        );
-                    }
-                }
+                // Unfocused (or released) surfaces do not blink; a
+                // focused one shows the cursor at once and blinks again.
+                if (v and self.flags.gpu_resident) self.startCursorBlink() else self.stopCursorBlink();
             },
+
+            .gpu_residency => self.applyGpuResidency(),
 
             .reset_cursor_blink => {
                 self.flags.cursor_blink_visible = true;
@@ -465,13 +461,169 @@ fn drainMailbox(self: *Thread) !void {
 }
 
 /// Whether output must wake this thread (renderer.State.output_wakes):
-/// always while visible; while hidden only until the compression timer is
-/// armed, since that timer then tracks output on its own. With compression
-/// off a hidden renderer needs no output wakes at all.
+/// always while it draws; while hidden or GPU-released only until the
+/// compression timer is armed, since that timer then tracks output on its
+/// own. With compression off such a renderer needs no output wakes at all.
 fn syncOutputWakes(self: *Thread) void {
-    const needed = self.flags.visible or
-        (terminalpkg.compression_enabled and self.config.scrollback_compression and !self.compression.armed);
+    const needed = outputWakesNeeded(
+        drawsFrames(self.flags.visible, self.flags.gpu_resident),
+        terminalpkg.compression_enabled and self.config.scrollback_compression,
+        terminalpkg.compression_enabled and self.compression.armed,
+    );
     self.state.output_wakes.store(needed, .release);
+}
+
+/// Whether output must wake the thread: always while it draws; otherwise
+/// only while scrollback compression is on and its timer is not armed yet
+/// (that timer then tracks output on its own).
+fn outputWakesNeeded(draws: bool, compression: bool, compression_armed: bool) bool {
+    return draws or (compression and !compression_armed);
+}
+
+/// Whether the thread updates and draws frames: the view is visible and
+/// the surface holds GPU resources.
+fn drawsFrames(visible: bool, gpu_resident: bool) bool {
+    return visible and gpu_resident;
+}
+
+test "renderer thread: a released surface draws nothing and output does not wake it" {
+    const testing = std.testing;
+    try testing.expect(drawsFrames(true, true));
+    try testing.expect(!drawsFrames(true, false));
+    try testing.expect(!drawsFrames(false, true));
+
+    // Released while visible: no output wakes once compression tracks output.
+    try testing.expect(!outputWakesNeeded(drawsFrames(true, false), true, true));
+    try testing.expect(!outputWakesNeeded(drawsFrames(true, false), false, false));
+    // Until the compression timer is armed, output still wakes it.
+    try testing.expect(outputWakesNeeded(drawsFrames(true, false), true, false));
+    try testing.expect(outputWakesNeeded(drawsFrames(true, true), false, false));
+}
+
+/// Apply the embedder's latest GPU residency request
+/// (`ghostty_surface_set_gpu_resident`).
+fn applyGpuResidency(self: *Thread) void {
+    switch (self.residency.next(&self.renderer.residency)) {
+        .none => return,
+        .release => {
+            self.flags.gpu_resident = false;
+            self.setQosClass();
+            self.stopCursorBlink();
+            self.releaseGpuResidency();
+        },
+        .restore => {
+            self.flags.gpu_resident = true;
+            self.setQosClass();
+            self.cancelResidencyRetry();
+            self.renderer.restoreGpuResidency();
+            if (self.flags.focused) self.startCursorBlink();
+            // Rebuild and draw now (the frame update also restarts the
+            // display link and any animation wake).
+            _ = renderCallback(self, undefined, undefined, {});
+        },
+    }
+    self.syncOutputWakes();
+}
+
+/// Release the GPU resources, or retry later while frames are in flight.
+fn releaseGpuResidency(self: *Thread) void {
+    if (self.renderer.releaseGpuResidency()) {
+        self.residency.release_pending = false;
+        self.residency.release_retries = 0;
+        return;
+    }
+    const delay = releaseRetryDelayMs(self.residency.release_retries);
+    self.residency.release_pending = true;
+    self.residency.release_retries +|= 1;
+    self.residency_h.reset(
+        &self.loop,
+        &self.residency_c,
+        &self.residency_c_cancel,
+        delay,
+        Thread,
+        self,
+        residencyRetryCallback,
+    );
+}
+
+/// The delay before release retry `retries` (0 for the first): about a
+/// frame first, since a GPU frame completes within it, then doubling up
+/// to a second, because the system can hold GPU completions back for long
+/// (iOS does while the app moves to the background).
+fn releaseRetryDelayMs(retries: u8) u64 {
+    const first_ms = 16;
+    const max_ms = 1000;
+    if (retries >= 6) return max_ms;
+    return @min(max_ms, @as(u64, first_ms) << @intCast(retries));
+}
+
+test "renderer thread: a release retry backs off to one second" {
+    const testing = std.testing;
+    try testing.expectEqual(@as(u64, 16), releaseRetryDelayMs(0));
+    try testing.expectEqual(@as(u64, 32), releaseRetryDelayMs(1));
+    try testing.expectEqual(@as(u64, 512), releaseRetryDelayMs(5));
+    try testing.expectEqual(@as(u64, 1000), releaseRetryDelayMs(6));
+    try testing.expectEqual(@as(u64, 1000), releaseRetryDelayMs(255));
+}
+
+fn residencyRetryCallback(
+    self_: ?*Thread,
+    _: *xev.Loop,
+    _: *xev.Completion,
+    r: xev.Timer.RunError!void,
+) xev.CallbackAction {
+    _ = r catch |err| switch (err) {
+        // A restore cancelled it, or a newer retry replaced it.
+        error.Canceled => return .disarm,
+        else => {
+            log.warn("error in GPU residency retry timer err={}", .{err});
+            return .disarm;
+        },
+    };
+    const t = self_ orelse return .disarm;
+    // A restore already requested (its message not drained yet) needs no release.
+    if (t.residency.release_pending and !t.flags.gpu_resident and
+        !t.renderer.residency.isResident()) t.releaseGpuResidency();
+    return .disarm;
+}
+
+fn cancelResidencyRetry(self: *Thread) void {
+    if (self.residency_c.state() != .active or
+        self.residency_c_cancel.state() != .dead) return;
+    self.residency_h.cancel(
+        &self.loop,
+        &self.residency_c,
+        &self.residency_c_cancel,
+        void,
+        null,
+        timerCancelCallback,
+    );
+}
+
+fn startCursorBlink(self: *Thread) void {
+    if (self.cursor_c.state() == .active) return;
+    self.flags.cursor_blink_visible = true;
+    self.cursor_h.run(
+        &self.loop,
+        &self.cursor_c,
+        cursorBlinkInterval(),
+        Thread,
+        self,
+        cursorTimerCallback,
+    );
+}
+
+fn stopCursorBlink(self: *Thread) void {
+    if (self.cursor_c.state() != .active or
+        self.cursor_c_cancel.state() != .dead) return;
+    self.cursor_h.cancel(
+        &self.loop,
+        &self.cursor_c,
+        &self.cursor_c_cancel,
+        void,
+        null,
+        timerCancelCallback,
+    );
 }
 
 fn changeConfig(self: *Thread, config: *const DerivedConfig) !void {
@@ -492,8 +644,8 @@ fn changeConfig(self: *Thread, config: *const DerivedConfig) !void {
 /// Trigger a draw. This will not update frame data or anything, it will
 /// just trigger a draw/paint.
 fn drawFrame(self: *Thread, now: bool) void {
-    // If we're invisible, we do not draw.
-    if (!self.flags.visible) return;
+    // If we're invisible or released, we do not draw.
+    if (!drawsFrames(self.flags.visible, self.flags.gpu_resident)) return;
 
     // If the renderer is managing a vsync on its own, we only draw
     // when we're forced to via `now`.
@@ -603,7 +755,8 @@ fn renderCallback(
     // If we're not visible there's no point spending CPU rebuilding cells —
     // we'll catch up when the .visible mailbox message flips us back on.
     // Kitty graphics animations pause with us and resume on visibility.
-    if (!t.flags.visible) return .disarm;
+    // A released surface (gpu_resident false) waits for its restore.
+    if (!drawsFrames(t.flags.visible, t.flags.gpu_resident)) return .disarm;
 
     // A running display link means frames are already being paced; one
     // that is stopped means the terminal was idle until this update.
@@ -680,9 +833,9 @@ fn animationTimerCallback(
         return .disarm;
     };
 
-    // Animations pause entirely while we're invisible; the .visible
-    // mailbox message re-arms us when we can be seen again.
-    if (!t.flags.visible) return .disarm;
+    // Animations pause entirely while we're invisible or released; the
+    // .visible and .gpu_residency messages re-arm us.
+    if (!drawsFrames(t.flags.visible, t.flags.gpu_resident)) return .disarm;
 
     switch (t.animation_wake) {
         // Frame data must be updated (a Kitty animation frame is
@@ -784,7 +937,7 @@ test "renderer thread: a blink tick draws only a visible blinking cursor" {
     try testing.expect(!blinkTickDraws(&state));
 }
 
-fn cursorCancelCallback(
+fn timerCancelCallback(
     _: ?*void,
     _: *xev.Loop,
     _: *xev.Completion,
@@ -802,7 +955,7 @@ fn cursorCancelCallback(
         error.Canceled => {}, // success
         error.NotFound => {}, // completed before it could cancel
         else => {
-            log.warn("error in cursor cancel callback err={}", .{err});
+            log.warn("error in timer cancel callback err={}", .{err});
             unreachable;
         },
     };

@@ -3831,6 +3831,23 @@ pub fn occlusionCallback(self: *Surface, visible: bool) !void {
     try self.queueRender();
 }
 
+/// Keep (true) or release (false) the renderer's GPU resources; see
+/// `ghostty_surface_set_gpu_resident`. Main thread; never waits.
+pub fn setGpuResident(self: *Surface, resident: bool) void {
+    if (!self.renderer.residency.request(resident)) return;
+
+    // The display pass and the layer belong to the main thread: what they
+    // show changes in this turn, before the renderer thread hears of it.
+    if (comptime @hasDecl(@TypeOf(self.renderer.api), "setGpuResidentFromMain")) {
+        self.renderer.api.setGpuResidentFromMain(resident);
+    }
+
+    _ = self.renderer_thread.mailbox.push(global.io(), .gpu_residency, .{ .forever = {} });
+    self.renderer_thread.wakeup.notify() catch |err| {
+        log.warn("failed to wake the renderer for GPU residency err={}", .{err});
+    };
+}
+
 pub fn focusCallback(self: *Surface, focused: bool) !void {
     // Crash metadata in case we crash in here
     crash.sentry.thread_state = self.crashThreadState();

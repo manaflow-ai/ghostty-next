@@ -36,6 +36,7 @@ pub fn init() !IOSurfaceLayer {
     layer.setInstanceVariable("display_cb", .{ .value = null });
     layer.setInstanceVariable("display_ctx", .{ .value = null });
     layer.setInstanceVariable("host_size", .{ .value = null });
+    layer.setInstanceVariable("released", .{ .value = null });
 
     return .{ .layer = layer };
 }
@@ -85,6 +86,20 @@ pub fn setHostSize(self: *IOSurfaceLayer, value: u64) void {
     // ivar is never retained or released (no ARC layout on this class).
     const stored: usize = @intCast(value << 3);
     self.layer.setInstanceVariable("host_size", .{ .value = @ptrFromInt(stored) });
+}
+
+/// The surface released its GPU resources (`Metal.setGpuResidentFromMain`):
+/// frames still in flight are not shown. Main thread, like the callback
+/// that reads it.
+pub fn setReleased(self: *IOSurfaceLayer, released: bool) void {
+    // Any 8-aligned non-null value marks it; never retained or released.
+    self.layer.setInstanceVariable("released", .{
+        .value = if (released) @ptrFromInt(8) else null,
+    });
+}
+
+fn isReleased(layer: objc.Object) bool {
+    return layer.getInstanceVariable("released").value != null;
 }
 
 /// The value `setHostSize` stored.
@@ -169,6 +184,9 @@ fn setSurfaceCallback(
     // See explanation of why we retain and release in `setSurface`.
     defer surface.release();
 
+    // A frame that completed after a GPU release: the layer stays empty.
+    if (isReleased(layer)) return;
+
     // We check to see if the surface is the appropriate size for
     // the layer, if it's not then we discard it. This is because
     // asynchronously drawn frames can sometimes finish just after
@@ -222,6 +240,7 @@ fn getSubclass() error{ObjCFailed}!objc.Class {
     if (!subclass.addIvar("display_cb")) return error.ObjCFailed;
     if (!subclass.addIvar("display_ctx")) return error.ObjCFailed;
     if (!subclass.addIvar("host_size")) return error.ObjCFailed;
+    if (!subclass.addIvar("released")) return error.ObjCFailed;
 
     subclass.replaceMethod("display", struct {
         fn display(target: objc.c.id, sel: objc.c.SEL) callconv(.c) void {

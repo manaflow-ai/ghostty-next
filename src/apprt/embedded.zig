@@ -2260,6 +2260,8 @@ pub const CAPI = struct {
         host_main_draws: u64,
         host_fresh_presents: u64,
         host_late_presents: u64,
+        gpu_releases: u64,
+        gpu_restores: u64,
     };
 
     /// The renderer's frame counters. See ghostty.h.
@@ -2281,6 +2283,8 @@ pub const CAPI = struct {
             .host_main_draws = hostCounter(surface, "main_draws"),
             .host_fresh_presents = hostCounter(surface, "fresh_presents"),
             .host_late_presents = hostCounter(surface, "late"),
+            .gpu_releases = c.gpu_releases.load(.monotonic),
+            .gpu_restores = c.gpu_restores.load(.monotonic),
         };
     }
 
@@ -2405,6 +2409,11 @@ pub const CAPI = struct {
     /// Update the occlusion state of a surface.
     export fn ghostty_surface_set_occlusion(surface: *Surface, visible: bool) void {
         surface.occlusionCallback(visible);
+    }
+
+    /// Keep or release the surface's GPU resources. See ghostty.h.
+    export fn ghostty_surface_set_gpu_resident(surface: *Surface, resident: bool) void {
+        surface.core_surface.setGpuResident(resident);
     }
 
     /// Filter the mods if necessary. This handles settings such as

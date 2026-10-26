@@ -758,6 +758,10 @@ typedef struct {
   uint64_t host_main_draws;
   uint64_t host_fresh_presents;
   uint64_t host_late_presents;
+  // ghostty_surface_set_gpu_resident: releases that freed the GPU
+  // resources, and restores.
+  uint64_t gpu_releases;
+  uint64_t gpu_restores;
 } ghostty_surface_render_counters_s;
 
 // Config types
@@ -1440,6 +1444,24 @@ GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
 GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
+// Keep (true, the default) or release (false) the surface's GPU resources.
+// Released: once its frames in flight completed (their completion handlers
+// ran), the renderer frees its swap chain (the IOSurface render targets),
+// its cell, uniform and per-frame atlas buffers and its image textures, and
+// the layer drops its contents in this call (it shows nothing; cover the
+// view with your own last frame). The renderer thread then idles: no frame
+// updates, draws, cursor blink, display link or animation wakes, and output
+// does not wake it. The terminal state, scrollback, PTY, shaders and the
+// shared font atlas stay. Restored: the renderer thread rebuilds what it
+// freed and draws the kept cells at once (when the surface is visible); a
+// host-sized surface's next display pass, or
+// ghostty_surface_present_host_frame in this turn, waits at most 4 ms for
+// that frame, like a reveal, and never draws on the main thread. While a
+// surface is released, a hidden/shown cycle (ghostty_surface_set_occlusion)
+// does not draw it. Idempotent; a release then a restore before the
+// renderer ran leaves it resident and redrawn. Main thread; never waits for
+// the renderer.
+GHOSTTY_API void ghostty_surface_set_gpu_resident(ghostty_surface_t, bool);
 // Install a per-surface callback for performed font binding actions. Call
 // once after ghostty_surface_new; a second call returns false. Not inherited
 // by child surfaces. userdata must stay valid until ghostty_surface_free

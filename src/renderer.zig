@@ -21,6 +21,7 @@ pub const Options = @import("renderer/Options.zig");
 pub const Overlay = @import("renderer/Overlay.zig");
 pub const Thread = @import("renderer/Thread.zig");
 pub const State = @import("renderer/State.zig");
+pub const Residency = @import("renderer/Residency.zig");
 pub const ColorBlend = @import("renderer/ColorBlend.zig");
 pub const LinkFilter = @import("renderer/link.zig").Filter;
 pub const CursorStyle = cursor.Style;
@@ -68,5 +69,6 @@ test {
     _ = size;
     _ = Thread;
     _ = State;
+    _ = Residency;
     _ = @import("renderer/mailbox.zig");
 }

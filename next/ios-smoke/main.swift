@@ -17,6 +17,10 @@
 //   snapshot  encode the red fill (READY and HISTORY), clear it, set a
 //             64 KiB scrollback-limit-bytes on the surface, then restore
 //             the snapshot: the red fill is back.
+//   gpu       ghostty_surface_set_gpu_resident(false) empties the layer at
+//             once, the renderer frees its GPU resources and draws
+//             nothing; set_gpu_resident(true) draws the same pixels as
+//             before the release.
 import GhosttyNextKit
 import IOSurface
 import UIKit
@@ -108,6 +112,8 @@ func finish(_ pass: Bool, _ detail: String) -> Never {
 @MainActor
 struct Pixels {
     let width: Int, height: Int, layerWidthPt: Int, layerHeightPt: Int
+    /// The IOSurface's bytes (BGRA rows), for exact comparisons.
+    let bytes: [UInt8]
     let isRed: (Int, Int) -> Bool
     let nonBlack: (Int, Int) -> Bool
 
@@ -144,7 +150,7 @@ func capture(_ view: TerminalView) -> Pixels? {
         return (Int(copy[i + 2]), Int(copy[i + 1]), Int(copy[i]))
     }
     return Pixels(
-        width: w, height: h,
+        width: w, height: h, bytes: copy,
         layerWidthPt: Int(host.bounds.width), layerHeightPt: Int(host.bounds.height),
         isRed: { x, y in let (r, g, b) = px(x, y); return r > 200 && g < 60 && b < 60 },
         nonBlack: { x, y in let (r, g, b) = px(x, y); return r + g + b > 30 })
@@ -281,6 +287,37 @@ func runSnapshot(_ app: ghostty_app_t, _ view: TerminalView, _ surface: ghostty_
 }
 
 @MainActor
+func runGpu(_ app: ghostty_app_t, _ view: TerminalView, _ surface: ghostty_surface_t) async -> (Bool, String) {
+    let ref = SurfaceRef(raw: surface)
+    // A hidden cursor: a blink between the two captures would change pixels.
+    await onOutput(ref) { feed($0, redFill + "\u{1b}[?25l") }
+    await drawFrames(app, surface)
+    guard let before = capture(view) else { return (false, "no IOSurface") }
+
+    ghostty_surface_set_gpu_resident(surface, false)
+    ghostty_surface_set_gpu_resident(surface, false) // Idempotent.
+    let emptiedAtOnce = capture(view) == nil
+    try? await Task.sleep(for: .milliseconds(300))
+    await drawFrames(app, surface) // Draw requests while released draw nothing.
+    let stayedEmpty = capture(view) == nil
+    let released = ghostty_surface_render_counters(surface)
+
+    ghostty_surface_set_gpu_resident(surface, true)
+    await drawFrames(app, surface)
+    guard let after = capture(view) else { return (false, "no IOSurface after restore") }
+    let restored = ghostty_surface_render_counters(surface)
+
+    let identical = before.width == after.width && before.height == after.height && before.bytes == after.bytes
+    let detail = String(
+        format: "surface=%dx%dpx red=%.2f emptied_at_once=%d stayed_empty=%d releases=%llu restores=%llu identical=%d",
+        after.width, after.height, after.redFraction(), emptiedAtOnce ? 1 : 0, stayedEmpty ? 1 : 0,
+        restored.gpu_releases, restored.gpu_restores, identical ? 1 : 0)
+    let pass = before.redFraction() > 0.8 && emptiedAtOnce && stayedEmpty
+        && released.gpu_releases == 1 && restored.gpu_restores == 1 && identical
+    return (pass, detail)
+}
+
+@MainActor
 final class AppDelegate: UIResponder, UIApplicationDelegate {
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
         guard ghostty_init(UInt(CommandLine.argc), CommandLine.unsafeArgv) == GHOSTTY_SUCCESS,
@@ -327,6 +364,7 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
             switch mode {
             case "grid": (pass, detail) = await runGrid(app, view, surface)
             case "snapshot": (pass, detail) = await runSnapshot(app, view, surface)
+            case "gpu": (pass, detail) = await runGpu(app, view, surface)
             default: (pass, detail) = await runFill(app, view, surface)
             }
             print("RENDER-SMOKE-READY")

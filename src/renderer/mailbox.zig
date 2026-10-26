@@ -13,10 +13,11 @@
 //! overflow list instead, in order. Once the overflow holds a message,
 //! every later push goes there too, so the renderer sees messages in
 //! push order: the queue first, then the overflow. State messages whose
-//! latest value wins (focus, visible, resize, cursor blink reset, display
-//! id, presentation health) replace an older one of the same kind in the
-//! overflow, which bounds it while the renderer is stalled. An `.instant`
-//! push keeps its meaning: it fails when the queue is full.
+//! latest value wins (focus, visible, GPU residency, resize, cursor blink
+//! reset, display id, presentation health) replace an older one of the
+//! same kind in the overflow, which bounds it while the renderer is
+//! stalled. An `.instant` push keeps its meaning: it fails when the queue
+//! is full.
 const Mailbox = @This();
 
 const std = @import("std");
@@ -114,6 +115,7 @@ fn coalesces(value: Message) bool {
     return switch (value) {
         .focus,
         .visible,
+        .gpu_residency,
         .resize,
         .reset_cursor_blink,
         .macos_display_id,

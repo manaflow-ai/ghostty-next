@@ -72,6 +72,17 @@ fresh: FreshFrame = .{},
 /// surface's display pass draws nothing.
 visible_hint: std.atomic.Value(bool) = .init(true),
 
+/// The embedder lets the surface hold GPU resources
+/// (`ghostty_surface_set_gpu_resident`). Written on the main thread, read by
+/// the display pass and the present path.
+gpu_resident: std.atomic.Value(bool) = .init(true),
+
+/// A GPU release cleared the layer's contents, so an empty layer is not
+/// "nothing presented yet": the display pass of a host-sized surface waits
+/// for the renderer thread's frame instead of drawing on the main thread.
+/// Main thread.
+contents_released: bool = false,
+
 /// The renderer skips frame updates (synchronized output, a restore's
 /// frame hold): no fresh frame can come, so a display pass of a new size
 /// keeps the last frame at once instead of waiting for one. Renderer
@@ -304,6 +315,8 @@ pub fn loopEnter(self: *Metal) void {
 
 fn displayCallback(renderer: *Renderer) align(8) void {
     _ = renderer.api.counters.display_passes.fetchAdd(1, .monotonic);
+    // Released: nothing to draw, and drawing would rebuild the swap chain.
+    if (!renderer.api.gpu_resident.load(.acquire)) return;
     if (comptime builtin.os.tag == .macos) {
         if (renderer.api.presentHostSized()) return;
     }
@@ -463,17 +476,24 @@ fn takeFresh(self: *Metal, width: usize, height: usize) ?*IOSurface {
 pub fn presentHostSized(self: *Metal) bool {
     const host = self.host_size.load(.acquire);
     if (host == 0) return false;
-    // Hidden: nothing to draw now (the renderer draws when shown again),
-    // and drawing here would rebuild the released swap chain.
-    if (!self.visible_hint.load(.acquire)) return true;
+    // Hidden or GPU-released: nothing to draw now (the renderer draws when
+    // shown or restored), and drawing here would rebuild the released swap
+    // chain.
+    if (!self.visible_hint.load(.acquire) or !self.gpu_resident.load(.acquire)) return true;
     const width: usize = @intCast(host >> 32);
     const height: usize = @intCast(host & 0xffff_ffff);
-    const shown = self.layer.layer.getProperty(?*anyopaque, "contents") orelse return false;
-    const shown_surface: *IOSurface = @ptrCast(shown);
-    if (shown_surface.getWidth() == width and shown_surface.getHeight() == height) {
-        // The renderer thread's frame at this size already landed.
-        if (self.takeFresh(width, height)) |surface| surface.release();
-        return true;
+    // Empty after a GPU release: wait for the restored frame below like a
+    // new size (the embedder's last frame covers the view meanwhile).
+    // Empty otherwise: nothing presented yet, the main thread draws.
+    const shown = self.layer.layer.getProperty(?*anyopaque, "contents");
+    if (shown == null and !self.contents_released) return false;
+    if (shown) |s| {
+        const shown_surface: *IOSurface = @ptrCast(s);
+        if (shown_surface.getWidth() == width and shown_surface.getHeight() == height) {
+            // The renderer thread's frame at this size already landed.
+            if (self.takeFresh(width, height)) |surface| surface.release();
+            return true;
+        }
     }
 
     const io = global.io();
@@ -488,7 +508,8 @@ pub fn presentHostSized(self: *Metal) bool {
         }
         // Read each time: a hold (synchronized output, a restore) or a hide that starts while
         // this pass waits wakes it (setFramesHeld / setVisibleHint), and no frame can come then.
-        if (self.frames_held.load(.acquire) or !self.visible_hint.load(.acquire)) break;
+        if (self.frames_held.load(.acquire) or !self.visible_hint.load(.acquire) or
+            !self.gpu_resident.load(.acquire)) break;
         const now: std.Io.Timestamp = .now(io, .awake);
         const waited: i96 = set_at.durationTo(now).nanoseconds;
         if (waited >= host_frame_wait_ns) break;
@@ -523,6 +544,31 @@ pub fn setShownFromMain(self: *Metal, visible: bool) void {
         self.host_size_set_at = .now(global.io(), .awake);
     }
     self.setVisibleHint(visible);
+}
+
+/// `ghostty_surface_set_gpu_resident`, main thread, in the caller's turn.
+/// Released: the layer drops its contents (it holds the last frame's
+/// IOSurface, which the swap chain release alone would not free) and
+/// refuses frames still in flight, and the display pass draws nothing.
+/// Restored: a frame drawn from here on is presented at the next display
+/// pass of a host-sized surface, waited for from now (like a reveal).
+pub fn setGpuResidentFromMain(self: *Metal, resident: bool) void {
+    self.gpu_resident.store(resident, .release);
+    self.layer.setReleased(!resident);
+    if (!resident) {
+        self.fresh.armed.store(false, .release);
+        self.dropFresh();
+        self.wakePresent();
+        self.layer.layer.setProperty("contents", @as(?*anyopaque, null));
+        self.contents_released = true;
+        return;
+    }
+    if (self.host_size.load(.acquire) != 0) {
+        self.dropFresh();
+        _ = self.fresh.generation.fetchAdd(1, .acq_rel);
+        self.fresh.armed.store(true, .release);
+        self.host_size_set_at = .now(global.io(), .awake);
+    }
 }
 
 /// Frame updates are held or resumed (`frames_held`). Renderer thread.

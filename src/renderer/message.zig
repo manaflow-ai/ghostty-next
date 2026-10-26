@@ -22,6 +22,11 @@ pub const Message = union(enum) {
     /// and still have focus.
     visible: bool,
 
+    /// The embedder changed the GPU residency request
+    /// (`ghostty_surface_set_gpu_resident`); the renderer reads the latest
+    /// one from `Renderer.residency`.
+    gpu_residency,
+
     /// Reset the cursor blink by immediately showing the cursor then
     /// restarting the timer.
     reset_cursor_blink,

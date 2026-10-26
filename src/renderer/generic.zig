@@ -45,6 +45,10 @@ pub const RenderCounters = struct {
     full_swap: std.atomic.Value(u64) = .init(0),
     /// The drawn terminal's grid changed size.
     full_resize: std.atomic.Value(u64) = .init(0),
+    /// GPU residency (`ghostty_surface_set_gpu_resident`): releases that
+    /// freed the GPU resources, and restores.
+    gpu_releases: std.atomic.Value(u64) = .init(0),
+    gpu_restores: std.atomic.Value(u64) = .init(0),
 };
 const imagepkg = @import("image.zig");
 const ImageState = imagepkg.State;
@@ -274,6 +278,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// resources. Creating any GPU resource while this is false is invalid.
         display_realized: bool = true,
 
+        /// Whether the embedder lets this surface hold GPU resources
+        /// (`ghostty_surface_set_gpu_resident`). While it does not, nothing
+        /// draws, so nothing rebuilds what `releaseGpuResidency` freed.
+        residency: renderer.Residency = .{},
+
+        /// `releaseGpuResidency` freed the Kitty image textures: the next
+        /// frame update builds the image state again from the terminal.
+        /// Renderer thread only.
+        kitty_reupload: bool = false,
+
         /// Our swap chain (multiple buffering). Null when it has
         /// been released, either because the surface is hidden
         /// (`releaseGpuResources`) or because the display is
@@ -434,7 +448,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 return true;
             }
 
-            /// Free the frames after `waitIdle` returned true.
+            /// `waitIdle` without waiting: true takes every frame (no frame
+            /// is in flight), false changes nothing.
+            pub fn tryIdle(self: *SwapChain) bool {
+                const io = global.io();
+                const sema = &self.frame_sema;
+                sema.mutex.lockUncancelable(io);
+                defer sema.mutex.unlock(io);
+                if (sema.permits < buf_count) return false;
+                sema.permits = 0;
+                return true;
+            }
+
+            /// Free the frames after `waitIdle` or `tryIdle` returned true.
             pub fn deinitIdle(self: *SwapChain) void {
                 for (&self.frames) |*frame| frame.deinit();
             }
@@ -1383,6 +1409,59 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
         }
 
+        /// `ghostty_surface_set_gpu_resident(false)`, renderer thread: free
+        /// the swap chain (render targets, cell and uniform buffers, font
+        /// atlas texture copies, custom shader textures) and the image
+        /// textures once every frame in flight completed (its completion
+        /// handler presented it and gave the frame back). Keeps the
+        /// terminal state, the CPU cells, the shaders and the font grid
+        /// with its shared atlas. Returns false when a frame is still in
+        /// flight: nothing was freed, and the caller retries later. Never
+        /// waits, so the draw lock is never held across a GPU wait.
+        pub fn releaseGpuResidency(self: *Self) bool {
+            // The display link stops (it reads the residency); never
+            // synced under the draw lock (see syncDisplayLink).
+            self.syncDisplayLink(null, null);
+
+            self.draw_mutex.lockUncancelable(global.io());
+            defer self.draw_mutex.unlock(global.io());
+
+            if (self.swap_chain) |*sc| {
+                if (!sc.tryIdle()) return false;
+                sc.deinitIdle();
+                self.swap_chain = null;
+            }
+
+            // Unlike a hide, the images go too; their textures are rebuilt
+            // from the terminal (Kitty) and the config (background).
+            self.images.deinit(self.alloc);
+            self.images = .empty;
+            self.kitty_reupload = true;
+            if (self.bg_image) |img| {
+                img.deinit(self.alloc);
+                self.bg_image = null;
+            }
+
+            _ = self.counters.gpu_releases.fetchAdd(1, .monotonic);
+            return true;
+        }
+
+        /// `ghostty_surface_set_gpu_resident(true)`, renderer thread: the
+        /// next draw rebuilds what was released and draws the kept cells,
+        /// even when nothing changed (the main thread cleared the layer).
+        pub fn restoreGpuResidency(self: *Self) void {
+            self.draw_mutex.lockUncancelable(global.io());
+            defer self.draw_mutex.unlock(global.io());
+
+            self.cells_rebuilt = true;
+            if (self.bg_image == null and self.config.bg_image != null) {
+                self.prepBackgroundImage() catch |err| {
+                    log.warn("error loading the background image again err={}", .{err});
+                };
+            }
+            _ = self.counters.gpu_restores.fetchAdd(1, .monotonic);
+        }
+
         /// Create or update the display link and match it to the current
         /// surface state.
         ///
@@ -1433,6 +1512,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const should_run =
                 // Non-visible windows never vsync
                 self.visible and
+                // Neither do surfaces without GPU resources
+                self.residency.isResident() and
                 // Only vsync if we have cell changes or animation
                 (self.cells_rebuilt or self.animationWake() != null);
 
@@ -1700,11 +1781,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // If we have any virtual references, we must also rebuild our
                 // kitty state on every frame because any cell change can move
                 // an image.
-                if (self.images.kittyRequiresUpdate(drawn)) {
+                if (self.kitty_reupload or self.images.kittyRequiresUpdate(drawn)) {
                     // We need to grab the draw mutex since this updates
                     // our image state that drawFrame uses.
                     self.draw_mutex.lockUncancelable(global.io());
                     defer self.draw_mutex.unlock(global.io());
+                    self.kitty_reupload = false;
                     self.images.kittyUpdate(
                         self.alloc,
                         drawn,
@@ -1979,6 +2061,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self: *Self,
             sync: bool,
         ) !void {
+            // A released surface draws nothing. Checked before the draw
+            // lock too, so a main-thread display pass never waits for a
+            // release that waits for frames in flight.
+            if (!self.residency.isResident()) return;
+
             // Everything that touches draw state happens under the draw
             // mutex. The display link is synced only after the mutex is
             // released; see `syncDisplayLink` for why it must never be
@@ -2029,6 +2116,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // only the case while unrealized (GTK); displayRealized
             // rebuilds the swap chain.
             if (!self.display_realized) return false;
+
+            // Released (`ghostty_surface_set_gpu_resident`): drawing would
+            // rebuild the swap chain the release freed.
+            if (!self.residency.isResident()) return false;
 
             // Get our swap chain, rebuilding it if it was released
             // while we were hidden. Rebuilding is deferred to draw

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # ghostty-next iOS render smoke: builds next/ios-smoke into a simulator app
 # and runs it in the booted simulator $NX_SIM_UDID once per check (fill,
-# grid, snapshot; see next/ios-smoke/main.swift). Each check passes only
-# when
+# grid, snapshot, gpu; see next/ios-smoke/main.swift). Each check passes
+# only when
 #   1. the app reports RENDER-SMOKE PASS (its checks of the pixels in the
 #      renderer's IOSurface), and
 #   2. a simulator screenshot taken while the app is on screen has the
-#      expected share of red pixels: at least 20% for fill and snapshot,
+#      expected share of red pixels: at least 20% for fill, snapshot and gpu,
 #      1 to 10% for grid (a 10x5 grid smaller than the view).
 #
 #   next/ios-render-smoke.sh --xcframework <dir>
@@ -67,10 +67,10 @@ print(round(100 * red / max(total, 1)))
 PY2
 }
 
-# One launch per check. The screenshot bounds: fill and snapshot cover
+# One launch per check. The screenshot bounds: fill, snapshot and gpu cover
 # the screen with red; grid ends with a 10x5 grid in a corner.
 failed=0
-for mode in fill grid snapshot; do
+for mode in fill grid snapshot gpu; do
   log="$work/console-$mode.log"
   shot="$work/shot-$mode.png"
   xcrun simctl launch --console-pty --terminate-running-process "$NX_SIM_UDID" "$bundle" "$mode" >"$log" 2>&1 &
