@@ -131,6 +131,10 @@ pub const Message = union(enum) {
     /// the viewport to follow the mouse cursor.
     selection_scroll_tick: bool,
 
+    /// The termio thread cleared the selection for a key press that found
+    /// the terminal lock busy (termio ``Message.typed``): tell the apprt.
+    selection_changed,
+
     /// The terminal has reported a change in the working directory.
     pwd_change: WriteReq,
 

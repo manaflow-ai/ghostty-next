@@ -50,7 +50,6 @@ scroll_plain: std.atomic.Value(bool) = .init(true),
 /// Output chunks that did not wake the renderer (`output_wakes` false).
 output_wakes_skipped: std.atomic.Value(u64) = .init(0),
 
-
 /// Bumped by every config change that sets the terminal's colors
 /// (`Termio.changeConfig`): the renderer blends that change with
 /// `color_transition` (`ColorBlend`). Protected by `mutex`.
@@ -94,6 +93,97 @@ demand: std.atomic.Value(u32) = .init(0),
 /// `unlockDemand` after a demanding waiter releases the mutex, so that
 /// `yieldToDemand` knows the waiter had its turn.
 handoff_gen: std.atomic.Value(u32) = .init(0),
+
+/// The number of input entry points (key, text, preedit, the manual
+/// backend's input writes) waiting to acquire `mutex` via `lockInput`.
+/// The output parser checks it between `input_slice_len` sub-slices of
+/// a chunk and hands the mutex over (`yieldToInputLocked`), so a key
+/// waits behind at most one sub-slice, never a whole chunk. Not
+/// protected by the mutex.
+input_waiting: std.atomic.Value(u32) = .init(0),
+
+/// Whether the active screen has a selection, and whether its viewport
+/// follows the active area with no place kept for a restore
+/// (`Termio.publishInputMirrorsLocked`). Written under `mutex` by every
+/// change that can make them true (selection) or false (viewport); read
+/// without it by `Surface.keyCallback`, which takes the lock after a
+/// plain key press only when one of them says there is work. A stale
+/// value only sends a press down the locked path.
+input_selection: std.atomic.Value(bool) = .init(false),
+input_viewport_follows: std.atomic.Value(bool) = .init(true),
+
+/// The embedder's report of `lockInput` waits of `lock_wait_report_ns`
+/// or more (`ghostty_surface_set_lock_wait_callback`), or null. Set once
+/// before the surface gets input.
+lock_wait_report: ?LockWaitReport = null,
+
+/// The output parser's sub-slice: a waiting input entry point gets the
+/// mutex after at most this many bytes are parsed.
+pub const input_slice_len = 4 * 1024;
+
+/// `lockInput` waits shorter than this are not reported.
+pub const lock_wait_report_ns = 50 * std.time.ns_per_us;
+
+pub const LockWaitReport = struct {
+    /// ghostty_surface_lock_wait_cb: (userdata, waited ns), on the thread
+    /// that waited, after it released the mutex.
+    pub const Callback = *const fn (?*anyopaque, u64) callconv(.c) void;
+
+    callback: Callback,
+    userdata: ?*anyopaque,
+};
+
+/// What `lockInput` returns and `unlockInput` takes.
+pub const InputLock = struct {
+    /// The mutex was held by another thread when the input asked for it.
+    contended: bool,
+    waited_ns: u64,
+};
+
+/// Acquire `mutex` for an input entry point. The output parser hands
+/// the mutex over between sub-slices while one waits. Release with
+/// `unlockInput`.
+pub fn lockInput(self: *State, io: std.Io) InputLock {
+    if (self.mutex.tryLock()) return .{ .contended = false, .waited_ns = 0 };
+    const start: std.Io.Timestamp = .now(io, .awake);
+    _ = self.input_waiting.fetchAdd(1, .monotonic);
+    self.mutex.lockUncancelable(io);
+    const prev = self.input_waiting.fetchSub(1, .monotonic);
+    assert(prev > 0);
+    const waited = start.durationTo(.now(io, .awake)).toNanoseconds();
+    return .{ .contended = true, .waited_ns = @intCast(@max(waited, 0)) };
+}
+
+/// Release `mutex` acquired with `lockInput`. A contended acquisition
+/// wakes the parser parked in `yieldToInputLocked`, then reports a wait
+/// of `lock_wait_report_ns` or more.
+pub fn unlockInput(self: *State, io: std.Io, held: InputLock) void {
+    if (!held.contended) return self.mutex.unlock(io);
+    self.unlockDemand(io);
+    if (held.waited_ns < lock_wait_report_ns) return;
+    const report = self.lock_wait_report orelse return;
+    report.callback(report.userdata, held.waited_ns);
+}
+
+/// Called by the output parser with `mutex` held, between sub-slices of
+/// one chunk: if an input entry point waits for the mutex, release it
+/// until that input had its turn (or the handoff timeout passes), then
+/// lock it again. Returns whether it released the mutex.
+pub fn yieldToInputLocked(self: *State, io: std.Io) bool {
+    if (self.input_waiting.load(.monotonic) == 0) return false;
+    // Read under the mutex: the waiter cannot have taken its turn yet,
+    // so its `unlockInput` changes the generation after this read.
+    const gen = self.handoff_gen.load(.monotonic);
+    self.mutex.unlock(io);
+    io.futexWaitTimeout(
+        @TypeOf(self.handoff_gen),
+        &self.handoff_gen,
+        .init(gen),
+        .{ .duration = .{ .raw = .fromNanoseconds(handoff_timeout_ns), .clock = .awake } },
+    ) catch {};
+    self.mutex.lockUncancelable(io);
+    return true;
+}
 
 /// How long `yieldToDemand` sleeps waiting for a demanding waiter to
 /// take its turn before giving up. This bounds how long the IO parse

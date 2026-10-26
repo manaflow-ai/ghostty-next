@@ -89,7 +89,6 @@ grid_locked: std.atomic.Value(bool) = .init(false),
 /// behind output.
 pending_size: PendingSize = .{},
 
-
 /// A snapshot whose history is still arriving after its READY prefix
 /// was restored (see `restoreSnapshot`). Only the output queue uses it.
 snapshot_restore: ?SnapshotRestore = null,
@@ -692,8 +691,9 @@ fn queueWriteManual(
     // Inline writes read it from the terminal, which the parser updates
     // under the renderer state lock.
     const linefeed = linefeed: {
-        if (mutex == .unlocked) self.renderer_state.mutex.lockUncancelable(global.io());
-        defer if (mutex == .unlocked) self.renderer_state.mutex.unlock(global.io());
+        if (mutex == .locked) break :linefeed self.terminal.modes.get(.linefeed);
+        const held = self.renderer_state.lockInput(global.io());
+        defer self.renderer_state.unlockInput(global.io(), held);
         break :linefeed self.terminal.modes.get(.linefeed);
     };
 
@@ -1183,6 +1183,7 @@ fn swapTerminalLocked(
         while (it.next()) |entry| entry.value.*.kitty_images.dirty = true;
     }
     self.terminal_stream.handler.queueRender() catch {};
+    self.publishInputMirrorsLocked();
     return old;
 }
 
@@ -1407,6 +1408,7 @@ pub fn restoreSnapshotLocalHistory(
         self.local_restore_scroll = null;
         if (keep) |kept| self.terminal.screens.get(.primary).?.scroll(.{ .row = kept.row });
         pending.apply(&self.terminal);
+        self.publishInputMirrorsLocked();
     }
     ready_terminal.deinit(self.alloc);
     return .restored;
@@ -1482,6 +1484,7 @@ fn keptViewportLocked(self: *Termio) ?ViewportKeep {
 /// arrives. Caller must hold `renderer_state.mutex`.
 fn placeKeptViewportLocked(self: *Termio) void {
     if (self.viewport_keep) |*keep| placePrimaryFromBottom(&self.terminal, keep);
+    self.publishInputMirrorsLocked();
 }
 
 /// The history is complete: the kept row is the viewport's first row.
@@ -1490,6 +1493,7 @@ fn finishKeptViewportLocked(self: *Termio) void {
     const keep = self.keptViewportLocked() orelse return;
     self.viewport_keep = null;
     self.terminal.screens.get(.primary).?.scroll(.{ .row = keep.row });
+    self.publishInputMirrorsLocked();
 }
 
 const LiveTerminalState = struct {
@@ -1886,6 +1890,7 @@ pub fn scrollViewportLocked(
         self.renderer_state.hold_frames = true;
     }
     self.terminal.scrollViewport(scroll);
+    self.publishInputMirrorsLocked();
 }
 
 /// Applies a wheel scroll the main thread handed over (``Message.scroll_wheel``)
@@ -1949,6 +1954,7 @@ pub fn jumpToPrompt(self: *Termio, delta: isize) !void {
         defer self.renderer_state.mutex.unlock(global.io());
         self.live_epoch +%= 1;
         self.terminal.screens.active.scroll(.{ .delta_prompt = delta });
+        self.publishInputMirrorsLocked();
     }
 
     try self.renderer_wakeup.notify();
@@ -1984,6 +1990,41 @@ pub fn processOutput(self: *Termio, buf: []const u8) void {
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
     self.processOutputLocked(buf);
+}
+
+/// Publish the input mirrors `Surface.keyCallback` reads without the
+/// lock (renderer.State.input_selection, input_viewport_follows). Every
+/// change that can give the active screen a selection, move its viewport
+/// off the active area or keep a place for a restore calls this before
+/// it releases the lock. Caller must hold `renderer_state.mutex`.
+pub fn publishInputMirrorsLocked(self: *Termio) void {
+    const screen = self.terminal.screens.active;
+    self.renderer_state.input_selection.store(screen.selection != null, .release);
+    self.renderer_state.input_viewport_follows.store(
+        screen.pages.viewport == .active and
+            self.viewport_keep == null and
+            self.local_restore_scroll == null,
+        .release,
+    );
+}
+
+/// Applies a key press's selection clear and scroll to the bottom that
+/// `Surface.keyCallback` posted because the lock was busy
+/// (``Message.typed``). Returns whether a selection was cleared: the
+/// caller tells the surface.
+pub fn typed(self: *Termio, t: termio.Message.Typed) bool {
+    const cleared = cleared: {
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+        const screen = self.terminal.screens.active;
+        const clear = t.clear_selection and screen.selection != null;
+        if (clear) screen.clearSelection();
+        if (t.scroll_bottom) self.scrollViewportLocked(.bottom);
+        self.publishInputMirrorsLocked();
+        break :cleared clear;
+    };
+    self.renderer_wakeup.notify() catch {};
+    return cleared;
 }
 
 /// Process output from readdata but the lock is already held.
@@ -2034,8 +2075,21 @@ fn processOutputLocked(self: *Termio, buf: []const u8) void {
             self.terminal_stream.next(byte);
         }
     } else {
-        self.terminal_stream.nextSlice(buf);
+        // Sub-slices: between two, a waiting input entry point gets the
+        // lock (renderer.State.yieldToInputLocked).
+        var rest = buf;
+        while (rest.len > renderer.State.input_slice_len) {
+            self.terminal_stream.nextSlice(rest[0..renderer.State.input_slice_len]);
+            rest = rest[renderer.State.input_slice_len..];
+            if (self.renderer_state.input_waiting.load(.monotonic) == 0) continue;
+            self.publishInputMirrorsLocked();
+            if (self.renderer_state.yieldToInputLocked(global.io())) {
+                self.applyPendingSizeLocked();
+            }
+        }
+        self.terminal_stream.nextSlice(rest);
     }
+    self.publishInputMirrorsLocked();
 
     // If our stream handling caused messages to be sent to the mailbox
     // thread, then we need to wake it up so that it processes them.
@@ -2176,6 +2230,39 @@ fn testDrainMailbox(mailbox: *termio.Mailbox) usize {
 
 /// Run `body` against a Termio with a manual backend. The surface
 /// mailbox is not set up: nothing in these tests sends to it.
+/// `len` bytes of full-screen repaints in dense SGR, as a TUI that redraws
+/// (btop, a game of life): from the top left, every cell its own
+/// truecolor or 256-color run, rows joined by CRLF, no scrolling.
+fn testDenseSgrFrames(
+    alloc: std.mem.Allocator,
+    len: usize,
+    cols: usize,
+    rows: usize,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const w = &out.writer;
+    var frame: usize = 0;
+    while (out.written().len < len) : (frame += 1) {
+        try w.writeAll("\x1b[H");
+        for (0..rows) |row| {
+            for (0..cols) |col| {
+                const v = (frame + row * cols + col) % 256;
+                if (col % 2 == 0) {
+                    try w.print("\x1b[1;38;2;{d};{d};0m#", .{ v, 255 - v });
+                } else {
+                    try w.print("\x1b[0;3;48;5;{d}m.", .{v});
+                }
+            }
+            try w.writeAll(if (row + 1 < rows) "\x1b[m\r\n" else "\x1b[m");
+        }
+    }
+    const bytes = try out.toOwnedSlice();
+    if (bytes.len == len) return bytes;
+    defer alloc.free(bytes);
+    return try alloc.dupe(u8, bytes[0..len]);
+}
+
 fn testManualTermio(
     mirror: bool,
     comptime body: anytype,
@@ -2368,6 +2455,133 @@ test "manual: set_grid locks the grid and resizes change only pixels" {
     }.run;
 
     try testManualTermio(false, body);
+    try testManualTermio(true, body);
+}
+
+test "manual: input mirrors follow the selection and the viewport" {
+    const body = struct {
+        fn run(io: *Termio, _: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            const state = io.renderer_state;
+            for (0..100) |_| io.processOutput("line\r\n");
+            try testing.expect(state.input_viewport_follows.load(.acquire));
+            try testing.expect(!state.input_selection.load(.acquire));
+
+            // A person's scroll moves the viewport off the bottom; output
+            // keeps it there and the parser says so again.
+            io.scrollViewport(.{ .delta = -5 });
+            try testing.expect(!state.input_viewport_follows.load(.acquire));
+            io.processOutput("more\r\n");
+            try testing.expect(!state.input_viewport_follows.load(.acquire));
+
+            {
+                state.mutex.lockUncancelable(global.io());
+                defer state.mutex.unlock(global.io());
+                const screen = io.terminal.screens.active;
+                try screen.select(.init(
+                    screen.pages.pin(.{ .active = .{ .x = 0, .y = 1 } }).?,
+                    screen.pages.pin(.{ .active = .{ .x = 2, .y = 1 } }).?,
+                    false,
+                ));
+                io.publishInputMirrorsLocked();
+            }
+            try testing.expect(state.input_selection.load(.acquire));
+
+            // The termio thread's half of a press that found the lock busy.
+            try testing.expect(io.typed(.{ .clear_selection = true, .scroll_bottom = true }));
+            try testing.expect(io.terminal.screens.active.selection == null);
+            try testing.expect(!state.input_selection.load(.acquire));
+            try testing.expect(state.input_viewport_follows.load(.acquire));
+            try testing.expect(!io.typed(.{ .clear_selection = true, .scroll_bottom = false }));
+        }
+    }.run;
+
+    try testManualTermio(false, body);
+    try testManualTermio(true, body);
+}
+
+test "manual: a key waits for one 4 KiB slice of dense SGR output, not a 64 KiB chunk" {
+    const body = struct {
+        /// The main thread's input entry points: lock for input, then wait
+        /// 100 us, until the output is parsed.
+        const Input = struct {
+            state: *renderer.State,
+            done: std.atomic.Value(bool) = .init(false),
+            waits: std.ArrayList(u64) = .empty,
+            reported: std.atomic.Value(u32) = .init(0),
+
+            fn report(userdata: ?*anyopaque, _: u64) callconv(.c) void {
+                const self: *@This() = @ptrCast(@alignCast(userdata.?));
+                _ = self.reported.fetchAdd(1, .monotonic);
+            }
+
+            fn run(self: *@This()) void {
+                while (!self.done.load(.acquire)) {
+                    const held = self.state.lockInput(global.io());
+                    self.state.unlockInput(global.io(), held);
+                    self.waits.append(std.testing.allocator, held.waited_ns) catch return;
+                    std.Io.sleep(global.io(), .fromMicroseconds(100), .awake) catch {};
+                }
+            }
+        };
+
+        fn run(io: *Termio, _: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            const alloc = testing.allocator;
+            const chunk = 64 * 1024;
+
+            const bytes = try testDenseSgrFrames(alloc, 8 << 20, io.terminal.cols, io.terminal.rows);
+            defer alloc.free(bytes);
+
+            // What one 64 KiB chunk (ghostty_surface_process_output's
+            // slice) takes to parse here, nothing waiting: the median of
+            // the first 16.
+            var chunk_ns: [16]u64 = undefined;
+            for (&chunk_ns, 0..) |*ns, i| {
+                const start: std.Io.Timestamp = .now(global.io(), .awake);
+                io.processOutput(bytes[i * chunk ..][0..chunk]);
+                ns.* = @intCast(start.durationTo(.now(global.io(), .awake)).toNanoseconds());
+            }
+            std.mem.sort(u64, &chunk_ns, {}, std.sort.asc(u64));
+            const chunk_median = chunk_ns[chunk_ns.len / 2];
+
+            var input: Input = .{ .state = io.renderer_state };
+            defer input.waits.deinit(alloc);
+            io.renderer_state.lock_wait_report = .{ .callback = Input.report, .userdata = &input };
+            defer io.renderer_state.lock_wait_report = null;
+
+            const thread = try std.Thread.spawn(.{}, Input.run, .{&input});
+            var rest: []const u8 = bytes[chunk_ns.len * chunk ..];
+            while (rest.len > 0) {
+                const n = @min(rest.len, chunk);
+                io.processOutput(rest[0..n]);
+                rest = rest[n..];
+            }
+            input.done.store(true, .release);
+            thread.join();
+
+            const waits = input.waits.items;
+            try testing.expect(waits.len > 0);
+            var over: u32 = 0;
+            for (waits) |w| {
+                if (w >= renderer.State.lock_wait_report_ns) over += 1;
+            }
+            try testing.expectEqual(over, input.reported.load(.monotonic));
+
+            std.mem.sort(u64, waits, {}, std.sort.asc(u64));
+            const p99 = waits[(waits.len * 99) / 100];
+            log.info("input lock waits n={d} p99={d}ns max={d}ns chunk={d}ns", .{
+                waits.len, p99, waits[waits.len - 1], chunk_median,
+            });
+            // A key waits for one 4 KiB slice, a 16th of a chunk, never
+            // the chunk (a quarter leaves room for a loaded host). The
+            // test executable is Debug, whose parse of one slice is
+            // slower than the 0.5 ms budget an optimized parser meets.
+            try testing.expect(p99 < chunk_median / 4);
+            if (builtin.mode != .Debug) try testing.expect(p99 < 500 * std.time.ns_per_us);
+        }
+    }.run;
+
     try testManualTermio(true, body);
 }
 

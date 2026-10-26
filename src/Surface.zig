@@ -1284,6 +1284,14 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             try self.selectionScrollTick();
         },
 
+        .selection_changed => _ = self.rt_app.performAction(
+            .{ .surface = self },
+            .selection_changed,
+            {},
+        ) catch |err| {
+            log.warn("apprt failed selection_changed notification err={}", .{err});
+        },
+
         .start_command => {
             self.command_timer = .now(global.io(), .awake);
         },
@@ -2731,6 +2739,7 @@ fn setSelection(self: *Surface, sel_: ?terminal.Selection) !void {
     };
 
     try self.io.terminal.screens.active.select(sel_);
+    self.io.publishInputMirrorsLocked();
 
     if (changed) {
         _ = self.rt_app.performAction(
@@ -2994,8 +3003,8 @@ pub fn preeditCallback(self: *Surface, preedit_: ?[]const u8) !void {
     crash.sentry.thread_state = self.crashThreadState();
     defer crash.sentry.thread_state = null;
 
-    self.renderer_state.mutex.lockUncancelable(global.io());
-    defer self.renderer_state.mutex.unlock(global.io());
+    const held = self.renderer_state.lockInput(global.io());
+    defer self.renderer_state.unlockInput(global.io(), held);
 
     // We clear our selection when ANY OF:
     // 1. We have an existing preedit
@@ -3161,8 +3170,8 @@ pub fn keyCallback(
     )) |v| return v;
     // If we allow KAM and KAM is enabled then we do nothing.
     if (self.config.vt_kam_allowed) {
-        self.renderer_state.mutex.lockUncancelable(global.io());
-        defer self.renderer_state.mutex.unlock(global.io());
+        const held = self.renderer_state.lockInput(global.io());
+        defer self.renderer_state.unlockInput(global.io(), held);
         if (self.io.terminal.modes.get(.disable_keyboard)) return .consumed;
     }
 
@@ -3192,8 +3201,8 @@ pub fn keyCallback(
         {
             // Refresh our link state
             const pos = self.rt_surface.getCursorPos() catch break :mouse_mods;
-            self.renderer_state.mutex.lockUncancelable(global.io());
-            defer self.renderer_state.mutex.unlock(global.io());
+            const held = self.renderer_state.lockInput(global.io());
+            defer self.renderer_state.unlockInput(global.io(), held);
             self.mouseRefreshLinks(
                 pos,
                 self.posToViewport(pos.x, pos.y),
@@ -3284,22 +3293,36 @@ pub fn keyCallback(
     // If our event is any keypress that isn't a modifier and we generated
     // some data to send to the pty, then we move the viewport down to the
     // bottom. We also clear the selection for any key other then modifiers.
-    if (!event.key.modifier()) {
-        self.renderer_state.mutex.lockUncancelable(global.io());
-        defer self.renderer_state.mutex.unlock(global.io());
-
-        if (self.config.selection_clear_on_typing or
-            event.key == .escape)
-        {
-            try self.setSelection(null);
-        }
-
-        if (self.config.scroll_to_bottom.keystroke) self.io.scrollViewportLocked(.bottom);
-
-        try self.queueRender();
-    }
+    if (!event.key.modifier()) try self.typedSideEffects(event.key == .escape);
 
     return .consumed;
+}
+
+/// A typed key's selection clear and scroll to the bottom. The press never
+/// waits for the terminal lock: the input mirrors
+/// (renderer.State.input_selection, input_viewport_follows) say whether
+/// there is anything to do; when there is and the lock is busy (output
+/// being parsed), the termio thread does it (termio Message.typed).
+fn typedSideEffects(self: *Surface, escape: bool) !void {
+    const state = &self.renderer_state;
+    const clear_selection = (self.config.selection_clear_on_typing or escape) and
+        state.input_selection.load(.acquire);
+    const scroll_bottom = self.config.scroll_to_bottom.keystroke and
+        !state.input_viewport_follows.load(.acquire);
+    if (clear_selection or scroll_bottom) {
+        if (state.mutex.tryLock()) {
+            defer state.mutex.unlock(global.io());
+            if (clear_selection) try self.setSelection(null);
+            if (scroll_bottom) self.io.scrollViewportLocked(.bottom);
+        } else {
+            self.queueIo(.{ .typed = .{
+                .clear_selection = clear_selection,
+                .scroll_bottom = scroll_bottom,
+            } }, .unlocked);
+        }
+    }
+
+    try self.queueRender();
 }
 
 /// Maybe handles a binding for a given event and if so returns the effect.
@@ -3717,9 +3740,9 @@ fn encodeKey(
     return write_req;
 }
 
-fn encodeKeyOpts(self: *const Surface) input.key_encode.Options {
-    self.renderer_state.mutex.lockUncancelable(global.io());
-    defer self.renderer_state.mutex.unlock(global.io());
+fn encodeKeyOpts(self: *Surface) input.key_encode.Options {
+    const held = self.renderer_state.lockInput(global.io());
+    defer self.renderer_state.unlockInput(global.io(), held);
     const t = &self.io.terminal;
 
     var opts: input.key_encode.Options = .fromTerminal(t);
@@ -3785,11 +3808,7 @@ pub fn textInputCallback(self: *Surface, text: []const u8) !void {
     ), .unlocked);
 
     // Same side effects as typing a key.
-    self.renderer_state.mutex.lockUncancelable(global.io());
-    defer self.renderer_state.mutex.unlock(global.io());
-    if (self.config.selection_clear_on_typing) try self.setSelection(null);
-    if (self.config.scroll_to_bottom.keystroke) self.io.scrollViewportLocked(.bottom);
-    try self.queueRender();
+    try self.typedSideEffects(false);
 }
 
 /// Callback for when the surface is fully visible or not, regardless
@@ -5861,6 +5880,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                 const sel = self.io.terminal.screens.active.selection orelse return false;
                 const tl = sel.topLeft(self.io.terminal.screens.active);
                 self.io.terminal.screens.active.scroll(.{ .pin = tl });
+                self.io.publishInputMirrorsLocked();
             }
 
             try self.queueRender();
@@ -6275,6 +6295,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                     sel.end().up(screen.pages.rows - 1) orelse sel.end();
 
                 screen.scroll(.{ .pin = target });
+                self.io.publishInputMirrorsLocked();
             }
 
             // Queue a render so its shown

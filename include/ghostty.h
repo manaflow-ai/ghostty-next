@@ -1452,6 +1452,20 @@ GHOSTTY_API bool ghostty_surface_set_font_size_action_callback(
     ghostty_surface_t,
     ghostty_font_size_action_cb,
     void* userdata);
+// Reports each wait of 50 us or more by an input entry point (key, text,
+// preedit, a manual surface's input write) for the terminal lock, in
+// nanoseconds. Output parsing hands the lock to a waiting input every
+// 4 KiB, so a wait is at most one such slice. Runs on the thread that
+// waited (the app thread for input), after it released the lock; it must
+// not call into Ghostty. Call once after ghostty_surface_new, before the
+// surface gets input: a second call or a NULL callback returns false.
+// userdata must stay valid until ghostty_surface_free returns.
+typedef void (*ghostty_surface_lock_wait_cb)(void* userdata,
+                                             uint64_t wait_ns);
+GHOSTTY_API bool ghostty_surface_set_lock_wait_callback(
+    ghostty_surface_t,
+    ghostty_surface_lock_wait_cb,
+    void* userdata);
 // Installs the link filter for this surface; a NULL callback removes it.
 // userdata must stay valid until the filter is removed or
 // ghostty_surface_free returns.

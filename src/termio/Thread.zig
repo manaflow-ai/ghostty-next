@@ -329,6 +329,9 @@ fn drainMailbox(
             .clear_screen => |v| try io.clearScreen(data, v.history),
             .scroll_viewport => |v| io.scrollViewport(v),
             .scroll_wheel => |v| io.scrollWheel(data, v),
+            .typed => |v| if (io.typed(v)) {
+                _ = data.surface_mailbox.push(.{ .selection_changed = {} }, .{ .forever = {} });
+            },
             .selection_scroll => |v| {
                 if (v) {
                     self.startScrollTimer(cb);

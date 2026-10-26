@@ -26,6 +26,13 @@ pub const Message = union(enum) {
         mouse_reporting: bool,
     };
 
+    /// A key press's side effects that `Surface.keyCallback` could not
+    /// apply because the terminal lock was busy (``Message.typed``).
+    pub const Typed = struct {
+        clear_selection: bool,
+        scroll_bottom: bool,
+    };
+
     /// Represents a write request. Magic number comes from the largest
     /// other union value. It can be upped if we add a larger union member
     /// in the future.
@@ -82,6 +89,11 @@ pub const Message = union(enum) {
     /// the terminal has then (``Termio.scrollWheel``): a viewport scroll,
     /// alternate-screen arrow keys, or mouse reports.
     scroll_wheel: ScrollWheel,
+
+    /// A key press found the terminal lock busy: clear the selection and
+    /// scroll to the bottom under the lock (``Termio.typed``), so the press
+    /// never waits for output being parsed.
+    typed: Typed,
 
     /// Selection scrolling. If this is set to true then the termio
     /// thread starts a timer that will trigger a `selection_scroll_tick`

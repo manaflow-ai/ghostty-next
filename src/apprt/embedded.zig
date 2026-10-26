@@ -1661,7 +1661,6 @@ pub const CAPI = struct {
         cell_height_px: u32,
     };
 
-
     // ghostty_clipboard_content_s
     //
     // One representation of clipboard contents. The data is binary-safe
@@ -2168,6 +2167,20 @@ pub const CAPI = struct {
         if (surface.font_size_action_cb != null) return false;
         surface.font_size_action_cb = registered;
         surface.font_size_action_userdata = userdata;
+        return true;
+    }
+
+    /// Install the report of input waits for the terminal lock. One-shot:
+    /// a second call or a null callback returns false. See ghostty.h.
+    export fn ghostty_surface_set_lock_wait_callback(
+        surface: *Surface,
+        callback: ?renderer.State.LockWaitReport.Callback,
+        userdata: ?*anyopaque,
+    ) bool {
+        const registered = callback orelse return false;
+        const state = &surface.core_surface.renderer_state;
+        if (state.lock_wait_report != null) return false;
+        state.lock_wait_report = .{ .callback = registered, .userdata = userdata };
         return true;
     }
 
