@@ -1,15 +1,15 @@
-//! A wrapper around a CALayer with a utility method
-//! for settings its `contents` to an IOSurface.
+//! The surface's root layer: a CALayer whose `contents` the main thread
+//! sets to an IOSurface for a frame it presents itself (a synchronous draw
+//! or the resize pre-commit), and whose `display` pass calls the renderer.
+//! Every method runs on the main thread; the renderer's own frames go to
+//! the drawable overlay above it (`DrawablePresenter`).
 const IOSurfaceLayer = @This();
 
 const std = @import("std");
-const Allocator = std.mem.Allocator;
 const objc = @import("objc");
 const macos = @import("macos");
 
 const IOSurface = macos.iosurface.IOSurface;
-
-const log = std.log.scoped(.IOSurfaceLayer);
 
 /// We subclass CALayer with a custom display handler, we only need
 /// to make the subclass once, and then we can use it as a singleton.
@@ -35,8 +35,6 @@ pub fn init() !IOSurfaceLayer {
 
     layer.setInstanceVariable("display_cb", .{ .value = null });
     layer.setInstanceVariable("display_ctx", .{ .value = null });
-    layer.setInstanceVariable("host_size", .{ .value = null });
-    layer.setInstanceVariable("overlay_gen", .{ .value = null });
 
     return .{ .layer = layer };
 }
@@ -51,131 +49,22 @@ pub fn release(self: *IOSurfaceLayer) void {
 
 /// Detach this layer from its host (the embedder's view layer) if its
 /// display callback still belongs to `display_cb`/`display_ctx`: clear
-/// the callback, the contents, and remove it from its superlayer. Runs
-/// synchronously on the main queue, because Core Animation calls the
-/// display callback from main thread transactions while the renderer is
-/// being destroyed.
+/// the callback, the contents, and remove it from its superlayer. Main
+/// thread: the surface is freed there (`ghostty_surface_free`), and Core
+/// Animation calls the display callback only in main-thread transactions,
+/// so nothing calls into the renderer after this returns.
 pub fn detachFromHostIfDisplayCallbackOwned(
     self: *IOSurfaceLayer,
     display_cb: DisplayCallback,
     display_ctx: ?*anyopaque,
 ) void {
-    var block = DetachFromHostBlock.init(.{
-        .layer = self.layer.value,
-        .display_cb = @ptrCast(@constCast(display_cb)),
-        .display_ctx = display_ctx,
-    }, &detachFromHostCallback);
-
-    const NSThread = objc.getClass("NSThread").?;
-    if (NSThread.msgSend(bool, "isMainThread", .{})) {
-        detachFromHostCallback(&block);
-    } else {
-        macos.dispatch.dispatch_sync(
-            @ptrCast(macos.dispatch.queue.getMain()),
-            @ptrCast(&block),
-        );
-    }
-}
-
-/// Records the host-set target size (`Metal.setHostDrawableSize`, packed
-/// width << 32 | height; 0 when the target follows the bounds), which
-/// `setSurfaceCallback` checks frames against. Main thread.
-pub fn setHostSize(self: *IOSurfaceLayer, value: u64) void {
-    setIntIvar(self.layer, "host_size", value);
-}
-
-/// The value `setHostSize` stored.
-fn hostSize(layer: objc.Object) u64 {
-    return intIvar(layer, "host_size");
-}
-
-/// The off-main present forms (`OffMainPresenter`): the generation of the
-/// main thread's last hide of the overlay layer. A reveal posted by the
-/// renderer shows the overlay again only in its own generation; the value
-/// lives on the layer so the reveal block never reads renderer memory.
-/// Main thread.
-pub fn setOverlayGeneration(layer: objc.Object, value: u64) void {
-    setIntIvar(layer, "overlay_gen", value);
-}
-
-/// The value `setOverlayGeneration` stored. Main thread.
-pub fn overlayGeneration(layer: objc.Object) u64 {
-    return intIvar(layer, "overlay_gen");
-}
-
-fn setIntIvar(layer: objc.Object, comptime name: [:0]const u8, value: u64) void {
-    // Stored shifted left by 3 so the object-typed ivar holds an 8-aligned
-    // pointer value (safe builds check the alignment of @ptrFromInt). The
-    // ivar is never retained or released (no ARC layout on this class).
-    const stored: usize = @intCast(value << 3);
-    layer.setInstanceVariable(name, .{ .value = @ptrFromInt(stored) });
-}
-
-fn intIvar(layer: objc.Object, comptime name: [:0]const u8) u64 {
-    return @as(u64, @intFromPtr(layer.getInstanceVariable(name).value)) >> 3;
-}
-
-/// Sets the layer's `contents` to the provided IOSurface.
-///
-/// Makes sure to do so on the main thread to avoid visual artifacts.
-pub inline fn setSurface(self: *IOSurfaceLayer, surface: *IOSurface) !void {
-    // We retain the surface to make sure it's not GC'd
-    // before we can set it as the contents of the layer.
-    //
-    // We release in the callback after setting the contents.
-    surface.retain();
-    // NOTE: Since `self.layer` is passed as an `objc.c.id`, it's
-    //       automatically retained when the block is copied, so we
-    //       don't need to retain it ourselves like with the surface.
-
-    var block = SetSurfaceBlock.init(.{
-        .layer = self.layer.value,
-        .surface = surface,
-    }, &setSurfaceCallback);
-
-    // We check if we're on the main thread and run the block directly if so.
-    const NSThread = objc.getClass("NSThread").?;
-    if (NSThread.msgSend(bool, "isMainThread", .{})) {
-        setSurfaceCallback(&block);
-    } else {
-        // NOTE: The block will be copied when we pass it to dispatch_async,
-        //       and then automatically be deallocated by the objc runtime
-        //       once it's executed.
-
-        macos.dispatch.dispatch_async(
-            @ptrCast(macos.dispatch.queue.getMain()),
-            @ptrCast(&block),
-        );
-    }
-}
-
-/// Sets the layer's `contents` to the provided IOSurface.
-///
-/// Does not ensure this happens on the main thread.
-pub inline fn setSurfaceSync(self: *IOSurfaceLayer, surface: *IOSurface) void {
-    self.layer.setProperty("contents", surface);
-}
-
-const SetSurfaceBlock = objc.Block(struct {
-    layer: objc.c.id,
-    surface: *IOSurface,
-}, .{}, void);
-
-const DetachFromHostBlock = objc.Block(struct {
-    layer: objc.c.id,
-    display_cb: ?*anyopaque,
-    display_ctx: ?*anyopaque,
-}, .{}, void);
-
-fn detachFromHostCallback(
-    block: *const DetachFromHostBlock.Context,
-) callconv(.c) void {
-    const layer = objc.Object.fromId(block.layer);
+    const layer = self.layer;
 
     // Ownership guard: a layer rebound to another renderer stays as it is.
     const cur_cb: ?*anyopaque = @ptrCast(layer.getInstanceVariable("display_cb").value);
     const cur_ctx: ?*anyopaque = @ptrCast(layer.getInstanceVariable("display_ctx").value);
-    if (cur_cb != block.display_cb or cur_ctx != block.display_ctx) return;
+    const own_cb: ?*anyopaque = @ptrCast(@constCast(display_cb));
+    if (cur_cb != own_cb or cur_ctx != display_ctx) return;
 
     layer.setInstanceVariable("display_cb", .{ .value = null });
     layer.setInstanceVariable("display_ctx", .{ .value = null });
@@ -183,36 +72,17 @@ fn detachFromHostCallback(
     layer.msgSend(void, objc.sel("removeFromSuperlayer"), .{});
 }
 
-fn setSurfaceCallback(
-    block: *const SetSurfaceBlock.Context,
-) callconv(.c) void {
-    const layer = objc.Object.fromId(block.layer);
-    const surface: *IOSurface = block.surface;
+/// Sets the layer's `contents` (null clears them) in the caller's Core
+/// Animation transaction. Main thread: the layer belongs to the embedder's
+/// view, and the renderer never writes it.
+pub fn setContents(self: *IOSurfaceLayer, surface: ?*IOSurface) void {
+    self.layer.setProperty("contents", surface);
+}
 
-    // See explanation of why we retain and release in `setSurface`.
-    defer surface.release();
-
-    // We check to see if the surface is the appropriate size for
-    // the layer, if it's not then we discard it. This is because
-    // asynchronously drawn frames can sometimes finish just after
-    // a synchronously drawn frame during a resize, and if we don't
-    // discard the improperly sized surface it creates jank.
-    // A host-sized layer expects the host's size, not its bounds (which
-    // move ahead of it during a drag).
-    const host = hostSize(layer);
-    const bounds = layer.getProperty(macos.graphics.Rect, "bounds");
-    const scale = layer.getProperty(f64, "contentsScale");
-    const width: usize = if (host != 0) @intCast(host >> 32) else @intFromFloat(bounds.size.width * scale);
-    const height: usize = if (host != 0) @intCast(host & 0xffff_ffff) else @intFromFloat(bounds.size.height * scale);
-    if (width != surface.getWidth() or height != surface.getHeight()) {
-        log.debug(
-            "setSurfaceCallback(): surface is wrong size for layer, discarding. surface = {d}x{d}, layer = {d}x{d}",
-            .{ surface.getWidth(), surface.getHeight(), width, height },
-        );
-        return;
-    }
-
-    layer.setProperty("contents", surface);
+/// The IOSurface in `contents`, or null. Main thread.
+pub fn contentsSurface(self: *const IOSurfaceLayer) ?*IOSurface {
+    const contents = self.layer.getProperty(?*anyopaque, "contents") orelse return null;
+    return @ptrCast(contents);
 }
 
 pub const DisplayCallback = ?*align(8) const fn (?*anyopaque) void;
@@ -244,8 +114,6 @@ fn getSubclass() error{ObjCFailed}!objc.Class {
 
     if (!subclass.addIvar("display_cb")) return error.ObjCFailed;
     if (!subclass.addIvar("display_ctx")) return error.ObjCFailed;
-    if (!subclass.addIvar("host_size")) return error.ObjCFailed;
-    if (!subclass.addIvar("overlay_gen")) return error.ObjCFailed;
 
     subclass.replaceMethod("display", struct {
         fn display(target: objc.c.id, sel: objc.c.SEL) callconv(.c) void {

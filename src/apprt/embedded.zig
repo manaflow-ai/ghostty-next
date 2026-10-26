@@ -457,6 +457,10 @@ pub const FontSizeActionCallback = *const fn (
     bool,
 ) callconv(.c) void;
 
+/// ghostty_surface_presented_cb: userdata, frame id, host time
+/// (`mach_absolute_time`) and the drawable's `presentedTime` (0: not shown).
+pub const PresentedCallback = *const fn (?*anyopaque, u64, u64, f64) callconv(.c) void;
+
 pub const Surface = struct {
     app: *App,
     platform: Platform,
@@ -479,6 +483,11 @@ pub const Surface = struct {
     io_mode: apprt.SurfaceIoMode = .exec,
     io_write_cb: ?termio.Manual.WriteCallback = null,
     io_write_userdata: ?*anyopaque = null,
+
+    /// The embedder's presented callback (Options.presented_cb). The
+    /// renderer reads it once, when it is made.
+    presented_cb: ?PresentedCallback = null,
+    presented_userdata: ?*anyopaque = null,
 
     /// Font binding callback, run on the GUI thread. Belongs to this exact
     /// surface; child surfaces never inherit it.
@@ -544,6 +553,15 @@ pub const Surface = struct {
 
         /// Passed as the first argument of io_write_cb.
         io_write_userdata: ?*anyopaque = null,
+
+        /// Called after each frame the renderer presented off the main
+        /// thread. See ghostty_surface_presented_cb in ghostty.h for the
+        /// threading contract. Surfaces Ghostty asks the embedder to create
+        /// do not inherit it.
+        presented_cb: ?PresentedCallback = null,
+
+        /// Passed as the first argument of presented_cb.
+        presented_userdata: ?*anyopaque = null,
     };
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
@@ -564,6 +582,8 @@ pub const Surface = struct {
             ) orelse return error.InvalidIoMode,
             .io_write_cb = opts.io_write_cb,
             .io_write_userdata = opts.io_write_userdata,
+            .presented_cb = opts.presented_cb,
+            .presented_userdata = opts.presented_userdata,
         };
 
         // Add ourselves to the list of surfaces on the app.
@@ -1354,7 +1374,7 @@ pub const Surface = struct {
     }
 };
 
-// The IO fields extend ghostty_surface_config_s. ghostty.h must match;
+// The IO and presented fields extend ghostty_surface_config_s. ghostty.h must match;
 // the "ghostty.h surface config IO fields" test in apprt/structs.zig
 // checks the header side of the same layout.
 comptime {
@@ -1364,8 +1384,10 @@ comptime {
             @offsetOf(O, "io_mode") != 88 or
             @offsetOf(O, "io_write_cb") != 96 or
             @offsetOf(O, "io_write_userdata") != 104 or
-            @sizeOf(O) != 112)
-            @compileError("Surface.Options IO fields must match ghostty_surface_config_s");
+            @offsetOf(O, "presented_cb") != 112 or
+            @offsetOf(O, "presented_userdata") != 120 or
+            @sizeOf(O) != 128)
+            @compileError("Surface.Options IO and presented fields must match ghostty_surface_config_s");
     }
 }
 
@@ -2203,6 +2225,28 @@ pub const CAPI = struct {
         if (comptime !@hasDecl(@TypeOf(api.*), "presentHostSized")) return false;
         _ = api.counters.present_calls.fetchAdd(1, .monotonic);
         return api.presentHostSized();
+    }
+
+    /// The frame on screen, retained. See ghostty.h.
+    export fn ghostty_surface_presented_frame(surface: *Surface) ?*anyopaque {
+        const api = &surface.core_surface.renderer.api;
+        if (comptime !@hasDecl(@TypeOf(api.*), "presentedFrame")) return null;
+        return @ptrCast(api.presentedFrame());
+    }
+
+    /// Hide, show or purge what the surface presents. See ghostty.h.
+    export fn ghostty_surface_set_presentation(surface: *Surface, value: c_int) void {
+        const api = &surface.core_surface.renderer.api;
+        if (comptime !@hasDecl(@TypeOf(api.*), "setPresentation")) return;
+        const presentation = std.enums.fromInt(renderer.Presentation, value) orelse {
+            log.warn("invalid presentation value={}", .{value});
+            return;
+        };
+        if (api.setPresentation(presentation)) {
+            surface.core_surface.refreshCallback() catch |err| {
+                log.warn("error queueing a render after show err={}", .{err});
+            };
+        }
     }
 
     /// Draw a reflow preview while the locked grid does not fit the view.

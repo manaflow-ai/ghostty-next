@@ -12,7 +12,7 @@ const Target = @import("Target.zig");
 const RenderPass = @import("RenderPass.zig");
 
 const Health = @import("../../renderer.zig").Health;
-const OffMainPresenter = @import("OffMainPresenter.zig");
+const PresentState = @import("PresentState.zig");
 
 const log = std.log.scoped(.metal);
 
@@ -62,9 +62,9 @@ const CompletionBlock = objc.Block(struct {
     renderer: *Renderer,
     target: *Target,
     sync: bool,
-    /// What the off-main present form encoded for this frame
+    /// The drawable present encoded for this frame
     /// (`Metal.encodePresent`); empty for a synchronous frame.
-    ticket: OffMainPresenter.Ticket = .{},
+    ticket: PresentState.Ticket = .{},
 }, .{
     objc.c.id, // MTLCommandBuffer
 }, void);

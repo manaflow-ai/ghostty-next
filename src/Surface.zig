@@ -1248,6 +1248,10 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
 
         .renderer_health => |health| self.updateRendererHealth(health),
 
+        .present_reveal => if (@hasDecl(@TypeOf(self.renderer.api), "revealPresented")) {
+            self.renderer.api.revealPresented();
+        },
+
         .scrollbar => |scrollbar| self.updateScrollbar(scrollbar),
 
         .present_surface => try self.presentSurface(),

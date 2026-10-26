@@ -616,6 +616,35 @@ typedef enum {
 // into the surface. It can be called until ghostty_surface_free returns.
 typedef void (*ghostty_io_write_cb)(void*, const char*, uintptr_t);
 
+// Called once for each frame the renderer presented off the main thread
+// (macOS and iOS: the renderer copies each frame into a drawable of its
+// CAMetalLayer and presents it from its own thread; no main-thread turn and
+// no Core Animation transaction of the embedder carries the frame).
+// Arguments: userdata (ghostty_surface_config_s.presented_userdata), the
+// frame id (monotonic for the surface, from 1), mach_absolute_time() when
+// the callback runs, and the drawable's presentedTime (seconds,
+// CACurrentMediaTime base; 0 when the frame was not shown).
+//
+// Runs on a Core Animation thread, never the main thread. It must return
+// quickly, never block or wait for the main thread, and never call into
+// Ghostty: ghostty_surface_free waits for a running call to return. No call
+// starts after ghostty_surface_free returned.
+typedef void (*ghostty_surface_presented_cb)(void* userdata,
+                                             uint64_t frame_id,
+                                             uint64_t host_time,
+                                             double presented_time);
+
+// ghostty_surface_set_presentation.
+typedef enum {
+  // Nothing new is presented, and the surface's layers show nothing.
+  GHOSTTY_PRESENTATION_HIDDEN = 0,
+  // The last frame shows at once and the renderer's next frame replaces it.
+  GHOSTTY_PRESENTATION_SHOWN = 1,
+  // Hidden, and the kept frames and drawables are freed: the next show
+  // shows nothing until the renderer's next frame.
+  GHOSTTY_PRESENTATION_PURGE = 2,
+} ghostty_presentation_e;
+
 // Font binding actions reported after Ghostty applied them (increase,
 // decrease, reset, set). The callback runs synchronously on the surface's
 // GUI thread and must not free or reenter the surface.
@@ -662,6 +691,10 @@ typedef struct {
   ghostty_surface_io_mode_e io_mode;
   ghostty_io_write_cb io_write_cb;
   void* io_write_userdata;
+  // See ghostty_surface_presented_cb; NULL for none. Not inherited by the
+  // surfaces Ghostty asks the embedder to create.
+  ghostty_surface_presented_cb presented_cb;
+  void* presented_userdata;
 } ghostty_surface_config_s;
 
 typedef struct {
@@ -1464,7 +1497,7 @@ GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t)
 // cells rebuilt for it (the reflow preview included); the next display pass
 // presents that frame in its Core Animation transaction, waiting for it at
 // most 4 ms after the size was set, and otherwise keeps the last frame (the
-// new one lands at the following pass). The main thread draws only the first
+// renderer presents the new one itself when it completes). The main thread draws only the first
 // frame. A hidden surface's display pass draws nothing. Until the first
 // ghostty_surface_set_size the target follows the bounds.
 // Default false (the target follows the bounds). No effect on iOS, where the
@@ -1483,6 +1516,25 @@ GHOSTTY_API void ghostty_surface_set_host_sized(ghostty_surface_t, bool);
 // (ghostty_surface_set_occlusion true) counts as a size change: call it in
 // that turn too, and its frame is waited for from the reveal. Main thread.
 GHOSTTY_API bool ghostty_surface_present_host_frame(ghostty_surface_t);
+// The frame on screen as an IOSurfaceRef, retained (+1: CFRelease it), or
+// NULL before the first frame and after a purge. It is the renderer's own
+// buffer: the renderer draws into it again a few frames later, so copy the
+// pixels you keep. Any thread.
+//
+// Who writes the presented layers: the renderer writes only the drawables of
+// its CAMetalLayer, from its own thread. The main thread writes the root
+// layer's contents only for a frame it presents itself (the first frame, a
+// synchronous ghostty_surface_draw, the resize pre-commit of
+// ghostty_surface_present_host_frame) and shows the renderer's layer again
+// from ghostty_app_tick after the renderer's next frame. The embedder never
+// writes these layers; it hides, shows and purges through
+// ghostty_surface_set_presentation.
+GHOSTTY_API void* ghostty_surface_presented_frame(ghostty_surface_t);
+// Hide, show or purge what the surface presents (ghostty_presentation_e).
+// Independent of ghostty_surface_set_occlusion, which stops the renderer.
+// SHOWN after HIDDEN or PURGE queues a frame. Main thread.
+GHOSTTY_API void ghostty_surface_set_presentation(ghostty_surface_t,
+                                                  ghostty_presentation_e);
 GHOSTTY_API ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
 // Fills the grid metrics. Returns false while a resize of an unlocked grid
 // is in flight; with a host-locked grid (ghostty_surface_set_grid) the

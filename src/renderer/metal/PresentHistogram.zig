@@ -1,6 +1,5 @@
-//! Durations of the present-form spike (OffMainPresenter: the renderer's
-//! `nextDrawable` wait or its transaction commit), safe to record from any
-//! thread. Bucket 0 holds durations below 1 us; bucket i (i > 0) holds
+//! Durations of the renderer's `nextDrawable` wait (DrawablePresenter),
+//! safe to record from any thread. Bucket 0 holds durations below 1 us; bucket i (i > 0) holds
 //! durations from 2^(i-1) us to below 2^i us; the last bucket also holds
 //! everything above it. Count, sum and max are exact.
 const PresentHistogram = @This();

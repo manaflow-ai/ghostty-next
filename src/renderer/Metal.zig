@@ -19,7 +19,9 @@ const IOSurface = macos.iosurface.IOSurface;
 
 const mtl = @import("metal/api.zig");
 const IOSurfaceLayer = @import("metal/IOSurfaceLayer.zig");
-const OffMainPresenter = @import("metal/OffMainPresenter.zig");
+const DrawablePresenter = @import("metal/DrawablePresenter.zig");
+const PresentState = @import("metal/PresentState.zig");
+const PresentedSink = @import("metal/PresentedSink.zig");
 pub const Device = @import("metal/Device.zig");
 
 pub const GraphicsAPI = Metal;
@@ -44,14 +46,16 @@ const log = std.log.scoped(.metal);
 
 layer: IOSurfaceLayer,
 
-/// macOS, `macos-present-form` other than `main-contents`: the layer above
-/// `layer` that the renderer shows its frames in without the main thread
-/// (OffMainPresenter). Null: every frame goes through the main queue.
-offmain: ?OffMainPresenter = null,
+/// The drawable layer above `layer` that the renderer presents its frames
+/// in, without the main thread.
+presenter: DrawablePresenter,
 
-/// Frames that the renderer handed to the main queue (`setSurface`), in
-/// every present form: the main-thread turns that frames cost.
-main_hops: std.atomic.Value(u64) = .init(0),
+/// The frame on screen, for `ghostty_surface_presented_frame`.
+last_frame: LastFrame = .{},
+
+/// Whether the presentation was purged (`setPresentation(.purge)`): the
+/// next show sizes the drawables again. Main thread.
+purged: bool = false,
 
 /// The shared render device.
 device: *const Device,
@@ -68,7 +72,9 @@ autorelease_pool: ?*objc.AutoreleasePool = null,
 /// macOS, opt-in (`ghostty_surface_set_host_sized`): the render target's
 /// pixel size, packed width << 32 | height, as the embedder last set it
 /// with `ghostty_surface_set_size`. 0 follows the layer's bounds (default).
-/// Written on the main thread, read by `surfaceSize` on any thread.
+/// Written on the main thread (after the drawables of that size are set),
+/// read by `surfaceSize` on any thread: the renderer draws at it, and its
+/// frames of another size are dropped (`PresentState.accepts`).
 host_size: std.atomic.Value(u64) = .init(0),
 
 /// macOS host-sized surfaces: the newest frame the renderer thread drew with
@@ -121,6 +127,15 @@ const FreshFrame = struct {
     seq: std.atomic.Value(u32) = .init(0),
 };
 
+pub const LastFrame = struct {
+    /// Held only to swap the pointer and retain it; nothing waits under it.
+    mutex: std.Io.Mutex = .init,
+    /// Retained.
+    surface: ?*IOSurface = null,
+};
+
+pub const Presentation = rendererpkg.Presentation;
+
 /// How long after a new host size the display pass waits for the renderer
 /// thread's frame at that size. The renderer thread starts it when the size
 /// is set (during layout), so the wait overlaps layout and the other
@@ -138,8 +153,6 @@ pub fn init(
         .macos, .ios => {},
         else => @compileError("unsupported platform for Metal"),
     };
-
-    _ = alloc;
 
     // Create a MTLCommandQueue for our app-scoped MTLDevice.
     const mtl_device = device.device;
@@ -204,27 +217,25 @@ pub fn init(
     // This makes it so that our display callback will actually be called.
     layer.layer.setProperty("needsDisplayOnBoundsChange", true);
 
-    const offmain: ?OffMainPresenter = if (comptime builtin.os.tag == .macos) offmain: {
-        const form: OffMainPresenter.Form = switch (opts.config.present_form) {
-            .@"main-contents" => break :offmain null,
-            .@"metal-layer" => .metal_layer,
-            .@"layer-host" => .layer_host,
-        };
-        break :offmain OffMainPresenter.init(
-            form,
-            layer.layer,
-            mtl_device,
-            targetPixelFormat(opts.config.blending),
-            info.scaleFactor,
-        ) catch |err| {
-            log.warn("present form {s} unavailable, using main-contents err={}", .{ @tagName(form), err });
-            break :offmain null;
-        };
-    } else null;
+    // The embedder's presented callback (ghostty_surface_config_s).
+    const sink = try PresentedSink.create(
+        alloc,
+        opts.rt_surface.presented_cb,
+        opts.rt_surface.presented_userdata,
+    );
+    defer sink.release();
+    var presenter = try DrawablePresenter.init(
+        layer.layer,
+        mtl_device,
+        targetPixelFormat(opts.config.blending),
+        info.scaleFactor,
+        sink,
+    );
+    errdefer presenter.deinit();
 
     return .{
         .layer = layer,
-        .offmain = offmain,
+        .presenter = presenter,
         .device = device,
         .queue = queue,
         .blending = opts.config.blending,
@@ -238,13 +249,12 @@ fn targetPixelFormat(blending: configpkg.Config.AlphaBlending) mtl.MTLPixelForma
     return if (blending.isLinear()) .bgra8unorm_srgb else .bgra8unorm;
 }
 
+/// After the renderer thread stopped and its frames completed. Main thread.
 pub fn deinit(self: *Metal) void {
-    if (comptime builtin.os.tag == .macos) {
-        const main_hops = self.main_hops.load(.monotonic);
-        if (self.offmain) |*p| p.deinit(main_hops) else OffMainPresenter.logMainContents(main_hops);
-    }
+    self.presenter.deinit();
     self.queue.release();
     if (self.fresh.surface) |surface| surface.release();
+    if (self.last_frame.surface) |surface| surface.release();
 
     // The MTLDevice is app-scoped and destroyed
     // by the render device, not by us.
@@ -281,6 +291,16 @@ pub fn setHostedLayerSize(
             .height = @as(f64, @floatFromInt(height_px)) / scale,
         },
     });
+    self.presenter.syncGeometry(layer);
+    self.syncDrawableSize();
+}
+
+/// The drawables follow the size the renderer draws at (`surfaceSize`).
+/// Main thread.
+fn syncDrawableSize(self: *Metal) void {
+    const size = self.surfaceSize() catch return;
+    if (size.width == 0 or size.height == 0) return;
+    self.presenter.setDrawableSize(PresentState.pack(size.width, size.height));
 }
 
 /// macOS only: make the render target follow the size the embedder sets
@@ -300,8 +320,12 @@ pub fn setHostDrawableSize(self: *Metal, enabled: bool, width_px: u32, height_px
         (@as(u64, @min(width_px, max)) << 32) | @min(height_px, max)
     else
         0;
-    if (self.host_size.swap(value, .acq_rel) == value) return;
-    if (value != 0) if (self.offmain) |*p| p.setAcceptSize(value);
+    if (self.host_size.load(.acquire) == value) return;
+    // Drawables of the new size first: a frame the renderer draws at the
+    // new host size must find them, or it is dropped as a wrong-size frame.
+    if (value != 0) self.presenter.setDrawableSize(value);
+    self.host_size.store(value, .release);
+    if (value == 0) self.syncDrawableSize();
     self.host_size_set_at = .now(global.io(), .awake);
     // A fresh frame kept from an earlier size is not this size's frame,
     // even when the sizes are equal (a drag back): only a frame published
@@ -309,7 +333,6 @@ pub fn setHostDrawableSize(self: *Metal, enabled: bool, width_px: u32, height_px
     self.dropFresh();
     _ = self.fresh.generation.fetchAdd(1, .acq_rel);
     self.fresh.armed.store(value != 0, .release);
-    self.layer.setHostSize(value);
     self.layer.layer.setProperty("needsDisplayOnBoundsChange", value == 0);
     // One synchronous frame at the new target size (or at the bounds again).
     self.layer.layer.msgSend(void, objc.sel("setNeedsDisplay"), .{});
@@ -322,8 +345,9 @@ pub fn setHostDrawableSize(self: *Metal, enabled: bool, width_px: u32, height_px
 /// context) in its instance variables. On iOS it is a sublayer of the
 /// embedder's view, which outlives the surface, so a Core Animation pass
 /// on the main thread after the free would call into freed memory.
-/// Clearing the pointers, the contents and the sublayer link on the main
-/// queue, while they still name this renderer, closes that window. A
+/// Clearing the pointers, the contents and the sublayer link (the surface
+/// is freed on the main thread), while they still name this renderer,
+/// closes that window. A
 /// layer whose callback was rebound to another renderer is left alone.
 /// Ported from manaflow-ai/ghostty adee7043fc and dd726a9a60.
 pub fn prepareDeinit(self: *Metal) void {
@@ -430,18 +454,29 @@ pub fn initTarget(self: *const Metal, width: usize, height: usize) !Target {
     });
 }
 
-/// Renderer thread, before the frame's command buffer commits: the
-/// off-main present form encodes what it needs (OffMainPresenter.encode).
-pub fn encodePresent(self: *Metal, buffer: objc.Object, target: *const Target) OffMainPresenter.Ticket {
-    if (comptime builtin.os.tag != .macos) return .{};
-    if (self.offmain) |*p| return p.encode(buffer, target.texture, target.width, target.height);
-    return .{};
+/// Renderer thread, before `drawFrame` takes the draw lock: the drawable
+/// for the frame, so a wait for one never holds the lock that a main-thread
+/// draw takes (DrawablePresenter.acquire).
+pub fn acquirePresentable(self: *Metal) void {
+    self.presenter.acquire();
 }
 
-/// Present the provided target. `sync`: on the main thread, in its
-/// transaction. Otherwise on the GPU completion thread, with the `ticket`
-/// that `encodePresent` returned for the frame.
-pub inline fn present(self: *Metal, target: Target, sync: bool, ticket: OffMainPresenter.Ticket) !void {
+/// Renderer thread, after `drawFrame` released the draw lock.
+pub fn releasePresentable(self: *Metal) void {
+    self.presenter.releaseUnused();
+}
+
+/// Renderer thread, before the frame's command buffer commits: encodes the
+/// frame's copy into a drawable and its present (DrawablePresenter.encode).
+pub fn encodePresent(self: *Metal, buffer: objc.Object, target: *const Target) PresentState.Ticket {
+    return self.presenter.encode(buffer, target.texture, target.width, target.height);
+}
+
+/// Present the provided target. `sync`: a frame drawn on the main thread,
+/// shown in its transaction. Otherwise the GPU completion thread, with the
+/// `ticket` that `encodePresent` returned: the drawable present is already
+/// encoded, so nothing is posted to the main thread for the frame.
+pub inline fn present(self: *Metal, target: Target, sync: bool, ticket: PresentState.Ticket) !void {
     if (sync) {
         self.presentOnMain(target.surface);
         return;
@@ -450,21 +485,105 @@ pub inline fn present(self: *Metal, target: Target, sync: bool, ticket: OffMainP
         if (target.cells_fresh and self.fresh.armed.load(.acquire) and
             target.size_generation == self.fresh.generation.load(.acquire) and
             self.host_size.load(.acquire) != 0) self.publishFresh(target.surface);
-        if (self.offmain) |*p| {
-            if (p.present(self.layer.layer, target.surface, ticket)) return;
-        }
     }
-    _ = self.main_hops.fetchAdd(1, .monotonic);
-    try self.layer.setSurface(target.surface);
+    if (!ticket.encoded) return;
+    self.setLastFrame(target.surface);
+    const size = PresentState.pack(target.surface.getWidth(), target.surface.getHeight());
+    if (!self.presenter.presented(ticket, size)) return;
+    // The overlay is hidden behind a frame main presented: ask the main
+    // thread to show it through the app mailbox, which the embedder drains
+    // at its own tick. Never wait on this thread.
+    const renderer: *align(1) Renderer = @fieldParentPtr("api", self);
+    if (renderer.surface_mailbox.push(.present_reveal, .instant) == 0) {
+        self.presenter.state.revealPostFailed(ticket.generation);
+    }
 }
 
-/// Sets `surface` as the layer's contents in the main thread's
-/// transaction; an off-main overlay hides in the same transaction until the
-/// renderer's next frame. Main thread.
+/// Sets `surface` as the root layer's contents in the main thread's
+/// transaction; the overlay hides in the same transaction until the
+/// renderer's next frame. A hidden presentation shows nothing: the frame
+/// is kept for the next show. Main thread.
 fn presentOnMain(self: *Metal, surface: *IOSurface) void {
-    self.layer.setSurfaceSync(surface);
-    if (comptime builtin.os.tag == .macos) {
-        if (self.offmain) |*p| p.mainPresented(self.layer.layer, surface.getWidth(), surface.getHeight());
+    if (!self.presenter.state.presenting.load(.acquire)) {
+        self.setLastFrame(surface);
+        return;
+    }
+    self.layer.setContents(surface);
+    self.presenter.mainPresented(
+        self.layer.layer,
+        PresentState.pack(surface.getWidth(), surface.getHeight()),
+    );
+    self.setLastFrame(surface);
+}
+
+/// The renderer presented a frame encoded after main's last present (the
+/// `present_reveal` surface message). Main thread.
+pub fn revealPresented(self: *Metal) void {
+    self.presenter.reveal(self.layer.layer);
+}
+
+/// Any thread: `surface` is the frame on screen now (null: none).
+fn setLastFrame(self: *Metal, surface: ?*IOSurface) void {
+    if (surface) |s| s.retain();
+    const io = global.io();
+    const old = old: {
+        self.last_frame.mutex.lockUncancelable(io);
+        defer self.last_frame.mutex.unlock(io);
+        const old = self.last_frame.surface;
+        self.last_frame.surface = surface;
+        break :old old;
+    };
+    if (old) |o| o.release();
+}
+
+/// The frame on screen, retained (+1), or null before the first frame or
+/// after a purge (`ghostty_surface_presented_frame`). Any thread.
+pub fn presentedFrame(self: *Metal) ?*IOSurface {
+    const io = global.io();
+    self.last_frame.mutex.lockUncancelable(io);
+    defer self.last_frame.mutex.unlock(io);
+    const surface = self.last_frame.surface orelse return null;
+    surface.retain();
+    return surface;
+}
+
+/// `ghostty_surface_set_presentation`. Main thread. Returns true when the
+/// renderer must draw a frame (shown again): the caller queues a render.
+///   * hidden: nothing is presented and the layers show nothing.
+///   * shown: the last frame shows at once (the root's contents) and the
+///     renderer's next frame takes over.
+///   * purge: hidden, and the kept frames and the drawable pool are freed.
+pub fn setPresentation(self: *Metal, presentation: Presentation) bool {
+    const state = &self.presenter.state;
+    switch (presentation) {
+        .hidden, .purge => {
+            state.presenting.store(false, .release);
+            self.presenter.hideOverlay();
+            self.layer.setContents(null);
+            if (presentation == .purge) {
+                self.purged = true;
+                self.setLastFrame(null);
+                self.dropFresh();
+                self.presenter.purgeDrawables();
+            }
+            return false;
+        },
+        .shown => {
+            if (state.presenting.load(.acquire)) return false;
+            if (self.purged) {
+                self.purged = false;
+                self.syncDrawableSize();
+            }
+            // A new hide generation: only a frame encoded from here on shows
+            // the overlay again; until then the root shows the last frame.
+            self.presenter.hideOverlay();
+            if (self.presentedFrame()) |surface| {
+                defer surface.release();
+                self.layer.setContents(surface);
+            }
+            state.presenting.store(true, .release);
+            return true;
+        },
     }
 }
 
@@ -529,7 +648,7 @@ pub fn presentHostSized(self: *Metal) bool {
     const height: usize = @intCast(host & 0xffff_ffff);
     const shown = self.shownSize();
     if (shown == 0) return false;
-    if (shown == OffMainPresenter.pack(width, height)) {
+    if (shown == PresentState.pack(width, height)) {
         // The renderer thread's frame at this size already landed.
         if (self.takeFresh(width, height)) |surface| surface.release();
         return true;
@@ -560,17 +679,14 @@ pub fn presentHostSized(self: *Metal) bool {
         ) catch {};
     }
     // Late: keep the last frame; the renderer thread's frame at this size
-    // lands through `setSurface` when it completes.
+    // lands in the overlay (not hidden by this pass) when it completes.
     _ = self.counters.late.fetchAdd(1, .monotonic);
     return true;
 }
 
 /// The pixel size of the frame on screen, 0 before the first. Main thread.
 fn shownSize(self: *const Metal) u64 {
-    if (self.offmain) |*p| return p.shownSize(self.layer.layer);
-    const shown = self.layer.layer.getProperty(?*anyopaque, "contents") orelse return 0;
-    const surface: *IOSurface = @ptrCast(shown);
-    return OffMainPresenter.pack(surface.getWidth(), surface.getHeight());
+    return self.presenter.shownSize(self.layer.layer);
 }
 
 /// The host size generation a frame drawn now belongs to (Target.size_generation).

@@ -112,6 +112,11 @@ pub const Message = union(enum) {
     /// Health status change for the renderer.
     renderer_health: renderer.Health,
 
+    /// The renderer presented a frame encoded after the main thread's last
+    /// present of its own: show the renderer's drawable layer again (Metal
+    /// `revealPresented`). Sent at most once for each main present.
+    present_reveal: void,
+
     /// Tell the surface to present itself to the user. This may require raising
     /// a window and switching tabs.
     present_surface: void,

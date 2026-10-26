@@ -58,10 +58,23 @@ pub const Health = enum(c_int) {
     }
 };
 
+/// What a surface presents (`ghostty_surface_set_presentation`). Only the
+/// Metal renderer implements it.
+pub const Presentation = enum(c_int) {
+    hidden,
+    shown,
+    purge,
+
+    test "ghostty.h Presentation" {
+        try lib.checkGhosttyHEnum(Presentation, "GHOSTTY_PRESENTATION_");
+    }
+};
+
 test {
     // Our comptime-chosen renderer
     _ = Renderer;
 
+    _ = Presentation;
     _ = cursor;
     _ = message;
     _ = shadertoy;
@@ -70,4 +83,6 @@ test {
     _ = State;
     _ = @import("renderer/mailbox.zig");
     _ = @import("renderer/metal/PresentHistogram.zig");
+    _ = @import("renderer/metal/PresentState.zig");
+    _ = @import("renderer/metal/PresentedSink.zig");
 }

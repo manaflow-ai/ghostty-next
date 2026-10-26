@@ -126,14 +126,18 @@ struct Pixels {
     }
 }
 
-/// Copy the layer's IOSurface into a pixel reader. Nil when the layer or
-/// its contents are missing.
+/// Copy the frame on screen (ghostty_surface_presented_frame) into a pixel
+/// reader. Nil when the renderer's layer or the frame is missing. The
+/// renderer presents its frames in a drawable layer off the main thread, so
+/// the root layer's contents hold a frame only until the renderer's next one.
 @MainActor
 func capture(_ view: TerminalView) -> Pixels? {
     guard let host = view.layer.sublayers?.first(where: { String(describing: type(of: $0)) == "IOSurfaceLayer" }),
-          let contents = host.contents, CFGetTypeID(contents as CFTypeRef) == IOSurfaceGetTypeID()
+          let surface = view.surface,
+          let frame = ghostty_surface_presented_frame(surface)
     else { return nil }
-    let io = contents as! IOSurfaceRef
+    // +1 from Ghostty: released when `io` goes.
+    let io = Unmanaged<IOSurfaceRef>.fromOpaque(frame).takeRetainedValue()
     IOSurfaceLock(io, .readOnly, nil)
     defer { IOSurfaceUnlock(io, .readOnly, nil) }
     let w = IOSurfaceGetWidth(io), h = IOSurfaceGetHeight(io), stride = IOSurfaceGetBytesPerRow(io)

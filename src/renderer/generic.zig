@@ -730,7 +730,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             background_blur: configpkg.Config.BackgroundBlur,
             scroll_to_bottom_on_output: bool,
             custom_shader_animation: configpkg.CustomShaderAnimation,
-            present_form: configpkg.Config.MacPresentForm,
 
             pub fn init(
                 alloc_gpa: Allocator,
@@ -807,7 +806,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .background_blur = config.@"background-blur",
                     .scroll_to_bottom_on_output = config.@"scroll-to-bottom".output,
                     .custom_shader_animation = config.@"custom-shader-animation",
-                    .present_form = config.@"macos-present-form",
                     .arena = arena,
                 };
             }
@@ -1985,6 +1983,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // mutex. The display link is synced only after the mutex is
             // released; see `syncDisplayLink` for why it must never be
             // called with the draw mutex held.
+            //
+            // A frame drawn off the main thread may need something to present
+            // into (a Metal drawable) that can take a while to get: it is
+            // taken before the mutex, so a main-thread draw never waits for it.
+            if (!sync and @hasDecl(GraphicsAPI, "acquirePresentable")) self.api.acquirePresentable();
+            defer if (!sync and @hasDecl(GraphicsAPI, "releasePresentable")) self.api.releasePresentable();
             const sync_display_link = locked: {
                 self.draw_mutex.lockUncancelable(global.io());
                 defer self.draw_mutex.unlock(global.io());

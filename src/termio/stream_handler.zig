@@ -75,6 +75,7 @@ fn isReplyRequest(msg: apprt.surface.Message) bool {
         .child_exited,
         .desktop_notification,
         .renderer_health,
+        .present_reveal,
         .present_surface,
         .password_input,
         .color_change,

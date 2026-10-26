@@ -372,5 +372,7 @@ test "ghostty.h surface config IO fields" {
     try testing.expectEqual(@as(usize, 88), @offsetOf(T, "io_mode"));
     try testing.expectEqual(@as(usize, 96), @offsetOf(T, "io_write_cb"));
     try testing.expectEqual(@as(usize, 104), @offsetOf(T, "io_write_userdata"));
-    try testing.expectEqual(@as(usize, 112), @sizeOf(T));
+    try testing.expectEqual(@as(usize, 112), @offsetOf(T, "presented_cb"));
+    try testing.expectEqual(@as(usize, 120), @offsetOf(T, "presented_userdata"));
+    try testing.expectEqual(@as(usize, 128), @sizeOf(T));
 }
