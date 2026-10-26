@@ -1971,6 +1971,55 @@ GHOSTTY_API void ghostty_inspector_metal_render(ghostty_inspector_t, void*, void
 GHOSTTY_API bool ghostty_inspector_metal_shutdown(ghostty_inspector_t);
 #endif
 
+// Trace hook: one process-wide callback for each surface's render, GPU,
+// present and IO events, so the embedder can place them on its own trace.
+// Off (no hook installed), each event site costs one atomic load. The
+// callback runs on the renderer thread, the GPU completion thread, the main
+// thread and the threads that write input, possibly with Ghostty's draw or
+// terminal lock held: it must return quickly, never block, and never call
+// into Ghostty. `surface` is the surface's ghostty_surface_trace_id. Metal
+// renderers (macOS, iOS) report the frame events; io_write is MANUAL modes
+// only. A contents_set queued to the main thread before a surface was freed
+// can arrive after its surface_destroy: ignore ids you no longer track.
+typedef enum {
+  // A draw starts. seq: the number its frame gets if it commits one.
+  GHOSTTY_TRACE_FRAME_BEGIN = 0,
+  // The draw ends. seq: the number of the frame it committed, or 0 when it
+  // committed none (nothing changed).
+  GHOSTTY_TRACE_FRAME_END = 1,
+  // A frame's IOSurface became the layer's contents. seq: frame number. In
+  // a host-size change the display pass can present a frame before its own
+  // present lands, so one frame can be reported twice: count the first.
+  GHOSTTY_TRACE_CONTENTS_SET = 2,
+  // The GPU completed a frame (its command buffer's completed handler).
+  // seq: frame number.
+  GHOSTTY_TRACE_GPU_DONE = 3,
+  // Ghostty passed encoded input to io_write_cb. seq: the byte count.
+  GHOSTTY_TRACE_IO_WRITE = 4,
+  // ghostty_surface_free returned. seq: 0.
+  GHOSTTY_TRACE_SURFACE_DESTROY = 5,
+} ghostty_trace_event_e;
+
+typedef void (*ghostty_trace_hook_cb)(void* ctx,
+                                      ghostty_trace_event_e event,
+                                      uint64_t surface,
+                                      uint64_t seq);
+
+// The installed hook. The embedder owns this record and must neither change
+// nor free it for the rest of the process: a call in flight may still read
+// it after a later ghostty_set_trace_hook returns.
+typedef struct {
+  ghostty_trace_hook_cb callback;
+  void* ctx;
+} ghostty_trace_hook_s;
+
+// Install the trace hook, or turn tracing off with NULL (or a NULL
+// callback). Any thread.
+GHOSTTY_API void ghostty_set_trace_hook(const ghostty_trace_hook_s*);
+// The surface's trace id: nonzero, never reused in this process. Any thread
+// until ghostty_surface_free.
+GHOSTTY_API uint64_t ghostty_surface_trace_id(ghostty_surface_t);
+
 // APIs I'd like to get rid of eventually but are still needed for now.
 // Don't use these unless you know what you're doing.
 GHOSTTY_API void ghostty_set_window_background_blur(ghostty_app_t, void*);

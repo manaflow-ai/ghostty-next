@@ -8,6 +8,7 @@ const objc = @import("objc");
 const macos = @import("macos");
 
 const IOSurface = macos.iosurface.IOSurface;
+const trace_hook = @import("../../trace_hook.zig");
 
 const log = std.log.scoped(.IOSurfaceLayer);
 
@@ -18,7 +19,10 @@ var Subclass: ?objc.Class = null;
 /// The underlying CALayer
 layer: objc.Object,
 
-pub fn init() !IOSurfaceLayer {
+/// The surface's trace id, for the trace hook's `contents_set` events.
+trace_surface: u64,
+
+pub fn init(trace_surface: u64) !IOSurfaceLayer {
     // The layer returned by `[CALayer layer]` is autoreleased, which means
     // that at the end of the current autorelease pool it will be deallocated
     // if it isn't retained, so we retain it here manually an extra time.
@@ -38,7 +42,7 @@ pub fn init() !IOSurfaceLayer {
     layer.setInstanceVariable("host_size", .{ .value = null });
     layer.setInstanceVariable("present_seq", .{ .value = null });
 
-    return .{ .layer = layer };
+    return .{ .layer = layer, .trace_surface = trace_surface };
 }
 
 pub fn release(self: *IOSurfaceLayer) void {
@@ -96,7 +100,8 @@ fn hostSize(layer: objc.Object) u64 {
 /// Sets the layer's `contents` to the provided IOSurface.
 ///
 /// Makes sure to do so on the main thread to avoid visual artifacts.
-pub inline fn setSurface(self: *IOSurfaceLayer, surface: *IOSurface, seq: u64) !void {
+/// `frame` is the frame's trace number (`contents_set`).
+pub inline fn setSurface(self: *IOSurfaceLayer, surface: *IOSurface, seq: u64, frame: u64) !void {
     // We retain the surface to make sure it's not GC'd
     // before we can set it as the contents of the layer.
     //
@@ -110,6 +115,8 @@ pub inline fn setSurface(self: *IOSurfaceLayer, surface: *IOSurface, seq: u64) !
         .layer = self.layer.value,
         .surface = surface,
         .seq = seq,
+        .trace_surface = self.trace_surface,
+        .frame = frame,
     }, &setSurfaceCallback);
 
     // We check if we're on the main thread and run the block directly if so.
@@ -128,17 +135,21 @@ pub inline fn setSurface(self: *IOSurfaceLayer, surface: *IOSurface, seq: u64) !
     }
 }
 
-/// Sets the layer's `contents` to the provided IOSurface.
+/// Sets the layer's `contents` to the provided IOSurface, the frame with
+/// trace number `frame`.
 ///
 /// Does not ensure this happens on the main thread.
-pub inline fn setSurfaceSync(self: *IOSurfaceLayer, surface: *IOSurface) void {
+pub inline fn setSurfaceSync(self: *IOSurfaceLayer, surface: *IOSurface, frame: u64) void {
     self.layer.setProperty("contents", surface);
+    trace_hook.emit(.contents_set, self.trace_surface, frame);
 }
 
 const SetSurfaceBlock = objc.Block(struct {
     layer: objc.c.id,
     surface: *IOSurface,
     seq: u64,
+    trace_surface: u64,
+    frame: u64,
 }, .{}, void);
 
 /// Presents `surface`, a frame that changes only content, from the calling
@@ -149,23 +160,28 @@ const SetSurfaceBlock = objc.Block(struct {
 /// thread is pending for it, and only if no newer frame was presented
 /// (`seq`). Returns false, and changes nothing, otherwise: the caller then
 /// presents it through the main thread (`setSurface`).
-pub fn setSurfaceOffMain(self: *IOSurfaceLayer, surface: *IOSurface, seq: u64) bool {
+pub fn setSurfaceOffMain(self: *IOSurfaceLayer, surface: *IOSurface, seq: u64, frame: u64) bool {
     const width = surface.getWidth();
     const height = surface.getHeight();
     const host = hostSize(self.layer);
     if (host == 0 or (host >> 32) != width or (host & 0xffff_ffff) != height) return false;
-    const CATransaction = objc.getClass("CATransaction").?;
-    CATransaction.msgSend(void, objc.sel("begin"), .{});
-    defer CATransaction.msgSend(void, objc.sel("commit"), .{});
-    // The Core Animation lock orders this against `setSurfaceCallback` on main.
-    CATransaction.msgSend(void, objc.sel("lock"), .{});
-    defer CATransaction.msgSend(void, objc.sel("unlock"), .{});
-    const shown = self.layer.getProperty(?*anyopaque, "contents") orelse return false;
-    const shown_surface: *IOSurface = @ptrCast(shown);
-    if (shown_surface.getWidth() != width or shown_surface.getHeight() != height) return false;
-    if (seq <= presentSeq(self.layer)) return true;
-    setPresentSeq(self.layer, seq);
-    self.layer.setProperty("contents", surface);
+    const presented = presented: {
+        const CATransaction = objc.getClass("CATransaction").?;
+        CATransaction.msgSend(void, objc.sel("begin"), .{});
+        defer CATransaction.msgSend(void, objc.sel("commit"), .{});
+        // The Core Animation lock orders this against `setSurfaceCallback` on main.
+        CATransaction.msgSend(void, objc.sel("lock"), .{});
+        defer CATransaction.msgSend(void, objc.sel("unlock"), .{});
+        const shown = self.layer.getProperty(?*anyopaque, "contents") orelse return false;
+        const shown_surface: *IOSurface = @ptrCast(shown);
+        if (shown_surface.getWidth() != width or shown_surface.getHeight() != height) return false;
+        if (seq <= presentSeq(self.layer)) break :presented false;
+        setPresentSeq(self.layer, seq);
+        self.layer.setProperty("contents", surface);
+        break :presented true;
+    };
+    // After the transaction's commit, outside the Core Animation lock.
+    if (presented) trace_hook.emit(.contents_set, self.trace_surface, frame);
     return true;
 }
 
@@ -234,12 +250,15 @@ fn setSurfaceCallback(
 
     // A newer frame went to the screen off the main thread meanwhile
     // (`setSurfaceOffMain`): this older one must not replace it.
-    const CATransaction = objc.getClass("CATransaction").?;
-    CATransaction.msgSend(void, objc.sel("lock"), .{});
-    defer CATransaction.msgSend(void, objc.sel("unlock"), .{});
-    if (block.seq != 0 and block.seq <= presentSeq(layer)) return;
-    if (block.seq != 0) setPresentSeq(layer, block.seq);
-    layer.setProperty("contents", surface);
+    {
+        const CATransaction = objc.getClass("CATransaction").?;
+        CATransaction.msgSend(void, objc.sel("lock"), .{});
+        defer CATransaction.msgSend(void, objc.sel("unlock"), .{});
+        if (block.seq != 0 and block.seq <= presentSeq(layer)) return;
+        if (block.seq != 0) setPresentSeq(layer, block.seq);
+        layer.setProperty("contents", surface);
+    }
+    trace_hook.emit(.contents_set, block.trace_surface, block.frame);
 }
 
 pub const DisplayCallback = ?*align(8) const fn (?*anyopaque) void;

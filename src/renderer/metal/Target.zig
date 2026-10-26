@@ -50,6 +50,10 @@ cells_fresh: bool = false,
 /// began: a frame publishes for a display pass only in its own generation.
 size_generation: u64 = 0,
 
+/// The trace number of the frame drawn into this target last
+/// (`Metal.beginFrame`, the trace hook's `seq`).
+trace_frame: u64 = 0,
+
 pub fn init(opts: Options) !Self {
     // We set our surface's color space to Display P3.
     // This allows us to have "Apple-style" alpha blending,

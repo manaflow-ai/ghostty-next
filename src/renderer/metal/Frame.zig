@@ -12,6 +12,7 @@ const Target = @import("Target.zig");
 const RenderPass = @import("RenderPass.zig");
 
 const Health = @import("../../renderer.zig").Health;
+const trace_hook = @import("../../trace_hook.zig");
 
 const log = std.log.scoped(.metal);
 
@@ -69,6 +70,7 @@ fn bufferCompleted(
     buffer_id: objc.c.id,
 ) callconv(.c) void {
     const buffer = objc.Object.fromId(buffer_id);
+    trace_hook.emit(.gpu_done, block.renderer.api.layer.trace_surface, block.target.trace_frame);
 
     // Get our command buffer status to pass back to the generic renderer.
     const status = buffer.getProperty(mtl.MTLCommandBufferStatus, "status");
