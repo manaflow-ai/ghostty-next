@@ -68,6 +68,8 @@ const macos = switch (builtin.os.tag) {
 
 const DisplayLink = switch (builtin.os.tag) {
     .macos => *macos.video.DisplayLink,
+    // A CADisplayLink on the main run loop (IosDisplayLink.zig).
+    .ios => *@import("IosDisplayLink.zig"),
     else => void,
 };
 
@@ -1077,6 +1079,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // is gone which is fine.
             const display_link = self.display_link orelse return;
             display_link.stop() catch {};
+
+            // An iOS link ticks this thread's draw_now, which goes away
+            // with the thread: release it now, not in deinit.
+            if (comptime builtin.os.tag == .ios) {
+                display_link.release();
+                self.display_link = null;
+            }
         }
 
         /// This is called by the GTK apprt after the surface is
@@ -1401,33 +1410,45 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const display_link = self.display_link orelse display_link: {
                 if (!self.config.vsync) return;
                 const callback = draw_now orelse return;
-                const result = macos.video.DisplayLink.createWithActiveCGDisplays() catch |err| {
-                    // A locked macOS session can temporarily have no active
-                    // displays. Rendering can continue without vsync and a
-                    // later display update will retry this method.
-                    log.warn("error creating display link; using fallback rendering err={}", .{err});
-                    return;
-                };
-                result.setOutputCallback(
-                    xev.Async,
-                    &displayLinkCallback,
-                    callback,
-                ) catch |err| {
-                    log.warn("error configuring display link err={}", .{err});
-                    result.release();
-                    return;
-                };
+                if (comptime builtin.os.tag == .ios) {
+                    const result = @import("IosDisplayLink.zig").create(callback) catch |err| {
+                        log.warn("error creating display link; using fallback rendering err={}", .{err});
+                        return;
+                    };
+                    self.display_link = result;
+                    log.info("created display link", .{});
+                    break :display_link result;
+                } else {
+                    const result = macos.video.DisplayLink.createWithActiveCGDisplays() catch |err| {
+                        // A locked macOS session can temporarily have no active
+                        // displays. Rendering can continue without vsync and a
+                        // later display update will retry this method.
+                        log.warn("error creating display link; using fallback rendering err={}", .{err});
+                        return;
+                    };
+                    result.setOutputCallback(
+                        xev.Async,
+                        &displayLinkCallback,
+                        callback,
+                    ) catch |err| {
+                        log.warn("error configuring display link err={}", .{err});
+                        result.release();
+                        return;
+                    };
 
-                self.display_link = result;
-                log.info("created display link", .{});
-                break :display_link result;
+                    self.display_link = result;
+                    log.info("created display link", .{});
+                    break :display_link result;
+                }
             };
 
-            if (display_id) |id| {
-                log.info("updating display link display id={}", .{id});
-                display_link.setCurrentCGDisplay(id) catch |err| {
-                    log.warn("error setting display link display id err={}", .{err});
-                };
+            if (comptime builtin.os.tag == .macos) {
+                if (display_id) |id| {
+                    log.info("updating display link display id={}", .{id});
+                    display_link.setCurrentCGDisplay(id) catch |err| {
+                        log.warn("error setting display link display id err={}", .{err});
+                    };
+                }
             }
 
             const should_run =
