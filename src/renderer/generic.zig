@@ -122,6 +122,92 @@ fn packScreen(screen: renderer.ScreenSize) u64 {
     return (@as(u64, screen.width) << 32) | screen.height;
 }
 
+/// A background image file's bytes and the type read from them (or from
+/// the file name). Owned.
+const EncodedImage = struct {
+    data: []u8,
+    file_type: FileType,
+
+    fn deinit(self: EncodedImage, alloc: Allocator) void {
+        alloc.free(self.data);
+    }
+};
+
+/// Read the background image file at `path`. Null (logged) when it cannot
+/// be opened or read.
+fn readBackgroundImage(alloc: Allocator, path: []const u8) ?EncodedImage {
+    var file = std.Io.Dir.openFileAbsolute(global.io(), path, .{}) catch |err| {
+        log.warn("error opening background image file \"{s}\": {}", .{ path, err });
+        return null;
+    };
+    defer file.close(global.io());
+
+    const data = compat_file.readToEndAlloc(
+        file,
+        alloc,
+        std.math.maxInt(u32), // Max size of 4 GiB, for now.
+    ) catch |err| {
+        log.warn("error reading background image file \"{s}\": {}", .{ path, err });
+        return null;
+    };
+
+    // Figure out what type it probably is.
+    const file_type = switch (FileType.detect(data)) {
+        .unknown => FileType.guessFromExtension(std.fs.path.extension(path)),
+        else => |t| t,
+    };
+    return .{ .data = data, .file_type = file_type };
+}
+
+/// Decode a background image into a pending (not yet uploaded) image. Null
+/// for a type that cannot be decoded. Does no file I/O, so a GPU restore
+/// decodes the kept bytes to the image shown before the release.
+fn decodeBackgroundImage(alloc: Allocator, encoded: EncodedImage) !?imagepkg.Image {
+    const image_data = switch (encoded.file_type) {
+        .png => try wuffs.png.decode(alloc, encoded.data),
+        .jpeg => try wuffs.jpeg.decode(alloc, encoded.data),
+        else => return null,
+    };
+    return .{ .pending = .{
+        .width = image_data.width,
+        .height = image_data.height,
+        .pixel_format = .rgba,
+        .data = image_data.data.ptr,
+    } };
+}
+
+test "gpu residency: a background image decodes again to the same pixels with no file" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const png = @embedFile("../font/testdata/glyf_rasterize.png");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "bg.png", .data = png });
+    const dir_path = try tmp.dir.realPathFileAlloc(testing.io, ".", alloc);
+    defer alloc.free(dir_path);
+    const path = try std.fs.path.join(alloc, &.{ dir_path, "bg.png" });
+    defer alloc.free(path);
+
+    const encoded = readBackgroundImage(alloc, path).?;
+    defer encoded.deinit(alloc);
+    try testing.expectEqual(FileType.png, encoded.file_type);
+
+    const first = (try decodeBackgroundImage(alloc, encoded)).?;
+    defer first.deinit(alloc);
+
+    // The file is gone (or changed) by the time of the restore: the kept
+    // bytes still decode to the image shown before the release.
+    try tmp.dir.deleteFile(testing.io, "bg.png");
+    const again = (try decodeBackgroundImage(alloc, encoded)).?;
+    defer again.deinit(alloc);
+
+    try testing.expectEqual(first.pending.width, again.pending.width);
+    try testing.expectEqual(first.pending.height, again.pending.height);
+    try testing.expectEqualSlices(u8, first.pending.dataSlice(), again.pending.dataSlice());
+    try testing.expect(readBackgroundImage(alloc, path) == null);
+}
+
 pub fn Renderer(comptime GraphicsAPI: type) type {
     return struct {
         const Self = @This();
@@ -244,6 +330,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         /// Background image, if we have one.
         bg_image: ?imagepkg.Image = null,
+        /// The shown background image's file as read at load (its encoded
+        /// bytes, a fraction of the decoded size), so a GPU restore decodes
+        /// the same image again without file I/O, like Chromium re-decodes a
+        /// hidden tab's images from their kept encoded data
+        /// (cc/tiles/gpu_image_decode_cache.cc). Written by
+        /// `prepBackgroundImage` (init and config changes); renderer thread.
+        bg_image_encoded: ?EncodedImage = null,
         /// Set whenever the background image changes, signalling
         /// that the new background image needs to be uploaded to
         /// the GPU.
@@ -287,6 +380,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// frame update builds the image state again from the terminal.
         /// Renderer thread only.
         kitty_reupload: bool = false,
+
+        /// The last completed `releaseGpuResidency` freed something, so the
+        /// next restore counts in `counters.gpu_restores`. Renderer thread
+        /// only.
+        gpu_freed: bool = false,
+
+        /// `releaseGpuResidency` freed the background image: the restore
+        /// decodes it again from `bg_image_encoded`. Renderer thread only.
+        bg_image_released: bool = false,
 
         /// Our swap chain (multiple buffering). Null when it has
         /// been released, either because the surface is hidden
@@ -1004,6 +1106,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.font_shaper.deinit();
             self.font_shaper_cache.deinit(self.alloc);
 
+            if (self.bg_image_encoded) |e| e.deinit(self.alloc);
+
             self.config.deinit();
             self.api.deinit();
 
@@ -1426,23 +1530,33 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.draw_mutex.lockUncancelable(global.io());
             defer self.draw_mutex.unlock(global.io());
 
+            var freed = false;
             if (self.swap_chain) |*sc| {
                 if (!sc.tryIdle()) return false;
                 sc.deinitIdle();
                 self.swap_chain = null;
+                freed = true;
             }
 
-            // Unlike a hide, the images go too; their textures are rebuilt
-            // from the terminal (Kitty) and the config (background).
-            self.images.deinit(self.alloc);
-            self.images = .empty;
+            // Unlike a hide, the images go too. Kitty textures are rebuilt
+            // from the terminal's image storage, the background from its
+            // kept encoded bytes (`bg_image_encoded`).
+            if (self.images.release(self.alloc)) freed = true;
             self.kitty_reupload = true;
             if (self.bg_image) |img| {
                 img.deinit(self.alloc);
                 self.bg_image = null;
+                self.bg_image_released = true;
+                freed = true;
             }
 
-            _ = self.counters.gpu_releases.fetchAdd(1, .monotonic);
+            // Counted only when something was freed: a repeated release
+            // (a surface already released, or hidden with nothing drawn)
+            // is not a release of GPU resources.
+            if (freed) {
+                self.gpu_freed = true;
+                _ = self.counters.gpu_releases.fetchAdd(1, .monotonic);
+            }
             return true;
         }
 
@@ -1450,16 +1564,29 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// next draw rebuilds what was released and draws the kept cells,
         /// even when nothing changed (the main thread cleared the layer).
         pub fn restoreGpuResidency(self: *Self) void {
+            // Decoded before the draw lock, so a main-thread draw never
+            // waits for it; no file I/O (the bytes were kept at load).
+            const bg: ?imagepkg.Image = bg: {
+                if (!self.bg_image_released) break :bg null;
+                self.bg_image_released = false;
+                const encoded = self.bg_image_encoded orelse break :bg null;
+                break :bg decodeBackgroundImage(self.alloc, encoded) catch |err| {
+                    log.warn("error decoding the background image again err={}", .{err});
+                    break :bg null;
+                };
+            };
+
             self.draw_mutex.lockUncancelable(global.io());
             defer self.draw_mutex.unlock(global.io());
 
             self.cells_rebuilt = true;
-            if (self.bg_image == null and self.config.bg_image != null) {
-                self.prepBackgroundImage() catch |err| {
-                    log.warn("error loading the background image again err={}", .{err});
-                };
+            if (bg) |img| {
+                if (self.bg_image == null) self.bg_image = img else img.deinit(self.alloc);
             }
-            _ = self.counters.gpu_restores.fetchAdd(1, .monotonic);
+            if (self.gpu_freed) {
+                self.gpu_freed = false;
+                _ = self.counters.gpu_restores.fetchAdd(1, .monotonic);
+            }
         }
 
         /// Create or update the display link and match it to the current
@@ -2451,76 +2578,32 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         ///
         /// Caller must hold the draw mutex.
         fn prepBackgroundImage(self: *Self) !void {
+            // A new path (or none) replaces whatever a GPU release freed.
+            self.bg_image_released = false;
+
             // Then we try to load the background image if we have a path.
             if (self.config.bg_image) |p| load_background: {
                 const path = switch (p) {
                     .required, .optional => |slice| slice,
                 };
 
-                // Open the file
-                var file = std.Io.Dir.openFileAbsolute(
-                    global.io(),
-                    path,
-                    .{},
-                ) catch |err| {
+                const encoded = readBackgroundImage(self.alloc, path) orelse
+                    break :load_background;
+                var keep = false;
+                defer if (!keep) encoded.deinit(self.alloc);
+
+                const image = try decodeBackgroundImage(self.alloc, encoded) orelse {
                     log.warn(
-                        "error opening background image file \"{s}\": {}",
-                        .{ path, err },
+                        "unsupported or unknown file type {} for background image file \"{s}\"",
+                        .{ encoded.file_type, path },
                     );
                     break :load_background;
                 };
-                defer file.close(global.io());
 
-                // Read it
-                const contents = compat_file.readToEndAlloc(
-                    file,
-                    self.alloc,
-                    std.math.maxInt(u32), // Max size of 4 GiB, for now.
-                ) catch |err| {
-                    log.warn(
-                        "error reading background image file \"{s}\": {}",
-                        .{ path, err },
-                    );
-                    break :load_background;
-                };
-                defer self.alloc.free(contents);
-
-                // Figure out what type it probably is.
-                const file_type = switch (FileType.detect(contents)) {
-                    .unknown => FileType.guessFromExtension(
-                        std.fs.path.extension(path),
-                    ),
-                    else => |t| t,
-                };
-
-                // Decode it if we know how.
-                const image_data = switch (file_type) {
-                    .png => try wuffs.png.decode(self.alloc, contents),
-                    .jpeg => try wuffs.jpeg.decode(self.alloc, contents),
-                    .unknown => {
-                        log.warn(
-                            "Cannot determine file type for background image file \"{s}\"!",
-                            .{path},
-                        );
-                        break :load_background;
-                    },
-                    else => |f| {
-                        log.warn(
-                            "Unsupported file type {} for background image file \"{s}\"!",
-                            .{ f, path },
-                        );
-                        break :load_background;
-                    },
-                };
-
-                const image: imagepkg.Image = .{
-                    .pending = .{
-                        .width = image_data.width,
-                        .height = image_data.height,
-                        .pixel_format = .rgba,
-                        .data = image_data.data.ptr,
-                    },
-                };
+                // Kept for a GPU restore; it matches the image shown now.
+                keep = true;
+                if (self.bg_image_encoded) |old| old.deinit(self.alloc);
+                self.bg_image_encoded = encoded;
 
                 // If we have an existing background image, replace it.
                 // Otherwise, set this as our background image directly.
@@ -2533,6 +2616,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // If we don't have a background image path, mark our
                 // background image for unload if we currently have one.
                 if (self.bg_image) |*img| img.markForUnload();
+                if (self.bg_image_encoded) |old| old.deinit(self.alloc);
+                self.bg_image_encoded = null;
             }
         }
 

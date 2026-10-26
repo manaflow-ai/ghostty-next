@@ -110,7 +110,10 @@ flags: packed struct {
 
     /// The surface holds GPU resources (`ghostty_surface_set_gpu_resident`).
     /// While false the thread parks: no frame updates, draws, cursor
-    /// blink, display link or animation wakes, and output does not wake it.
+    /// blink, display link or animation wakes. Like a hidden surface,
+    /// output wakes it only until the scrollback compression timer is
+    /// armed (`syncOutputWakes`); that timer, and the retry of a release
+    /// that found frames in flight, still run.
     gpu_resident: bool = true,
 
     /// A resize arrived since the last frame update: the next frame draws

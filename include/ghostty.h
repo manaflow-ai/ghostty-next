@@ -758,8 +758,9 @@ typedef struct {
   uint64_t host_main_draws;
   uint64_t host_fresh_presents;
   uint64_t host_late_presents;
-  // ghostty_surface_set_gpu_resident: releases that freed the GPU
-  // resources, and restores.
+  // ghostty_surface_set_gpu_resident: releases that freed GPU resources
+  // (a repeated release with nothing left to free does not count), and
+  // the restores that followed such a release.
   uint64_t gpu_releases;
   uint64_t gpu_restores;
 } ghostty_surface_render_counters_s;
@@ -1449,11 +1450,16 @@ GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
 // ran), the renderer frees its swap chain (the IOSurface render targets),
 // its cell, uniform and per-frame atlas buffers and its image textures, and
 // the layer drops its contents in this call (it shows nothing; cover the
-// view with your own last frame). The renderer thread then idles: no frame
-// updates, draws, cursor blink, display link or animation wakes, and output
-// does not wake it. The terminal state, scrollback, PTY, shaders and the
-// shared font atlas stay. Restored: the renderer thread rebuilds what it
-// freed and draws the kept cells at once (when the surface is visible); a
+// view with your own last frame). The renderer thread then parks (it does
+// not exit): no frame updates, draws, cursor blink, display link or
+// animation wakes. As for a hidden surface, output wakes it only until its
+// scrollback compression timer is armed, and that timer still runs, as does
+// the retry (16 ms doubling to 1 s) of a release that found frames in
+// flight. The terminal state, scrollback, PTY, shaders, the shared font
+// atlas and a background image's file bytes stay. Restored: the renderer
+// thread rebuilds what it freed (a background image is decoded again from
+// the kept bytes, with no file I/O) and draws the kept cells at once (when
+// the surface is visible); a
 // host-sized surface's next display pass, or
 // ghostty_surface_present_host_frame in this turn, waits at most 4 ms for
 // that frame, like a reveal, and never draws on the main thread. While a

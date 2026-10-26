@@ -17,7 +17,8 @@
 //   snapshot  encode the red fill (READY and HISTORY), clear it, set a
 //             64 KiB scrollback-limit-bytes on the surface, then restore
 //             the snapshot: the red fill is back.
-//   gpu       ghostty_surface_set_gpu_resident(false) empties the layer at
+//   gpu       glyphs and a Kitty image on the red fill;
+//             ghostty_surface_set_gpu_resident(false) empties the layer at
 //             once, the renderer frees its GPU resources and draws
 //             nothing; set_gpu_resident(true) draws the same pixels as
 //             before the release.
@@ -286,33 +287,61 @@ func runSnapshot(_ app: ghostty_app_t, _ view: TerminalView, _ surface: ghostty_
     return (pass, detail)
 }
 
+/// Glyphs the GPU release frees and rebuilds: plain, bold, italic,
+/// underlined and wide text, box drawing (sprite glyphs) and a 16x16 green
+/// Kitty image placed over 4x2 cells (an image texture), on the red fill.
+let gpuContent: String = {
+    var pixels = [UInt8]()
+    for _ in 0..<(16 * 16) { pixels += [0, 255, 0] }
+    let image = Data(pixels).base64EncodedString()
+    return redFill
+        + "plain \u{1b}[1mbold\u{1b}[22m \u{1b}[3mitalic\u{1b}[23m \u{1b}[4munder\u{1b}[24m\r\n"
+        + "wide \u{6F22}\u{5B57} box \u{250C}\u{2500}\u{252C}\u{2510} \u{2502}x\u{2502}\r\n"
+        + "\u{1b}_Ga=T,q=2,f=24,s=16,v=16,c=4,r=2;\(image)\u{1b}\\\r\n"
+}()
+
+/// Poll the render counters until `done` holds or a few seconds passed: a
+/// release waits for frames in flight (retried 16 ms doubling to 1 s), so a
+/// fixed wait would race it.
+@MainActor
+func awaitCounters(
+    _ surface: ghostty_surface_t, _ done: (ghostty_surface_render_counters_s) -> Bool
+) async -> ghostty_surface_render_counters_s {
+    let deadline = ContinuousClock.now + .seconds(5)
+    var counters = ghostty_surface_render_counters(surface)
+    while !done(counters) && ContinuousClock.now < deadline {
+        try? await Task.sleep(for: .milliseconds(16)) // Deterministic waits are fine in a test harness.
+        counters = ghostty_surface_render_counters(surface)
+    }
+    return counters
+}
+
 @MainActor
 func runGpu(_ app: ghostty_app_t, _ view: TerminalView, _ surface: ghostty_surface_t) async -> (Bool, String) {
     let ref = SurfaceRef(raw: surface)
     // A hidden cursor: a blink between the two captures would change pixels.
-    await onOutput(ref) { feed($0, redFill + "\u{1b}[?25l") }
+    await onOutput(ref) { feed($0, gpuContent + "\u{1b}[?25l") }
     await drawFrames(app, surface)
     guard let before = capture(view) else { return (false, "no IOSurface") }
 
     ghostty_surface_set_gpu_resident(surface, false)
     ghostty_surface_set_gpu_resident(surface, false) // Idempotent.
     let emptiedAtOnce = capture(view) == nil
-    try? await Task.sleep(for: .milliseconds(300))
+    let released = await awaitCounters(surface) { $0.gpu_releases >= 1 }
     await drawFrames(app, surface) // Draw requests while released draw nothing.
     let stayedEmpty = capture(view) == nil
-    let released = ghostty_surface_render_counters(surface)
 
     ghostty_surface_set_gpu_resident(surface, true)
+    let restored = await awaitCounters(surface) { $0.gpu_restores >= 1 }
     await drawFrames(app, surface)
     guard let after = capture(view) else { return (false, "no IOSurface after restore") }
-    let restored = ghostty_surface_render_counters(surface)
 
     let identical = before.width == after.width && before.height == after.height && before.bytes == after.bytes
     let detail = String(
         format: "surface=%dx%dpx red=%.2f emptied_at_once=%d stayed_empty=%d releases=%llu restores=%llu identical=%d",
         after.width, after.height, after.redFraction(), emptiedAtOnce ? 1 : 0, stayedEmpty ? 1 : 0,
-        restored.gpu_releases, restored.gpu_restores, identical ? 1 : 0)
-    let pass = before.redFraction() > 0.8 && emptiedAtOnce && stayedEmpty
+        released.gpu_releases, restored.gpu_restores, identical ? 1 : 0)
+    let pass = before.redFraction() > 0.6 && emptiedAtOnce && stayedEmpty
         && released.gpu_releases == 1 && restored.gpu_restores == 1 && identical
     return (pass, detail)
 }

@@ -80,6 +80,7 @@ gpu_resident: std.atomic.Value(bool) = .init(true),
 /// A GPU release cleared the layer's contents, so an empty layer is not
 /// "nothing presented yet": the display pass of a host-sized surface waits
 /// for the renderer thread's frame instead of drawing on the main thread.
+/// Cleared by the first display pass that finds a frame in the layer again.
 /// Main thread.
 contents_released: bool = false,
 
@@ -416,20 +417,27 @@ pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
         if (comptime builtin.os.tag == .macos) {
             if (target.cells_fresh and self.fresh.armed.load(.acquire) and
                 target.size_generation == self.fresh.generation.load(.acquire) and
-                self.host_size.load(.acquire) != 0) self.publishFresh(target.surface);
+                self.host_size.load(.acquire) != 0) self.publishFresh(target.surface, target.size_generation);
         }
         try self.layer.setSurface(target.surface);
     }
 }
 
-/// Keeps `surface` as the newest fresh frame and wakes a display pass that
-/// waits for it. GPU completion thread.
-fn publishFresh(self: *Metal, surface: *IOSurface) void {
+/// Keeps `surface`, drawn under host size `generation`, as the newest fresh
+/// frame and wakes a display pass that waits for it. GPU completion thread.
+fn publishFresh(self: *Metal, surface: *IOSurface, generation: u64) void {
     const io = global.io();
-    surface.retain();
     const old = old: {
         self.fresh.mutex.lockUncancelable(io);
         defer self.fresh.mutex.unlock(io);
+        // Checked again under the lock: the main thread disarms (a GPU
+        // release, a take) or bumps the generation before its `dropFresh`
+        // takes this lock, so a frame checked before that cannot be kept
+        // after the drop.
+        if (!self.fresh.armed.load(.acquire) or
+            generation != self.fresh.generation.load(.acquire) or
+            !self.gpu_resident.load(.acquire)) return;
+        surface.retain();
         const old = self.fresh.surface;
         self.fresh.surface = surface;
         break :old old;
@@ -486,6 +494,7 @@ pub fn presentHostSized(self: *Metal) bool {
     // new size (the embedder's last frame covers the view meanwhile).
     // Empty otherwise: nothing presented yet, the main thread draws.
     const shown = self.layer.layer.getProperty(?*anyopaque, "contents");
+    if (shown != null) self.contents_released = false;
     if (shown == null and !self.contents_released) return false;
     if (shown) |s| {
         const shown_surface: *IOSurface = @ptrCast(s);
@@ -503,6 +512,7 @@ pub fn presentHostSized(self: *Metal) bool {
         if (self.takeFresh(width, height)) |surface| {
             defer surface.release();
             self.layer.setSurfaceSync(surface);
+            self.contents_released = false;
             _ = self.counters.fresh_presents.fetchAdd(1, .monotonic);
             return true;
         }

@@ -56,6 +56,18 @@ pub const State = struct {
         self.overlay_placements.deinit(alloc);
     }
 
+    /// Free every image (texture or pending data) and placement, for a GPU
+    /// release (`ghostty_surface_set_gpu_resident`). True when there was an
+    /// image to free. The next `kittyUpdate` builds the same Kitty images
+    /// and placements from the terminal's image storage, and the next frame
+    /// update the overlay.
+    pub fn release(self: *State, alloc: Allocator) bool {
+        const had_images = self.images.count() != 0;
+        self.deinit(alloc);
+        self.* = .empty;
+        return had_images;
+    }
+
     /// Upload any images to the GPU that need to be uploaded,
     /// and remove any images that are no longer needed on the GPU.
     ///
@@ -1274,6 +1286,56 @@ test "kitty renderer keeps an image that returns with the same generation" {
     try testing.expectEqual(generation, entry.generation);
     try testing.expect(!entry.image.isUnloading());
     try testing.expectEqual(@as(usize, 1), state.kitty_placements.items.len);
+}
+
+test "gpu residency: a release then a Kitty update places the same images again" {
+    // The renderer frees its image state on a GPU release and sets
+    // kitty_reupload, so the restore's frame update calls kittyUpdate with
+    // the storage no longer dirty. That update must rebuild the same
+    // images, pixels and placements the frame before the release drew.
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try terminal.Terminal.init(io, alloc, .{ .rows = 6, .cols = 10 });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 60;
+    var stream = t.vtStream();
+    defer stream.deinit();
+    // Two images (RGBA 1x1 and RGB 2x1), placed at different cells, sizes
+    // and z layers, with text between them.
+    stream.nextSlice("ab\x1b_Ga=T,q=2,f=32,s=1,v=1,i=1,c=2,r=1;/wAA/w==\x1b\\");
+    stream.nextSlice("\r\n\x1b[2Ccd\x1b_Ga=T,q=2,f=24,s=2,v=1,i=2,c=3,r=2,z=-1;AP8AAAD/\x1b\\");
+
+    var state: State = .empty;
+    defer state.deinit(alloc);
+    const cell: CellSize = .{ .width = 10, .height = 10 };
+
+    state.kittyUpdate(alloc, &t, cell);
+    try testing.expectEqual(@as(usize, 2), state.kitty_placements.items.len);
+    const placements = try alloc.dupe(Placement, state.kitty_placements.items);
+    defer alloc.free(placements);
+    const bg_end = state.kitty_bg_end;
+    const text_end = state.kitty_text_end;
+    const before_1 = try alloc.dupe(u8, state.images.get(.{ .kitty = 1 }).?.image.getPending().?.dataSlice());
+    defer alloc.free(before_1);
+    const before_2 = try alloc.dupe(u8, state.images.get(.{ .kitty = 2 }).?.image.getPending().?.dataSlice());
+    defer alloc.free(before_2);
+    try testing.expect(!t.screens.active.kitty_images.dirty);
+
+    try testing.expect(state.release(alloc));
+    try testing.expectEqual(@as(usize, 0), state.images.count());
+    try testing.expectEqual(@as(usize, 0), state.kitty_placements.items.len);
+    // Nothing left: a second release frees nothing.
+    try testing.expect(!state.release(alloc));
+
+    state.kittyUpdate(alloc, &t, cell);
+    try testing.expectEqualDeep(placements, state.kitty_placements.items);
+    try testing.expectEqual(bg_end, state.kitty_bg_end);
+    try testing.expectEqual(text_end, state.kitty_text_end);
+    try testing.expectEqualSlices(u8, before_1, state.images.get(.{ .kitty = 1 }).?.image.getPending().?.dataSlice());
+    try testing.expectEqualSlices(u8, before_2, state.images.get(.{ .kitty = 2 }).?.image.getPending().?.dataSlice());
 }
 
 test "kitty renderer uses the intersected source rectangle" {
