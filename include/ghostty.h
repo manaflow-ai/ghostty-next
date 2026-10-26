@@ -1420,6 +1420,11 @@ GHOSTTY_API void ghostty_app_free(ghostty_app_t);
 GHOSTTY_API void ghostty_app_tick(ghostty_app_t);
 GHOSTTY_API void* ghostty_app_userdata(ghostty_app_t);
 GHOSTTY_API void ghostty_app_set_focus(ghostty_app_t, bool);
+// Energy Saver for every surface of the app, current and future (off by
+// default): shader and Kitty animation wakes wait at least 33 ms and are
+// not paced by the display link, and scrollback compression runs at
+// utility QoS. Main thread only; repeating the state does nothing.
+GHOSTTY_API void ghostty_app_set_energy_saver(ghostty_app_t, bool);
 GHOSTTY_API bool ghostty_app_key(ghostty_app_t, ghostty_input_key_s);
 GHOSTTY_API void ghostty_app_keyboard_changed(ghostty_app_t);
 GHOSTTY_API void ghostty_app_open_config(ghostty_app_t);

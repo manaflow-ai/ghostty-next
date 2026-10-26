@@ -1868,6 +1868,19 @@ pub const CAPI = struct {
         app.focusEvent(focused);
     }
 
+    /// Turn Energy Saver on or off for every surface of the app, current
+    /// and future: shader and Kitty animation wakes wait at least 33 ms
+    /// (30 fps, Chrome's battery saver frame rate) and are not paced by
+    /// the display link, and scrollback compression runs at utility
+    /// QoS. Off by default. Main thread only; a call that repeats the
+    /// state does nothing.
+    export fn ghostty_app_set_energy_saver(
+        app: *App,
+        on: bool,
+    ) void {
+        app.core_app.energySaverEvent(on);
+    }
+
     /// Notify the app of a global keypress capture. This will return
     /// true if the key was captured by the app, in which case the caller
     /// should not process the key.

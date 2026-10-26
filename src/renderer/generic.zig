@@ -46,6 +46,158 @@ pub const RenderCounters = struct {
     /// The drawn terminal's grid changed size.
     full_resize: std.atomic.Value(u64) = .init(0),
 };
+
+/// When a renderer's animations (custom shaders, Kitty graphics, a theme
+/// color blend) need the renderer thread again, and how.
+const animation = struct {
+    /// The cadence of continuous (draw-only) animation wakes, i.e. 120fps,
+    /// and the floor for any animation wake delay.
+    pub const draw_interval_ms: u64 = 8;
+
+    /// The floor of shader and Kitty animation wakes under Energy Saver:
+    /// 30 fps, the rate Chrome's battery saver throttles frame sinks to
+    /// (chrome/browser/performance_manager/user_tuning/
+    /// battery_saver_mode_manager.cc, `StartThrottlingAllFrameSinks`).
+    pub const saver_interval_ms: u64 = 33;
+
+    /// A point in the future when the renderer needs to be driven
+    /// again to keep animating, and what kind of drive it needs.
+    pub const Wake = struct {
+        /// Delay in milliseconds until the wake is due.
+        delay_ms: u64,
+        kind: Kind,
+        /// The display link paces this animation: it runs and every
+        /// tick draws a frame. False under Energy Saver: the renderer
+        /// thread's animation timer draws each frame and the link
+        /// stops once the cells stop changing.
+        paced: bool = true,
+
+        pub const Kind = enum {
+            /// A redraw alone suffices, no updateFrame. Much cheaper
+            /// than `update`.
+            draw,
+
+            /// Frame data must be updated first: updateFrame, then draw.
+            update,
+        };
+    };
+
+    /// What runs now, as the renderer reads it on its thread.
+    pub const Demand = struct {
+        /// Custom shader animation runs (configured, and focused unless
+        /// `custom-shader-animation = always`).
+        shader: bool = false,
+        /// Milliseconds until the next Kitty animation frame is due
+        /// (0: overdue); null while no Kitty animation runs.
+        kitty_remaining_ms: ?u64 = null,
+        /// A theme color blend runs.
+        color_blend: bool = false,
+        /// Energy Saver is on.
+        saver: bool = false,
+
+        /// The soonest wake: custom shaders want continuous draw-only
+        /// wakes, a Kitty animation an update wake when its next frame
+        /// is due. Under Energy Saver both wait at least
+        /// `saver_interval_ms` and are not display-paced. A color blend
+        /// keeps the display's rate: it is the person's theme switch,
+        /// and it ends.
+        pub fn wake(self: Demand) ?Wake {
+            const floor: u64 = if (self.saver) saver_interval_ms else draw_interval_ms;
+            const paced = !self.saver;
+
+            // Never wake faster than the floor; an overdue frame is
+            // picked up on the next wake.
+            const kitty_delay: ?u64 = if (self.kitty_remaining_ms) |k| @max(k, floor) else null;
+
+            // A theme color blend redraws every frame until it ends: draw
+            // only, the cells stay (ColorBlend).
+            if (self.color_blend) {
+                if (kitty_delay) |k| {
+                    if (k <= draw_interval_ms) return .{ .delay_ms = k, .kind = .update };
+                }
+                return .{ .delay_ms = draw_interval_ms, .kind = .draw };
+            }
+
+            // An update wake includes a draw, so it wins ties.
+            if (kitty_delay) |k| {
+                if (!self.shader or k <= floor) {
+                    return .{ .delay_ms = k, .kind = .update, .paced = paced };
+                }
+            }
+
+            if (self.shader) return .{ .delay_ms = floor, .kind = .draw, .paced = paced };
+
+            return null;
+        }
+    };
+};
+
+test "renderer animation: wakes are unchanged without Energy Saver" {
+    const testing = std.testing;
+    try testing.expectEqual(@as(?animation.Wake, null), (animation.Demand{}).wake());
+    try testing.expectEqual(
+        animation.Wake{ .delay_ms = 8, .kind = .draw, .paced = true },
+        (animation.Demand{ .shader = true }).wake().?,
+    );
+    try testing.expectEqual(
+        animation.Wake{ .delay_ms = 8, .kind = .update, .paced = true },
+        (animation.Demand{ .kitty_remaining_ms = 2 }).wake().?,
+    );
+    try testing.expectEqual(
+        animation.Wake{ .delay_ms = 40, .kind = .update, .paced = true },
+        (animation.Demand{ .kitty_remaining_ms = 40 }).wake().?,
+    );
+    try testing.expectEqual(
+        animation.Wake{ .delay_ms = 8, .kind = .draw, .paced = true },
+        (animation.Demand{ .shader = true, .kitty_remaining_ms = 40 }).wake().?,
+    );
+}
+
+test "renderer animation: Energy Saver wakes shaders and Kitty no closer than 33 ms, off the display link" {
+    const testing = std.testing;
+    try testing.expectEqual(
+        animation.Wake{ .delay_ms = 33, .kind = .draw, .paced = false },
+        (animation.Demand{ .shader = true, .saver = true }).wake().?,
+    );
+    try testing.expectEqual(
+        animation.Wake{ .delay_ms = 33, .kind = .update, .paced = false },
+        (animation.Demand{ .kitty_remaining_ms = 0, .saver = true }).wake().?,
+    );
+    try testing.expectEqual(
+        animation.Wake{ .delay_ms = 33, .kind = .update, .paced = false },
+        (animation.Demand{ .shader = true, .kitty_remaining_ms = 20, .saver = true }).wake().?,
+    );
+    try testing.expectEqual(
+        animation.Wake{ .delay_ms = 33, .kind = .draw, .paced = false },
+        (animation.Demand{ .shader = true, .kitty_remaining_ms = 90, .saver = true }).wake().?,
+    );
+    try testing.expectEqual(
+        animation.Wake{ .delay_ms = 90, .kind = .update, .paced = false },
+        (animation.Demand{ .kitty_remaining_ms = 90, .saver = true }).wake().?,
+    );
+
+    // Every shader or Kitty wake under the saver: the timer re-arms after
+    // each wake, so consecutive wakes are at least this far apart.
+    for ([_]bool{ false, true }) |shader| {
+        for ([_]?u64{ null, 0, 1, 8, 32, 33, 34, 1000 }) |kitty| {
+            const wake = (animation.Demand{
+                .shader = shader,
+                .kitty_remaining_ms = kitty,
+                .saver = true,
+            }).wake() orelse continue;
+            try testing.expect(wake.delay_ms >= animation.saver_interval_ms);
+            try testing.expect(!wake.paced);
+        }
+    }
+}
+
+test "renderer animation: a theme color blend keeps the display's rate under Energy Saver" {
+    const testing = std.testing;
+    try testing.expectEqual(
+        animation.Wake{ .delay_ms = 8, .kind = .draw, .paced = true },
+        (animation.Demand{ .shader = true, .color_blend = true, .saver = true }).wake().?,
+    );
+}
 const imagepkg = @import("image.zig");
 const ImageState = imagepkg.State;
 const shadertoy = @import("shadertoy.zig");
@@ -174,6 +326,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         /// True if the window is visible.
         visible: bool,
+
+        /// Energy Saver is on (`ghostty_app_set_energy_saver`): shader and
+        /// Kitty animations wake at most every `saver_interval_ms` from
+        /// the renderer thread's timer, not on every display-link tick.
+        /// Written on the render thread, read by draws on any thread.
+        energy_saver: std.atomic.Value(bool) = .init(false),
+
+        /// The renderer thread's animation timer asked for the next draw
+        /// (`markAnimationFrameDue`). Under Energy Saver only that draw
+        /// renders an animation frame; display-link ticks that carry no
+        /// new cells draw nothing and let the link stop.
+        animation_frame_due: std.atomic.Value(bool) = .init(false),
 
         /// Flag to indicate that our focus state changed for custom
         /// shaders to update their state.
@@ -1211,52 +1375,30 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.syncDisplayLink(id, draw_now);
         }
 
-        /// The cadence of continuous (draw-only) animation wakes,
-        /// i.e. 120fps, and the floor for any animation wake delay.
-        pub const draw_interval_ms: u64 = 8;
+        pub const draw_interval_ms = animation.draw_interval_ms;
+        pub const saver_interval_ms = animation.saver_interval_ms;
+        pub const AnimationWake = animation.Wake;
 
-        /// A point in the future when the renderer needs to be driven
-        /// again to keep animating, and what kind of drive it needs.
-        pub const AnimationWake = struct {
-            /// Delay in milliseconds until the wake is due.
-            delay_ms: u64,
-            kind: Kind,
-
-            pub const Kind = enum {
-                /// A redraw alone suffices, no updateFrame. Much cheaper
-                /// than `update`.
-                draw,
-
-                /// Frame data must be updated first: updateFrame, then draw.
-                update,
-            };
-        };
-
-        /// The soonest animation wake this renderer needs, if any:
-        /// custom shader animation wants continuous draw-only wakes
-        /// at draw_interval_ms while active, and a running Kitty
-        /// graphics animation wants an update wake when its next
-        /// frame is due. The renderer thread drives its animation
-        /// timer off this, re-querying after every wake.
+        /// The soonest animation wake this renderer needs, if any
+        /// (`animation.Demand.wake`). The renderer thread drives its
+        /// animation timer off this, re-querying after every wake.
         ///
         /// Must be called on the render thread.
         pub fn animationWake(self: *const Self) ?AnimationWake {
             // Custom shaders animate by redrawing on a fixed cadence,
             // gated by configuration and focus.
-            const shader_delay: ?u64 = shader: {
-                if (!self.has_custom_shaders) break :shader null;
-                break :shader switch (self.config.custom_shader_animation) {
-                    .false => null,
-                    .always => draw_interval_ms,
-                    .true => if (self.focused) draw_interval_ms else null,
+            const shader = self.has_custom_shaders and
+                switch (self.config.custom_shader_animation) {
+                    .false => false,
+                    .always => true,
+                    .true => self.focused,
                 };
-            };
 
             // Kitty animations tick during updateFrame; between
             // updates the deadline is absolute on the animation
             // clock, so a stream of draw wakes recomputing this
             // cannot starve it into the future.
-            const kitty_delay: ?u64 = kitty: {
+            const kitty_remaining_ms: ?u64 = kitty: {
                 const next = self.kitty_animation_next_ms orelse break :kitty null;
                 const base = self.kitty_animation_clock orelse break :kitty null;
                 const now: std.Io.Timestamp = .now(global.io(), .awake);
@@ -1264,30 +1406,51 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     base.durationTo(now).nanoseconds,
                     std.time.ns_per_ms,
                 ));
-                // Never wake faster than the draw interval; an
-                // overdue frame is picked up on the next wake.
-                break :kitty @max(next -| now_ms, draw_interval_ms);
+                break :kitty next -| now_ms;
             };
 
-            // A theme color blend redraws every frame until it ends: draw
-            // only, the cells stay (ColorBlend).
-            if (self.color_blend.isRunning()) {
-                if (kitty_delay) |k| {
-                    if (k <= draw_interval_ms) return .{ .delay_ms = k, .kind = .update };
-                }
-                return .{ .delay_ms = draw_interval_ms, .kind = .draw };
-            }
+            const demand: animation.Demand = .{
+                .shader = shader,
+                .kitty_remaining_ms = kitty_remaining_ms,
+                .color_blend = self.color_blend.isRunning(),
+                .saver = self.energy_saver.load(.monotonic),
+            };
+            return demand.wake();
+        }
 
-            // An update wake includes a draw, so it wins ties.
-            if (kitty_delay) |k| {
-                if (shader_delay == null or k <= shader_delay.?) {
-                    return .{ .delay_ms = k, .kind = .update };
-                }
-            }
+        /// Turns Energy Saver on or off for this renderer
+        /// (`ghostty_app_set_energy_saver`). The caller re-arms its
+        /// animation timer for the new floor.
+        ///
+        /// Must be called on the render thread.
+        pub fn setEnergySaver(self: *Self, on: bool) void {
+            self.energy_saver.store(on, .monotonic);
+            // Under the saver an animation alone no longer keeps the
+            // display link running; off again, it starts it.
+            self.syncDisplayLink(null, null);
+        }
 
-            if (shader_delay) |s| return .{ .delay_ms = s, .kind = .draw };
+        /// The renderer thread's animation timer fired: the next draw
+        /// renders an animation frame even under Energy Saver.
+        pub fn markAnimationFrameDue(self: *Self) void {
+            self.animation_frame_due.store(true, .release);
+        }
 
-            return null;
+        /// Whether an animation needs the draw that calls this: a
+        /// display-paced wake needs every draw, an unpaced one (Energy
+        /// Saver) only the draw its timer asked for. Consumes the
+        /// timer's request.
+        fn animationNeedsDraw(self: *Self) bool {
+            const due = self.animation_frame_due.swap(false, .acq_rel);
+            const wake = self.animationWake() orelse return false;
+            return wake.paced or due;
+        }
+
+        /// Whether an animation keeps the display link running: only a
+        /// display-paced wake does.
+        fn animationNeedsVsync(self: *const Self) bool {
+            const wake = self.animationWake() orelse return false;
+            return wake.paced;
         }
 
         /// True if our renderer is using vsync. If true, the renderer or apprt
@@ -1454,8 +1617,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const should_run =
                 // Non-visible windows never vsync
                 self.visible and
-                // Only vsync if we have cell changes or animation
-                (self.cells_rebuilt or self.animationWake() != null);
+                // Only vsync if we have cell changes or a display-paced
+                // animation (Energy Saver's animations run off the timer)
+                (self.cells_rebuilt or self.animationNeedsVsync());
 
             if (should_run) {
                 if (!display_link.isRunning()) {
@@ -2072,13 +2236,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Conditions under which we need to draw the frame, otherwise we
             // don't need to since the previous frame should be identical.
             //
-            // While any animation is in progress (a pending animation wake)
-            // every draw must actually render.
+            // While an animation is in progress (a pending animation wake)
+            // every draw must actually render; under Energy Saver only the
+            // draws its timer asks for. Read first: it consumes the request.
+            const animation_draw = self.animationNeedsDraw();
             const needs_redraw =
                 size_changed or
                 swap_chain_rebuilt or
                 self.cells_rebuilt or
-                self.animationWake() != null or
+                animation_draw or
                 sync;
 
             if (!needs_redraw) {

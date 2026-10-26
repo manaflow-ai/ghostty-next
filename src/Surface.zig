@@ -698,6 +698,10 @@ pub fn init(
     );
     errdefer render_thread.deinit();
 
+    // A surface made while Energy Saver is on starts under it.
+    render_thread.flags.energy_saver = app.energy_saver;
+    renderer_impl.energy_saver.store(app.energy_saver, .monotonic);
+
     // Create the IO thread
     var io_thread = try termio.Thread.init(alloc);
     errdefer io_thread.deinit();
@@ -3829,6 +3833,15 @@ pub fn occlusionCallback(self: *Surface, visible: bool) !void {
     }, .{ .forever = {} });
 
     try self.queueRender();
+}
+
+/// Energy Saver turned on or off (App.energySaverEvent). Main thread only.
+pub fn energySaverCallback(self: *Surface, on: bool) void {
+    _ = self.renderer_thread.mailbox.push(global.io(), .{
+        .energy_saver = on,
+    }, .{ .forever = {} });
+    self.queueRender() catch |err|
+        log.warn("error waking renderer for energy saver err={}", .{err});
 }
 
 pub fn focusCallback(self: *Surface, focused: bool) !void {

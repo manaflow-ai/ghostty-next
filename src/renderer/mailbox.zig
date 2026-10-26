@@ -14,7 +14,7 @@
 //! every later push goes there too, so the renderer sees messages in
 //! push order: the queue first, then the overflow. State messages whose
 //! latest value wins (focus, visible, resize, cursor blink reset, display
-//! id, presentation health) replace an older one of the same kind in the
+//! id, presentation health, energy saver) replace an older one of the same kind in the
 //! overflow, which bounds it while the renderer is stalled. An `.instant`
 //! push keeps its meaning: it fails when the queue is full.
 const Mailbox = @This();
@@ -118,6 +118,7 @@ fn coalesces(value: Message) bool {
         .reset_cursor_blink,
         .macos_display_id,
         .presentation_health,
+        .energy_saver,
         => true,
         else => false,
     };
@@ -144,7 +145,9 @@ test "renderer mailbox: a full mailbox never blocks and keeps order" {
     try testing.expect(mailbox.push(io, .{ .focus = true }, .forever) > 0);
     try testing.expect(mailbox.push(io, .{ .inspector = false }, .forever) > 0);
     try testing.expect(mailbox.push(io, .{ .focus = false }, .{ .ns = 1 }) > 0);
-    try testing.expectEqual(@as(usize, 3), mailbox.overflow.items.len);
+    try testing.expect(mailbox.push(io, .{ .energy_saver = true }, .forever) > 0);
+    try testing.expect(mailbox.push(io, .{ .energy_saver = false }, .forever) > 0);
+    try testing.expectEqual(@as(usize, 4), mailbox.overflow.items.len);
 
     for (0..capacity) |i| {
         const value = mailbox.pop(io).?;
@@ -158,6 +161,7 @@ test "renderer mailbox: a full mailbox never blocks and keeps order" {
     try testing.expectEqual(true, mailbox.pop(io).?.inspector);
     try testing.expectEqual(false, mailbox.pop(io).?.inspector);
     try testing.expectEqual(false, mailbox.pop(io).?.focus);
+    try testing.expectEqual(false, mailbox.pop(io).?.energy_saver);
     try testing.expectEqual(false, mailbox.pop(io).?.visible);
     try testing.expect(mailbox.pop(io) == null);
 
