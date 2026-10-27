@@ -3655,21 +3655,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     continue;
                 }
 
-                // Give links a single underline, unless they already have
-                // an underline, in which case use a double underline to
-                // distinguish them.
-                const underline: terminal.Attribute.Underline = underline: {
-                    if (links.contains(.{
+                // A hovered link gets one underline (link.hoverUnderline).
+                const underline: terminal.Attribute.Underline = link.hoverUnderline(
+                    style.flags.underline,
+                    links.contains(.{
                         .x = @intCast(x),
                         .y = @intCast(y),
-                    })) {
-                        break :underline if (style.flags.underline == .single)
-                            .double
-                        else
-                            .single;
-                    }
-                    break :underline style.flags.underline;
-                };
+                    }),
+                );
 
                 // We draw underlines first so that they layer underneath text.
                 // This improves readability when a colored underline is used
