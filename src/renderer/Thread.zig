@@ -250,18 +250,10 @@ fn threadMain_(self: *Thread) !void {
     self.stop.wait(&self.loop, &self.stop_c, Thread, self, stopCallback);
     self.draw_now.wait(&self.loop, &self.draw_now_c, Thread, self, drawNowCallback);
 
-    // Send an initial wakeup message so that we render right away.
+    // Send an initial wakeup message so that we render right away. The
+    // cursor blink timer starts once a frame update finds a blinking
+    // cursor (syncCursorTimer).
     try self.wakeup.notify();
-
-    // Start blinking the cursor.
-    self.cursor_h.run(
-        &self.loop,
-        &self.cursor_c,
-        cursorBlinkInterval(),
-        Thread,
-        self,
-        cursorTimerCallback,
-    );
 
     // Arm the animation timer in case the renderer already needs
     // animation wakes (e.g. custom shaders loaded at startup).
@@ -366,51 +358,15 @@ fn drainMailbox(self: *Thread) !void {
                 // the animation timer for the new state.
                 self.armAnimationTimer();
 
-                if (!v) {
-                    // If we're not focused, then we stop the cursor blink
-                    if (self.cursor_c.state() == .active and
-                        self.cursor_c_cancel.state() == .dead)
-                    {
-                        self.cursor_h.cancel(
-                            &self.loop,
-                            &self.cursor_c,
-                            &self.cursor_c_cancel,
-                            void,
-                            null,
-                            cursorCancelCallback,
-                        );
-                    }
-                } else {
-                    // If we're focused, we immediately show the cursor again
-                    // and then restart the timer.
-                    if (self.cursor_c.state() != .active) {
-                        self.flags.cursor_blink_visible = true;
-                        self.cursor_h.run(
-                            &self.loop,
-                            &self.cursor_c,
-                            cursorBlinkInterval(),
-                            Thread,
-                            self,
-                            cursorTimerCallback,
-                        );
-                    }
-                }
+                // Losing focus stops the blink: the next tick finds the
+                // surface unfocused and does not re-arm. Gaining it shows
+                // the cursor at once for a full interval.
+                if (v) self.restartCursorBlink();
             },
 
-            .reset_cursor_blink => {
-                self.flags.cursor_blink_visible = true;
-                if (self.cursor_c.state() == .active) {
-                    self.cursor_h.reset(
-                        &self.loop,
-                        &self.cursor_c,
-                        &self.cursor_c_cancel,
-                        cursorBlinkInterval(),
-                        Thread,
-                        self,
-                        cursorTimerCallback,
-                    );
-                }
-            },
+            .reset_cursor_blink => self.restartCursorBlink(),
+
+            .redraw => self.renderer.markFrameChanged(),
 
             .font_grid => |grid| {
                 self.renderer.setFontGrid(grid.grid);
@@ -616,6 +572,10 @@ fn renderCallback(
     ) catch |err|
         log.warn("error rendering err={}", .{err});
 
+    // The update may have made the cursor blink (DECSCUSR, a mode
+    // change, focus): start the blink timer if it is stopped.
+    t.syncCursorTimer();
+
     // Draw. updateFrame starts the display link for the rebuilt cells, so
     // a vsync-deferred draw would hold the first frame after idle (a
     // keystroke's echo) until the next refresh: up to a full interval,
@@ -727,13 +687,19 @@ fn cursorTimerCallback(
         return .disarm;
     };
 
+    // A tick changes pixels only for a focused, visible surface whose
+    // cursor blinks and shows: a hidden cursor (DECTCEM off, as agent TUIs
+    // keep it), a steady one or an unfocused surface draws the same frame,
+    // so the timer stops with the cursor shown: no wake every interval, no
+    // frame update, no draw. The renderer thread owns `terminal_state`; the
+    // next update or focus that makes a tick matter starts the timer again
+    // (syncCursorTimer).
+    if (!blinkTimerRuns(t.flags.focused, t.flags.visible, &t.renderer.terminal_state)) {
+        t.flags.cursor_blink_visible = true;
+        return .disarm;
+    }
     t.flags.cursor_blink_visible = !t.flags.cursor_blink_visible;
-    // A tick changes pixels only when the cursor blinks and shows: a hidden
-    // cursor (DECTCEM off, as agent TUIs keep it) or a steady one draws the
-    // same frame, so the tick wakes nothing (no frame update, no draw). The
-    // renderer thread owns `terminal_state`; the next update after output
-    // that turns blinking on picks the ticks up again.
-    if (blinkTickDraws(&t.renderer.terminal_state)) t.wakeup.notify() catch {};
+    t.wakeup.notify() catch {};
 
     t.cursor_h.run(
         &t.loop,
@@ -765,49 +731,61 @@ test "renderer thread: an early frame only after a quiet interval while the link
     try testing.expect(!drawsNow(true, false, true, false));
 }
 
-/// Whether a cursor blink tick can change the frame of `state` (the
-/// renderer's last frame update): the cursor blinks and is visible.
-fn blinkTickDraws(state: *const terminalpkg.RenderState) bool {
-    return state.cursor.blinking and state.cursor.visible;
+/// Whether the cursor blink timer runs: a tick can change the frame only
+/// for a focused, visible surface whose cursor (in `state`, the renderer's
+/// last frame update) blinks and is shown. An unfocused surface draws a
+/// steady hollow block; a hidden one draws nothing.
+fn blinkTimerRuns(focused: bool, visible: bool, state: *const terminalpkg.RenderState) bool {
+    return focused and visible and state.cursor.blinking and state.cursor.visible;
 }
 
-test "renderer thread: a blink tick draws only a visible blinking cursor" {
+test "renderer thread: the blink timer runs only for a shown blinking cursor of a focused visible surface" {
     const testing = std.testing;
     var state: terminalpkg.RenderState = .empty;
     state.cursor.blinking = true;
     state.cursor.visible = true;
-    try testing.expect(blinkTickDraws(&state));
+    try testing.expect(blinkTimerRuns(true, true, &state));
+    try testing.expect(!blinkTimerRuns(false, true, &state));
+    try testing.expect(!blinkTimerRuns(true, false, &state));
     state.cursor.visible = false;
-    try testing.expect(!blinkTickDraws(&state));
+    try testing.expect(!blinkTimerRuns(true, true, &state));
     state.cursor.visible = true;
     state.cursor.blinking = false;
-    try testing.expect(!blinkTickDraws(&state));
+    try testing.expect(!blinkTimerRuns(true, true, &state));
 }
 
-fn cursorCancelCallback(
-    _: ?*void,
-    _: *xev.Loop,
-    _: *xev.Completion,
-    r: xev.Timer.CancelError!void,
-) xev.CallbackAction {
-    // This makes it easier to work across platforms where different platforms
-    // support different sets of errors, so we just unify it.
-    const CancelError = xev.Timer.CancelError || error{
-        Canceled,
-        NotFound,
-        Unexpected,
-    };
+/// Start the blink timer, with the cursor shown, if a tick can change the
+/// frame and the timer is stopped. It never cancels the timer: a tick that
+/// finds nothing to blink does not re-arm (cursorTimerCallback), so a
+/// steady, hidden or unfocused cursor costs at most one more wake.
+fn syncCursorTimer(self: *Thread) void {
+    if (self.cursor_c.state() == .active) return;
+    if (!blinkTimerRuns(self.flags.focused, self.flags.visible, &self.renderer.terminal_state)) return;
+    self.flags.cursor_blink_visible = true;
+    self.cursor_h.run(
+        &self.loop,
+        &self.cursor_c,
+        cursorBlinkInterval(),
+        Thread,
+        self,
+        cursorTimerCallback,
+    );
+}
 
-    _ = r catch |err| switch (@as(CancelError, @errorCast(err))) {
-        error.Canceled => {}, // success
-        error.NotFound => {}, // completed before it could cancel
-        else => {
-            log.warn("error in cursor cancel callback err={}", .{err});
-            unreachable;
-        },
-    };
-
-    return .disarm;
+/// Show the cursor and start a full blink interval (a key press, focus
+/// gained).
+fn restartCursorBlink(self: *Thread) void {
+    self.flags.cursor_blink_visible = true;
+    if (self.cursor_c.state() != .active) return self.syncCursorTimer();
+    self.cursor_h.reset(
+        &self.loop,
+        &self.cursor_c,
+        &self.cursor_c_cancel,
+        cursorBlinkInterval(),
+        Thread,
+        self,
+        cursorTimerCallback,
+    );
 }
 
 // fn prepFrameCallback(h: *libuv.Prepare) void {

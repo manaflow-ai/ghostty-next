@@ -116,6 +116,7 @@ fn coalesces(value: Message) bool {
         .visible,
         .resize,
         .reset_cursor_blink,
+        .redraw,
         .macos_display_id,
         .presentation_health,
         => true,
