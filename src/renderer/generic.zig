@@ -46,6 +46,12 @@ pub const RenderCounters = struct {
     full_swap: std.atomic.Value(u64) = .init(0),
     /// The drawn terminal's grid changed size.
     full_resize: std.atomic.Value(u64) = .init(0),
+    /// Renderer thread wakes: a mailbox wakeup, a draw-now (display link)
+    /// or a timer (animation, cursor blink, scrollback compression).
+    thread_wakes: std.atomic.Value(u64) = .init(0),
+    /// Cursor blink timer ticks, which a cursor blinking on its own layer
+    /// (`CursorLayer`) never needs.
+    cursor_blink_ticks: std.atomic.Value(u64) = .init(0),
 };
 const imagepkg = @import("image.zig");
 const ImageState = imagepkg.State;

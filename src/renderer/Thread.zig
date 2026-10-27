@@ -491,6 +491,7 @@ fn wakeupCallback(
     };
 
     const t = self_.?;
+    t.countWake();
 
     // When we wake up, we check the mailbox. Mailbox producers should
     // wake up our thread after publishing.
@@ -538,6 +539,7 @@ fn drawNowCallback(
 
     // Draw immediately
     const t = self_.?;
+    t.countWake();
     const before = t.renderer.counters.frames.load(.monotonic);
     t.drawFrame(true);
     t.flags.last_tick_drew = t.renderer.counters.frames.load(.monotonic) != before;
@@ -655,6 +657,7 @@ fn animationTimerCallback(
         log.warn("animation callback fired without data set", .{});
         return .disarm;
     };
+    t.countWake();
 
     // Animations pause entirely while we're invisible; the .visible
     // mailbox message re-arms us when we can be seen again.
@@ -703,6 +706,8 @@ fn cursorTimerCallback(
         return .disarm;
     };
 
+    t.countWake();
+    _ = t.renderer.counters.cursor_blink_ticks.fetchAdd(1, .monotonic);
     t.flags.cursor_blink_visible = !t.flags.cursor_blink_visible;
     // A tick changes pixels only when the cursor blinks and shows: a hidden
     // cursor (DECTCEM off, as agent TUIs keep it) or a steady one draws the
@@ -847,6 +852,11 @@ fn stopCallback(
     return .disarm;
 }
 
+/// Counts one renderer thread wake (RenderCounters `thread_wakes`).
+fn countWake(self: *Thread) void {
+    _ = self.renderer.counters.thread_wakes.fetchAdd(1, .monotonic);
+}
+
 /// Returns the interval for the blinking cursor in milliseconds.
 fn cursorBlinkInterval() u64 {
     if (std.valgrind.runningOnValgrind() > 0) {
@@ -950,6 +960,7 @@ const Compression = struct {
             },
         };
 
+        thread.countWake();
         const self = &thread.compression;
 
         if (self.step(thread)) |delay| {

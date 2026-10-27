@@ -762,6 +762,12 @@ typedef struct {
   // unchanged) that went to the screen from the renderer's GPU completion
   // thread, in their own Core Animation transaction, without the main thread.
   uint64_t host_off_main_presents;
+  // Renderer thread wakes: a mailbox wakeup, a draw-now (display link) or a
+  // timer (animation, cursor blink, scrollback compression). Of them, cursor
+  // blink timer ticks; a cursor blinking on its own layer
+  // (ghostty_app_set_cursor_blink_layer) needs none.
+  uint64_t thread_wakes;
+  uint64_t cursor_blink_ticks;
 } ghostty_surface_render_counters_s;
 
 // Config types

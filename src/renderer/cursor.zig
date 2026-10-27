@@ -135,6 +135,90 @@ pub fn layerRect(
     };
 }
 
+/// Core Animation's autoresizing bits (`CAAutoresizingMask`) a cursor layer
+/// uses: its right margin, and its bottom one, flex.
+pub const autoresizing_max_x_margin: u32 = 1 << 2;
+pub const autoresizing_min_y_margin: u32 = 1 << 3;
+pub const autoresizing_max_y_margin: u32 = 1 << 5;
+
+/// A rectangle in a layer's points, in that layer's own y direction.
+pub const LayerRect = struct {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+};
+
+/// Where the sublayer of a blinking cursor goes in its superlayer.
+pub const LayerFrame = struct {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    /// `CAAutoresizingMask`: keeps the layer at its distance from the
+    /// superlayer's top-left corner when the superlayer's bounds change
+    /// before the next frame places it again, as the contents stay there.
+    autoresizing_mask: u32,
+};
+
+/// The frame, in the superlayer's points, of the sublayer that shows a
+/// cursor at `rect` (pixels from the contents' top-left corner, at `scale`
+/// pixels per point). The contents sit at the superlayer's top-left corner
+/// (`contentsGravity`), whichever way its y axis points (`flipped`): the
+/// cursor goes there too, and its bottom and right margins flex.
+pub fn layerFrame(rect: Rect, scale: f64, bounds: LayerRect, flipped: bool) LayerFrame {
+    const width = @as(f64, @floatFromInt(rect.width)) / scale;
+    const height = @as(f64, @floatFromInt(rect.height)) / scale;
+    const top = @as(f64, @floatFromInt(rect.y)) / scale;
+    return .{
+        .x = bounds.x + @as(f64, @floatFromInt(rect.x)) / scale,
+        .y = bounds.y + if (flipped) top else bounds.height - top - height,
+        .width = width,
+        .height = height,
+        // The bottom margin is the low-y one unless the geometry is flipped.
+        .autoresizing_mask = autoresizing_max_x_margin |
+            if (flipped) autoresizing_max_y_margin else autoresizing_min_y_margin,
+    };
+}
+
+test "cursor: a cursor layer stays at its cell when the bounds change" {
+    const testing = std.testing;
+    const rect: Rect = .{ .x = 36, .y = 44, .width = 10, .height = 20 };
+
+    // Core Animation's rule for one flexible margin per axis: that margin
+    // takes the whole change of the superlayer's size.
+    const autoresize = struct {
+        fn apply(frame: LayerFrame, old: LayerRect, new: LayerRect) LayerFrame {
+            var out = frame;
+            if (frame.autoresizing_mask & autoresizing_min_y_margin != 0) out.y += new.height - old.height;
+            return out;
+        }
+    }.apply;
+
+    for ([_]bool{ false, true }) |flipped| {
+        const old: LayerRect = .{ .x = 0, .y = 0, .width = 240, .height = 120 };
+        const placed = layerFrame(rect, 2, old, flipped);
+        try testing.expectEqual(@as(f64, 18), placed.x);
+        try testing.expectEqual(@as(f64, 5), placed.width);
+        try testing.expectEqual(@as(f64, 10), placed.height);
+        // 22 points below the top edge.
+        try testing.expectEqual(@as(f64, if (flipped) 22 else 120 - 22 - 10), placed.y);
+
+        // Taller, then shorter, and narrower: the frame the next draw
+        // places is where autoresizing already moved the layer.
+        for ([_]LayerRect{
+            .{ .x = 0, .y = 0, .width = 240, .height = 280 },
+            .{ .x = 0, .y = 0, .width = 120, .height = 60 },
+        }) |new| {
+            const moved = autoresize(placed, old, new);
+            const replaced = layerFrame(rect, 2, new, flipped);
+            try testing.expectEqual(replaced.x, moved.x);
+            try testing.expectEqual(replaced.y, moved.y);
+            try testing.expectEqual(replaced.autoresizing_mask, moved.autoresizing_mask);
+        }
+    }
+}
+
 test "cursor: only a focused visible blinking cursor blinks" {
     const testing = std.testing;
     const alloc = testing.allocator;

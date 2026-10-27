@@ -6,6 +6,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const objc = @import("objc");
 const macos = @import("macos");
+const cursorpkg = @import("../cursor.zig");
 
 const IOSurface = macos.iosurface.IOSurface;
 
@@ -120,10 +121,6 @@ const cursor_blink_key = "ghosttyCursorBlink";
 /// Shows `cursor` on the cursor sublayer, or hides it. Main thread, or
 /// inside an explicit transaction under the Core Animation lock (as
 /// `setSurfaceOffMain`).
-pub fn setCursorSync(self: *IOSurfaceLayer, cursor: Cursor) void {
-    applyCursor(self.layer, cursor);
-}
-
 fn applyCursor(layer: objc.Object, cursor: Cursor) void {
     const existing = cursorSublayer(layer);
     if (cursor.surface == null and existing == null) return;
@@ -142,21 +139,27 @@ fn applyCursor(layer: objc.Object, cursor: Cursor) void {
     const sub = existing orelse createCursorSublayer(layer) orelse return;
 
     // The contents sit at the layer's top-left corner (contentsGravity):
-    // the cursor goes there too, whichever way the layer's y axis points.
+    // the cursor goes there too, whichever way the layer's y axis points,
+    // and stays there when the bounds change before the next frame.
     const scale = layer.getProperty(f64, "contentsScale");
     if (!(scale > 0)) return;
     const bounds = layer.getProperty(macos.graphics.Rect, "bounds");
-    const flipped = layer.msgSend(bool, objc.sel("isGeometryFlipped"), .{});
-    const width = @as(f64, @floatFromInt(cursor.width)) / scale;
-    const height = @as(f64, @floatFromInt(cursor.height)) / scale;
-    const top = @as(f64, @floatFromInt(cursor.y)) / scale;
-    sub.setProperty("contentsScale", scale);
-    sub.setProperty("frame", macos.graphics.Rect{
-        .origin = .{
-            .x = bounds.origin.x + @as(f64, @floatFromInt(cursor.x)) / scale,
-            .y = bounds.origin.y + if (flipped) top else bounds.size.height - top - height,
+    const placed = cursorpkg.layerFrame(
+        .{ .x = cursor.x, .y = cursor.y, .width = cursor.width, .height = cursor.height },
+        scale,
+        .{
+            .x = bounds.origin.x,
+            .y = bounds.origin.y,
+            .width = bounds.size.width,
+            .height = bounds.size.height,
         },
-        .size = .{ .width = width, .height = height },
+        layer.msgSend(bool, objc.sel("isGeometryFlipped"), .{}),
+    );
+    sub.setProperty("contentsScale", scale);
+    sub.setProperty("autoresizingMask", @as(c_uint, placed.autoresizing_mask));
+    sub.setProperty("frame", macos.graphics.Rect{
+        .origin = .{ .x = placed.x, .y = placed.y },
+        .size = .{ .width = placed.width, .height = placed.height },
     });
     sub.setProperty("contents", surface);
     sub.setProperty("hidden", false);
@@ -279,11 +282,14 @@ pub inline fn setSurface(self: *IOSurfaceLayer, surface: *IOSurface, cursor: Cur
     }
 }
 
-/// Sets the layer's `contents` to the provided IOSurface.
+/// Sets the layer's `contents` to the provided IOSurface, and `cursor`, the
+/// frame's blinking cursor, on the cursor sublayer: a frame and its cursor
+/// go in the same Core Animation transaction.
 ///
 /// Does not ensure this happens on the main thread.
-pub inline fn setSurfaceSync(self: *IOSurfaceLayer, surface: *IOSurface) void {
+pub inline fn setFrameSync(self: *IOSurfaceLayer, surface: *IOSurface, cursor: Cursor) void {
     self.layer.setProperty("contents", surface);
+    applyCursor(self.layer, cursor);
 }
 
 const SetSurfaceBlock = objc.Block(struct {
