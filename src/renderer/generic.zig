@@ -21,6 +21,7 @@ const rowNeverExtendBg = @import("row.zig").neverExtendBg;
 const Overlay = @import("Overlay.zig");
 const ReflowPreview = @import("ReflowPreview.zig");
 const ColorBlend = @import("ColorBlend.zig");
+const AtlasTexture = @import("AtlasTexture.zig");
 
 /// Why a frame update rebuilds every row (RenderCounters).
 const RebuildCause = enum { none, config, font };
@@ -135,6 +136,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         const Sampler = GraphicsAPI.Sampler;
         const Texture = GraphicsAPI.Texture;
         const RenderPass = GraphicsAPI.RenderPass;
+        const AtlasTextures = AtlasTexture.Set(Texture);
 
         const shaderpkg = GraphicsAPI.shaders;
         const Shaders = shaderpkg.Shaders;
@@ -234,6 +236,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         font_grid: *font.SharedGrid,
         font_shaper: font.Shaper,
         font_shaper_cache: font.ShaperCache,
+
+        /// This surface's own atlas textures, used only where the graphics
+        /// API cannot share them across surfaces (`atlasTextures`).
+        own_atlas_textures: AtlasTextures = .{},
 
         /// The images that we may render.
         images: ImageState = .empty,
@@ -468,10 +474,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             cells: CellTextBuffer,
             cells_bg: CellBgBuffer,
 
-            grayscale: Texture,
-            grayscale_modified: usize = 0,
-            color: Texture,
-            color_modified: usize = 0,
+            /// The atlas textures this frame samples (`syncAtlasTextures`).
+            grayscale: AtlasTextures.Shared.Ref = .{},
+            color: AtlasTextures.Shared.Ref = .{},
 
             target: Target,
             /// See property of same name on Renderer for explanation.
@@ -518,23 +523,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 );
                 errdefer bg_image_buffer.deinit();
 
-                // Initialize our textures for our font atlas.
-                //
-                // As with the buffers above, we start these off as small
-                // as possible since they'll inevitably be resized anyway.
-                const grayscale = try api.initAtlasTexture(&.{
-                    .data = undefined,
-                    .size = 1,
-                    .format = .grayscale,
-                });
-                errdefer grayscale.deinit();
-                const color = try api.initAtlasTexture(&.{
-                    .data = undefined,
-                    .size = 1,
-                    .format = .bgra,
-                });
-                errdefer color.deinit();
-
                 var custom_shader_state =
                     if (custom_shaders)
                         try CustomShaderState.init(api)
@@ -551,8 +539,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .cells = cells,
                     .cells_bg = cells_bg,
                     .bg_image_buffer = bg_image_buffer,
-                    .grayscale = grayscale,
-                    .color = color,
                     .target = target,
                     .custom_shader_state = custom_shader_state,
                 };
@@ -563,8 +549,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.uniforms.deinit();
                 self.cells.deinit();
                 self.cells_bg.deinit();
-                self.grayscale.deinit();
-                self.color.deinit();
+                self.grayscale.release();
+                self.color.release();
                 self.bg_image_buffer.deinit();
                 if (self.custom_shader_state) |*state| state.deinit();
             }
@@ -1375,6 +1361,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     sc.deinit();
                 }
                 self.swap_chain = null;
+                self.own_atlas_textures.deinit();
             }
 
             // Release the shaders as well if we're unrealized.
@@ -1455,14 +1442,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Update our grid
             self.font_grid = grid;
 
-            // Update all our textures so that they sync on the next frame.
-            // We can modify this without a lock because the GPU does not
-            // touch this data. A released swap chain is rebuilt with
-            // fresh frames that sync all textures on first use.
+            // Drop the old grid's atlas textures; every frame syncs the new
+            // grid's on its next draw. A frame still in flight keeps its
+            // texture: the command buffer holds a reference.
             if (self.swap_chain) |*sc| for (&sc.frames) |*frame| {
-                frame.grayscale_modified = 0;
-                frame.color_modified = 0;
+                frame.grayscale.release();
+                frame.color.release();
             };
+            self.own_atlas_textures.deinit();
 
             // Get our metrics from the grid. This doesn't require a lock because
             // the metrics are never recalculated.
@@ -2185,22 +2172,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             // If our font atlas changed, sync the texture data
-            texture: {
-                const modified = self.font_grid.atlas_grayscale.modified.load(.monotonic);
-                if (modified <= frame.grayscale_modified) break :texture;
-                self.font_grid.lock.lockSharedUncancelable(global.io());
-                defer self.font_grid.lock.unlockShared(global.io());
-                frame.grayscale_modified = self.font_grid.atlas_grayscale.modified.load(.monotonic);
-                try self.syncAtlasTexture(&self.font_grid.atlas_grayscale, &frame.grayscale);
-            }
-            texture: {
-                const modified = self.font_grid.atlas_color.modified.load(.monotonic);
-                if (modified <= frame.color_modified) break :texture;
-                self.font_grid.lock.lockSharedUncancelable(global.io());
-                defer self.font_grid.lock.unlockShared(global.io());
-                frame.color_modified = self.font_grid.atlas_color.modified.load(.monotonic);
-                try self.syncAtlasTexture(&self.font_grid.atlas_color, &frame.color);
-            }
+            try self.syncAtlasTextures(frame);
 
             // Whether this frame shows the cells built for its size (macOS
             // host-sized display passes present only those).
@@ -2288,8 +2260,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         frame.cells_bg.buffer,
                     },
                     .textures = &.{
-                        frame.grayscale,
-                        frame.color,
+                        frame.grayscale.texture(),
+                        frame.color.texture(),
                     },
                     .draw = .{
                         .type = .triangle_strip,
@@ -4091,23 +4063,30 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
         }
 
-        /// Sync the atlas data to the given texture. This copies the bytes
-        /// associated with the atlas to the given texture. If the atlas no
-        /// longer fits into the texture, the texture will be resized.
-        fn syncAtlasTexture(
-            self: *const Self,
-            atlas: *const font.Atlas,
-            texture: *Texture,
-        ) !void {
-            if (atlas.size > texture.width) {
-                // Free our old texture
-                texture.*.deinit();
+        /// The atlas textures of the current grid: the grid's own, shared
+        /// by every surface drawing it, where the graphics API allows it.
+        fn atlasTextures(self: *Self) *AtlasTextures {
+            return if (comptime GraphicsAPI.atlas_textures_per_device)
+                &self.font_grid.textures
+            else
+                &self.own_atlas_textures;
+        }
 
-                // Reallocate
-                texture.* = try self.api.initAtlasTexture(atlas);
-            }
+        /// Point the frame at textures holding the current atlases. A
+        /// changed atlas is uploaded once, by the first frame (of any
+        /// surface sharing the textures) that draws after the change.
+        fn syncAtlasTextures(self: *Self, frame: *FrameState) !void {
+            const grid = self.font_grid;
+            if (!frame.grayscale.stale(&grid.atlas_grayscale) and
+                !frame.color.stale(&grid.atlas_color)) return;
 
-            try texture.replaceRegion(0, 0, atlas.size, atlas.size, atlas.data);
+            // Exclusive: the textures are the grid's, written by whichever
+            // surface's renderer gets here first.
+            grid.lock.lockUncancelable(global.io());
+            defer grid.lock.unlock(global.io());
+            const textures = self.atlasTextures();
+            try textures.grayscale.sync(self.alloc, &self.api, &grid.atlas_grayscale, &frame.grayscale);
+            try textures.color.sync(self.alloc, &self.api, &grid.atlas_color, &frame.color);
         }
     };
 }
@@ -4219,9 +4198,9 @@ fn cellsKey(
     // Which config colors follow a cell's colors: the variant, not the
     // color (a color is a table entry).
     inline for (.{
-        "cursor-color",         "cursor-text",
-        "selection-background", "selection-foreground",
-        "search-background",    "search-foreground",
+        "cursor-color",               "cursor-text",
+        "selection-background",       "selection-foreground",
+        "search-background",          "search-foreground",
         "search-selected-background", "search-selected-foreground",
     }) |name| {
         const value: ?configpkg.Config.TerminalColor = @field(config, name);

@@ -46,6 +46,17 @@ const GraphicsAPI = switch (build_config.renderer) {
 /// The app-scoped render device from which surface renderers are created.
 pub const Device = GraphicsAPI.Device;
 
+/// The GPU textures of a `font.SharedGrid`'s atlases, shared by every
+/// surface drawing that grid where the graphics API allows it
+/// (`GraphicsAPI.atlas_textures_per_device`); empty otherwise.
+pub const GridTextures = if (GraphicsAPI.atlas_textures_per_device)
+    AtlasTexture.Set(GraphicsAPI.Texture)
+else
+    struct {
+        pub fn deinit(_: *@This()) void {}
+    };
+pub const AtlasTexture = @import("renderer/AtlasTexture.zig");
+
 /// The health status of a renderer. These must be shared across all
 /// renderers even if some states aren't reachable so that our API users
 /// can use the same enum for all renderers.
@@ -82,6 +93,8 @@ test {
     _ = Thread;
     _ = State;
     _ = @import("renderer/mailbox.zig");
+    _ = AtlasTexture;
+    if (comptime build_config.renderer == .metal) _ = Metal.Device;
     _ = @import("renderer/metal/PresentHistogram.zig");
     _ = @import("renderer/metal/PresentState.zig");
     _ = @import("renderer/metal/PresentedSink.zig");

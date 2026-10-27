@@ -49,6 +49,11 @@ glyphs: std.HashMapUnmanaged(GlyphKey, Render, GlyphKey.Context, 80) = .{},
 atlas_grayscale: Atlas,
 atlas_color: Atlas,
 
+/// The GPU copies of the two atlases, shared by every surface that draws
+/// this grid where the graphics API allows it (`renderer/AtlasTexture.zig`).
+/// Synced under `lock` held exclusively; frames hold references of their own.
+textures: renderer.GridTextures = .{},
+
 /// The underlying resolver for font data, fallbacks, etc. The shared
 /// grid takes ownership of the resolver and will free it.
 resolver: CodepointResolver,
@@ -124,6 +129,7 @@ pub fn deinit(self: *SharedGrid, alloc: Allocator) void {
     self.glyphs.deinit(alloc);
     self.atlas_grayscale.deinit(alloc);
     self.atlas_color.deinit(alloc);
+    self.textures.deinit();
     self.resolver.deinit(alloc);
 }
 

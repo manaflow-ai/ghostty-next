@@ -39,6 +39,10 @@ const log = std.log.scoped(.opengl);
 pub const MIN_VERSION_MAJOR = 4;
 pub const MIN_VERSION_MINOR = 3;
 
+/// Contexts are per surface and share no objects, so each renderer
+/// uploads its own atlas textures (`AtlasTexture.zig`).
+pub const atlas_textures_per_device = false;
+
 alloc: std.mem.Allocator,
 
 /// Alpha blending mode

@@ -42,6 +42,10 @@ pub const custom_shader_y_is_down = true;
 /// Triple buffering.
 pub const swap_chain_count = 3;
 
+/// Every surface samples the same device's textures, so a font grid's
+/// atlas textures are shared (`AtlasTexture.zig`).
+pub const atlas_textures_per_device = true;
+
 const log = std.log.scoped(.metal);
 
 layer: IOSurfaceLayer,
@@ -57,11 +61,9 @@ last_frame: LastFrame = .{},
 /// next show sizes the drawables again. Main thread.
 purged: bool = false,
 
-/// The shared render device.
+/// The shared render device; its one MTLCommandQueue takes every
+/// surface's command buffers.
 device: *const Device,
-
-/// MTLCommandQueue
-queue: objc.Object,
 
 /// Alpha blending mode
 blending: configpkg.Config.AlphaBlending,
@@ -154,10 +156,7 @@ pub fn init(
         else => @compileError("unsupported platform for Metal"),
     };
 
-    // Create a MTLCommandQueue for our app-scoped MTLDevice.
     const mtl_device = device.device;
-    const queue = mtl_device.msgSend(objc.Object, objc.sel("newCommandQueue"), .{});
-    errdefer queue.release();
 
     const ViewInfo = struct {
         view: objc.Object,
@@ -238,7 +237,6 @@ pub fn init(
         .layer = layer,
         .presenter = presenter,
         .device = device,
-        .queue = queue,
         .blending = opts.config.blending,
     };
 }
@@ -273,12 +271,11 @@ fn targetPixelFormat(blending: configpkg.Config.AlphaBlending) mtl.MTLPixelForma
 /// After the renderer thread stopped and its frames completed. Main thread.
 pub fn deinit(self: *Metal) void {
     self.presenter.deinit();
-    self.queue.release();
     if (self.fresh.surface) |surface| surface.release();
     if (self.last_frame.surface) |surface| surface.release();
 
-    // The MTLDevice is app-scoped and destroyed
-    // by the render device, not by us.
+    // The MTLDevice and its command queue are app-scoped and
+    // destroyed by the render device, not by us.
 
     self.layer.release();
 }
@@ -935,5 +932,5 @@ pub inline fn beginFrame(
     /// The target is presented via the provided renderer's API when completed.
     target: *Target,
 ) !Frame {
-    return try Frame.begin(.{ .queue = self.queue }, renderer, target);
+    return try Frame.begin(.{ .queue = self.device.queue }, renderer, target);
 }

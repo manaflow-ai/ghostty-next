@@ -1,8 +1,10 @@
 //! The Metal device context.
 //!
-//! This holds the MTLDevice and metadata derived from it.
-//! The device is shared by all surface renderers; each renderer
-//! creates its own MTLCommandQueue.
+//! This holds the MTLDevice, metadata derived from it and the one
+//! MTLCommandQueue that every surface renderer commits to. Chrome's GPU
+//! process does the same: ANGLE's Metal display owns one command queue
+//! for all of its contexts (third_party/angle/src/libANGLE/renderer/metal/
+//! DisplayMtl.h, `mCmdQueue`). MTLCommandQueue is thread-safe.
 const Device = @This();
 
 const std = @import("std");
@@ -17,6 +19,9 @@ const log = std.log.scoped(.metal);
 /// MTLDevice
 device: objc.Object,
 
+/// MTLCommandQueue shared by every surface renderer.
+queue: objc.Object,
+
 /// The default storage mode to use for resources created with our device.
 ///
 /// This is based on whether the device is a discrete GPU or not, since
@@ -27,12 +32,26 @@ default_storage_mode: mtl.MTLResourceOptions.StorageMode,
 /// The maximum 2D texture width and height supported by the device.
 max_texture_size: u32,
 
-pub fn init(self: *Device, alloc: std.mem.Allocator) !void {
+/// Uncompleted command buffers the queue allows before `commandBuffer`
+/// waits. A surface has at most `swap_chain_count` frames in flight, so
+/// this serves about 340 surfaces drawing at once (Metal's default is 64).
+const max_command_buffers = 1024;
+
+pub const InitError = error{ NoMetalDevice, CommandQueueFailed };
+
+pub fn init(self: *Device, alloc: std.mem.Allocator) InitError!void {
     _ = alloc;
 
     // Choose our MTLDevice.
     const device = try chooseDevice();
     errdefer device.release();
+
+    const queue = objc.Object.fromId(device.msgSend(
+        ?*anyopaque,
+        objc.sel("newCommandQueueWithMaxCommandBufferCount:"),
+        .{@as(c_ulong, max_command_buffers)},
+    ) orelse return error.CommandQueueFailed);
+    errdefer queue.release();
 
     // Grab metadata about the device.
     const default_storage_mode: mtl.MTLResourceOptions.StorageMode = switch (comptime builtin.os.tag) {
@@ -48,12 +67,14 @@ pub fn init(self: *Device, alloc: std.mem.Allocator) !void {
 
     self.* = .{
         .device = device,
+        .queue = queue,
         .default_storage_mode = default_storage_mode,
         .max_texture_size = max_texture_size,
     };
 }
 
 pub fn deinit(self: *Device) void {
+    self.queue.release();
     self.device.release();
     self.* = undefined;
 }
@@ -146,4 +167,21 @@ fn queryMaxTextureSize(device: objc.Object) u32 {
     )) return 16384;
 
     return 8192;
+}
+
+test "one command queue per device" {
+    var device: Device = undefined;
+    device.init(std.testing.allocator) catch |err| switch (err) {
+        // A Mac without a display-attached GPU (a headless VM).
+        error.NoMetalDevice => return error.SkipZigTest,
+        else => return err,
+    };
+    defer device.deinit();
+
+    // Command buffers of two surfaces come from the one queue.
+    const a = device.queue.msgSend(objc.Object, objc.sel("commandBuffer"), .{});
+    const b = device.queue.msgSend(objc.Object, objc.sel("commandBuffer"), .{});
+    const queue: ?*anyopaque = @ptrCast(device.queue.value);
+    try std.testing.expectEqual(queue, a.getProperty(?*anyopaque, "commandQueue"));
+    try std.testing.expectEqual(queue, b.getProperty(?*anyopaque, "commandQueue"));
 }
