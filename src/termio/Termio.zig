@@ -1993,7 +1993,8 @@ fn processOutputLocked(self: *Termio, buf: []const u8) void {
     // Schedule a render. We can call this first because we have the lock.
     // A hidden renderer with its compression timer armed needs no wake
     // (renderer.State.output_wakes); it rebuilds everything when shown.
-    if (self.renderer_state.output_wakes.load(.acquire)) {
+    const wakes = self.renderer_state.output_wakes.load(.acquire);
+    if (wakes) {
         self.terminal_stream.handler.queueRender() catch unreachable;
     } else {
         _ = self.renderer_state.output_wakes_skipped.fetchAdd(1, .monotonic);
@@ -2002,9 +2003,11 @@ fn processOutputLocked(self: *Termio, buf: []const u8) void {
     // Whenever a character is typed, we ensure the cursor is in the
     // non-blink state so it is rendered if visible. If we're under
     // HEAVY read load, we don't want to send a ton of these so we
-    // use a timer under the covers
-    const now = std.Io.Timestamp.now(global.io(), .awake);
+    // use a timer under the covers. A renderer that takes no output wakes
+    // is hidden and draws no cursor: the reset would only sit in its mailbox.
     cursor_reset: {
+        if (!wakes) break :cursor_reset;
+        const now = std.Io.Timestamp.now(global.io(), .awake);
         if (self.last_cursor_reset) |last| {
             if (last.durationTo(now).toMilliseconds() <= 500) {
                 break :cursor_reset;

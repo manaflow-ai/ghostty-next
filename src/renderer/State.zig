@@ -35,7 +35,7 @@ reflow_preview: std.atomic.Value(bool) = .init(false),
 
 /// Whether terminal output must wake the renderer thread. False while the
 /// surface is hidden and its scrollback-compression timer is armed: that
-/// timer rechecks the terminal every 250 ms while output changes it, and a
+/// timer rechecks the terminal every second while output changes it, and a
 /// hidden renderer draws nothing, so a wake per output chunk (hundreds a
 /// second for a busy hidden terminal) did no work. Written by the renderer
 /// thread, read by the output queue (`Termio.processOutputLocked`).

@@ -330,6 +330,10 @@ fn drainMailbox(self: *Thread) !void {
                 // Visibility affects our QoS class
                 self.setQosClass();
 
+                // A hidden surface's first blink tick stopped the timer
+                // (blinkTick); a focused surface shown again blinks at once.
+                if (v and self.flags.focused) self.startCursorBlink();
+
                 // If we became visible then we immediately rebuild cells
                 // (renderCallback skips updateFrame while invisible) and
                 // draw. Going through renderCallback also reschedules
@@ -380,20 +384,10 @@ fn drainMailbox(self: *Thread) !void {
                             cursorCancelCallback,
                         );
                     }
-                } else {
-                    // If we're focused, we immediately show the cursor again
-                    // and then restart the timer.
-                    if (self.cursor_c.state() != .active) {
-                        self.flags.cursor_blink_visible = true;
-                        self.cursor_h.run(
-                            &self.loop,
-                            &self.cursor_c,
-                            cursorBlinkInterval(),
-                            Thread,
-                            self,
-                            cursorTimerCallback,
-                        );
-                    }
+                } else if (self.flags.visible) {
+                    // A hidden surface's blink timer stays stopped; the
+                    // .visible message starts it.
+                    self.startCursorBlink();
                 }
             },
 
@@ -472,6 +466,20 @@ fn syncOutputWakes(self: *Thread) void {
     const needed = self.flags.visible or
         (terminalpkg.compression_enabled and self.config.scrollback_compression and !self.compression.armed);
     self.state.output_wakes.store(needed, .release);
+}
+
+/// Show the cursor and start its blink timer, unless it is running.
+fn startCursorBlink(self: *Thread) void {
+    if (self.cursor_c.state() == .active) return;
+    self.flags.cursor_blink_visible = true;
+    self.cursor_h.run(
+        &self.loop,
+        &self.cursor_c,
+        cursorBlinkInterval(),
+        Thread,
+        self,
+        cursorTimerCallback,
+    );
 }
 
 /// Count a wake of this thread (RenderCounters.thread_wakes).
@@ -742,7 +750,8 @@ fn cursorTimerCallback(
     t.flags.cursor_blink_visible = !t.flags.cursor_blink_visible;
     switch (blinkTick(t.flags.visible, &t.renderer.terminal_state)) {
         .draw => t.wakeup.notify() catch {},
-        .quiet, .stop => {},
+        .quiet => {},
+        .stop => return .disarm,
     }
 
     t.cursor_h.run(
@@ -789,7 +798,7 @@ const BlinkTick = enum {
 /// The blink tick of a surface (`visible`) whose last frame update is
 /// `state`.
 fn blinkTick(visible: bool, state: *const terminalpkg.RenderState) BlinkTick {
-    _ = visible;
+    if (!visible) return .stop;
     return if (blinkTickDraws(state)) .draw else .quiet;
 }
 
@@ -896,6 +905,10 @@ fn cursorBlinkInterval() u64 {
 /// terminal lock.
 const Compression = struct {
     const idle_interval = 250;
+    /// A hidden surface's recheck: Chromium wakes a hidden page's timers at
+    /// most once a second (third_party/blink/renderer/platform/scheduler/
+    /// main_thread/page_scheduler_impl.cc, kDefaultThrottledWakeUpInterval).
+    const hidden_idle_interval = 1000;
     const step_interval = 1;
 
     timer: xev.Timer,
@@ -940,7 +953,12 @@ const Compression = struct {
         // Contention may mean parsing is active. Scheduling is a harmless
         // false positive when no compression work is actually pending, but is
         // necessary when no timer is already active.
-        self.schedule(thread, idle_interval);
+        self.schedule(thread, idleInterval(thread));
+    }
+
+    /// How long the terminal must stay unchanged before a compression step.
+    fn idleInterval(thread: *const Thread) u64 {
+        return if (thread.flags.visible) idle_interval else hidden_idle_interval;
     }
 
     /// Start the one-shot timer, or move its deadline if it is already active.
@@ -993,13 +1011,13 @@ const Compression = struct {
         if (!thread.config.scrollback_compression) return null;
 
         const state = thread.state;
-        if (!state.mutex.tryLock()) return idle_interval;
+        if (!state.mutex.tryLock()) return idleInterval(thread);
         defer state.mutex.unlock(global.io());
 
         const activity = state.terminal.compressionActivity();
         if (self.activity != activity) {
             self.activity = activity;
-            return idle_interval;
+            return idleInterval(thread);
         }
 
         return switch (state.terminal.compress(.incremental)) {
