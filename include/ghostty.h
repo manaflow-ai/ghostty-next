@@ -633,11 +633,12 @@ typedef struct {
   uint64_t serial;
   // The cell's pixels: an IOSurfaceRef of width by height pixels,
   // premultiplied, in the colorspace of the surface's frames, as Ghostty
-  // would draw the cell with the cursor (a block holds the cell background
-  // and the character in the cursor text color; a bar, underline, hollow
-  // block or lock is transparent around the cursor). NULL when not visible.
-  // Valid during the call: retain it to keep it. Each cell has a new
-  // surface; Ghostty never draws into a surface after publishing it.
+  // would draw the cell with the cursor (a block holds the cell background,
+  // the block, and every glyph that reaches into the cell, the cell's own
+  // character in the cursor text color; a bar, underline, hollow block or
+  // lock is transparent around the cursor). NULL when not visible, and when
+  // unchanged. Valid during the call: retain it to keep it. Each cell has a
+  // new surface; Ghostty never draws into a surface after publishing it.
   void* surface;
   // The cell (two cells for a wide character) in the surface's pixels,
   // from the top-left corner of its frames.
@@ -652,15 +653,21 @@ typedef struct {
   // or IME preedit text, which the frames draw).
   bool visible;
   // True: blink the cursor, blink_interval_ms shown, then as long hidden,
-  // starting shown with this cell and again after each key input (as
-  // Ghostty's own blink does). False: show it steadily.
+  // starting shown with each call. False: show it steadily.
   bool blinking;
+  // True: the cell, its rect and its pixels are the previous call's (keep
+  // that surface; surface is NULL). Ghostty sends it where its own blink
+  // restarts: on terminal output (at most every 500 ms) that leaves the
+  // cell alone, so the cursor starts shown again.
+  bool unchanged;
   uint32_t blink_interval_ms;
 } ghostty_cursor_cell_s;
 
 // External cursor: a new cursor cell, once per cursor move or change of
-// the cell (character, colors, style, focus, font), after the GPU drew it
-// and with the frame that leaves the cursor out. Runs on a renderer thread
+// what the cell shows (its character, a glyph reaching into it, colors,
+// style, focus, font), after the GPU drew it and with the frame that leaves
+// the cursor out; output elsewhere on the screen sends none. Also an
+// unchanged cell where Ghostty's blink restarts (terminal output). Runs on a renderer thread
 // (the GPU completion thread on macOS), never the main thread, and can run
 // before ghostty_surface_new returns. Calls for one surface never overlap
 // and come in serial order. It must return quickly and never block or wait
@@ -719,8 +726,10 @@ typedef struct {
   // so a blink wakes no Ghostty thread; cursor_cb (required:
   // ghostty_surface_new fails without it) receives the cursor cell to show
   // and blink above the frames. Off while a custom shader or a background
-  // image is set (on macOS only; other renderers always draw the cursor):
-  // then cursor_cb gets a cell that is not visible and the frames draw the
+  // image is set, while cursor-opacity is below 1, and while a kitty image
+  // drawn in front of text (or the debug overlay) covers the cursor cell
+  // (on macOS only; other renderers always draw the cursor): then cursor_cb
+  // gets a cell that is not visible and the frames draw and blink the
   // cursor. Not inherited by the surfaces Ghostty asks the embedder to
   // create.
   bool cursor_external;

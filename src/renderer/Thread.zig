@@ -373,6 +373,9 @@ fn drainMailbox(self: *Thread) !void {
 
             .reset_cursor_blink => {
                 self.flags.cursor_blink_visible = true;
+                // An external cursor blinks in the embedder, which does
+                // not see terminal output: tell it with the next frame.
+                self.renderer.restartCursorBlink();
                 if (self.cursor_c.state() == .active) {
                     self.cursor_h.reset(
                         &self.loop,
@@ -594,6 +597,10 @@ fn renderCallback(
     ) catch |err|
         log.warn("error rendering err={}", .{err});
 
+    // An external cursor that an image or the overlay covers is the
+    // frame's again (Renderer.cursorExternal), and blinks with this timer.
+    if (t.renderer.cursor_external != null) t.syncCursorTimer();
+
     // Draw. updateFrame starts the display link for the rebuilt cells, so
     // a vsync-deferred draw would hold the first frame after idle (a
     // keystroke's echo) until the next refresh: up to a full interval,
@@ -705,8 +712,11 @@ fn cursorTimerCallback(
         return .disarm;
     };
 
-    // The embedder blinks an external cursor: the timer stops.
-    if (t.renderer.cursorExternal()) return .disarm;
+    // The embedder blinks an external cursor: the timer stops, shown.
+    if (t.renderer.cursorExternal()) {
+        t.flags.cursor_blink_visible = true;
+        return .disarm;
+    }
 
     t.flags.cursor_blink_visible = !t.flags.cursor_blink_visible;
     // A tick changes pixels only when the cursor blinks and shows: a hidden
@@ -741,17 +751,22 @@ fn syncCursorTimer(self: *Thread) void {
             self,
             cursorTimerCallback,
         );
-    } else if (self.cursor_c.state() == .active and
-        self.cursor_c_cancel.state() == .dead)
-    {
-        self.cursor_h.cancel(
-            &self.loop,
-            &self.cursor_c,
-            &self.cursor_c_cancel,
-            void,
-            null,
-            cursorCancelCallback,
-        );
+    } else {
+        // The embedder blinks an external cursor: when the frame draws it
+        // again (Renderer.cursor_covered), it starts shown.
+        if (self.renderer.cursorExternal()) self.flags.cursor_blink_visible = true;
+        if (self.cursor_c.state() == .active and
+            self.cursor_c_cancel.state() == .dead)
+        {
+            self.cursor_h.cancel(
+                &self.loop,
+                &self.cursor_c,
+                &self.cursor_c_cancel,
+                void,
+                null,
+                cursorCancelCallback,
+            );
+        }
     }
 }
 

@@ -384,8 +384,9 @@ test "ghostty.h cursor cell" {
     const Cell = @import("../renderer/cursor.zig").Cell;
     const T = c.ghostty_cursor_cell_s;
     inline for (.{
-        "serial", "surface", "x",     "y",       "width",    "height",
-        "column", "row",     "style", "visible", "blinking", "blink_interval_ms",
+        "serial",            "surface", "x",     "y",       "width",    "height",
+        "column",            "row",     "style", "visible", "blinking", "unchanged",
+        "blink_interval_ms",
     }) |field| {
         try testing.expectEqual(@offsetOf(Cell, field), @offsetOf(T, field));
     }
