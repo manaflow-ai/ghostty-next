@@ -2228,12 +2228,11 @@ fn testDrainMailbox(mailbox: *termio.Mailbox) usize {
     return n;
 }
 
-/// Run `body` against a Termio with a manual backend. The surface
-/// mailbox is not set up: nothing in these tests sends to it.
 /// `len` bytes of full-screen repaints in dense SGR, as a TUI that redraws
 /// (btop, a game of life): from the top left, every cell its own
-/// truecolor or 256-color run, rows joined by CRLF, no scrolling.
-fn testDenseSgrFrames(
+/// truecolor or 256-color run, rows joined by CRLF, no scrolling. The
+/// key path's lock latency tests in Surface.zig parse it.
+pub fn testDenseSgrFrames(
     alloc: std.mem.Allocator,
     len: usize,
     cols: usize,
@@ -2263,6 +2262,8 @@ fn testDenseSgrFrames(
     return try alloc.dupe(u8, bytes[0..len]);
 }
 
+/// Run `body` against a Termio with a manual backend. The surface
+/// mailbox is not set up: nothing in these tests sends to it.
 fn testManualTermio(
     mirror: bool,
     comptime body: anytype,
@@ -2497,91 +2498,6 @@ test "manual: input mirrors follow the selection and the viewport" {
     }.run;
 
     try testManualTermio(false, body);
-    try testManualTermio(true, body);
-}
-
-test "manual: a key waits for one 4 KiB slice of dense SGR output, not a 64 KiB chunk" {
-    const body = struct {
-        /// The main thread's input entry points: lock for input, then wait
-        /// 100 us, until the output is parsed.
-        const Input = struct {
-            state: *renderer.State,
-            done: std.atomic.Value(bool) = .init(false),
-            waits: std.ArrayList(u64) = .empty,
-            reported: std.atomic.Value(u32) = .init(0),
-
-            fn report(userdata: ?*anyopaque, _: u64) callconv(.c) void {
-                const self: *@This() = @ptrCast(@alignCast(userdata.?));
-                _ = self.reported.fetchAdd(1, .monotonic);
-            }
-
-            fn run(self: *@This()) void {
-                while (!self.done.load(.acquire)) {
-                    const held = self.state.lockInput(global.io());
-                    self.state.unlockInput(global.io(), held);
-                    self.waits.append(std.testing.allocator, held.waited_ns) catch return;
-                    std.Io.sleep(global.io(), .fromMicroseconds(100), .awake) catch {};
-                }
-            }
-        };
-
-        fn run(io: *Termio, _: *TestSink, _: bool) !void {
-            const testing = std.testing;
-            const alloc = testing.allocator;
-            const chunk = 64 * 1024;
-
-            const bytes = try testDenseSgrFrames(alloc, 8 << 20, io.terminal.cols, io.terminal.rows);
-            defer alloc.free(bytes);
-
-            // What one 64 KiB chunk (ghostty_surface_process_output's
-            // slice) takes to parse here, nothing waiting: the median of
-            // the first 16.
-            var chunk_ns: [16]u64 = undefined;
-            for (&chunk_ns, 0..) |*ns, i| {
-                const start: std.Io.Timestamp = .now(global.io(), .awake);
-                io.processOutput(bytes[i * chunk ..][0..chunk]);
-                ns.* = @intCast(start.durationTo(.now(global.io(), .awake)).toNanoseconds());
-            }
-            std.mem.sort(u64, &chunk_ns, {}, std.sort.asc(u64));
-            const chunk_median = chunk_ns[chunk_ns.len / 2];
-
-            var input: Input = .{ .state = io.renderer_state };
-            defer input.waits.deinit(alloc);
-            io.renderer_state.lock_wait_report = .{ .callback = Input.report, .userdata = &input };
-            defer io.renderer_state.lock_wait_report = null;
-
-            const thread = try std.Thread.spawn(.{}, Input.run, .{&input});
-            var rest: []const u8 = bytes[chunk_ns.len * chunk ..];
-            while (rest.len > 0) {
-                const n = @min(rest.len, chunk);
-                io.processOutput(rest[0..n]);
-                rest = rest[n..];
-            }
-            input.done.store(true, .release);
-            thread.join();
-
-            const waits = input.waits.items;
-            try testing.expect(waits.len > 0);
-            var over: u32 = 0;
-            for (waits) |w| {
-                if (w >= renderer.State.lock_wait_report_ns) over += 1;
-            }
-            try testing.expectEqual(over, input.reported.load(.monotonic));
-
-            std.mem.sort(u64, waits, {}, std.sort.asc(u64));
-            const p99 = waits[(waits.len * 99) / 100];
-            log.info("input lock waits n={d} p99={d}ns max={d}ns chunk={d}ns", .{
-                waits.len, p99, waits[waits.len - 1], chunk_median,
-            });
-            // A key waits for one 4 KiB slice, a 16th of a chunk, never
-            // the chunk (a quarter leaves room for a loaded host). The
-            // test executable is Debug, whose parse of one slice is
-            // slower than the 0.5 ms budget an optimized parser meets.
-            try testing.expect(p99 < chunk_median / 4);
-            if (builtin.mode != .Debug) try testing.expect(p99 < 500 * std.time.ns_per_us);
-        }
-    }.run;
-
     try testManualTermio(true, body);
 }
 

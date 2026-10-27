@@ -1720,8 +1720,10 @@ fn modsChanged(self: *Surface, mods: input.Mods) void {
         // highlight links. Additionally, mark the screen as dirty so
         // that the highlight state of all links is properly updated.
         {
-            self.renderer_state.mutex.lockUncancelable(global.io());
-            defer self.renderer_state.mutex.unlock(global.io());
+            // An input entry point (a key's modifier change): the output
+            // parser hands the lock over between slices.
+            const held = self.renderer_state.lockInput(global.io());
+            defer self.renderer_state.unlockInput(global.io(), held);
             self.renderer_state.mouse.mods = self.mouseModsWithCapture(self.mouse.mods);
 
             // We use the clear screen dirty flag to force a rebuild of all
@@ -2331,11 +2333,12 @@ fn resolvePathForOpening(
 
 /// Returns the x/y coordinate of where the IME (Input Method Editor)
 /// keyboard should be rendered.
-pub fn imePoint(self: *const Surface) apprt.IMEPos {
-    self.renderer_state.mutex.lockUncancelable(global.io());
+pub fn imePoint(self: *Surface) apprt.IMEPos {
+    // Asked on each IME composition keystroke: an input entry point.
+    const held = self.renderer_state.lockInput(global.io());
     const cursor = self.renderer_state.terminal.screens.active.cursor;
     const preedit_width: usize = if (self.renderer_state.preedit) |preedit| preedit.width() else 0;
-    self.renderer_state.mutex.unlock(global.io());
+    self.renderer_state.unlockInput(global.io(), held);
 
     // TODO: need to handle when scrolling and the cursor is not
     // in the visible portion of the screen.
@@ -7348,4 +7351,274 @@ test "bounded clipboard: an empty selection gives empty plain text" {
         4096,
     );
     try testing.expectEqualStrings("", contents[0].data);
+}
+
+/// A Surface with only what a key's terminal lock and side effects use:
+/// the renderer state, a manual-backend Termio, the mouse mods, the
+/// typing config and the renderer wakeup. Tests of the key path
+/// (`modsChanged`, `encodeKeyOpts`, `typedSideEffects`) run against it.
+const TestKeySurface = struct {
+    surface: Surface,
+    mutex: std.Io.Mutex,
+    full_config: configpkg.Config,
+    renderer_mailbox: *rendererpkg.Thread.Mailbox,
+    termio_wakeup: global.xev.Async,
+
+    fn create(alloc: Allocator) !*TestKeySurface {
+        const self = try alloc.create(TestKeySurface);
+        errdefer alloc.destroy(self);
+        self.mutex = .init;
+        self.full_config = try .default(alloc);
+        errdefer self.full_config.deinit();
+        self.renderer_mailbox = try rendererpkg.Thread.Mailbox.create(alloc);
+        errdefer self.renderer_mailbox.destroy(alloc);
+        self.termio_wakeup = try .init();
+        errdefer self.termio_wakeup.deinit();
+
+        const s = &self.surface;
+        s.alloc = alloc;
+        s.readonly = false;
+        s.child_exited = false;
+        s.mouse = .{};
+        s.config.selection_clear_on_typing = true;
+        s.config.scroll_to_bottom = .{ .keystroke = true };
+        s.config.macos_option_as_alt = .false;
+        s.config.mouse_shift_capture = .false;
+        s.renderer_state = .{ .mutex = &self.mutex, .terminal = undefined };
+        s.renderer_thread.wakeup = try .init();
+        errdefer s.renderer_thread.wakeup.deinit();
+
+        try termio.Termio.init(&s.io, alloc, .{
+            .size = .{
+                .screen = .{ .width = 800, .height = 480 },
+                .cell = .{ .width = 10, .height = 20 },
+                .padding = .{},
+            },
+            .full_config = &self.full_config,
+            .config = try .init(alloc, &self.full_config),
+            .color_scheme = .light,
+            .backend = .{ .manual = try termio.Manual.init(alloc, .{ .mirror = true }) },
+            .suppress_terminal_responses = true,
+            .mailbox = try termio.Mailbox.initSPSC(alloc),
+            .renderer_state = &s.renderer_state,
+            .renderer_wakeup = self.termio_wakeup,
+            .renderer_mailbox = self.renderer_mailbox,
+            .surface_mailbox = undefined,
+        });
+        s.renderer_state.terminal = &s.io.terminal;
+        return self;
+    }
+
+    fn destroy(self: *TestKeySurface, alloc: Allocator) void {
+        self.surface.io.deinit();
+        while (self.renderer_mailbox.pop(global.io())) |_| {}
+        self.renderer_mailbox.destroy(alloc);
+        self.surface.renderer_thread.wakeup.deinit();
+        self.termio_wakeup.deinit();
+        self.full_config.deinit();
+        alloc.destroy(self);
+    }
+
+    /// Pop the next message queued for the termio thread.
+    fn popTermio(self: *TestKeySurface) ?termio.Message {
+        return self.surface.io.mailbox.spsc.queue.pop(global.io());
+    }
+};
+
+test "key: a press with output holding the terminal lock does not wait and posts its side effects" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const t = try TestKeySurface.create(alloc);
+    defer t.destroy(alloc);
+    const s = &t.surface;
+    const state = &s.renderer_state;
+
+    // A selection, and the viewport scrolled off the bottom.
+    for (0..100) |_| s.io.processOutput("line\r\n");
+    s.io.scrollViewport(.{ .delta = -5 });
+    {
+        state.mutex.lockUncancelable(global.io());
+        defer state.mutex.unlock(global.io());
+        const screen = s.io.terminal.screens.active;
+        try screen.select(.init(
+            screen.pages.pin(.{ .active = .{ .x = 0, .y = 1 } }).?,
+            screen.pages.pin(.{ .active = .{ .x = 2, .y = 1 } }).?,
+            false,
+        ));
+        s.io.publishInputMirrorsLocked();
+    }
+    try testing.expect(state.input_selection.load(.acquire));
+    try testing.expect(!state.input_viewport_follows.load(.acquire));
+
+    // Output holds the lock, as the termio thread parsing a chunk does,
+    // until the press returned or 2 s passed.
+    const Holder = struct {
+        state: *rendererpkg.State,
+        locked: std.atomic.Value(bool) = .init(false),
+        press_done: std.atomic.Value(bool) = .init(false),
+        timed_out: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            self.state.mutex.lockUncancelable(global.io());
+            defer self.state.mutex.unlock(global.io());
+            self.locked.store(true, .release);
+            const start: std.Io.Timestamp = .now(global.io(), .awake);
+            while (!self.press_done.load(.acquire)) {
+                if (start.durationTo(.now(global.io(), .awake)).toNanoseconds() > 2 * std.time.ns_per_s) {
+                    self.timed_out.store(true, .release);
+                    return;
+                }
+                std.Io.sleep(global.io(), .fromMicroseconds(100), .awake) catch {};
+            }
+        }
+    };
+    var holder: Holder = .{ .state = state };
+    const thread = try std.Thread.spawn(.{}, Holder.run, .{&holder});
+    while (!holder.locked.load(.acquire)) std.Thread.yield() catch {};
+
+    // A plain press's side effects, as keyCallback runs them.
+    try s.typedSideEffects(false);
+    holder.press_done.store(true, .release);
+    thread.join();
+    // The press returned while output still held the lock.
+    try testing.expect(!holder.timed_out.load(.acquire));
+
+    // The termio thread got both side effects, and nothing else.
+    const msg = t.popTermio() orelse return error.TestExpectedTyped;
+    defer msg.deinit();
+    switch (msg) {
+        .typed => |typed| {
+            try testing.expect(typed.clear_selection);
+            try testing.expect(typed.scroll_bottom);
+        },
+        else => return error.TestExpectedTyped,
+    }
+    try testing.expect(t.popTermio() == null);
+    // The press changed nothing itself: the termio thread does.
+    try testing.expect(s.io.terminal.screens.active.selection != null);
+}
+
+test "key: a press with the lock free brings the viewport down itself" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const t = try TestKeySurface.create(alloc);
+    defer t.destroy(alloc);
+    const s = &t.surface;
+    const state = &s.renderer_state;
+
+    for (0..100) |_| s.io.processOutput("line\r\n");
+    s.io.scrollViewport(.{ .delta = -5 });
+    try testing.expect(!state.input_viewport_follows.load(.acquire));
+
+    try s.typedSideEffects(false);
+    try testing.expect(t.popTermio() == null);
+    try testing.expect(state.input_viewport_follows.load(.acquire));
+    try testing.expect(s.io.terminal.screens.active.pages.viewport == .active);
+
+    // Nothing to do: the press takes no lock (this thread holds it).
+    state.mutex.lockUncancelable(global.io());
+    defer state.mutex.unlock(global.io());
+    try s.typedSideEffects(false);
+    try testing.expect(t.popTermio() == null);
+}
+
+test "key: the key path waits for one 4 KiB slice of dense SGR output, not a 64 KiB chunk" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const t = try TestKeySurface.create(alloc);
+    defer t.destroy(alloc);
+    const s = &t.surface;
+
+    // The main thread's key presses, as keyCallback runs them: each
+    // changes the modifiers (the link highlight's lock), reads the
+    // encoding options and runs the press's side effects, then waits
+    // 100 us, until the output is parsed. A press's time is that whole
+    // key path.
+    const Keys = struct {
+        surface: *Surface,
+        done: std.atomic.Value(bool) = .init(false),
+        press_ns: std.ArrayList(u64) = .empty,
+        reported: std.atomic.Value(u32) = .init(0),
+        reported_max: std.atomic.Value(u64) = .init(0),
+        failed: std.atomic.Value(bool) = .init(false),
+
+        fn report(userdata: ?*anyopaque, waited_ns: u64) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            if (waited_ns < rendererpkg.State.lock_wait_report_ns) self.failed.store(true, .release);
+            _ = self.reported.fetchAdd(1, .monotonic);
+            _ = self.reported_max.fetchMax(waited_ns, .monotonic);
+        }
+
+        fn run(self: *@This()) void {
+            var shift = false;
+            while (!self.done.load(.acquire)) {
+                shift = !shift;
+                const start: std.Io.Timestamp = .now(global.io(), .awake);
+                self.surface.modsChanged(.{ .shift = shift });
+                _ = self.surface.encodeKeyOpts();
+                self.surface.typedSideEffects(false) catch {
+                    self.failed.store(true, .release);
+                    return;
+                };
+                const ns = start.durationTo(.now(global.io(), .awake)).toNanoseconds();
+                self.press_ns.append(std.testing.allocator, @intCast(@max(ns, 0))) catch {
+                    self.failed.store(true, .release);
+                    return;
+                };
+                std.Io.sleep(global.io(), .fromMicroseconds(100), .awake) catch {};
+            }
+        }
+    };
+
+    const chunk = 64 * 1024;
+    const bytes = try termio.Termio.testDenseSgrFrames(alloc, 8 << 20, s.io.terminal.cols, s.io.terminal.rows);
+    defer alloc.free(bytes);
+
+    // What one 64 KiB chunk (ghostty_surface_process_output's slice)
+    // takes to parse here, nothing waiting: the median of the first 16.
+    var chunk_ns: [16]u64 = undefined;
+    for (&chunk_ns, 0..) |*ns, i| {
+        const start: std.Io.Timestamp = .now(global.io(), .awake);
+        s.io.processOutput(bytes[i * chunk ..][0..chunk]);
+        ns.* = @intCast(start.durationTo(.now(global.io(), .awake)).toNanoseconds());
+    }
+    std.mem.sort(u64, &chunk_ns, {}, std.sort.asc(u64));
+    const chunk_median = chunk_ns[chunk_ns.len / 2];
+
+    var keys: Keys = .{ .surface = s };
+    defer keys.press_ns.deinit(alloc);
+    s.renderer_state.lock_wait_report = .{ .callback = Keys.report, .userdata = &keys };
+    defer s.renderer_state.lock_wait_report = null;
+
+    const thread = try std.Thread.spawn(.{}, Keys.run, .{&keys});
+    var rest: []const u8 = bytes[chunk_ns.len * chunk ..];
+    while (rest.len > 0) {
+        const n = @min(rest.len, chunk);
+        s.io.processOutput(rest[0..n]);
+        rest = rest[n..];
+    }
+    keys.done.store(true, .release);
+    thread.join();
+
+    try testing.expect(!keys.failed.load(.acquire));
+    const presses = keys.press_ns.items;
+    try testing.expect(presses.len > 0);
+    std.mem.sort(u64, presses, {}, std.sort.asc(u64));
+    const p99 = presses[(presses.len * 99) / 100];
+    log.info("key path n={d} p99={d}ns max={d}ns chunk={d}ns reported={d}", .{
+        presses.len,
+        p99,
+        presses[presses.len - 1],
+        chunk_median,
+        keys.reported.load(.monotonic),
+    });
+    // Every reported wait is inside one press's time.
+    try testing.expect(keys.reported_max.load(.monotonic) <= presses[presses.len - 1]);
+    // A press waits for one 4 KiB slice per lock, a 16th of a chunk,
+    // never the chunk (a quarter leaves room for a loaded host). A Debug
+    // parse of one slice is slower than the 0.5 ms budget, so the budget
+    // holds in an optimized test build:
+    // `zig build test -Dtest-optimize=ReleaseFast -Dtest-filter="key: "`.
+    try testing.expect(p99 < chunk_median / 4);
+    if (builtin.mode != .Debug) try testing.expect(p99 < 500 * std.time.ns_per_us);
 }

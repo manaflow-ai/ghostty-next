@@ -1453,7 +1453,7 @@ GHOSTTY_API bool ghostty_surface_set_font_size_action_callback(
     ghostty_font_size_action_cb,
     void* userdata);
 // Reports each wait of 50 us or more by an input entry point (key, text,
-// preedit, a manual surface's input write) for the terminal lock, in
+// preedit, the IME point, a manual surface's input write) for the terminal lock, in
 // nanoseconds. Output parsing hands the lock to a waiting input every
 // 4 KiB, so a wait is at most one such slice. Runs on the thread that
 // waited (the app thread for input), after it released the lock; it must

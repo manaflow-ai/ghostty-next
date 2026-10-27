@@ -10,6 +10,18 @@ pub const App = struct {
     /// the core app mailbox stay queued until something drains it.
     pub fn wakeup(_: *App) void {}
 
+    /// Always return false: there is no apprt to perform an action. Core
+    /// code that notifies the apprt (the key path's tests in Surface.zig)
+    /// compiles against this runtime.
+    pub fn performAction(
+        _: *App,
+        _: apprt.Target,
+        comptime action: apprt.Action.Key,
+        _: apprt.Action.Value(action),
+    ) !bool {
+        return false;
+    }
+
     /// Always return false as there is no apprt to communicate with.
     pub fn performIpc(
         _: Allocator,

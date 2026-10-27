@@ -46,6 +46,11 @@ pub fn build(b: *std.Build) !void {
         "test-filter",
         "Filter for test. Only applies to Zig tests.",
     ) orelse &[0][]const u8{};
+    const test_optimize = b.option(
+        std.builtin.OptimizeMode,
+        "test-optimize",
+        "Optimize mode of the Zig unit test executable (default Debug). The input lock latency tests assert their 0.5 ms budget only when optimized.",
+    ) orelse .Debug;
 
     // Ghostty dependencies used by many artifacts.
     const deps = try buildpkg.SharedDeps.init(b, &config);
@@ -384,7 +389,7 @@ pub fn build(b: *std.Build) !void {
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/main.zig"),
                 .target = config.baselineTarget(b.graph.io),
-                .optimize = .Debug,
+                .optimize = test_optimize,
                 .strip = false,
                 .omit_frame_pointer = false,
                 .unwind_tables = .sync,
