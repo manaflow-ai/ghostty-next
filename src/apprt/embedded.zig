@@ -1868,6 +1868,17 @@ pub const CAPI = struct {
         app.focusEvent(focused);
     }
 
+    /// Draw the focused blinking cursor of every surface of the app,
+    /// current and future, on its own layer, blinked by a Core Animation
+    /// opacity animation, so renderer threads run no blink timer and wake
+    /// for no blink. Off by default. Main thread only. See ghostty.h.
+    export fn ghostty_app_set_cursor_blink_layer(
+        app: *App,
+        enabled: bool,
+    ) void {
+        app.core_app.cursorBlinkLayerEvent(enabled);
+    }
+
     /// Notify the app of a global keypress capture. This will return
     /// true if the key was captured by the app, in which case the caller
     /// should not process the key.
@@ -2271,6 +2282,8 @@ pub const CAPI = struct {
         host_fresh_presents: u64,
         host_late_presents: u64,
         host_off_main_presents: u64,
+        thread_wakes: u64,
+        cursor_blink_ticks: u64,
     };
 
     /// The renderer's frame counters. See ghostty.h.
@@ -2293,6 +2306,8 @@ pub const CAPI = struct {
             .host_fresh_presents = hostCounter(surface, "fresh_presents"),
             .host_late_presents = hostCounter(surface, "late"),
             .host_off_main_presents = hostCounter(surface, "off_main_presents"),
+            .thread_wakes = c.thread_wakes.load(.monotonic),
+            .cursor_blink_ticks = c.cursor_blink_ticks.load(.monotonic),
         };
     }
 

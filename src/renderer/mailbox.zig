@@ -13,7 +13,7 @@
 //! overflow list instead, in order. Once the overflow holds a message,
 //! every later push goes there too, so the renderer sees messages in
 //! push order: the queue first, then the overflow. State messages whose
-//! latest value wins (focus, visible, resize, cursor blink reset, display
+//! latest value wins (focus, visible, resize, cursor blink reset and layer, display
 //! id, presentation health) replace an older one of the same kind in the
 //! overflow, which bounds it while the renderer is stalled. An `.instant`
 //! push keeps its meaning: it fails when the queue is full.
@@ -116,6 +116,7 @@ fn coalesces(value: Message) bool {
         .visible,
         .resize,
         .reset_cursor_blink,
+        .cursor_blink_layer,
         .macos_display_id,
         .presentation_health,
         => true,

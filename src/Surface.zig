@@ -698,6 +698,9 @@ pub fn init(
     );
     errdefer render_thread.deinit();
 
+    // A surface made while the cursor blink layer is on starts with it.
+    renderer_impl.setCursorBlinkLayer(app.cursor_blink_layer);
+
     // Create the IO thread
     var io_thread = try termio.Thread.init(alloc);
     errdefer io_thread.deinit();
@@ -3829,6 +3832,18 @@ pub fn occlusionCallback(self: *Surface, visible: bool) !void {
     }, .{ .forever = {} });
 
     try self.queueRender();
+}
+
+/// Draw a focused blinking cursor on its own layer, blinked by the
+/// compositor with no renderer wake, or in the frame again
+/// (App.cursorBlinkLayerEvent, `renderer.Message.cursor_blink_layer`). The
+/// renderer draws the cursor the new way at once. Main thread only.
+pub fn cursorBlinkLayerCallback(self: *Surface, enabled: bool) void {
+    _ = self.renderer_thread.mailbox.push(global.io(), .{
+        .cursor_blink_layer = enabled,
+    }, .{ .forever = {} });
+    self.queueRender() catch |err|
+        log.warn("error waking renderer for the cursor blink layer err={}", .{err});
 }
 
 pub fn focusCallback(self: *Surface, focused: bool) !void {

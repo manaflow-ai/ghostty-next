@@ -68,6 +68,11 @@ last_notification_digest: u64 = 0,
 /// to the app-level config and as a default for new surfaces.
 config_conditional_state: configpkg.ConditionalState,
 
+/// A focused blinking cursor blinks on its own layer
+/// (`ghostty_app_set_cursor_blink_layer`). Surfaces made while it is on
+/// start with it.
+cursor_blink_layer: bool = false,
+
 /// Set to false once we've created at least one surface. This
 /// never goes true again. This can be used by surfaces to determine
 /// if they are the first surface.
@@ -349,6 +354,15 @@ pub fn focusEvent(self: *App, focused: bool) void {
 
     log.debug("focus event focused={}", .{focused});
     self.focused = focused;
+}
+
+/// Draw every surface's focused blinking cursor on its own layer, blinked
+/// by the compositor, or in the frame again (renderer CursorLayer). Main
+/// thread only; only a change reaches the surfaces.
+pub fn cursorBlinkLayerEvent(self: *App, enabled: bool) void {
+    if (self.cursor_blink_layer == enabled) return;
+    self.cursor_blink_layer = enabled;
+    for (self.surfaces.items) |surface| surface.core().cursorBlinkLayerCallback(enabled);
 }
 
 /// Handle a key event at the app-scope. If this key event is used,

@@ -39,6 +39,12 @@ pub const custom_shader_y_is_down = true;
 /// Triple buffering.
 pub const swap_chain_count = 3;
 
+/// A blinking cursor can show on a sublayer of the surface's layer, blinked
+/// by a Core Animation opacity animation (`Target.cursor_layer`,
+/// `IOSurfaceLayer.Cursor`). macOS only for now: on iOS the surface's layer
+/// is itself a sublayer of the embedder's view, with UIKit's geometry.
+pub const cursor_blink_layer = builtin.os.tag == .macos;
+
 const log = std.log.scoped(.metal);
 
 layer: IOSurfaceLayer,
@@ -114,6 +120,9 @@ const FreshFrame = struct {
     mutex: std.Io.Mutex = .init,
     /// Retained; null after a take or before the first fresh frame.
     surface: ?*IOSurface = null,
+    /// That frame's blinking cursor (`Target.cursor_layer`), presented with
+    /// it; its surface is retained with `surface`.
+    cursor: IOSurfaceLayer.Cursor = .{},
     /// Bumped on each publish; the display pass waits on it (futex).
     seq: std.atomic.Value(u32) = .init(0),
 };
@@ -211,7 +220,7 @@ pub fn init(
 
 pub fn deinit(self: *Metal) void {
     self.queue.release();
-    if (self.fresh.surface) |surface| surface.release();
+    self.dropFresh();
 
     // The MTLDevice is app-scoped and destroyed
     // by the render device, not by us.
@@ -405,41 +414,67 @@ pub fn initTarget(self: *const Metal, width: usize, height: usize) !Target {
 /// Present the provided target.
 pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
     if (sync) {
-        self.layer.setSurfaceSync(target.surface);
+        self.layer.setFrameSync(target.surface, target.cursor_layer);
     } else {
         if (comptime builtin.os.tag == .macos) {
             if (target.cells_fresh and self.fresh.armed.load(.acquire) and
                 target.size_generation == self.fresh.generation.load(.acquire) and
-                self.host_size.load(.acquire) != 0) self.publishFresh(target.surface);
+                self.host_size.load(.acquire) != 0) self.publishFresh(.{ .surface = target.surface, .cursor = target.cursor_layer });
         }
         const seq = self.present_seq.fetchAdd(1, .monotonic) + 1;
         // A content-only frame of a host-sized surface goes to the screen from
         // this (completion) thread: a terminal echo does not wait for main.
         if (comptime builtin.os.tag == .macos) {
-            if (self.host_size.load(.acquire) != 0 and self.layer.setSurfaceOffMain(target.surface, seq)) {
+            if (self.host_size.load(.acquire) != 0 and self.layer.setSurfaceOffMain(target.surface, target.cursor_layer, seq)) {
                 _ = self.counters.off_main_presents.fetchAdd(1, .monotonic);
                 return;
             }
         }
-        try self.layer.setSurface(target.surface, seq);
+        try self.layer.setSurface(target.surface, target.cursor_layer, seq);
     }
 }
 
-/// Keeps `surface` as the newest fresh frame and wakes a display pass that
+/// A frame and its blinking cursor, as the fresh slot keeps them.
+const Presented = struct {
+    surface: *IOSurface,
+    cursor: IOSurfaceLayer.Cursor,
+};
+
+fn retainFrame(frame: Presented) void {
+    frame.surface.retain();
+    if (frame.cursor.surface) |cursor| cursor.retain();
+}
+
+fn releaseFrame(frame: Presented) void {
+    frame.surface.release();
+    if (frame.cursor.surface) |cursor| cursor.release();
+}
+
+/// Keeps `frame` as the newest fresh frame and wakes a display pass that
 /// waits for it. GPU completion thread.
-fn publishFresh(self: *Metal, surface: *IOSurface) void {
+fn publishFresh(self: *Metal, frame: Presented) void {
     const io = global.io();
-    surface.retain();
+    retainFrame(frame);
     const old = old: {
         self.fresh.mutex.lockUncancelable(io);
         defer self.fresh.mutex.unlock(io);
-        const old = self.fresh.surface;
-        self.fresh.surface = surface;
-        break :old old;
+        break :old self.swapFresh(frame);
     };
-    if (old) |o| o.release();
+    if (old) |o| releaseFrame(o);
     _ = self.fresh.seq.fetchAdd(1, .release);
     io.futexWake(@TypeOf(self.fresh.seq), &self.fresh.seq, std.math.maxInt(u32));
+}
+
+/// Puts `frame` (or nothing) in the fresh slot and returns what it held.
+/// Caller holds `fresh.mutex`.
+fn swapFresh(self: *Metal, frame: ?Presented) ?Presented {
+    const old: ?Presented = if (self.fresh.surface) |surface|
+        .{ .surface = surface, .cursor = self.fresh.cursor }
+    else
+        null;
+    self.fresh.surface = if (frame) |f| f.surface else null;
+    self.fresh.cursor = if (frame) |f| f.cursor else .{};
+    return old;
 }
 
 /// Releases the kept fresh frame, if any. Main thread.
@@ -448,24 +483,22 @@ fn dropFresh(self: *Metal) void {
     const old = old: {
         self.fresh.mutex.lockUncancelable(io);
         defer self.fresh.mutex.unlock(io);
-        const old = self.fresh.surface;
-        self.fresh.surface = null;
-        break :old old;
+        break :old self.swapFresh(null);
     };
-    if (old) |o| o.release();
+    if (old) |o| releaseFrame(o);
 }
 
 /// The fresh frame if it has `width` x `height` pixels (retained; the caller
-/// releases it). A fresh frame of another size stays for its own pass.
-fn takeFresh(self: *Metal, width: usize, height: usize) ?*IOSurface {
+/// releases it, `releaseFrame`). A fresh frame of another size stays for its
+/// own pass.
+fn takeFresh(self: *Metal, width: usize, height: usize) ?Presented {
     const io = global.io();
     self.fresh.mutex.lockUncancelable(io);
     defer self.fresh.mutex.unlock(io);
     const surface = self.fresh.surface orelse return null;
     if (surface.getWidth() != width or surface.getHeight() != height) return null;
-    self.fresh.surface = null;
     self.fresh.armed.store(false, .release);
-    return surface;
+    return self.swapFresh(null);
 }
 
 /// The display pass of a host-sized surface (main thread): present the
@@ -494,7 +527,7 @@ pub fn presentHostSizedWait(self: *Metal, wait: bool) bool {
     const shown_surface: *IOSurface = @ptrCast(shown);
     if (shown_surface.getWidth() == width and shown_surface.getHeight() == height) {
         // The renderer thread's frame at this size already landed.
-        if (self.takeFresh(width, height)) |surface| surface.release();
+        if (self.takeFresh(width, height)) |frame| releaseFrame(frame);
         return true;
     }
 
@@ -502,9 +535,11 @@ pub fn presentHostSizedWait(self: *Metal, wait: bool) bool {
     const set_at = self.host_size_set_at orelse std.Io.Timestamp.now(io, .awake);
     while (true) {
         const seq = self.fresh.seq.load(.acquire);
-        if (self.takeFresh(width, height)) |surface| {
-            defer surface.release();
-            self.layer.setSurfaceSync(surface);
+        if (self.takeFresh(width, height)) |frame| {
+            defer releaseFrame(frame);
+            // The frame's cursor in the same transaction: the sublayer never
+            // shows the old frame's cursor over the new frame.
+            self.layer.setFrameSync(frame.surface, frame.cursor);
             _ = self.counters.fresh_presents.fetchAdd(1, .monotonic);
             return true;
         }

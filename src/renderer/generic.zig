@@ -14,6 +14,7 @@ const math = @import("../math.zig");
 const Surface = @import("../Surface.zig");
 const link = @import("link.zig");
 const cellpkg = @import("cell.zig");
+const cursorpkg = @import("cursor.zig");
 const noMinContrast = cellpkg.noMinContrast;
 const constraintWidth = cellpkg.constraintWidth;
 const isCovering = cellpkg.isCovering;
@@ -45,6 +46,12 @@ pub const RenderCounters = struct {
     full_swap: std.atomic.Value(u64) = .init(0),
     /// The drawn terminal's grid changed size.
     full_resize: std.atomic.Value(u64) = .init(0),
+    /// Renderer thread wakes: a mailbox wakeup, a draw-now (display link)
+    /// or a timer (animation, cursor blink, scrollback compression).
+    thread_wakes: std.atomic.Value(u64) = .init(0),
+    /// Cursor blink timer ticks, which a cursor blinking on its own layer
+    /// (`CursorLayer`) never needs.
+    cursor_blink_ticks: std.atomic.Value(u64) = .init(0),
 };
 const imagepkg = @import("image.zig");
 const ImageState = imagepkg.State;
@@ -360,6 +367,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Our overlay state, if any.
         overlay: ?Overlay = null,
 
+        /// A blinking cursor drawn on its own layer, whose blink the
+        /// compositor animates (`setCursorBlinkLayer`). Under `draw_mutex`.
+        cursor_layer: CursorLayer = .{},
+
         /// The base timestamp for the Kitty graphics animation clock.
         /// Animation frame timing is expressed as milliseconds since
         /// this instant. Set on the first frame update that observes
@@ -375,6 +386,38 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         const HighlightTag = enum(u8) {
             search_match,
             search_match_selected,
+        };
+
+        /// The graphics API can show a blinking cursor on a layer of its
+        /// own whose opacity the compositor animates (macOS Metal:
+        /// `Target.cursor_layer`, presented by IOSurfaceLayer).
+        const cursor_layer_supported = @hasDecl(GraphicsAPI, "cursor_blink_layer") and
+            GraphicsAPI.cursor_blink_layer;
+
+        /// A blinking cursor drawn on its own layer. The frame's target
+        /// shows the text under the cursor; the layer shows the cursor
+        /// (and, for a block, that text in the cursor text color), and the
+        /// compositor blinks it, so the renderer thread runs no blink timer.
+        /// AppKit's text insertion indicator blinks the same way; Chromium
+        /// repaints the caret from a main-thread timer
+        /// (third_party/blink/renderer/core/editing/frame_caret.cc).
+        const CursorLayer = struct {
+            /// The embedder turned it on (`setCursorBlinkLayer`).
+            enabled: bool = false,
+            /// Bumped when the blink restarts shown (`restartCursorBlink`,
+            /// a key press): the next frame's layer restarts its animation.
+            epoch: u64 = 0,
+            /// The cells the last frame update moved off the frame's
+            /// target (`cell.Contents.moveCursorTo`).
+            cells: std.ArrayListUnmanaged(shaderpkg.CellText) = .empty,
+            /// The cursor's glyph, which places the layer at draw time
+            /// (`cursor.layerRect`); null when the last frame update put no
+            /// cursor on it (the layer hides).
+            glyph: ?shaderpkg.CellText = null,
+            /// A block cursor's cell and width, for the text shader's
+            /// cursor text color (`Uniforms.cursor_pos`) on the layer.
+            block_pos: [2]u16 = .{ std.math.maxInt(u16), std.math.maxInt(u16) },
+            block_wide: bool = false,
         };
         /// Swap chain which maintains multiple copies of the state needed to
         /// render a frame, so that we can start building the next frame while
@@ -490,10 +533,34 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             /// Custom shader state, this is null if we have no custom shaders.
             custom_shader_state: ?CustomShaderState = null,
 
+            /// The blinking cursor layer's target and inputs for this frame.
+            cursor_layer: if (cursor_layer_supported) CursorLayerState else void,
+
             const UniformBuffer = Buffer(shaderpkg.Uniforms);
             const CellBgBuffer = Buffer(shaderpkg.CellBg);
             const CellTextBuffer = Buffer(shaderpkg.CellText);
             const BgImageBuffer = Buffer(shaderpkg.BgImage);
+
+            /// The cursor layer's own target (sized to the cursor, made at
+            /// its first draw) and its uniforms and cells.
+            const CursorLayerState = struct {
+                target: ?Target = null,
+                uniforms: UniformBuffer,
+                cells: CellTextBuffer,
+
+                fn init(api: GraphicsAPI) !CursorLayerState {
+                    var uniforms = try UniformBuffer.init(api.uniformBufferOptions(), 1);
+                    errdefer uniforms.deinit();
+                    const cells = try CellTextBuffer.init(api.fgBufferOptions(), 1);
+                    return .{ .uniforms = uniforms, .cells = cells };
+                }
+
+                fn deinit(self: *CursorLayerState) void {
+                    if (self.target) |*target| target.deinit();
+                    self.uniforms.deinit();
+                    self.cells.deinit();
+                }
+            };
 
             pub fn init(api: GraphicsAPI, custom_shaders: bool) !FrameState {
                 // Uniform buffer contains exactly 1 uniform struct. The
@@ -544,6 +611,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         null;
                 errdefer if (custom_shader_state) |*state| state.deinit();
 
+                const cursor_layer = if (comptime cursor_layer_supported)
+                    try CursorLayerState.init(api)
+                else {};
+                errdefer if (comptime cursor_layer_supported) {
+                    var owned = cursor_layer;
+                    owned.deinit();
+                };
+
                 // Initialize the target. Just as with the other resources,
                 // start it off as small as we can since it'll be resized.
                 const target = try api.initTarget(1, 1);
@@ -557,10 +632,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .color = color,
                     .target = target,
                     .custom_shader_state = custom_shader_state,
+                    .cursor_layer = cursor_layer,
                 };
             }
 
             pub fn deinit(self: *FrameState) void {
+                if (comptime cursor_layer_supported) self.cursor_layer.deinit();
                 self.target.deinit();
                 self.uniforms.deinit();
                 self.cells.deinit();
@@ -975,6 +1052,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             self.cells.deinit(self.alloc);
+            self.cursor_layer.cells.deinit(self.alloc);
             self.row_keys.deinit(self.alloc);
 
             self.font_shaper.deinit();
@@ -1311,6 +1389,41 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.custom_shader_focused_changed = true;
 
             self.syncDisplayLink(null, null);
+        }
+
+        /// Draw a focused blinking cursor on its own layer, blinked by the
+        /// compositor (`CursorLayer`), or in the frame again.
+        pub fn setCursorBlinkLayer(self: *Self, enabled: bool) void {
+            if (comptime !cursor_layer_supported) return;
+            self.draw_mutex.lockUncancelable(global.io());
+            defer self.draw_mutex.unlock(global.io());
+            self.cursor_layer.enabled = enabled;
+        }
+
+        /// Whether a blinking cursor blinks on the cursor layer, so the
+        /// renderer thread needs no blink timer. False where the graphics
+        /// API has no such layer, and with custom shaders, which
+        /// post-process the whole frame and must see the cursor.
+        pub fn cursorBlinksOnLayer(self: *Self) bool {
+            if (comptime !cursor_layer_supported) return false;
+            self.draw_mutex.lockUncancelable(global.io());
+            defer self.draw_mutex.unlock(global.io());
+            return self.cursorOnLayer();
+        }
+
+        /// The blink restarts shown (a key press or output): the next
+        /// frame's cursor layer starts its animation again.
+        pub fn restartCursorBlink(self: *Self) void {
+            if (comptime !cursor_layer_supported) return;
+            self.draw_mutex.lockUncancelable(global.io());
+            defer self.draw_mutex.unlock(global.io());
+            self.cursor_layer.epoch +%= 1;
+        }
+
+        /// A blinking cursor goes on the cursor layer. Caller holds
+        /// `draw_mutex`.
+        fn cursorOnLayer(self: *const Self) bool {
+            return cursor_layer_supported and self.cursor_layer.enabled and !self.has_custom_shaders;
         }
 
         /// Called when the apprt reports a change in how well
@@ -1913,16 +2026,23 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 const cause = self.full_rebuild_cause;
                 self.full_rebuild_cause = .none;
                 defer self.countRebuild(cause, critical);
+                const cursor_opts: cursorpkg.StyleOptions = .{
+                    .preedit = critical.preedit != null,
+                    .focused = self.focused,
+                    .blink_visible = cursor_blink_visible,
+                };
+                // A cursor that blinks on its layer is built in its shown
+                // phase; the layer's animation hides it.
+                const cursor_on_layer = self.cursorOnLayer() and
+                    cursorpkg.blinks(&self.terminal_state, cursor_opts);
+                var style_opts = cursor_opts;
+                if (cursor_on_layer) style_opts.blink_visible = true;
                 self.rebuildCells(
                     // Only the drawn terminal changed: keep the rows whose
                     // content is the same (row_keys).
                     cause == .none and critical.swapped and !critical.resized and !critical.palette_dirty,
                     critical.preedit,
-                    renderer.cursorStyle(&self.terminal_state, .{
-                        .preedit = critical.preedit != null,
-                        .focused = self.focused,
-                        .blink_visible = cursor_blink_visible,
-                    }),
+                    renderer.cursorStyle(&self.terminal_state, style_opts),
                     &critical.links,
                 ) catch |err| {
                     // This means we weren't able to allocate our buffer
@@ -1931,6 +2051,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     comptime assert(@TypeOf(err) == error{OutOfMemory});
                     log.warn("error rebuilding GPU cells err={}", .{err});
                 };
+                self.updateCursorLayer(cursor_on_layer);
                 // The screen size these cells were laid out for (the grid
                 // that fits it, the reflow preview's too): a frame drawn at
                 // another size shows them clipped or padded.
@@ -2314,6 +2435,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .overlay,
                 );
             }
+
+            // A blinking cursor on its own layer (CursorLayer).
+            try self.drawCursorLayer(frame, &frame_ctx);
 
             // If we have custom shaders, then we render them.
             if (frame.custom_shader_state) |*state| {
@@ -2951,6 +3075,125 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             x: [2]terminal.size.CellCountInt,
             cp_offset: usize,
         };
+
+        /// After `rebuildCells`: with `on`, move the cursor the cells hold
+        /// onto the cursor layer, and the frame's block cursor text color
+        /// with it, so the frame shows the text under the cursor and the
+        /// layer shows the cursor. Caller holds `draw_mutex`.
+        fn updateCursorLayer(self: *Self, on: bool) void {
+            if (comptime cursor_layer_supported) {
+                const layer = &self.cursor_layer;
+                layer.glyph = null;
+                layer.cells.clearRetainingCapacity();
+                layer.block_pos = .{ std.math.maxInt(u16), std.math.maxInt(u16) };
+                layer.block_wide = false;
+                if (!on) return;
+                const glyph = self.cells.getCursorGlyph() orelse return;
+                const block = self.uniforms.cursor_pos[0] != std.math.maxInt(u16);
+                const wide = block and self.uniforms.bools.cursor_wide;
+                const moved = self.cells.moveCursorTo(
+                    self.alloc,
+                    &layer.cells,
+                    if (block) self.uniforms.cursor_pos else null,
+                    wide,
+                ) catch |err| {
+                    // The cursor stays in the frame, steady.
+                    log.warn("error moving the cursor to its layer err={}", .{err});
+                    layer.cells.clearRetainingCapacity();
+                    return;
+                };
+                if (!moved) return;
+                layer.glyph = glyph;
+                if (block) {
+                    layer.block_pos = self.uniforms.cursor_pos;
+                    layer.block_wide = wide;
+                    self.uniforms.cursor_pos = .{ std.math.maxInt(u16), std.math.maxInt(u16) };
+                    self.uniforms.bools.cursor_wide = false;
+                }
+            }
+        }
+
+        /// Draw the cursor layer of `frame` (its own small target, in the
+        /// same command buffer as the frame) and tell the frame's target
+        /// where it goes, or that no cursor shows on it. Caller holds
+        /// `draw_mutex`, after the frame's uniforms and buffers synced.
+        fn drawCursorLayer(self: *Self, frame: *FrameState, frame_ctx: anytype) !void {
+            if (comptime cursor_layer_supported) {
+                frame.target.cursor_layer = .{};
+                const glyph = self.cursor_layer.glyph orelse return;
+                const rect = cursorpkg.layerRect(
+                    glyph.grid_pos,
+                    self.cursor_layer.block_wide,
+                    .{ .width = self.grid_metrics.cell_width, .height = self.grid_metrics.cell_height },
+                    self.size.padding,
+                    self.size.screen,
+                    glyph.glyph_size,
+                    glyph.bearings,
+                ) orelse return;
+
+                const state = &frame.cursor_layer;
+                if (state.target) |*target| {
+                    if (target.width != rect.width or target.height != rect.height) {
+                        target.deinit();
+                        state.target = null;
+                    }
+                }
+                if (state.target == null) state.target = try self.api.initTarget(rect.width, rect.height);
+                const target = state.target.?;
+
+                // The frame's uniforms, projected onto the layer's pixels
+                // (grid coordinates start at the padding's top-left), with
+                // the block cursor's text color at its cell.
+                var uniforms = self.uniforms;
+                const left = @as(f32, @floatFromInt(rect.x)) - @as(f32, @floatFromInt(self.size.padding.left));
+                const top = @as(f32, @floatFromInt(rect.y)) - @as(f32, @floatFromInt(self.size.padding.top));
+                uniforms.projection_matrix = math.ortho2d(
+                    left,
+                    left + @as(f32, @floatFromInt(rect.width)),
+                    top + @as(f32, @floatFromInt(rect.height)),
+                    top,
+                );
+                uniforms.cursor_pos = self.cursor_layer.block_pos;
+                uniforms.bools.cursor_wide = self.cursor_layer.block_wide;
+                try state.uniforms.sync(&.{uniforms});
+                try state.cells.sync(self.cursor_layer.cells.items);
+
+                {
+                    var pass = frame_ctx.renderPass(&.{.{
+                        .target = .{ .target = target },
+                        .clear_color = .{ 0.0, 0.0, 0.0, 0.0 },
+                    }});
+                    defer pass.complete();
+                    pass.step(.{
+                        .pipeline = self.shaders.pipelines.cell_text,
+                        .uniforms = state.uniforms.buffer,
+                        .buffers = &.{
+                            state.cells.buffer,
+                            frame.cells_bg.buffer,
+                        },
+                        .textures = &.{
+                            frame.grayscale,
+                            frame.color,
+                        },
+                        .draw = .{
+                            .type = .triangle_strip,
+                            .vertex_count = 4,
+                            .instance_count = self.cursor_layer.cells.items.len,
+                        },
+                    });
+                }
+
+                frame.target.cursor_layer = .{
+                    .surface = target.surface,
+                    .x = rect.x,
+                    .y = rect.y,
+                    .width = rect.width,
+                    .height = rect.height,
+                    .epoch = self.cursor_layer.epoch,
+                    .period = @as(f64, @floatFromInt(2 * cursorpkg.blink_interval_ms)) / std.time.ms_per_s,
+                };
+            }
+        }
 
         /// Counts the rows the last rebuildCells built and, for a full
         /// rebuild, its cause (RenderCounters).

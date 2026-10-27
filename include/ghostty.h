@@ -762,6 +762,12 @@ typedef struct {
   // unchanged) that went to the screen from the renderer's GPU completion
   // thread, in their own Core Animation transaction, without the main thread.
   uint64_t host_off_main_presents;
+  // Renderer thread wakes: a mailbox wakeup, a draw-now (display link) or a
+  // timer (animation, cursor blink, scrollback compression). Of them, cursor
+  // blink timer ticks; a cursor blinking on its own layer
+  // (ghostty_app_set_cursor_blink_layer) needs none.
+  uint64_t thread_wakes;
+  uint64_t cursor_blink_ticks;
 } ghostty_surface_render_counters_s;
 
 // Config types
@@ -1420,6 +1426,14 @@ GHOSTTY_API void ghostty_app_free(ghostty_app_t);
 GHOSTTY_API void ghostty_app_tick(ghostty_app_t);
 GHOSTTY_API void* ghostty_app_userdata(ghostty_app_t);
 GHOSTTY_API void ghostty_app_set_focus(ghostty_app_t, bool);
+// macOS: every surface of the app, current and future, draws a focused
+// blinking cursor on a sublayer of its layer whose opacity a Core Animation
+// keyframe animation blinks, so renderer threads run no blink timer and wake
+// for no blink (off by default). Output or a key press restarts the blink
+// shown. With custom shaders, or on other platforms, the cursor stays in the
+// frame and blinks as before. Main thread only; repeating the state does
+// nothing.
+GHOSTTY_API void ghostty_app_set_cursor_blink_layer(ghostty_app_t, bool);
 GHOSTTY_API bool ghostty_app_key(ghostty_app_t, ghostty_input_key_s);
 GHOSTTY_API void ghostty_app_keyboard_changed(ghostty_app_t);
 GHOSTTY_API void ghostty_app_open_config(ghostty_app_t);
