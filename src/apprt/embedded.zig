@@ -480,6 +480,11 @@ pub const Surface = struct {
     io_write_cb: ?termio.Manual.WriteCallback = null,
     io_write_userdata: ?*anyopaque = null,
 
+    /// Set when the embedder shows and blinks the cursor
+    /// (Options.cursor_external). The renderer copies it once, when it is
+    /// made; it never changes.
+    cursor_external: ?renderer.CursorExternal = null,
+
     /// Font binding callback, run on the GUI thread. Belongs to this exact
     /// surface; child surfaces never inherit it.
     font_size_action_cb: ?FontSizeActionCallback = null,
@@ -544,9 +549,31 @@ pub const Surface = struct {
 
         /// Passed as the first argument of io_write_cb.
         io_write_userdata: ?*anyopaque = null,
+
+        /// External cursor: the renderer does not draw or blink the
+        /// cursor; cursor_cb receives the cursor cell to show instead.
+        /// Requires cursor_cb. See ghostty_surface_cursor_cb in ghostty.h
+        /// for the threading contract. Surfaces Ghostty asks the embedder
+        /// to create do not inherit it.
+        cursor_external: bool = false,
+
+        /// Receives each new cursor cell.
+        cursor_cb: ?renderer.CursorExternal.Callback = null,
+
+        /// Passed as the first argument of cursor_cb.
+        cursor_userdata: ?*anyopaque = null,
+
+        /// The renderer's external cursor from these options; refuses
+        /// cursor_external without cursor_cb.
+        pub fn cursorExternal(self: *const Options) renderer.CursorExternal.Error!?renderer.CursorExternal {
+            return .fromConfig(self.cursor_external, self.cursor_cb, self.cursor_userdata);
+        }
     };
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
+        // Refused before anything is made or registered.
+        const cursor_external = try opts.cursorExternal();
+
         self.* = .{
             .app = app,
             .platform = try .init(opts.platform_tag, opts.platform),
@@ -564,6 +591,7 @@ pub const Surface = struct {
             ) orelse return error.InvalidIoMode,
             .io_write_cb = opts.io_write_cb,
             .io_write_userdata = opts.io_write_userdata,
+            .cursor_external = cursor_external,
         };
 
         // Add ourselves to the list of surfaces on the app.
@@ -1354,8 +1382,8 @@ pub const Surface = struct {
     }
 };
 
-// The IO fields extend ghostty_surface_config_s. ghostty.h must match;
-// the "ghostty.h surface config IO fields" test in apprt/structs.zig
+// The IO and cursor fields extend ghostty_surface_config_s. ghostty.h must
+// match; the "ghostty.h surface config IO fields" test in apprt/structs.zig
 // checks the header side of the same layout.
 comptime {
     if (@sizeOf(usize) == 8) {
@@ -1364,9 +1392,38 @@ comptime {
             @offsetOf(O, "io_mode") != 88 or
             @offsetOf(O, "io_write_cb") != 96 or
             @offsetOf(O, "io_write_userdata") != 104 or
-            @sizeOf(O) != 112)
-            @compileError("Surface.Options IO fields must match ghostty_surface_config_s");
+            @offsetOf(O, "cursor_external") != 112 or
+            @offsetOf(O, "cursor_cb") != 120 or
+            @offsetOf(O, "cursor_userdata") != 128 or
+            @sizeOf(O) != 136)
+            @compileError("Surface.Options IO and cursor fields must match ghostty_surface_config_s");
     }
+}
+
+test "Surface.Options cursor_external without cursor_cb is refused" {
+    const testing = std.testing;
+    const Cb = struct {
+        fn cb(_: ?*anyopaque, _: *const renderer.CursorCell) callconv(.c) void {}
+    };
+    var userdata: u8 = 0;
+
+    // Surface.init returns this error before it makes or registers anything.
+    try testing.expectError(
+        error.MissingCursorCallback,
+        (Surface.Options{ .cursor_external = true }).cursorExternal(),
+    );
+    try testing.expectEqual(
+        @as(?renderer.CursorExternal, null),
+        try (Surface.Options{ .cursor_cb = &Cb.cb }).cursorExternal(),
+    );
+
+    const external = (try (Surface.Options{
+        .cursor_external = true,
+        .cursor_cb = &Cb.cb,
+        .cursor_userdata = &userdata,
+    }).cursorExternal()).?;
+    try testing.expect(external.cb == &Cb.cb);
+    try testing.expect(external.userdata == @as(?*anyopaque, &userdata));
 }
 
 /// Inspector is the state required for the terminal inspector. A terminal

@@ -87,7 +87,7 @@ fn bufferCompleted(
         };
     }
 
-    block.renderer.frameCompleted(health);
+    block.renderer.frameCompleted(health, block.target);
 }
 
 /// Add a render pass to this frame with the provided attachments.

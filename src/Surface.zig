@@ -680,6 +680,11 @@ pub fn init(
         .surface_mailbox = .{ .surface = self, .app = app_mailbox },
         .rt_surface = rt_surface,
         .thread = &self.renderer_thread,
+        // Only the embedded runtime has an external cursor.
+        .cursor_external = if (comptime apprt.runtime == apprt.embedded)
+            rt_surface.cursor_external
+        else
+            null,
     });
     errdefer renderer_impl.deinit();
 

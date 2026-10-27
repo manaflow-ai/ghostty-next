@@ -26,3 +26,8 @@ rt_surface: *apprt.Surface,
 
 /// The renderer thread.
 thread: *renderer.Thread,
+
+/// Set when the embedder shows and blinks the cursor
+/// (`ghostty_surface_config_s.cursor_external`): the renderer's frames
+/// leave it out and it publishes the cursor cell instead.
+cursor_external: ?renderer.CursorExternal = null,

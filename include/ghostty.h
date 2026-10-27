@@ -616,6 +616,66 @@ typedef enum {
 // into the surface. It can be called until ghostty_surface_free returns.
 typedef void (*ghostty_io_write_cb)(void*, const char*, uintptr_t);
 
+// External cursor (ghostty_surface_config_s.cursor_external): the style of
+// the published cursor cell.
+typedef enum {
+  GHOSTTY_CURSOR_CELL_BLOCK = 0,
+  GHOSTTY_CURSOR_CELL_BLOCK_HOLLOW = 1,
+  GHOSTTY_CURSOR_CELL_BAR = 2,
+  GHOSTTY_CURSOR_CELL_UNDERLINE = 3,
+  GHOSTTY_CURSOR_CELL_LOCK = 4,
+} ghostty_cursor_cell_style_e;
+
+// External cursor: the cursor cell to show above the surface's frames,
+// which leave the cursor out.
+typedef struct {
+  // Increases with each published cell of a surface.
+  uint64_t serial;
+  // The cell's pixels: an IOSurfaceRef of width by height pixels,
+  // premultiplied, in the colorspace of the surface's frames, as Ghostty
+  // would draw the cell with the cursor (a block holds the cell background,
+  // the block, and every glyph that reaches into the cell, the cell's own
+  // character in the cursor text color; a bar, underline, hollow block or
+  // lock is transparent around the cursor). NULL when not visible, and when
+  // unchanged. Valid during the call: retain it to keep it. Each cell has a
+  // new surface; Ghostty never draws into a surface after publishing it.
+  void* surface;
+  // The cell (two cells for a wide character) in the surface's pixels,
+  // from the top-left corner of its frames.
+  uint32_t x;
+  uint32_t y;
+  uint32_t width;
+  uint32_t height;
+  uint16_t column;
+  uint16_t row;
+  ghostty_cursor_cell_style_e style;
+  // False: show no cursor (hidden by the terminal, scrolled out of view,
+  // or IME preedit text, which the frames draw).
+  bool visible;
+  // True: blink the cursor, blink_interval_ms shown, then as long hidden,
+  // starting shown with each call. False: show it steadily.
+  bool blinking;
+  // True: the cell, its rect and its pixels are the previous call's (keep
+  // that surface; surface is NULL). Ghostty sends it where its own blink
+  // restarts: on terminal output (at most every 500 ms) that leaves the
+  // cell alone, so the cursor starts shown again.
+  bool unchanged;
+  uint32_t blink_interval_ms;
+} ghostty_cursor_cell_s;
+
+// External cursor: a new cursor cell, once per cursor move or change of
+// what the cell shows (its character, a glyph reaching into it, colors,
+// style, focus, font), after the GPU drew it and with the frame that leaves
+// the cursor out; output elsewhere on the screen sends none. Also an
+// unchanged cell where Ghostty's blink restarts (terminal output). Runs on a renderer thread
+// (the GPU completion thread on macOS), never the main thread, and can run
+// before ghostty_surface_new returns. Calls for one surface never overlap
+// and come in serial order. It must return quickly and never block or wait
+// for the main thread, and must not call into Ghostty. No call starts
+// after ghostty_surface_free returned.
+typedef void (*ghostty_surface_cursor_cb)(void* userdata,
+                                          const ghostty_cursor_cell_s* cell);
+
 // Font binding actions reported after Ghostty applied them (increase,
 // decrease, reset, set). The callback runs synchronously on the surface's
 // GUI thread and must not free or reenter the surface.
@@ -662,6 +722,19 @@ typedef struct {
   ghostty_surface_io_mode_e io_mode;
   ghostty_io_write_cb io_write_cb;
   void* io_write_userdata;
+  // External cursor. True: the renderer does not draw or blink the cursor,
+  // so a blink wakes no Ghostty thread; cursor_cb (required:
+  // ghostty_surface_new fails without it) receives the cursor cell to show
+  // and blink above the frames. Off while a custom shader or a background
+  // image is set, while cursor-opacity is below 1, and while a kitty image
+  // drawn in front of text (or the debug overlay) covers the cursor cell
+  // (on macOS only; other renderers always draw the cursor): then cursor_cb
+  // gets a cell that is not visible and the frames draw and blink the
+  // cursor. Not inherited by the surfaces Ghostty asks the embedder to
+  // create.
+  bool cursor_external;
+  ghostty_surface_cursor_cb cursor_cb;
+  void* cursor_userdata;
 } ghostty_surface_config_s;
 
 typedef struct {
