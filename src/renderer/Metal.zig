@@ -61,6 +61,13 @@ last_frame: LastFrame = .{},
 /// next show sizes the drawables again. Main thread.
 purged: bool = false,
 
+/// Bumped by every hidden or purged presentation: the embedder may hold
+/// the presented frame volatile while hidden (TerminalHeldFrame), so after
+/// one every buffer is drawn fully once before it draws only its damage
+/// (`contentEpoch`, `Target.pixelsKept`). Main thread writes, the renderer
+/// reads under the draw lock.
+content_epoch: std.atomic.Value(u64) = .init(0),
+
 /// The shared render device; its one MTLCommandQueue takes every
 /// surface's command buffers.
 device: *const Device,
@@ -502,6 +509,12 @@ pub fn releasePresentable(self: *Metal) void {
     self.presenter.releaseUnused();
 }
 
+/// The renderer's content epoch (`content_epoch`): a buffer last drawn in
+/// another epoch is drawn fully. Under the draw lock.
+pub fn contentEpoch(self: *const Metal) u64 {
+    return self.content_epoch.load(.acquire);
+}
+
 /// Under the draw lock: the last frame was dropped for a drawable taken
 /// before a resize, so this one draws even with nothing changed.
 pub fn takeRedraw(self: *Metal) bool {
@@ -615,6 +628,7 @@ pub fn setPresentation(self: *Metal, presentation: Presentation) bool {
     const state = &self.presenter.state;
     switch (presentation) {
         .hidden, .purge => {
+            _ = self.content_epoch.fetchAdd(1, .acq_rel);
             state.presenting.store(false, .release);
             self.presenter.hideOverlay();
             self.layer.setContents(null);

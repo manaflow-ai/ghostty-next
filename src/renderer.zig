@@ -93,6 +93,7 @@ test {
     _ = Thread;
     _ = State;
     _ = @import("renderer/mailbox.zig");
+    _ = @import("renderer/damage.zig");
     _ = AtlasTexture;
     if (comptime build_config.renderer == .metal) _ = Metal.Device;
     _ = @import("renderer/metal/PresentHistogram.zig");

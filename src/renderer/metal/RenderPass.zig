@@ -19,6 +19,8 @@ pub const Options = struct {
     command_buffer: objc.Object,
     /// Color attachments for this render pass.
     attachments: []const Attachment,
+    /// Draw only these pixels (a partial redraw); null: the whole target.
+    scissor: ?mtl.MTLScissorRect = null,
 
     /// Describes a color attachment.
     pub const Attachment = struct {
@@ -115,6 +117,12 @@ pub fn begin(
         objc.Object,
         objc.sel("renderCommandEncoderWithDescriptor:"),
         .{desc.value},
+    );
+
+    if (opts.scissor) |rect| encoder.msgSend(
+        void,
+        objc.sel("setScissorRect:"),
+        .{rect},
     );
 
     return .{ .encoder = encoder };

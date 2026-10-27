@@ -131,4 +131,24 @@ pub const IOSurface = opaque {
     pub inline fn getPixelFormat(self: *IOSurface) video.PixelFormat {
         return @enumFromInt(c.IOSurfaceGetPixelFormat(@ptrCast(self)));
     }
+
+    /// kIOSurfacePurgeable* (IOSurfaceTypes.h).
+    pub const Purgeable = enum(u32) {
+        non_volatile = 0,
+        @"volatile" = 1,
+        empty = 2,
+        keep_current = 3,
+        _,
+    };
+
+    /// `IOSurfaceSetPurgeable`: sets the state (`keep_current` only reads
+    /// it) and returns the state before. `empty`: the system purged the
+    /// pages while they were volatile, so their contents are gone.
+    pub fn setPurgeable(self: *IOSurface, state: Purgeable) Error!Purgeable {
+        var old: u32 = 0;
+        if (c.IOSurfaceSetPurgeable(@ptrCast(self), @intFromEnum(state), &old) != 0) {
+            return error.InvalidOperation;
+        }
+        return @enumFromInt(old);
+    }
 };

@@ -440,6 +440,14 @@ pub const MTLSize = extern struct {
     depth: c_ulong,
 };
 
+/// https://developer.apple.com/documentation/metal/mtlscissorrect?language=objc
+pub const MTLScissorRect = extern struct {
+    x: c_ulong,
+    y: c_ulong,
+    width: c_ulong,
+    height: c_ulong,
+};
+
 /// https://developer.apple.com/documentation/metal/1433367-mtlcopyalldevices
 pub extern "c" fn MTLCopyAllDevices() ?*anyopaque;
 

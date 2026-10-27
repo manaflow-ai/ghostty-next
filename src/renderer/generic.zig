@@ -22,6 +22,8 @@ const Overlay = @import("Overlay.zig");
 const ReflowPreview = @import("ReflowPreview.zig");
 const ColorBlend = @import("ColorBlend.zig");
 const AtlasTexture = @import("AtlasTexture.zig");
+const damagepkg = @import("damage.zig");
+const Damage = damagepkg.Damage;
 
 /// Why a frame update rebuilds every row (RenderCounters).
 const RebuildCause = enum { none, config, font };
@@ -46,6 +48,9 @@ pub const RenderCounters = struct {
     full_swap: std.atomic.Value(u64) = .init(0),
     /// The drawn terminal's grid changed size.
     full_resize: std.atomic.Value(u64) = .init(0),
+    /// Frames that drew only their buffer's damaged rows (`takeDamage`).
+    /// Not in the C struct (ghostty.h) yet.
+    partial_frames: std.atomic.Value(u64) = .init(0),
 };
 const imagepkg = @import("image.zig");
 const ImageState = imagepkg.State;
@@ -138,6 +143,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         const RenderPass = GraphicsAPI.RenderPass;
         const AtlasTextures = AtlasTexture.Set(Texture);
 
+        /// Each target keeps the damage it missed and a frame draws only
+        /// that (`damage.zig`, buffer age). Metal; OpenGL draws every
+        /// frame fully.
+        const partial_redraw = @hasField(Target, "damage");
+
         const shaderpkg = GraphicsAPI.shaders;
         const Shaders = shaderpkg.Shaders;
 
@@ -207,13 +217,23 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// cells goes into a separate shader.
         cells: cellpkg.Contents,
 
-        /// What the next frame shows changed since the last draw: a frame
-        /// update changed a row, the cursor, the uniforms, the color
-        /// target, images or the overlay (`FrameShown`), or a setter
-        /// changed an input of the draw (config, font grid, screen size,
-        /// focus, shown again, `markFrameChanged`). Otherwise the next draw
-        /// draws nothing and the display link stops. Under `draw_mutex`.
-        frame_changed: bool = false,
+        /// What the next frame shows changed since the last draw, and
+        /// where: a frame update changed rows or the cursor (their rows), or
+        /// the uniforms, the color target, images or the overlay (all,
+        /// `FrameShown`), or a setter changed an input of the draw (config,
+        /// font grid, screen size, focus, shown again, `markFrameChanged`:
+        /// all). `.none`: the next draw draws nothing and the display link
+        /// stops. Each swap-chain buffer collects it at the draw and redraws
+        /// only what it missed (`damage.zig`). Under `draw_mutex`.
+        frame_damage: Damage = .none,
+
+        /// Grid rows the last `rebuildCells` built. Under `draw_mutex`.
+        rebuilt_damage: Damage = .none,
+
+        /// A frame the GPU failed: its buffer's pixels are unknown, so every
+        /// buffer redraws fully at the next draw. Set on the GPU completion
+        /// thread (`frameCompleted`), taken by the draw.
+        frames_failed: std.atomic.Value(bool) = .init(false),
 
         /// The screen size (packed width << 32 | height) the cells were
         /// last built for. Under `draw_mutex`.
@@ -1187,7 +1207,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         pub fn markFrameChanged(self: *Self) void {
             self.draw_mutex.lockUncancelable(global.io());
             defer self.draw_mutex.unlock(global.io());
-            self.frame_changed = true;
+            self.frame_damage = .full;
         }
 
         /// Called when we get an updated display ID for our display link.
@@ -1437,7 +1457,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Non-visible windows never vsync
                 self.visible and
                 // Only vsync if we have cell changes or animation
-                (self.frame_changed or self.animationWake() != null);
+                (self.frame_damage != .none or self.animationWake() != null);
 
             if (should_run) {
                 if (!display_link.isRunning()) {
@@ -1497,7 +1517,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // to be rendered.
             self.markDirty();
             self.full_rebuild_cause = .font;
-            self.frame_changed = true;
+            self.frame_damage = .full;
         }
 
         /// Update uniforms that are based on the font grid.
@@ -1538,8 +1558,39 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 };
             }
 
-            fn eql(a: *const FrameShown, b: *const FrameShown) bool {
-                return std.meta.eql(a.*, b.*);
+            /// Where a frame showing `b` differs from one showing `a`: the
+            /// cursor's rows (old and new) when only the cursor changed,
+            /// everything when the uniforms, the colors or the screen the
+            /// cells were built for changed.
+            fn damageTo(a: *const FrameShown, b: *const FrameShown) Damage {
+                if (a.has_colors != b.has_colors or
+                    a.cells_screen != b.cells_screen or
+                    !std.meta.eql(a.colors, b.colors) or
+                    !std.meta.eql(a.uncursored(), b.uncursored())) return .full;
+                if (std.meta.eql(a.cursor, b.cursor) and
+                    std.meta.eql(a.cursor_text, b.cursor_text) and
+                    std.meta.eql(a.uniforms, b.uniforms)) return .none;
+                var damage: Damage = .none;
+                a.addCursorRows(&damage);
+                b.addCursorRows(&damage);
+                return damage;
+            }
+
+            /// The uniforms without the block cursor's cell and text color,
+            /// which change only the cursor's row.
+            fn uncursored(self: *const FrameShown) shaderpkg.Uniforms {
+                var u = self.uniforms;
+                u.cursor_pos = .{ 0, 0 };
+                u.cursor_color = .{ 0, 0, 0, 0 };
+                u.bools.cursor_wide = false;
+                return u;
+            }
+
+            /// The rows the cursor glyph and the block cursor's cell are on.
+            fn addCursorRows(self: *const FrameShown, damage: *Damage) void {
+                if (self.cursor) |glyph| damage.addRow(glyph.grid_pos[1]);
+                const y = self.uniforms.cursor_pos[1];
+                if (y != std.math.maxInt(u16)) damage.addRow(y);
             }
         };
 
@@ -2017,15 +2068,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // changed one: a wake with no dirty row, no cursor change
                 // and no size change (a blink tick of a steady cursor,
                 // output that sets only a title) draws nothing, and the
-                // display link stops (G7). A change not drawn yet stays
-                // set until a draw takes it.
+                // display link stops (G7). A typed character damages its
+                // row and the cursor's rows only. Damage not drawn yet
+                // stays until a draw takes it.
                 const shown_after: FrameShown = .of(self);
-                if (self.rebuilt_rows > 0 or self.rebuilt_full or
-                    critical.kitty_updated or overlay_changed or custom_changed or
-                    !shown_before.eql(&shown_after))
-                {
-                    self.frame_changed = true;
-                }
+                var damage: Damage = if (self.rebuilt_full) .full else self.rebuilt_damage;
+                if (critical.kitty_updated or overlay_changed or custom_changed) damage = .full;
+                damage.add(shown_before.damageTo(&shown_after));
+                self.frame_damage.add(damage);
             }
 
             // Start the display link now that the rebuilt frame is ready.
@@ -2135,12 +2185,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.api.takeRedraw()
             else
                 false;
+            const animating = self.animationWake() != null;
             const needs_redraw =
                 redraw_requested or
                 size_changed or
                 swap_chain_rebuilt or
-                self.frame_changed or
-                self.animationWake() != null or
+                self.frame_damage != .none or
+                animating or
                 sync;
 
             if (!needs_redraw) {
@@ -2149,7 +2200,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // display link at this point.
                 return true;
             }
-            self.frame_changed = false;
+
+            // Where this frame differs from the last one drawn. A new size,
+            // an animation (a color blend moves the palette, a custom shader
+            // or a Kitty animation draws everywhere) or new shaders change
+            // every pixel. Taken into the buffers at the draw (`takeDamage`).
+            var frame_damage = self.frame_damage;
+            if (size_changed or animating or self.reinitialize_shaders) frame_damage = .full;
+            self.frame_damage = .none;
+            // A draw that fails leaves the buffers missing this damage:
+            // every one draws fully next.
+            errdefer if (comptime partial_redraw) for (&swap_chain.frames) |*f| {
+                f.target.damage.invalidate();
+            };
 
             // Wait for a frame to be available.
             const frame = swap_chain.nextFrame();
@@ -2257,18 +2320,27 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 frame.target.size_generation = self.api.sizeGeneration();
             }
 
+            // What this buffer draws: only the rows it missed, where the
+            // graphics API keeps each buffer's damage (buffer age).
+            const band = self.takeDamage(swap_chain, frame, frame_damage);
+
             // Get a frame context from the graphics API.
             var frame_ctx = try self.api.beginFrame(self, &frame.target);
             defer frame_ctx.complete(sync);
 
             {
-                var pass = frame_ctx.renderPass(&.{.{
+                // A partial frame loads the pixels outside its band.
+                const attachments = [_]RenderPass.Options.Attachment{.{
                     .target = if (frame.custom_shader_state) |state|
                         .{ .texture = state.back_texture }
                     else
                         .{ .target = frame.target },
-                    .clear_color = .{ 0.0, 0.0, 0.0, 0.0 },
-                }});
+                    .clear_color = if (band == null) .{ 0.0, 0.0, 0.0, 0.0 } else null,
+                }};
+                var pass = if (comptime partial_redraw)
+                    frame_ctx.renderPassIn(&attachments, band)
+                else
+                    frame_ctx.renderPass(&attachments);
                 defer pass.complete();
 
                 // First we draw our background image, if we have one.
@@ -2395,6 +2467,53 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             return false;
         }
 
+        /// Gives every buffer this frame's damage and takes what `frame`'s
+        /// buffer missed since it was last drawn: the pixel band it
+        /// redraws over its loaded pixels, or null to draw it fully. Full
+        /// when its pixels may not be the ones it drew (a new target, a
+        /// failed frame, a hidden or purged presentation, a volatile or
+        /// purged surface: `Target.pixelsKept`), with custom shaders (they
+        /// post-process the whole frame) or a background image, and when
+        /// the band reaches both edges. Chromium's display compositor
+        /// draws a buffer the same way
+        /// (components/viz/service/display_embedder/buffer_queue.cc,
+        /// `CurrentBufferDamage`). Under the draw lock.
+        fn takeDamage(
+            self: *Self,
+            swap_chain: *SwapChain,
+            frame: *FrameState,
+            frame_damage: Damage,
+        ) ?damagepkg.Band {
+            if (comptime !partial_redraw) return null;
+
+            if (self.frames_failed.swap(false, .acq_rel)) {
+                for (&swap_chain.frames) |*f| f.target.damage.invalidate();
+            }
+            for (&swap_chain.frames) |*f| f.target.damage.collect(frame_damage);
+
+            const epoch: u64 = if (comptime @hasDecl(GraphicsAPI, "contentEpoch"))
+                self.api.contentEpoch()
+            else
+                0;
+            const kept = frame.target.pixelsKept();
+            const draw = frame.target.damage.take(epoch, kept);
+            // A background image blends onto the cleared target, not onto
+            // the loaded pixels.
+            if (frame.custom_shader_state != null or self.bg_image != null) return null;
+            const rows = switch (draw) {
+                .none, .full => return null,
+                .rows => |rows| rows,
+            };
+            const b = damagepkg.band(rows, .{
+                .screen_height = @intCast(frame.target.height),
+                .pad_top = @floatFromInt(self.size.padding.top),
+                .cell_height = self.uniforms.cell_size[1],
+                .grid_rows = self.cells.size.rows,
+            }) orelse return null;
+            _ = self.counters.partial_frames.fetchAdd(1, .monotonic);
+            return b;
+        }
+
         // Callback from the graphics API when a frame is completed.
         pub fn frameCompleted(
             self: *Self,
@@ -2416,6 +2535,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.health.store(health, .seq_cst);
                 }
             }
+
+            // A failed frame left its buffer's pixels unknown: every buffer
+            // draws fully next (`takeDamage`). Before the release, so the
+            // draw that reuses the buffer sees it.
+            if (health == .unhealthy) self.frames_failed.store(true, .release);
 
             // Always release our semaphore. The swap chain is
             // guaranteed to exist here: it is only torn down after
@@ -2616,7 +2740,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // Contrast, color space, blending, images and shaders are read
             // by the draw, not by the rows.
-            self.frame_changed = true;
+            self.frame_damage = .full;
         }
 
         /// Resize the screen.
@@ -2637,7 +2761,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.size = size;
             self.size.cell = cell;
             self.updateScreenSizeUniforms();
-            self.frame_changed = true;
+            self.frame_damage = .full;
 
             // Some graphics APIs need to manually update their viewport,
             // like OpenGL. Do so here.
@@ -3070,6 +3194,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const state: *terminal.RenderState = &self.terminal_state;
             self.rebuilt_rows = 0;
             self.rebuilt_full = false;
+            self.rebuilt_damage = .none;
 
             const grid_size_diff =
                 self.cells.size.rows != state.rows or
@@ -3212,6 +3337,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
 
                 self.rebuilt_rows += 1;
+                self.rebuilt_damage.addRow(y);
 
                 // Unmark the dirty state in our render state.
                 dirty.* = false;
@@ -3366,6 +3492,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Setup our preedit text.
             if (preedit) |preedit_v| preedit: {
                 const range = preedit_range orelse break :preedit;
+                self.rebuilt_damage.addRow(range.y);
                 var x = range.x[0];
                 for (preedit_v.codepoints[range.cp_offset..]) |cp| {
                     self.addPreeditCell(
@@ -4332,4 +4459,36 @@ fn rowKey(
     std.hash.autoHash(&h, cursor_x);
     for (highlights.items) |hl| std.hash.autoHash(&h, hl);
     return h.final();
+}
+
+test "renderer damage: a cursor move damages its old and new rows only" {
+    const FrameShown = renderer.Renderer.FrameShown;
+    const shaderpkg = renderer.Renderer.shaderpkg;
+    var a: FrameShown = std.mem.zeroes(FrameShown);
+    a.uniforms.cursor_pos = .{ 3, 10 };
+    var b = a;
+    try std.testing.expectEqual(Damage.none, a.damageTo(&b));
+
+    // The block cursor moves one row down (a typed newline).
+    b.uniforms.cursor_pos = .{ 0, 11 };
+    try std.testing.expectEqualDeep(
+        Damage{ .rows = .{ .start = 10, .end = 12 } },
+        a.damageTo(&b),
+    );
+
+    // A bar cursor glyph moves along its row (a typed character).
+    a.uniforms.cursor_pos = .{ std.math.maxInt(u16), std.math.maxInt(u16) };
+    a.cursor = std.mem.zeroes(shaderpkg.CellText);
+    a.cursor.?.grid_pos = .{ 4, 7 };
+    b = a;
+    b.cursor.?.grid_pos = .{ 5, 7 };
+    try std.testing.expectEqualDeep(Damage.row(7), a.damageTo(&b));
+
+    // The background, the padding or the screen: every row.
+    b = a;
+    b.uniforms.bg_color = .{ 1, 2, 3, 255 };
+    try std.testing.expectEqual(Damage.full, a.damageTo(&b));
+    b = a;
+    b.cells_screen +%= 1;
+    try std.testing.expectEqual(Damage.full, a.damageTo(&b));
 }

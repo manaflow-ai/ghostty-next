@@ -10,6 +10,7 @@ const Renderer = @import("../generic.zig").Renderer(Metal);
 const Metal = @import("../Metal.zig");
 const Target = @import("Target.zig");
 const RenderPass = @import("RenderPass.zig");
+const damage = @import("../damage.zig");
 
 const Health = @import("../../renderer.zig").Health;
 const PresentState = @import("PresentState.zig");
@@ -105,6 +106,26 @@ pub inline fn renderPass(
     return RenderPass.begin(.{
         .attachments = attachments,
         .command_buffer = self.buffer,
+    });
+}
+
+/// A render pass that draws only `band` (a partial redraw by buffer age,
+/// `damage.zig`): give the attachments no clear color, so the pixels
+/// outside it are loaded as they are. Null: the whole target.
+pub inline fn renderPassIn(
+    self: *const Self,
+    attachments: []const RenderPass.Options.Attachment,
+    band: ?damage.Band,
+) RenderPass {
+    return RenderPass.begin(.{
+        .attachments = attachments,
+        .command_buffer = self.buffer,
+        .scissor = if (band) |b| .{
+            .x = 0,
+            .y = b.y,
+            .width = @intCast(self.block.target.width),
+            .height = b.height,
+        } else null,
     });
 }
 
