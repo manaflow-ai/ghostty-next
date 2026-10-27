@@ -135,3 +135,68 @@ pub fn pixelsKept(self: *Self) bool {
     const old = self.surface.setPurgeable(.non_volatile) catch return false;
     return old == .non_volatile;
 }
+
+/// What this target draws now (`damage.Buffer.take`): its damage since it
+/// was last drawn, or everything when its pixels are not kept
+/// (`pixelsKept`) or `epoch` is newer than its last draw.
+pub fn takeDamage(self: *Self, epoch: u64) damagepkg.Damage {
+    return self.damage.take(epoch, self.pixelsKept());
+}
+
+/// A target over a bare IOSurface with no texture: the tests below use only
+/// the surface and the damage, so they need no Metal device.
+fn testTarget() !Self {
+    const surface = try IOSurface.init(.{
+        .width = 64,
+        .height = 64,
+        .pixel_format = .@"32BGRA",
+        .bytes_per_element = 4,
+        .colorspace = null,
+    });
+    return .{ .surface = surface, .texture = undefined, .width = 64, .height = 64 };
+}
+
+test "pixelsKept: a volatile or purged surface is not kept, and is non-volatile after" {
+    var t = try testTarget();
+    defer t.surface.release();
+
+    try std.testing.expect(t.pixelsKept());
+    try std.testing.expect(t.pixelsKept());
+
+    // The embedder held the presented frame volatile while hidden.
+    _ = try t.surface.setPurgeable(.@"volatile");
+    try std.testing.expect(!t.pixelsKept());
+    try std.testing.expectEqual(IOSurface.Purgeable.non_volatile, try t.surface.setPurgeable(.keep_current));
+    try std.testing.expect(t.pixelsKept());
+
+    // The system purged it.
+    _ = try t.surface.setPurgeable(.empty);
+    try std.testing.expect(!t.pixelsKept());
+    try std.testing.expectEqual(IOSurface.Purgeable.non_volatile, try t.surface.setPurgeable(.keep_current));
+    try std.testing.expect(t.pixelsKept());
+}
+
+test "takeDamage: a volatile or purged surface forces a full redraw" {
+    const Damage = damagepkg.Damage;
+    var t = try testTarget();
+    defer t.surface.release();
+
+    // A new target draws fully once, then only its damage.
+    try std.testing.expectEqual(Damage.full, t.takeDamage(0));
+    t.damage.collect(.row(10));
+    try std.testing.expectEqualDeep(Damage.row(10), t.takeDamage(0));
+
+    // One typed character, but the surface was held volatile: full.
+    t.damage.collect(.row(10));
+    _ = try t.surface.setPurgeable(.@"volatile");
+    try std.testing.expectEqual(Damage.full, t.takeDamage(0));
+    t.damage.collect(.row(10));
+    try std.testing.expectEqualDeep(Damage.row(10), t.takeDamage(0));
+
+    // The system purged it: full.
+    t.damage.collect(.row(10));
+    _ = try t.surface.setPurgeable(.empty);
+    try std.testing.expectEqual(Damage.full, t.takeDamage(0));
+    t.damage.collect(.row(10));
+    try std.testing.expectEqualDeep(Damage.row(10), t.takeDamage(0));
+}

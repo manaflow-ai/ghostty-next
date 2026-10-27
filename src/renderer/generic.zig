@@ -2495,8 +2495,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.api.contentEpoch()
             else
                 0;
-            const kept = frame.target.pixelsKept();
-            const draw = frame.target.damage.take(epoch, kept);
+            const draw = frame.target.takeDamage(epoch);
             // A background image blends onto the cleared target, not onto
             // the loaded pixels.
             if (frame.custom_shader_state != null or self.bg_image != null) return null;

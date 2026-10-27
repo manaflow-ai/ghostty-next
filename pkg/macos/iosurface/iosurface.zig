@@ -152,3 +152,41 @@ pub const IOSurface = opaque {
         return @enumFromInt(old);
     }
 };
+
+/// A bare BGRA surface for the tests.
+fn testSurface() !*IOSurface {
+    return IOSurface.init(.{
+        .width = 64,
+        .height = 64,
+        .pixel_format = .@"32BGRA",
+        .bytes_per_element = 4,
+        .colorspace = null,
+    });
+}
+
+test "setPurgeable returns the state before; keep_current only reads it" {
+    const surface = try testSurface();
+    defer surface.release();
+
+    // A new surface is non-volatile.
+    try std.testing.expectEqual(IOSurface.Purgeable.non_volatile, try surface.setPurgeable(.keep_current));
+    try std.testing.expectEqual(IOSurface.Purgeable.non_volatile, try surface.setPurgeable(.@"volatile"));
+
+    // Volatile now; the system may purge it at any time, which reads empty.
+    const held = try surface.setPurgeable(.keep_current);
+    try std.testing.expect(held == .@"volatile" or held == .empty);
+
+    // Making it non-volatile reports the volatile (or purged) state once.
+    const was = try surface.setPurgeable(.non_volatile);
+    try std.testing.expect(was == .@"volatile" or was == .empty);
+    try std.testing.expectEqual(IOSurface.Purgeable.non_volatile, try surface.setPurgeable(.keep_current));
+}
+
+test "setPurgeable empty purges the pages: the next state change reports empty" {
+    const surface = try testSurface();
+    defer surface.release();
+
+    try std.testing.expectEqual(IOSurface.Purgeable.non_volatile, try surface.setPurgeable(.empty));
+    try std.testing.expectEqual(IOSurface.Purgeable.empty, try surface.setPurgeable(.non_volatile));
+    try std.testing.expectEqual(IOSurface.Purgeable.non_volatile, try surface.setPurgeable(.keep_current));
+}
