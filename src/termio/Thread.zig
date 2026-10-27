@@ -54,7 +54,17 @@ pub const Mode = enum {
 
     /// Another thread's event loop runs the handlers between `attach` and
     /// `detach`; no thread is spawned. For backends with no PTY (manual).
+    /// The host (the renderer thread) can wait a long time for a GPU
+    /// frame, so the mailbox never blocks its producers (`backpressure`).
     hosted,
+
+    /// What a send to the termio mailbox does when it is full.
+    pub fn backpressure(self: Mode) termio.mailbox.Backpressure {
+        return switch (self) {
+            .own => .block,
+            .hosted => .overflow,
+        };
+    }
 };
 
 /// Allocator used for some state

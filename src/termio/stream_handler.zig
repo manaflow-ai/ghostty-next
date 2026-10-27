@@ -2071,7 +2071,7 @@ test "kitty clipboard read: targets-only never consumes a one-time grant" {
 test "kitty clipboard write: oversized text replies EFBIG" {
     const testing = std.testing;
 
-    var mailbox = try termio.Mailbox.initSPSC(testing.allocator);
+    var mailbox = try termio.Mailbox.initSPSC(testing.allocator, .block);
     defer mailbox.deinit(testing.allocator);
 
     var mutex: std.Io.Mutex = .init;
@@ -2180,7 +2180,7 @@ const TestStream = struct {
                 .cell = .{ .width = 10, .height = 20 },
                 .padding = .{},
             },
-            .termio_mailbox = try termio.Mailbox.initSPSC(alloc),
+            .termio_mailbox = try termio.Mailbox.initSPSC(alloc, .block),
             .renderer_mailbox = try renderer.Thread.Mailbox.create(alloc),
             .renderer_wakeup = try xev.Async.init(),
             .app_queue = try App.Mailbox.Queue.create(alloc),

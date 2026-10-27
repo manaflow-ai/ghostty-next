@@ -24,7 +24,7 @@ const CURSOR_BLINK_INTERVAL = 600;
 /// hardcoded with a capacity. We can make this a comptime parameter in
 /// the future if we want it configurable.
 /// Producers never block on it; see mailbox.zig.
-pub const Mailbox = @import("mailbox.zig");
+pub const Mailbox = @import("mailbox.zig").Mailbox;
 
 /// Allocator used for some state
 alloc: std.mem.Allocator,
@@ -221,18 +221,26 @@ pub fn deinit(self: *Thread) void {
 
 /// The main entrypoint for the thread.
 pub fn threadMain(self: *Thread) void {
+    self.hostGuest(threadMain_);
+}
+
+/// Run `run_renderer` (threadMain_, `fn (*Thread) !void`) with the guest
+/// attached to the loop: the guest enters before the renderer and exits
+/// after it. Tests pass a renderer that fails to start, since they have
+/// no GPU.
+pub fn hostGuest(self: *Thread, comptime run_renderer: anytype) void {
     // Hosted work starts before the renderer and stops after it.
     if (self.guest) |g| g.enter(g.ctx, &self.loop);
     defer if (self.guest) |g| g.exit(g.ctx);
 
     // Call child function so we can use errors...
-    self.threadMain_() catch |err| {
+    run_renderer(self) catch |err| {
         // In the future, we should expose this on the thread struct.
         log.warn("error in renderer err={}", .{err});
 
         // Hosted work outlives a renderer that failed to start: a manual
-        // surface's termio mailbox must keep draining, or a full mailbox
-        // blocks its producer, until the surface stops this thread.
+        // surface's termio mailbox must keep draining until the surface
+        // stops this thread.
         if (self.guest != null) self.runGuestOnly();
     };
 }
@@ -998,3 +1006,125 @@ const Compression = struct {
         };
     }
 };
+
+/// A LoopGuest for tests: it records when it enters and exits, and runs an
+/// async of its own on the host loop.
+const TestGuest = struct {
+    steps: [4]Step = undefined,
+    len: usize = 0,
+    async_h: xev.Async,
+    async_c: xev.Completion = .{},
+    /// Set on the host thread when the guest's async ran.
+    ran: std.Io.Event = .unset,
+
+    const Step = enum { enter, renderer_start, renderer_stop, exit };
+
+    fn init() !TestGuest {
+        return .{ .async_h = try xev.Async.init() };
+    }
+
+    fn deinit(self: *TestGuest) void {
+        self.async_h.deinit();
+    }
+
+    fn record(self: *TestGuest, step: Step) void {
+        self.steps[self.len] = step;
+        self.len += 1;
+    }
+
+    fn loopGuest(self: *TestGuest) LoopGuest {
+        return .{ .ctx = self, .enter = enter, .exit = exit };
+    }
+
+    fn enter(ctx: *anyopaque, loop: *xev.Loop) void {
+        const self: *TestGuest = @ptrCast(@alignCast(ctx));
+        self.record(.enter);
+        self.async_h.wait(loop, &self.async_c, TestGuest, self, asyncCallback);
+    }
+
+    fn exit(ctx: *anyopaque) void {
+        const self: *TestGuest = @ptrCast(@alignCast(ctx));
+        self.record(.exit);
+    }
+
+    fn asyncCallback(
+        self_: ?*TestGuest,
+        _: *xev.Loop,
+        _: *xev.Completion,
+        r: xev.Async.WaitError!void,
+    ) xev.CallbackAction {
+        _ = r catch unreachable;
+        self_.?.ran.set(global.io());
+        return .rearm;
+    }
+
+    fn of(thread: *Thread) *TestGuest {
+        return @ptrCast(@alignCast(thread.guest.?.ctx));
+    }
+
+    /// A renderer that starts: it runs the loop until stopped.
+    fn runRenderer(thread: *Thread) !void {
+        of(thread).record(.renderer_start);
+        defer of(thread).record(.renderer_stop);
+        thread.stop.wait(&thread.loop, &thread.stop_c, Thread, thread, stopCallback);
+        try thread.loop.run(.until_done);
+    }
+
+    /// A renderer that fails before it registers any handler.
+    fn failRenderer(_: *Thread) !void {
+        return error.TestRendererUnavailable;
+    }
+
+    /// Run `run_renderer` on a thread with this guest, notify the guest's
+    /// async, wait until it ran, then stop the thread and join it.
+    fn host(self: *TestGuest, comptime run_renderer: anytype) !void {
+        const alloc = std.testing.allocator;
+        var config: configpkg.Config = try .default(alloc);
+        defer config.deinit();
+
+        // The renderer implementation is never used.
+        var thread = try Thread.init(alloc, &config, undefined, undefined, undefined);
+        defer thread.deinit();
+        thread.guest = self.loopGuest();
+
+        const Run = struct {
+            fn run(t: *Thread) void {
+                t.hostGuest(run_renderer);
+            }
+        };
+        const thr = try std.Thread.spawn(.{}, Run.run, .{&thread});
+
+        try self.async_h.notify();
+        const ran = self.ran.waitTimeout(global.io(), .{ .duration = .{
+            .clock = .awake,
+            .raw = .fromSeconds(5),
+        } });
+        try thread.stop.notify();
+        thr.join();
+        try ran;
+    }
+};
+
+test "renderer thread: the guest enters before the renderer and exits after it stops" {
+    var guest: TestGuest = try .init();
+    defer guest.deinit();
+    try guest.host(TestGuest.runRenderer);
+
+    try std.testing.expectEqualSlices(TestGuest.Step, &.{
+        .enter,
+        .renderer_start,
+        .renderer_stop,
+        .exit,
+    }, guest.steps[0..guest.len]);
+}
+
+test "renderer thread: a renderer that fails to start still runs the guest until stopped" {
+    var guest: TestGuest = try .init();
+    defer guest.deinit();
+    try guest.host(TestGuest.failRenderer);
+
+    try std.testing.expectEqualSlices(TestGuest.Step, &.{
+        .enter,
+        .exit,
+    }, guest.steps[0..guest.len]);
+}

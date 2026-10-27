@@ -8,106 +8,21 @@
 //! producers when full would then block the main thread or the output
 //! queue on the GPU.
 //!
-//! So producers never wait. Messages go to a fixed queue; when it is
-//! full, a push with a waiting timeout (`.forever`, `.ns`) appends to an
-//! overflow list instead, in order. Once the overflow holds a message,
-//! every later push goes there too, so the renderer sees messages in
-//! push order: the queue first, then the overflow. State messages whose
-//! latest value wins (focus, visible, resize, cursor blink reset, display
-//! id, presentation health) replace an older one of the same kind in the
+//! So producers never wait: the mailbox is an OverflowQueue
+//! (datastruct/overflow_queue.zig). When the fixed queue is full, pushes
+//! with a waiting timeout overflow in order. State messages whose latest
+//! value wins (focus, visible, resize, cursor blink reset, display id,
+//! presentation health) replace an older one of the same kind in the
 //! overflow, which bounds it while the renderer is stalled. An `.instant`
 //! push keeps its meaning: it fails when the queue is full.
-const Mailbox = @This();
-
 const std = @import("std");
-const Allocator = std.mem.Allocator;
-const BlockingQueue = @import("../datastruct/main.zig").BlockingQueue;
+const OverflowQueue = @import("../datastruct/main.zig").OverflowQueue;
 const Message = @import("message.zig").Message;
-
-const log = std.log.scoped(.renderer_mailbox);
-
-const Queue = BlockingQueue(Message, capacity);
 
 /// Messages the fixed queue holds before pushes overflow.
 pub const capacity = 64;
 
-pub const Size = Queue.Size;
-pub const Timeout = Queue.Timeout;
-
-alloc: Allocator,
-queue: Queue,
-
-/// Guards `overflow` and orders every push against it.
-overflow_mutex: std.Io.Mutex = .init,
-
-/// Messages pushed while the queue was full, oldest first.
-overflow: std.ArrayListUnmanaged(Message) = .empty,
-
-pub fn create(alloc: Allocator) Allocator.Error!*Mailbox {
-    const self = try alloc.create(Mailbox);
-    self.* = .{ .alloc = alloc, .queue = .{} };
-    return self;
-}
-
-/// Free the mailbox. Call only after all producers and the consumer
-/// stopped. Like the queue, it does not free undelivered messages.
-pub fn destroy(self: *Mailbox, alloc: Allocator) void {
-    self.overflow.deinit(self.alloc);
-    alloc.destroy(self);
-}
-
-/// Push a message. Returns the number of undelivered messages after the
-/// push, or zero if an `.instant` push found the queue full. Never waits
-/// for the consumer unless the overflow cannot grow (out of memory).
-pub fn push(
-    self: *Mailbox,
-    io: std.Io,
-    value: Message,
-    timeout: Timeout,
-) Size {
-    self.overflow_mutex.lockUncancelable(io);
-    defer self.overflow_mutex.unlock(io);
-
-    // The overflow holds older messages; this one must follow them.
-    if (self.overflow.items.len == 0) {
-        const n = self.queue.push(io, value, .instant);
-        if (n > 0) return n;
-    }
-
-    if (timeout == .instant) return 0;
-
-    if (coalesces(value)) {
-        const tag = std.meta.activeTag(value);
-        for (self.overflow.items, 0..) |existing, i| {
-            if (std.meta.activeTag(existing) == tag) {
-                _ = self.overflow.orderedRemove(i);
-                break;
-            }
-        }
-    }
-
-    self.overflow.append(self.alloc, value) catch {
-        // Keep the message. This waits for the consumer, which pops the
-        // queue without the overflow lock. The order relative to the
-        // overflow is lost; that is better than losing the message.
-        log.warn("renderer mailbox overflow allocation failed, waiting", .{});
-        return self.queue.push(io, value, timeout);
-    };
-
-    return std.math.cast(Size, capacity + self.overflow.items.len) orelse
-        std.math.maxInt(Size);
-}
-
-/// Pop the oldest message without blocking. Only the renderer thread
-/// calls this.
-pub fn pop(self: *Mailbox, io: std.Io) ?Message {
-    if (self.queue.pop(io)) |value| return value;
-
-    self.overflow_mutex.lockUncancelable(io);
-    defer self.overflow_mutex.unlock(io);
-    if (self.overflow.items.len == 0) return null;
-    return self.overflow.orderedRemove(0);
-}
+pub const Mailbox = OverflowQueue(Message, capacity, .{ .replaces = coalesces });
 
 /// True for messages that only carry the latest state and own no memory.
 fn coalesces(value: Message) bool {
@@ -136,7 +51,7 @@ test "renderer mailbox: a full mailbox never blocks and keeps order" {
     }
 
     // An instant push fails as before.
-    try testing.expectEqual(@as(Size, 0), mailbox.push(io, .{ .inspector = true }, .instant));
+    try testing.expectEqual(@as(Mailbox.Size, 0), mailbox.push(io, .{ .inspector = true }, .instant));
 
     // Waiting pushes overflow without blocking. Latest-wins state
     // replaces its older value; other messages keep every copy.

@@ -2145,19 +2145,24 @@ pub fn getProcessInfo(self: *Termio, comptime info: ProcessInfo) ?ProcessInfo.Ty
 }
 
 /// Collects io_write_cb bytes for the manual backend tests.
-const TestSink = struct {
+pub const TestSink = struct {
     out: std.ArrayList(u8) = .empty,
+
+    /// Set after each write, for a test whose writes come from another
+    /// thread. That test reads `out` only after joining the thread.
+    written: ?*std.Io.Event = null,
 
     fn cb(ud: ?*anyopaque, ptr: [*]const u8, len: usize) callconv(.c) void {
         const self: *TestSink = @ptrCast(@alignCast(ud.?));
         self.out.appendSlice(std.testing.allocator, ptr[0..len]) catch
             @panic("OOM");
+        if (self.written) |e| e.set(global.io());
     }
 
     /// Check the bytes written since the last check, then forget them.
     /// (Clearing the list invalidates its old contents, so the check
     /// happens first.)
-    fn expect(self: *TestSink, expected: []const u8) !void {
+    pub fn expect(self: *TestSink, expected: []const u8) !void {
         defer self.out.clearRetainingCapacity();
         try std.testing.expectEqualStrings(expected, self.out.items);
     }
@@ -2175,7 +2180,7 @@ fn testDrainMailbox(mailbox: *termio.Mailbox) usize {
 
 /// Run `body` against a Termio with a manual backend. The surface
 /// mailbox is not set up: nothing in these tests sends to it.
-fn testManualTermio(
+pub fn testManualTermio(
     mirror: bool,
     comptime body: anytype,
 ) !void {
@@ -2211,7 +2216,7 @@ fn testManualTermio(
             .mirror = mirror,
         }) },
         .suppress_terminal_responses = mirror,
-        .mailbox = try termio.Mailbox.initSPSC(alloc),
+        .mailbox = try termio.Mailbox.initSPSC(alloc, termio.Thread.Mode.hosted.backpressure()),
         .renderer_state = &renderer_state,
         .renderer_wakeup = renderer_wakeup,
         .renderer_mailbox = renderer_mailbox,
@@ -2377,6 +2382,32 @@ test "manual: the termio handlers run on the host loop, with no thread of their 
             try sink.expect("\x1b[I");
 
             guest.exit(guest.ctx);
+        }
+    }.run;
+
+    try testManualTermio(false, body);
+}
+
+test "manual: a full termio mailbox never blocks its producer while the host loop is busy" {
+    const body = struct {
+        fn run(io: *Termio, _: *TestSink, _: bool) !void {
+            const testing = std.testing;
+
+            // No loop runs: the renderer thread that hosts the handlers is
+            // waiting for a GPU frame. Far more than the 64 messages the
+            // fixed queue holds must each return at once, with and
+            // without the lock held; a blocking send would hang here.
+            for (0..300) |i| {
+                const mutex: MutexState = if (i % 2 == 0) .locked else .unlocked;
+                if (mutex == .locked) io.renderer_state.mutex.lockUncancelable(global.io());
+                defer if (mutex == .locked) io.renderer_state.mutex.unlock(global.io());
+                io.queueMessage(.{ .jump_to_prompt = 1 }, mutex);
+                io.queueMessage(.{ .scroll_viewport = .{ .delta = 1 } }, mutex);
+            }
+
+            // Nothing was lost; the scrolls between other messages stay
+            // separate, so every message is still there.
+            try testing.expectEqual(@as(usize, 600), testDrainMailbox(&io.mailbox));
         }
     }.run;
 

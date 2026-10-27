@@ -709,7 +709,8 @@ pub fn init(
     )) rt_surface.manualIo() else null;
 
     // Create the IO thread state
-    var io_thread = try termio.Thread.init(alloc, ioThreadMode(manual_io != null));
+    const io_mode = ioThreadMode(manual_io != null);
+    var io_thread = try termio.Thread.init(alloc, io_mode);
     errdefer io_thread.deinit();
 
     self.* = .{
@@ -804,7 +805,7 @@ pub fn init(
         errdefer io_backend.deinit();
 
         // Initialize our IO mailbox
-        var io_mailbox = try termio.Mailbox.initSPSC(alloc);
+        var io_mailbox = try termio.Mailbox.initSPSC(alloc, io_mode.backpressure());
         errdefer io_mailbox.deinit(alloc);
 
         try termio.Termio.init(&self.io, alloc, .{
@@ -851,33 +852,16 @@ pub fn init(
     // to duplicate.
     try self.resize(self.size.screen);
 
-    // A hosted IO thread runs on the renderer thread's loop.
-    switch (self.io_thread.loop) {
-        .own => {},
-        .hosted => self.renderer_thread.guest = self.io_thread.loopGuest(&self.io),
-    }
-
-    // Start our renderer thread
-    self.renderer_thr = try std.Thread.spawn(
-        .{},
-        rendererpkg.Thread.threadMain,
-        .{&self.renderer_thread},
+    // Start our renderer thread and, unless it hosts the termio
+    // handlers, our IO thread.
+    const threads = try startThreads(
+        ThreadSpawner{},
+        &self.renderer_thread,
+        &self.io_thread,
+        &self.io,
     );
-    self.renderer_thr.setName(global.io(), "renderer") catch {};
-
-    // Start our IO thread, unless the renderer thread hosts it.
-    switch (self.io_thread.loop) {
-        .own => {
-            const io_thr = try std.Thread.spawn(
-                .{},
-                termio.Thread.threadMain,
-                .{ &self.io_thread, &self.io },
-            );
-            io_thr.setName(global.io(), "io") catch {};
-            self.io_thr = io_thr;
-        },
-        .hosted => {},
-    }
+    self.renderer_thr = threads.renderer;
+    self.io_thr = threads.io;
 
     // Determine our initial window size if configured. We need to do this
     // quite late in the process because our height/width are in grid dimensions,
@@ -993,9 +977,172 @@ fn ioThreadMode(manual: bool) termio.Thread.Mode {
     return if (manual) .hosted else .own;
 }
 
-test "a manual surface spawns no IO thread" {
-    try std.testing.expectEqual(termio.Thread.Mode.hosted, ioThreadMode(true));
-    try std.testing.expectEqual(termio.Thread.Mode.own, ioThreadMode(false));
+/// The threads a surface started.
+const Threads = struct {
+    renderer: std.Thread,
+
+    /// Null when the renderer thread hosts the termio handlers.
+    io: ?std.Thread,
+};
+
+/// Spawns a surface's threads. Tests pass a spawner that counts them.
+const ThreadSpawner = struct {
+    fn spawnRenderer(_: ThreadSpawner, thread: *rendererpkg.Thread) !std.Thread {
+        const thr = try std.Thread.spawn(.{}, rendererpkg.Thread.threadMain, .{thread});
+        thr.setName(global.io(), "renderer") catch {};
+        return thr;
+    }
+
+    fn spawnIo(
+        _: ThreadSpawner,
+        thread: *termio.Thread,
+        termio_impl: *termio.Termio,
+    ) !std.Thread {
+        const thr = try std.Thread.spawn(.{}, termio.Thread.threadMain, .{ thread, termio_impl });
+        thr.setName(global.io(), "io") catch {};
+        return thr;
+    }
+};
+
+/// Start the renderer thread and, for an `.own` termio thread, the IO
+/// thread. A `.hosted` termio thread becomes the renderer thread's guest
+/// before the renderer starts, so the surface spawns one thread.
+fn startThreads(
+    spawner: anytype,
+    renderer_thread: *rendererpkg.Thread,
+    io_thread: *termio.Thread,
+    termio_impl: *termio.Termio,
+) !Threads {
+    switch (io_thread.loop) {
+        .own => {},
+        .hosted => renderer_thread.guest = io_thread.loopGuest(termio_impl),
+    }
+
+    const renderer_thr = try spawner.spawnRenderer(renderer_thread);
+    const io_thr: ?std.Thread = switch (io_thread.loop) {
+        .own => try spawner.spawnIo(io_thread, termio_impl),
+        .hosted => null,
+    };
+    return .{ .renderer = renderer_thr, .io = io_thr };
+}
+
+/// Counts the threads `startThreads` spawns. The renderer thread runs the
+/// real guest hosting of renderer.Thread with a renderer that fails to
+/// start (there is no GPU in tests), so it runs the guest alone until it
+/// is stopped. The IO thread does nothing.
+const TestSpawner = struct {
+    renderer: usize = 0,
+    io: usize = 0,
+
+    fn spawnRenderer(self: *TestSpawner, thread: *rendererpkg.Thread) !std.Thread {
+        self.renderer += 1;
+        return std.Thread.spawn(.{}, runFailedRenderer, .{thread});
+    }
+
+    fn spawnIo(self: *TestSpawner, _: *termio.Thread, _: *termio.Termio) !std.Thread {
+        self.io += 1;
+        return std.Thread.spawn(.{}, idle, .{});
+    }
+
+    fn runFailedRenderer(thread: *rendererpkg.Thread) void {
+        thread.hostGuest(failToStart);
+    }
+
+    fn failToStart(_: *rendererpkg.Thread) anyerror!void {
+        return error.TestRendererUnavailable;
+    }
+
+    fn idle() void {}
+};
+
+test "a manual surface spawns one thread, which drains its termio mailbox" {
+    const body = struct {
+        fn run(io: *termio.Termio, sink: anytype, _: bool) !void {
+            const testing = std.testing;
+            const alloc = testing.allocator;
+
+            var config: configpkg.Config = try .default(alloc);
+            defer config.deinit();
+
+            // The renderer is never used: the test renderer fails to start.
+            var renderer_thread = try rendererpkg.Thread.init(
+                alloc,
+                &config,
+                undefined,
+                undefined,
+                undefined,
+            );
+            defer renderer_thread.deinit();
+
+            var io_thread = try termio.Thread.init(alloc, ioThreadMode(true));
+            defer io_thread.deinit();
+
+            var written: std.Io.Event = .unset;
+            sink.written = &written;
+            io.terminal.modes.set(.focus_event, true);
+
+            var spawner: TestSpawner = .{};
+            const threads = try startThreads(&spawner, &renderer_thread, &io_thread, io);
+            try testing.expectEqual(@as(usize, 1), spawner.renderer);
+            try testing.expectEqual(@as(usize, 0), spawner.io);
+            try testing.expect(threads.io == null);
+            try testing.expect(renderer_thread.guest != null);
+
+            // With the lock held, the focus report takes the termio
+            // mailbox; only the renderer thread drains it.
+            {
+                io.renderer_state.mutex.lockUncancelable(global.io());
+                defer io.renderer_state.mutex.unlock(global.io());
+                io.queueMessage(.{ .focused = true }, .locked);
+            }
+            const drained = written.waitTimeout(global.io(), .{ .duration = .{
+                .clock = .awake,
+                .raw = .fromSeconds(5),
+            } });
+
+            try renderer_thread.stop.notify();
+            threads.renderer.join();
+            try drained;
+            try sink.expect("\x1b[I");
+        }
+    }.run;
+
+    try termio.Termio.testManualTermio(false, body);
+}
+
+test "an exec surface spawns its own IO thread" {
+    const body = struct {
+        fn run(io: *termio.Termio, _: anytype, _: bool) !void {
+            const testing = std.testing;
+            const alloc = testing.allocator;
+
+            var config: configpkg.Config = try .default(alloc);
+            defer config.deinit();
+            var renderer_thread = try rendererpkg.Thread.init(
+                alloc,
+                &config,
+                undefined,
+                undefined,
+                undefined,
+            );
+            defer renderer_thread.deinit();
+
+            var io_thread = try termio.Thread.init(alloc, ioThreadMode(false));
+            defer io_thread.deinit();
+
+            var spawner: TestSpawner = .{};
+            const threads = try startThreads(&spawner, &renderer_thread, &io_thread, io);
+            try testing.expectEqual(@as(usize, 1), spawner.renderer);
+            try testing.expectEqual(@as(usize, 1), spawner.io);
+            try testing.expect(renderer_thread.guest == null);
+
+            // With no guest, the failed renderer thread exits at once.
+            threads.renderer.join();
+            threads.io.?.join();
+        }
+    }.run;
+
+    try termio.Termio.testManualTermio(false, body);
 }
 
 /// Close this surface. This will trigger the runtime to start the
