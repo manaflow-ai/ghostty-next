@@ -428,6 +428,8 @@ const DerivedConfig = struct {
     middle_click_action: configpkg.MiddleClickAction,
     confirm_close_surface: configpkg.ConfirmCloseSurface,
     cursor_click_to_move: bool,
+    /// `cursor-style-blink-timeout` is set: a key restarts the blink.
+    cursor_blink_timeout: bool,
     desktop_notifications: bool,
     font: font.SharedGridSet.DerivedConfig,
     mouse_interval: u64,
@@ -509,6 +511,7 @@ const DerivedConfig = struct {
             .middle_click_action = config.@"middle-click-action",
             .confirm_close_surface = config.@"confirm-close-surface",
             .cursor_click_to_move = config.@"cursor-click-to-move",
+            .cursor_blink_timeout = config.@"cursor-style-blink-timeout".duration > 0,
             .desktop_notifications = config.@"desktop-notifications",
             .font = try font.SharedGridSet.DerivedConfig.init(alloc, config),
             .mouse_interval = config.@"click-repeat-interval" * 1_000_000, // 500ms
@@ -3295,6 +3298,15 @@ pub fn keyCallback(
         }
 
         if (self.config.scroll_to_bottom.keystroke) self.io.scrollViewportLocked(.bottom);
+
+        // A blink the timeout stopped starts again at a key, before the
+        // program echoes it (or when it never does). With no timeout the
+        // blink keeps its phase, as before.
+        if (self.config.cursor_blink_timeout) {
+            _ = self.renderer_thread.mailbox.push(global.io(), .{
+                .reset_cursor_blink = {},
+            }, .{ .instant = {} });
+        }
 
         try self.queueRender();
     }

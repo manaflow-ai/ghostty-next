@@ -901,6 +901,16 @@ palette: Palette = .{},
 ///   * `false`
 @"cursor-style-blink": ?bool = null,
 
+/// How long a blinking cursor blinks with no terminal output, no key and no
+/// focus change before it stops and stays shown. The next output, key or
+/// focus gain starts the blink again. While the cursor rests, the renderer does not wake for
+/// blink ticks. This matches GTK's `gtk-cursor-blink-timeout`.
+///
+/// `0` (the default) never stops the blink.
+///
+/// The value uses the duration format of `undo-timeout`, for example `15s`.
+@"cursor-style-blink-timeout": Duration = .{ .duration = 0 },
+
 /// The color of the text under the cursor. If this is not set, a default will
 /// be chosen.
 /// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.

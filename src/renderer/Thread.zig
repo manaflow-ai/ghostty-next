@@ -63,6 +63,11 @@ cursor_h: xev.Timer,
 cursor_c: xev.Completion = .{},
 cursor_c_cancel: xev.Completion = .{},
 
+/// How long the cursor has blinked since the last output, key, focus gain
+/// or config change, in milliseconds. The blink stops when this reaches
+/// `config.cursor_blink_timeout_ms` (`blinkTimedOut`).
+cursor_blink_idle_ms: u64 = 0,
+
 /// Incremental scrollback compression scheduling.
 compression: Compression = undefined,
 
@@ -119,10 +124,13 @@ flags: packed struct {
 
 pub const DerivedConfig = struct {
     scrollback_compression: bool,
+    /// `cursor-style-blink-timeout` in milliseconds; 0 never stops the blink.
+    cursor_blink_timeout_ms: u64,
 
     pub fn init(config: *const configpkg.Config) DerivedConfig {
         return .{
             .scrollback_compression = config.@"scrollback-compression",
+            .cursor_blink_timeout_ms = config.@"cursor-style-blink-timeout".asMilliseconds(),
         };
     }
 };
@@ -383,6 +391,7 @@ fn drainMailbox(self: *Thread) !void {
                 } else {
                     // If we're focused, we immediately show the cursor again
                     // and then restart the timer.
+                    self.cursor_blink_idle_ms = 0;
                     if (self.cursor_c.state() != .active) {
                         self.flags.cursor_blink_visible = true;
                         self.cursor_h.run(
@@ -397,20 +406,7 @@ fn drainMailbox(self: *Thread) !void {
                 }
             },
 
-            .reset_cursor_blink => {
-                self.flags.cursor_blink_visible = true;
-                if (self.cursor_c.state() == .active) {
-                    self.cursor_h.reset(
-                        &self.loop,
-                        &self.cursor_c,
-                        &self.cursor_c_cancel,
-                        cursorBlinkInterval(),
-                        Thread,
-                        self,
-                        cursorTimerCallback,
-                    );
-                }
-            },
+            .reset_cursor_blink => self.restartCursorBlink(),
 
             .font_grid => |grid| {
                 self.renderer.setFontGrid(grid.grid);
@@ -485,8 +481,44 @@ fn changeConfig(self: *Thread, config: *const DerivedConfig) !void {
         }
     }
 
+    const blink_timeout_changed =
+        self.config.cursor_blink_timeout_ms != config.cursor_blink_timeout_ms;
     self.config = config.*;
     self.syncOutputWakes();
+
+    // A new timeout counts from now, and a blink stopped by the old one
+    // (or turned off, 0) starts again.
+    if (blink_timeout_changed) self.restartCursorBlink();
+}
+
+/// Output, a key (while a blink timeout is set) or a new blink timeout: the
+/// cursor shows and blinks again from the start of its interval, its idle
+/// time counted from now. A timer the blink timeout stopped runs again
+/// while focused; an unfocused surface keeps its timer stopped until focus
+/// returns (the `.focus` message).
+fn restartCursorBlink(self: *Thread) void {
+    self.flags.cursor_blink_visible = true;
+    self.cursor_blink_idle_ms = 0;
+    if (self.cursor_c.state() == .active) {
+        self.cursor_h.reset(
+            &self.loop,
+            &self.cursor_c,
+            &self.cursor_c_cancel,
+            cursorBlinkInterval(),
+            Thread,
+            self,
+            cursorTimerCallback,
+        );
+    } else if (self.flags.focused) {
+        self.cursor_h.run(
+            &self.loop,
+            &self.cursor_c,
+            cursorBlinkInterval(),
+            Thread,
+            self,
+            cursorTimerCallback,
+        );
+    }
 }
 
 /// Trigger a draw. This will not update frame data or anything, it will
@@ -727,6 +759,17 @@ fn cursorTimerCallback(
         return .disarm;
     };
 
+    t.cursor_blink_idle_ms +|= cursorBlinkInterval();
+    if (blinkTimedOut(t.cursor_blink_idle_ms, t.config.cursor_blink_timeout_ms)) {
+        // The blink ran its timeout with no output or key: the cursor stays
+        // shown and the timer stops, so a terminal at rest wakes for
+        // nothing. Output, a key, focus or a config change starts it again.
+        const was_hidden = !t.flags.cursor_blink_visible;
+        t.flags.cursor_blink_visible = true;
+        if (was_hidden and blinkTickDraws(&t.renderer.terminal_state)) t.wakeup.notify() catch {};
+        return .disarm;
+    }
+
     t.flags.cursor_blink_visible = !t.flags.cursor_blink_visible;
     // A tick changes pixels only when the cursor blinks and shows: a hidden
     // cursor (DECTCEM off, as agent TUIs keep it) or a steady one draws the
@@ -782,6 +825,32 @@ test "renderer thread: a blink tick draws only a visible blinking cursor" {
     state.cursor.visible = true;
     state.cursor.blinking = false;
     try testing.expect(!blinkTickDraws(&state));
+}
+
+/// Whether the blink stops: a timeout is set and the cursor has blinked that
+/// long since the last output, key or focus gain. GTK stops its text cursor the
+/// same way (gtk/gtktext.c `blink_cb`, `gtk-cursor-blink-timeout`).
+fn blinkTimedOut(idle_ms: u64, timeout_ms: u64) bool {
+    return timeout_ms > 0 and idle_ms >= timeout_ms;
+}
+
+test "renderer thread: the blink stops at its timeout, never with 0" {
+    const testing = std.testing;
+    try testing.expect(!blinkTimedOut(0, 15_000));
+    try testing.expect(!blinkTimedOut(14_400, 15_000));
+    try testing.expect(blinkTimedOut(15_000, 15_000));
+    try testing.expect(blinkTimedOut(15_600, 15_000));
+    // 0 keeps the blink running for good.
+    try testing.expect(!blinkTimedOut(std.math.maxInt(u64), 0));
+}
+
+test "renderer thread: the blink timeout comes from cursor-style-blink-timeout" {
+    const testing = std.testing;
+    var config = try configpkg.Config.default(testing.allocator);
+    defer config.deinit();
+    try testing.expectEqual(@as(u64, 0), DerivedConfig.init(&config).cursor_blink_timeout_ms);
+    config.@"cursor-style-blink-timeout" = .{ .duration = 15 * std.time.ns_per_s };
+    try testing.expectEqual(@as(u64, 15_000), DerivedConfig.init(&config).cursor_blink_timeout_ms);
 }
 
 fn cursorCancelCallback(
