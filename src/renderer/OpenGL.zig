@@ -410,6 +410,17 @@ pub inline fn imageTextureOptions(
     };
 }
 
+/// Copies `atlas` into its texture. The context runs its commands in
+/// order, so frames drawn before keep sampling what they were drawn with.
+pub fn uploadAtlasTexture(
+    self: *const OpenGL,
+    texture: Texture,
+    atlas: *const font.Atlas,
+) Texture.Error!void {
+    _ = self;
+    try texture.replaceRegion(0, 0, atlas.size, atlas.size, atlas.data);
+}
+
 /// Initializes a Texture suitable for the provided font atlas.
 pub fn initAtlasTexture(
     self: *const OpenGL,

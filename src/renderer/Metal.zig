@@ -908,9 +908,9 @@ pub fn initAtlasTexture(
             .device = self.device.device,
             .pixel_format = pixel_format,
             .resource_options = .{
-                // Indicate that the CPU writes to this resource but never reads it.
-                .cpu_cache_mode = .write_combined,
-                .storage_mode = self.device.default_storage_mode,
+                // Only the GPU touches it: `uploadAtlasTexture` blits
+                // into it, shaders sample it.
+                .storage_mode = .private,
             },
             .usage = .{
                 // We only need to read from this texture from a shader.
@@ -921,6 +921,70 @@ pub fn initAtlasTexture(
         atlas.size,
         null,
     );
+}
+
+/// Copies `atlas` into its texture on the GPU timeline: a blit from a
+/// staging buffer, committed on the device's one command queue. Command
+/// buffers run in commit order and Metal tracks the texture's hazards, so
+/// the blit runs after every frame of every surface committed before it
+/// and before every frame committed after it. The CPU never writes a
+/// texture a frame in flight reads, as Skia defers atlas uploads into the
+/// flush (src/gpu/ganesh/GrOpFlushState.cpp, `doUpload`).
+pub fn uploadAtlasTexture(
+    self: *const Metal,
+    texture: Texture,
+    atlas: *const font.Atlas,
+) Texture.Error!void {
+    const bytes_per_row = texture.bpp * atlas.size;
+
+    // The bytes are copied here, so later glyphs in the atlas do not
+    // reach this upload.
+    const staging = objc.Object.fromId(self.device.device.msgSend(
+        ?*anyopaque,
+        objc.sel("newBufferWithBytes:length:options:"),
+        .{
+            @as(*const anyopaque, atlas.data.ptr),
+            @as(c_ulong, bytes_per_row * atlas.size),
+            mtl.MTLResourceOptions{
+                .cpu_cache_mode = .write_combined,
+                .storage_mode = .shared,
+            },
+        },
+    ) orelse return error.MetalFailed);
+    // The command buffer retains the buffer until the blit completed.
+    defer staging.release();
+
+    const buffer = self.device.queue.msgSend(
+        objc.Object,
+        objc.sel("commandBuffer"),
+        .{},
+    );
+    const blit = buffer.msgSend(
+        objc.Object,
+        objc.sel("blitCommandEncoder"),
+        .{},
+    );
+    blit.msgSend(
+        void,
+        objc.sel("copyFromBuffer:sourceOffset:sourceBytesPerRow:sourceBytesPerImage:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:"),
+        .{
+            staging.value,
+            @as(c_ulong, 0),
+            @as(c_ulong, bytes_per_row),
+            @as(c_ulong, 0),
+            mtl.MTLSize{
+                .width = atlas.size,
+                .height = atlas.size,
+                .depth = 1,
+            },
+            texture.texture.value,
+            @as(c_ulong, 0),
+            @as(c_ulong, 0),
+            mtl.MTLOrigin{ .x = 0, .y = 0, .z = 0 },
+        },
+    );
+    blit.msgSend(void, objc.sel("endEncoding"), .{});
+    buffer.msgSend(void, objc.sel("commit"), .{});
 }
 
 /// Begin a frame.

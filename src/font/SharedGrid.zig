@@ -51,7 +51,8 @@ atlas_color: Atlas,
 
 /// The GPU copies of the two atlases, shared by every surface that draws
 /// this grid where the graphics API allows it (`renderer/AtlasTexture.zig`).
-/// Synced under `lock` held exclusively; frames hold references of their own.
+/// Synced under `lock` held shared (each texture serializes its own syncers);
+/// frames hold references of their own.
 textures: renderer.GridTextures = .{},
 
 /// The underlying resolver for font data, fallbacks, etc. The shared

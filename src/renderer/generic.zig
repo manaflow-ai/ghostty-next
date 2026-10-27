@@ -4080,13 +4080,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             if (!frame.grayscale.stale(&grid.atlas_grayscale) and
                 !frame.color.stale(&grid.atlas_color)) return;
 
-            // Exclusive: the textures are the grid's, written by whichever
-            // surface's renderer gets here first.
-            grid.lock.lockUncancelable(global.io());
-            defer grid.lock.unlock(global.io());
-            const textures = self.atlasTextures();
-            try textures.grayscale.sync(self.alloc, &self.api, &grid.atlas_grayscale, &frame.grayscale);
-            try textures.color.sync(self.alloc, &self.api, &grid.atlas_color, &frame.color);
+            // The grid lock is taken shared, as by glyph lookups; each
+            // texture's own mutex serializes the surfaces syncing it.
+            try self.atlasTextures().sync(
+                self.alloc,
+                global.io(),
+                &self.api,
+                grid,
+                &frame.grayscale,
+                &frame.color,
+            );
         }
     };
 }
