@@ -88,18 +88,10 @@ fresh: FreshFrame = .{},
 /// surface's display pass draws nothing.
 visible_hint: std.atomic.Value(bool) = .init(true),
 
-/// The renderer skips frame updates (synchronized output, a restore's
-/// frame hold): no fresh frame can come, so a display pass of a new size
-/// keeps the last frame at once instead of waiting for one. Renderer
-/// thread writes, main thread reads.
-frames_held: std.atomic.Value(bool) = .init(false),
-
-/// When the host size last changed (`setHostDrawableSize`). Main thread.
-host_size_set_at: ?std.Io.Timestamp = null,
-
-/// Frames drawn by the display pass on the main thread (the fallback) and
-/// display passes of a new host size that kept the last frame because no
-/// fresh frame came within `host_frame_wait_ns` (render counters).
+/// Frames drawn by the display pass on the main thread (the fallback), and
+/// presents of a new host size: with the renderer's fresh frame, keeping the
+/// last frame because the fresh one was not drawn yet, or refused because
+/// the renderer had committed a newer frame since (render counters).
 counters: HostFrameCounters = .{},
 
 pub const HostFrameCounters = struct {
@@ -110,6 +102,7 @@ pub const HostFrameCounters = struct {
     main_draws: std.atomic.Value(u64) = .init(0),
     fresh_presents: std.atomic.Value(u64) = .init(0),
     late: std.atomic.Value(u64) = .init(0),
+    superseded: std.atomic.Value(u64) = .init(0),
 };
 
 const FreshFrame = struct {
@@ -123,8 +116,14 @@ const FreshFrame = struct {
     mutex: std.Io.Mutex = .init,
     /// Retained; null after a take or before the first fresh frame.
     surface: ?*IOSurface = null,
-    /// Bumped on each publish; the display pass waits on it (futex).
-    seq: std.atomic.Value(u32) = .init(0),
+    /// The frame id of `surface` (PresentState.begin).
+    sequence: u64 = 0,
+};
+
+/// A fresh frame taken for a present: the caller releases `surface`.
+const Fresh = struct {
+    surface: *IOSurface,
+    sequence: u64,
 };
 
 pub const LastFrame = struct {
@@ -135,14 +134,6 @@ pub const LastFrame = struct {
 };
 
 pub const Presentation = rendererpkg.Presentation;
-
-/// How long after a new host size the display pass waits for the renderer
-/// thread's frame at that size. The renderer thread starts it when the size
-/// is set (during layout), so the wait overlaps layout and the other
-/// surfaces' builds: the main thread waits for the slowest surface once,
-/// not for each surface's draw in turn. Past it the layer keeps its last
-/// frame (top-left, clipped), and the late frame lands at the next pass.
-const host_frame_wait_ns = 4 * std.time.ns_per_ms;
 
 pub fn init(
     alloc: Allocator,
@@ -326,7 +317,6 @@ pub fn setHostDrawableSize(self: *Metal, enabled: bool, width_px: u32, height_px
     if (value != 0) self.presenter.setDrawableSize(value);
     self.host_size.store(value, .release);
     if (value == 0) self.syncDrawableSize();
-    self.host_size_set_at = .now(global.io(), .awake);
     // A fresh frame kept from an earlier size is not this size's frame,
     // even when the sizes are equal (a drag back): only a frame published
     // after this call may be presented for it.
@@ -478,42 +468,46 @@ pub fn encodePresent(self: *Metal, buffer: objc.Object, target: *const Target) P
 /// encoded, so nothing is posted to the main thread for the frame.
 pub inline fn present(self: *Metal, target: Target, sync: bool, ticket: PresentState.Ticket) !void {
     if (sync) {
-        self.presentOnMain(target.surface);
+        // Under the draw lock, where every frame gets its id: the newest.
+        _ = self.presentOnMain(target.surface, self.presenter.state.begin().sequence);
         return;
     }
     if (comptime builtin.os.tag == .macos) {
         if (target.cells_fresh and self.fresh.armed.load(.acquire) and
             target.size_generation == self.fresh.generation.load(.acquire) and
-            self.host_size.load(.acquire) != 0) self.publishFresh(target.surface);
+            self.host_size.load(.acquire) != 0) self.publishFresh(target.surface, ticket.sequence);
     }
     if (!ticket.encoded) return;
     self.setLastFrame(target.surface);
     const size = PresentState.pack(target.surface.getWidth(), target.surface.getHeight());
-    if (!self.presenter.presented(ticket, size)) return;
-    // The overlay is hidden behind a frame main presented: ask the main
-    // thread to show it through the app mailbox, which the embedder drains
-    // at its own tick. Never wait on this thread.
+    const generation = self.presenter.presented(ticket, size) orelse return;
+    // The overlay is hidden behind an older frame main presented: ask the
+    // main thread to show it through the app mailbox, which the embedder
+    // drains at its own tick. Never wait on this thread.
     const renderer: *align(1) Renderer = @fieldParentPtr("api", self);
     if (renderer.surface_mailbox.push(.present_reveal, .instant) == 0) {
-        self.presenter.state.revealPostFailed(ticket.generation);
+        self.presenter.state.revealPostFailed(generation);
     }
 }
 
-/// Sets `surface` as the root layer's contents in the main thread's
-/// transaction; the overlay hides in the same transaction until the
-/// renderer's next frame. A hidden presentation shows nothing: the frame
-/// is kept for the next show. Main thread.
-fn presentOnMain(self: *Metal, surface: *IOSurface) void {
-    if (!self.presenter.state.presenting.load(.acquire)) {
+/// Sets `surface`, frame `sequence`, as the root layer's contents in the
+/// main thread's transaction; the overlay hides in the same transaction
+/// until the renderer's next frame. Returns false, and changes nothing, when
+/// the renderer committed a newer frame (PresentState.cover). A hidden
+/// presentation shows nothing: the frame is kept for the next show. Main
+/// thread.
+fn presentOnMain(self: *Metal, surface: *IOSurface, sequence: u64) bool {
+    const state = &self.presenter.state;
+    if (!state.presenting.load(.acquire)) {
+        if (!state.commit(sequence)) return false;
         self.setLastFrame(surface);
-        return;
+        return true;
     }
+    const size = PresentState.pack(surface.getWidth(), surface.getHeight());
+    if (!self.presenter.cover(self.layer.layer, size, sequence)) return false;
     self.layer.setContents(surface);
-    self.presenter.mainPresented(
-        self.layer.layer,
-        PresentState.pack(surface.getWidth(), surface.getHeight()),
-    );
     self.setLastFrame(surface);
+    return true;
 }
 
 /// The renderer presented a frame encoded after main's last present (the
@@ -558,7 +552,7 @@ pub fn setPresentation(self: *Metal, presentation: Presentation) bool {
     switch (presentation) {
         .hidden, .purge => {
             state.presenting.store(false, .release);
-            self.presenter.hideOverlay();
+            self.presenter.hideOverlay(state.committed.load(.seq_cst));
             self.layer.setContents(null);
             if (presentation == .purge) {
                 self.purged = true;
@@ -574,9 +568,9 @@ pub fn setPresentation(self: *Metal, presentation: Presentation) bool {
                 self.purged = false;
                 self.syncDrawableSize();
             }
-            // A new hide generation: only a frame encoded from here on shows
-            // the overlay again; until then the root shows the last frame.
-            self.presenter.hideOverlay();
+            // A new hide generation: only a frame newer than the last one
+            // shows the overlay again; until then the root shows the last frame.
+            self.presenter.hideOverlay(state.committed.load(.seq_cst));
             if (self.presentedFrame()) |surface| {
                 defer surface.release();
                 self.layer.setContents(surface);
@@ -587,9 +581,10 @@ pub fn setPresentation(self: *Metal, presentation: Presentation) bool {
     }
 }
 
-/// Keeps `surface` as the newest fresh frame and wakes a display pass that
-/// waits for it. GPU completion thread.
-fn publishFresh(self: *Metal, surface: *IOSurface) void {
+/// Keeps `surface`, frame `sequence`, as the newest fresh frame for the next
+/// present of the host size. GPU completion thread (one queue's frames
+/// complete in commit order, so each publish is newer than the last).
+fn publishFresh(self: *Metal, surface: *IOSurface, sequence: u64) void {
     const io = global.io();
     surface.retain();
     const old = old: {
@@ -597,11 +592,10 @@ fn publishFresh(self: *Metal, surface: *IOSurface) void {
         defer self.fresh.mutex.unlock(io);
         const old = self.fresh.surface;
         self.fresh.surface = surface;
+        self.fresh.sequence = sequence;
         break :old old;
     };
     if (old) |o| o.release();
-    _ = self.fresh.seq.fetchAdd(1, .release);
-    io.futexWake(@TypeOf(self.fresh.seq), &self.fresh.seq, std.math.maxInt(u32));
 }
 
 /// Releases the kept fresh frame, if any. Main thread.
@@ -619,7 +613,7 @@ fn dropFresh(self: *Metal) void {
 
 /// The fresh frame if it has `width` x `height` pixels (retained; the caller
 /// releases it). A fresh frame of another size stays for its own pass.
-fn takeFresh(self: *Metal, width: usize, height: usize) ?*IOSurface {
+fn takeFresh(self: *Metal, width: usize, height: usize) ?Fresh {
     const io = global.io();
     self.fresh.mutex.lockUncancelable(io);
     defer self.fresh.mutex.unlock(io);
@@ -627,17 +621,26 @@ fn takeFresh(self: *Metal, width: usize, height: usize) ?*IOSurface {
     if (surface.getWidth() != width or surface.getHeight() != height) return null;
     self.fresh.surface = null;
     self.fresh.armed.store(false, .release);
-    return surface;
+    return .{ .surface = surface, .sequence = self.fresh.sequence };
 }
 
-/// The display pass of a host-sized surface (main thread): present the
-/// renderer thread's frame at the host size, drawn with cells rebuilt for
-/// that size (the text reflowed to the new grid, the reflow preview
-/// included), in this Core Animation transaction. Never draws on the main
-/// thread: the cells the main thread could draw with are the ones built for
-/// the previous size, so a frame drawn here would show the old text at the
-/// new size. Returns false when the display pass should draw itself: not
-/// host-sized, or nothing presented yet (the first frame).
+/// The display pass of a host-sized surface, or the embedder's pre-commit
+/// present (main thread): present the renderer thread's frame at the host
+/// size, drawn with cells rebuilt for that size (the text reflowed to the new
+/// grid, the reflow preview included), in this Core Animation transaction,
+/// only if it is drawn already. Never waits: a frame not drawn yet keeps the
+/// last frame (counted late) and lands in the overlay when it completes.
+/// Never draws on the main thread: the cells the main thread could draw with
+/// are the previous size's, so a frame drawn here would show the old text at
+/// the new size. A fresh frame older than one the renderer committed since is
+/// not presented (PresentState.cover). Returns false when the display pass
+/// should draw itself: not host-sized, or nothing presented yet (the first
+/// frame).
+///
+/// Chromium does the same at a resize: the browser shows the newest frame the
+/// renderer submitted (a fallback surface) and never blocks the UI thread on
+/// the new size's frame (content/browser/renderer_host/delegated_frame_host.cc,
+/// `EmbedSurface`).
 pub fn presentHostSized(self: *Metal) bool {
     const host = self.host_size.load(.acquire);
     if (host == 0) return false;
@@ -650,37 +653,19 @@ pub fn presentHostSized(self: *Metal) bool {
     if (shown == 0) return false;
     if (shown == PresentState.pack(width, height)) {
         // The renderer thread's frame at this size already landed.
-        if (self.takeFresh(width, height)) |surface| surface.release();
+        if (self.takeFresh(width, height)) |fresh| fresh.surface.release();
         return true;
     }
-
-    const io = global.io();
-    const set_at = self.host_size_set_at orelse std.Io.Timestamp.now(io, .awake);
-    while (true) {
-        const seq = self.fresh.seq.load(.acquire);
-        if (self.takeFresh(width, height)) |surface| {
-            defer surface.release();
-            self.presentOnMain(surface);
-            _ = self.counters.fresh_presents.fetchAdd(1, .monotonic);
-            return true;
-        }
-        // Read each time: a hold (synchronized output, a restore) or a hide that starts while
-        // this pass waits wakes it (setFramesHeld / setVisibleHint), and no frame can come then.
-        if (self.frames_held.load(.acquire) or !self.visible_hint.load(.acquire)) break;
-        const now: std.Io.Timestamp = .now(io, .awake);
-        const waited: i96 = set_at.durationTo(now).nanoseconds;
-        if (waited >= host_frame_wait_ns) break;
-        const remaining: u64 = @intCast(@as(i96, host_frame_wait_ns) - waited);
-        io.futexWaitTimeout(
-            @TypeOf(self.fresh.seq),
-            &self.fresh.seq,
-            .init(seq),
-            .{ .duration = .{ .raw = .fromNanoseconds(remaining), .clock = .awake } },
-        ) catch {};
+    const fresh = self.takeFresh(width, height) orelse {
+        _ = self.counters.late.fetchAdd(1, .monotonic);
+        return true;
+    };
+    defer fresh.surface.release();
+    if (self.presentOnMain(fresh.surface, fresh.sequence)) {
+        _ = self.counters.fresh_presents.fetchAdd(1, .monotonic);
+    } else {
+        _ = self.counters.superseded.fetchAdd(1, .monotonic);
     }
-    // Late: keep the last frame; the renderer thread's frame at this size
-    // lands in the overlay (not hidden by this pass) when it completes.
-    _ = self.counters.late.fetchAdd(1, .monotonic);
     return true;
 }
 
@@ -697,37 +682,21 @@ pub fn sizeGeneration(self: *const Metal) u64 {
 /// The surface was shown or hidden (`ghostty_surface_set_occlusion`, main
 /// thread). Shown: a frame at the host size is due now (it was resized while
 /// hidden, or its last frame was purged), so the present is armed for a frame
-/// drawn from here on and its deadline starts now, not at the last resize.
+/// drawn from here on.
 pub fn setShownFromMain(self: *Metal, visible: bool) void {
     if (visible and self.host_size.load(.acquire) != 0) {
         self.dropFresh();
         _ = self.fresh.generation.fetchAdd(1, .acq_rel);
         self.fresh.armed.store(true, .release);
-        self.host_size_set_at = .now(global.io(), .awake);
     }
     self.setVisibleHint(visible);
-}
-
-/// Frame updates are held or resumed (`frames_held`). Renderer thread.
-pub fn setFramesHeld(self: *Metal, held: bool) void {
-    if (self.frames_held.swap(held, .acq_rel) == held) return;
-    if (held) self.wakePresent();
-}
-
-/// Wakes a display pass waiting for a fresh frame, so it re-reads the hold and visibility.
-fn wakePresent(self: *Metal) void {
-    _ = self.fresh.seq.fetchAdd(1, .release);
-    global.io().futexWake(@TypeOf(self.fresh.seq), &self.fresh.seq, std.math.maxInt(u32));
 }
 
 /// The renderer started or stopped drawing (`setVisible`). Renderer thread.
 pub fn setVisibleHint(self: *Metal, visible: bool) void {
     self.visible_hint.store(visible, .release);
     // A hidden surface holds no frame for a present that cannot come.
-    if (!visible) {
-        self.dropFresh();
-        self.wakePresent();
-    }
+    if (!visible) self.dropFresh();
 }
 
 /// Returns the options to use when constructing buffers.

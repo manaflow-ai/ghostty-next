@@ -1577,10 +1577,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // all rendering.
                 if (!state.renderable()) {
                     log.debug("frames held, skipping render", .{});
-                    if (@hasDecl(GraphicsAPI, "setFramesHeld")) self.api.setFramesHeld(true);
                     return;
                 }
-                if (@hasDecl(GraphicsAPI, "setFramesHeld")) self.api.setFramesHeld(false);
                 {
                     const t = state.terminal;
                     const alt_arrows = t.screens.active_key == .alternate and

@@ -779,18 +779,23 @@ typedef struct {
   uint64_t full_swap;
   uint64_t full_resize;
   // macOS: Core Animation display passes of the surface's layer. Host-sized
-  // surfaces (ghostty_surface_set_host_sized), per display pass of a new
-  // size: frames the main thread drew itself (the first frame,
-  // or a surface that is not host-sized), frames the renderer thread drew at
-  // the new size with cells rebuilt for it and the pass presented in its
-  // transaction, and passes that kept the last frame because that frame was
-  // not ready within 4 ms of the size change (it lands at the next pass).
+  // surfaces (ghostty_surface_set_host_sized), per present of a new size
+  // (a display pass or ghostty_surface_present_host_frame): frames the main
+  // thread drew itself (the first frame, or a surface that is not
+  // host-sized), frames the renderer thread drew at the new size with cells
+  // rebuilt for it and the present put in its transaction, and presents that
+  // kept the last frame because that frame was not drawn yet (it lands when
+  // it completes; the present never waits).
   uint64_t host_display_passes;
   // ghostty_surface_present_host_frame calls.
   uint64_t host_present_calls;
   uint64_t host_main_draws;
   uint64_t host_fresh_presents;
   uint64_t host_late_presents;
+  // Presents of a new size whose frame was older than one the renderer
+  // thread had already committed to show: nothing changed (the newer frame
+  // shows when it completes). Both writers order frames by one sequence.
+  uint64_t host_superseded_presents;
 } ghostty_surface_render_counters_s;
 
 // Config types
@@ -1495,9 +1500,9 @@ GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t)
 // corner (clip the view to keep it inside), and new output still draws at the
 // held size. Each new size draws at once on the renderer thread, with the
 // cells rebuilt for it (the reflow preview included); the next display pass
-// presents that frame in its Core Animation transaction, waiting for it at
-// most 4 ms after the size was set, and otherwise keeps the last frame (the
-// renderer presents the new one itself when it completes). The main thread draws only the first
+// presents that frame in its Core Animation transaction if it is drawn by
+// then, and otherwise keeps the last frame (the renderer presents the new
+// one itself when it completes); it never waits. The main thread draws only the first
 // frame. A hidden surface's display pass draws nothing. Until the first
 // ghostty_surface_set_size the target follows the bounds.
 // Default false (the target follows the bounds). No effect on iOS, where the
@@ -1505,16 +1510,19 @@ GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t)
 GHOSTTY_API void ghostty_surface_set_host_sized(ghostty_surface_t, bool);
 // macOS, host-sized surfaces: present the frame the renderer thread draws
 // for the last ghostty_surface_set_size (cells rebuilt at that size) in the
-// caller's Core Animation transaction, waiting for it at most 4 ms after the
-// size was set; otherwise keep the last frame (the new one lands later).
-// For an embedder whose layer gets no display pass for a size change: call
-// it once per size change, after every surface of the transaction got its
-// size (so their renderers build in parallel) and before the commit, e.g. in
-// a run-loop observer ahead of Core Animation's. Returns false when there is
-// nothing to present this way (not host-sized, nothing shown yet, iOS); true
-// otherwise. Never draws on the calling thread. A surface shown again
-// (ghostty_surface_set_occlusion true) counts as a size change: call it in
-// that turn too, and its frame is waited for from the reveal. Main thread.
+// caller's Core Animation transaction if it is drawn already; otherwise
+// keep the last frame (counted in host_late_presents; the new one lands
+// when it completes). Never waits and never draws on the calling thread.
+// The renderer and this present order frames by one monotonic sequence: a
+// frame older than one the renderer already committed to show is not
+// presented (host_superseded_presents), so an older frame never replaces a
+// newer one. For an embedder whose layer gets no display pass for a size
+// change: call it once per size change, after every surface of the
+// transaction got its size and before the commit, e.g. in a run-loop
+// observer ahead of Core Animation's. Returns false when there is nothing to
+// present this way (not host-sized, nothing shown yet, iOS); true otherwise.
+// A surface shown again (ghostty_surface_set_occlusion true) counts as a
+// size change: call it in that turn too. Main thread.
 GHOSTTY_API bool ghostty_surface_present_host_frame(ghostty_surface_t);
 // The frame on screen as an IOSurfaceRef, retained (+1: CFRelease it), or
 // NULL before the first frame and after a purge. It is the renderer's own

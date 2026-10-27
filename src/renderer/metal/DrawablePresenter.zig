@@ -54,6 +54,8 @@ pub const Stats = struct {
     /// the drawable size, or a hidden presentation.
     dropped: std.atomic.Value(u64) = .init(0),
     main_presents: std.atomic.Value(u64) = .init(0),
+    /// Main presents refused because the renderer had committed a newer frame.
+    superseded: std.atomic.Value(u64) = .init(0),
     reveals: std.atomic.Value(u64) = .init(0),
     /// The renderer thread's wait in `nextDrawable`.
     wait: PresentHistogram = .{},
@@ -105,12 +107,13 @@ pub fn deinit(self: *DrawablePresenter) void {
     const s = &self.stats;
     // scripts/cmux-next/ghostty-present-form-bench.py reads this line.
     log.info(
-        "present form metal_layer: offmain={d} refused={d} main_hops=0 main_presents={d} reveals={d} " ++
+        "present form metal_layer: offmain={d} refused={d} main_hops=0 main_presents={d} superseded={d} reveals={d} " ++
             "wait_n={d} wait_sum_ns={d} wait_max_ns={d} wait_buckets_us={any}",
         .{
             s.offmain_presents.load(.monotonic),
             s.dropped.load(.monotonic),
             s.main_presents.load(.monotonic),
+            s.superseded.load(.monotonic),
             s.reveals.load(.monotonic),
             s.wait.count.load(.monotonic),
             s.wait.sum_ns.load(.monotonic),
@@ -152,19 +155,27 @@ pub fn syncGeometry(self: *DrawablePresenter, root: objc.Object) void {
     self.overlay.setProperty("contentsScale", root.getProperty(f64, "contentsScale"));
 }
 
-/// Main presented a frame as the root's contents in its transaction: the
-/// overlay hides in the same transaction until the renderer's next frame.
-/// Main thread.
-pub fn mainPresented(self: *DrawablePresenter, root: objc.Object, size: u64) void {
+/// Main presents frame `id` (`size`, packed) as the root's contents: true
+/// when it may (no newer frame is committed, PresentState.cover), and then
+/// the overlay hides in the same transaction until the renderer's next
+/// frame. False: main sets no contents, and the renderer's newer frame
+/// shows when it completes. Main thread.
+pub fn cover(self: *DrawablePresenter, root: objc.Object, size: u64, id: u64) bool {
+    if (!self.state.cover(id)) {
+        _ = self.stats.superseded.fetchAdd(1, .monotonic);
+        return false;
+    }
     _ = self.stats.main_presents.fetchAdd(1, .monotonic);
     self.syncGeometry(root);
     self.setDrawableSize(size);
-    self.hideOverlay();
+    self.overlay.setProperty("hidden", true);
+    return true;
 }
 
-/// Hides the overlay and starts a new hide generation. Main thread.
-pub fn hideOverlay(self: *DrawablePresenter) void {
-    _ = self.state.hide();
+/// Hides the overlay until a frame newer than `through`
+/// (PresentState.hide). Main thread.
+pub fn hideOverlay(self: *DrawablePresenter, through: u64) void {
+    self.state.hide(through);
     self.overlay.setProperty("hidden", true);
 }
 
@@ -246,6 +257,8 @@ pub fn encode(
     if (!self.state.accepts(width, height, drawableWidth(drawable), drawableHeight(drawable))) {
         return self.drop(ticket);
     }
+    // Main showed a newer frame of its own (PresentState.commit).
+    if (!self.state.commit(ticket.sequence)) return self.drop(ticket);
     const target = drawable.getProperty(objc.Object, "texture");
 
     const blit = buffer.msgSend(objc.Object, objc.sel("blitCommandEncoder"), .{});
@@ -276,8 +289,8 @@ fn drawableHeight(drawable: objc.Object) usize {
 }
 
 /// GPU completion thread, for a healthy frame whose present `encode`
-/// encoded. True when the renderer must ask main to show the overlay.
-pub fn presented(self: *DrawablePresenter, ticket: PresentState.Ticket, size: u64) bool {
+/// encoded. The hide generation to ask main to show the overlay in, if any.
+pub fn presented(self: *DrawablePresenter, ticket: PresentState.Ticket, size: u64) ?u64 {
     _ = self.stats.offmain_presents.fetchAdd(1, .monotonic);
     return self.state.presented(ticket, size);
 }

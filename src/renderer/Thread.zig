@@ -100,9 +100,9 @@ flags: packed struct {
     focused: bool = true,
 
     /// A resize arrived since the last frame update: the next frame draws
-    /// at once, not at the next display-link tick, so a host-sized display
-    /// pass waiting for the frame at the new size gets it in its own
-    /// transaction (Metal.presentHostSized).
+    /// at once, not at the next display-link tick, so the frame at the new
+    /// size is drawn as early as it can be, often before the pre-commit
+    /// present of that size (Metal.presentHostSized, which never waits).
     resized: bool = false,
 
     /// A frame was drawn since the last display-link tick (or the link
