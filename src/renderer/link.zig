@@ -10,6 +10,19 @@ const Terminal = terminal.Terminal;
 
 const log = std.log.scoped(.renderer_link);
 
+/// The underline a cell gets while it is part of the hovered link. A cell the
+/// program already underlined keeps its own underline (style and color): the
+/// link is marked once, and a program that underlines its links itself (Codex,
+/// Claude Code) does not get a second line on hover. Upstream Ghostty doubles a
+/// single underline there instead. Any other link cell gets a single underline.
+pub fn hoverUnderline(
+    current: terminal.Attribute.Underline,
+    hovered_link: bool,
+) terminal.Attribute.Underline {
+    if (!hovered_link) return current;
+    return if (current == .none) .single else current;
+}
+
 /// The link configuration needed for renderers.
 pub const Link = struct {
     /// The regular expression to match the link against.
@@ -472,4 +485,18 @@ test "renderCellMap mods no match" {
     try testing.expect(!result.contains(.{ .x = 3, .y = 0 }));
     try testing.expect(!result.contains(.{ .x = 1, .y = 1 }));
     try testing.expect(!result.contains(.{ .x = 1, .y = 2 }));
+}
+
+test "link hover underline: one underline per hovered link cell" {
+    const testing = std.testing;
+    // Not part of the hovered link: the cell's own underline, whatever it is.
+    try testing.expectEqual(terminal.Attribute.Underline.none, hoverUnderline(.none, false));
+    try testing.expectEqual(terminal.Attribute.Underline.single, hoverUnderline(.single, false));
+    // A plain link cell gets the hover underline.
+    try testing.expectEqual(terminal.Attribute.Underline.single, hoverUnderline(.none, true));
+    // A cell the program underlined keeps that one underline, never a doubled or replaced one.
+    try testing.expectEqual(terminal.Attribute.Underline.single, hoverUnderline(.single, true));
+    try testing.expectEqual(terminal.Attribute.Underline.double, hoverUnderline(.double, true));
+    try testing.expectEqual(terminal.Attribute.Underline.curly, hoverUnderline(.curly, true));
+    try testing.expectEqual(terminal.Attribute.Underline.dotted, hoverUnderline(.dotted, true));
 }
