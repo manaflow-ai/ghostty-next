@@ -32,6 +32,9 @@ pub const ScreenSize = size.ScreenSize;
 pub const GridSize = size.GridSize;
 pub const Padding = size.Padding;
 pub const cursorStyle = cursor.style;
+pub const cursorBlinks = cursor.blinks;
+pub const CursorExternal = cursor.External;
+pub const CursorCell = cursor.Cell;
 pub const lib = @import("lib/main.zig");
 
 /// The implementation to use for the renderer. This is comptime chosen

@@ -372,5 +372,29 @@ test "ghostty.h surface config IO fields" {
     try testing.expectEqual(@as(usize, 88), @offsetOf(T, "io_mode"));
     try testing.expectEqual(@as(usize, 96), @offsetOf(T, "io_write_cb"));
     try testing.expectEqual(@as(usize, 104), @offsetOf(T, "io_write_userdata"));
-    try testing.expectEqual(@as(usize, 112), @sizeOf(T));
+    try testing.expectEqual(@as(usize, 112), @offsetOf(T, "cursor_external"));
+    try testing.expectEqual(@as(usize, 120), @offsetOf(T, "cursor_cb"));
+    try testing.expectEqual(@as(usize, 128), @offsetOf(T, "cursor_userdata"));
+    try testing.expectEqual(@as(usize, 136), @sizeOf(T));
+}
+
+test "ghostty.h cursor cell" {
+    const testing = std.testing;
+    const c = @import("ghostty.h");
+    const Cell = @import("../renderer/cursor.zig").Cell;
+    const T = c.ghostty_cursor_cell_s;
+    inline for (.{
+        "serial", "surface", "x",     "y",       "width",    "height",
+        "column", "row",     "style", "visible", "blinking", "blink_interval_ms",
+    }) |field| {
+        try testing.expectEqual(@offsetOf(Cell, field), @offsetOf(T, field));
+    }
+    try testing.expectEqual(@sizeOf(Cell), @sizeOf(T));
+}
+
+test "ghostty.h CursorCellStyle" {
+    try @import("../lib/enum.zig").checkGhosttyHEnum(
+        @import("../renderer/cursor.zig").CellStyle,
+        "GHOSTTY_CURSOR_CELL_",
+    );
 }

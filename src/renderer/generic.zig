@@ -21,6 +21,7 @@ const rowNeverExtendBg = @import("row.zig").neverExtendBg;
 const Overlay = @import("Overlay.zig");
 const ReflowPreview = @import("ReflowPreview.zig");
 const ColorBlend = @import("ColorBlend.zig");
+const cursorpkg = @import("cursor.zig");
 
 /// Why a frame update rebuilds every row (RenderCounters).
 const RebuildCause = enum { none, config, font };
@@ -352,6 +353,25 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// table.
         cursor_text_paint: ColorBlend.Paint = .{ .rgb = .{}, .ref = ColorBlend.direct },
 
+        /// Set when the embedder shows the cursor (Options.cursor_external,
+        /// `cursorExternal`). Never changes.
+        cursor_external: ?renderer.CursorExternal = null,
+        /// The external cursor of the last frame update, null when no
+        /// cursor shows, and its glyph: drawn only into the cursor cell
+        /// (`drawCursorCell`). Under `draw_mutex`.
+        cursor_placement: ?cursorpkg.Placement = null,
+        cursor_glyph: shaderpkg.CellText = undefined,
+        cursor_publisher: cursorpkg.Publisher = .{},
+        /// The surface of the last cell handed to a frame: the embedder
+        /// shows it, so no later frame draws into it. Under `draw_mutex`.
+        cursor_shown_surface: ?*anyopaque = null,
+        /// A frame with a cursor cell failed (`frameCompleted`, on the GPU
+        /// completion thread): the next frame draws and publishes it again.
+        cursor_republish: std.atomic.Value(bool) = .init(false),
+        /// A frame update since the last async draw: the cursor cell may
+        /// have changed. Under `draw_mutex`.
+        cursor_cell_due: bool = false,
+
         /// Frame diagnostics (`ghostty_surface_render_counters`): frames
         /// drawn, cell rebuilds, and frames drawn while a color blend
         /// ran. Atomic: any thread may read them.
@@ -490,6 +510,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             /// Custom shader state, this is null if we have no custom shaders.
             custom_shader_state: ?CustomShaderState = null,
 
+            /// The external cursor cell drawn in this frame, if any.
+            cursor: CursorFrame = .{},
+
             const UniformBuffer = Buffer(shaderpkg.Uniforms);
             const CellBgBuffer = Buffer(shaderpkg.CellBg);
             const CellTextBuffer = Buffer(shaderpkg.CellText);
@@ -569,7 +592,56 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.color.deinit();
                 self.bg_image_buffer.deinit();
                 if (self.custom_shader_state) |*state| state.deinit();
+                self.cursor.deinit();
             }
+
+            /// GPU state of the external cursor cell (`drawCursorCell`),
+            /// made on first use: surfaces without an external cursor
+            /// have none.
+            const CursorFrame = struct {
+                uniforms: ?UniformBuffer = null,
+                cells: ?CellTextBuffer = null,
+                target: ?Target = null,
+                /// The cell the frame publishes once the GPU drew it
+                /// (`frameCompleted`).
+                publish: ?cursorpkg.Cell = null,
+
+                fn deinit(self: *CursorFrame) void {
+                    if (self.uniforms) |*b| b.deinit();
+                    if (self.cells) |*b| b.deinit();
+                    if (self.target) |*t| t.deinit();
+                    self.* = .{};
+                }
+
+                /// The buffers, made on first use.
+                fn buffers(self: *CursorFrame, api: GraphicsAPI) !struct { *UniformBuffer, *CellTextBuffer } {
+                    if (self.uniforms == null) self.uniforms = try UniformBuffer.init(api.uniformBufferOptions(), 1);
+                    if (self.cells == null) self.cells = try CellTextBuffer.init(api.fgBufferOptions(), 1);
+                    return .{ &self.uniforms.?, &self.cells.? };
+                }
+
+                /// A target of the cell's size to draw into: the last one
+                /// unless its size changed or the embedder may show it
+                /// (`shown`, the surface of the last published cell, or
+                /// one the window server uses).
+                fn targetFor(
+                    self: *CursorFrame,
+                    api: GraphicsAPI,
+                    width: u32,
+                    height: u32,
+                    shown: ?*anyopaque,
+                ) !*Target {
+                    if (self.target) |*t| {
+                        const may_show = shown != null and targetSurface(t) == shown;
+                        if (t.width == width and t.height == height and
+                            !may_show and !targetInUse(t)) return t;
+                        t.deinit();
+                        self.target = null;
+                    }
+                    self.target = try api.initTarget(width, height);
+                    return &self.target.?;
+                }
+            };
 
             pub fn resize(
                 self: *FrameState,
@@ -934,6 +1006,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 .api = api,
                 .swap_chain = null,
                 .has_custom_shaders = has_custom_shaders,
+                .cursor_external = options.cursor_external,
                 .reinitialize_shaders = true,
                 // Shaders are initialized lazily on the render thread.
                 .shaders = .uninit,
@@ -1298,6 +1371,22 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const display_link = self.display_link orelse return false;
             return display_link.isRunning();
         }
+
+        /// The embedder shows and blinks the cursor (Options.cursor_external):
+        /// frames leave it out and no blink tick wakes the renderer. Custom
+        /// shaders see the cursor in the frame, so with them the renderer
+        /// draws it, as it does with a background image (the cursor cell
+        /// draws the background color) and where targets have no IOSurface
+        /// to hand over (OpenGL). Render thread, or with `draw_mutex` held.
+        pub fn cursorExternal(self: *const Self) bool {
+            return cursor_cells and self.cursor_external != null and
+                self.config.custom_shaders.value.items.len == 0 and
+                self.config.bg_image == null;
+        }
+
+        /// The graphics API's targets are IOSurfaces (Metal), which the
+        /// embedder can show: only then is the cursor external.
+        const cursor_cells = @hasField(Target, "surface");
 
         /// Callback when the focus changes for the terminal this is rendering.
         ///
@@ -1921,7 +2010,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     renderer.cursorStyle(&self.terminal_state, .{
                         .preedit = critical.preedit != null,
                         .focused = self.focused,
-                        .blink_visible = cursor_blink_visible,
+                        // The embedder blinks an external cursor.
+                        .blink_visible = cursor_blink_visible or self.cursorExternal(),
                     }),
                     &critical.links,
                 ) catch |err| {
@@ -2074,10 +2164,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             //
             // While any animation is in progress (a pending animation wake)
             // every draw must actually render.
+            // A frame update's cursor cell waits for a draw off the main
+            // thread (drawCursorCell) when a sync draw took the cells.
             const needs_redraw =
                 size_changed or
                 swap_chain_rebuilt or
                 self.cells_rebuilt or
+                (!sync and (self.cursor_cell_due or self.cursor_republish.load(.acquire))) or
                 self.animationWake() != null or
                 sync;
 
@@ -2315,6 +2408,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 );
             }
 
+            // The external cursor's cell, with this frame's colors and
+            // glyphs. Only frames that complete off the main thread publish
+            // it (ghostty_surface_cursor_cb), so a sync draw leaves it to
+            // the next frame (cursor_cell_due).
+            if (cursor_cells and self.cursor_external != null and !sync) {
+                self.cursor_cell_due = false;
+                self.drawCursorCell(frame, &frame_ctx) catch |err| {
+                    log.warn("error drawing the cursor cell err={}", .{err});
+                };
+            }
+
             // If we have custom shaders, then we render them.
             if (frame.custom_shader_state) |*state| {
                 // Sync our uniforms.
@@ -2352,7 +2456,21 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         pub fn frameCompleted(
             self: *Self,
             health: Health,
+            /// The frame's target: `drawFrameLocked` draws every frame
+            /// into its `FrameState.target`.
+            target: *Target,
         ) void {
+            // The external cursor cell this frame drew. A failed frame
+            // shows neither its cells nor its cursor cell.
+            const frame: *FrameState = @fieldParentPtr("target", target);
+            if (frame.cursor.publish) |cell| {
+                frame.cursor.publish = null;
+                if (health == .healthy)
+                    self.cursor_external.?.publish(&cell)
+                else
+                    self.cursor_republish.store(true, .release);
+            }
+
             // If our health value hasn't changed, then we do nothing. We don't
             // do a cmpxchg here because strict atomicity isn't important.
             if (self.health.load(.seq_cst) != health) {
@@ -2375,6 +2493,158 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // waiting for all in-flight frames to complete, and this
             // callback is what signals that completion.
             self.swap_chain.?.releaseFrame();
+        }
+
+        /// External cursor: when the cursor moved or its cell changed, draw
+        /// the cell into a target of its size with the frame's pipelines,
+        /// buffers and colors, and hand the frame the cell to publish once
+        /// drawn (`frameCompleted`). Nothing when the cell did not change.
+        /// The frame, drawn without the cursor, stays under the cell. As in
+        /// the frame with the cursor (`Contents.setCursor`), a block is
+        /// drawn over the background and under the glyphs of its row,
+        /// which take the cursor text color in the cursor cell; other
+        /// styles are drawn over the frame alone. Called with `draw_mutex`
+        /// held.
+        fn drawCursorCell(
+            self: *Self,
+            frame: *FrameState,
+            frame_ctx: *const GraphicsAPI.Frame,
+        ) !void {
+            const placement: ?cursorpkg.Placement = if (self.cursorExternal()) self.cursor_placement else null;
+
+            // The cursor glyph, then for a block the glyphs of its row
+            // (fg_rows[row + 1]), as the frame draws them.
+            var glyph = [1]shaderpkg.CellText{self.cursor_glyph};
+            const no_texts: []const shaderpkg.CellText = &.{};
+            const row_texts: []const shaderpkg.CellText = if (placement) |p|
+                if (p.style == .block and p.row + 1 < self.cells.fg_rows.len)
+                    self.cells.fg_rows[p.row + 1].items
+                else
+                    no_texts
+            else
+                no_texts;
+            const texts = [2]std.ArrayListUnmanaged(shaderpkg.CellText){
+                .{ .items = if (placement != null) &glyph else glyph[0..0], .capacity = 1 },
+                .{ .items = @constCast(row_texts), .capacity = row_texts.len },
+            };
+
+            if (self.cursor_republish.swap(false, .acq_rel)) self.cursor_publisher.reset();
+            const key = self.cursorCellKey(placement, texts[0].items, row_texts);
+            if (!self.cursor_publisher.changed(key)) return;
+
+            const p = placement orelse {
+                frame.cursor.publish = .{ .serial = self.cursor_publisher.commit(key) };
+                self.cursor_shown_surface = null;
+                return;
+            };
+
+            const cell_width = self.grid_metrics.cell_width;
+            const cell_height = self.grid_metrics.cell_height;
+            const rect = p.rect(self.size.padding.left, self.size.padding.top, cell_width, cell_height);
+            if (rect.width == 0 or rect.height == 0) return;
+
+            const uniforms, const cells = try frame.cursor.buffers(self.api);
+            const target = try frame.cursor.targetFor(self.api, rect.width, rect.height, self.cursor_shown_surface);
+            try uniforms.sync(&.{cursorpkg.cellUniforms(
+                shaderpkg.Uniforms,
+                self.uniforms,
+                p,
+                @floatFromInt(cell_width),
+                @floatFromInt(cell_height),
+            )});
+            const count = try cells.syncFromArrayLists(&texts);
+
+            {
+                var pass = frame_ctx.renderPass(&.{.{
+                    .target = .{ .target = target.* },
+                    .clear_color = .{ 0.0, 0.0, 0.0, 0.0 },
+                }});
+                defer pass.complete();
+
+                if (p.style == .block) {
+                    pass.step(.{
+                        .pipeline = self.shaders.pipelines.bg_color,
+                        .uniforms = uniforms.buffer,
+                        .buffers = &.{ null, frame.cells_bg.buffer },
+                        .draw = .{ .type = .triangle, .vertex_count = 3 },
+                    });
+                    pass.step(.{
+                        .pipeline = self.shaders.pipelines.cell_bg,
+                        .uniforms = uniforms.buffer,
+                        .buffers = &.{ null, frame.cells_bg.buffer },
+                        .draw = .{ .type = .triangle, .vertex_count = 3 },
+                    });
+                }
+                pass.step(.{
+                    .pipeline = self.shaders.pipelines.cell_text,
+                    .uniforms = uniforms.buffer,
+                    .buffers = &.{ cells.buffer, frame.cells_bg.buffer },
+                    .textures = &.{ frame.grayscale, frame.color },
+                    .draw = .{
+                        .type = .triangle_strip,
+                        .vertex_count = 4,
+                        .instance_count = count,
+                    },
+                });
+            }
+
+            const surface = targetSurface(target);
+            self.cursor_shown_surface = surface;
+            frame.cursor.publish = .{
+                .serial = self.cursor_publisher.commit(key),
+                .surface = surface,
+                .x = rect.x,
+                .y = rect.y,
+                .width = rect.width,
+                .height = rect.height,
+                .column = p.column,
+                .row = p.row,
+                .style = .fromStyle(p.style),
+                .visible = true,
+                .blinking = p.blinking,
+                .blink_interval_ms = if (p.blinking) cursorpkg.blink_interval_ms else 0,
+            };
+        }
+
+        /// What the cursor cell shows: equal keys draw equal pixels.
+        fn cursorCellKey(
+            self: *Self,
+            placement: ?cursorpkg.Placement,
+            glyph: []const shaderpkg.CellText,
+            row_texts: []const shaderpkg.CellText,
+        ) u64 {
+            var h: std.hash.Wyhash = .init(0);
+            std.hash.autoHash(&h, placement != null);
+            const p = placement orelse return h.final();
+            std.hash.autoHash(&h, p);
+            std.hash.autoHash(&h, self.size.padding.left);
+            std.hash.autoHash(&h, self.size.padding.top);
+            std.hash.autoHash(&h, self.grid_metrics.cell_width);
+            std.hash.autoHash(&h, self.grid_metrics.cell_height);
+            // Atlas positions are per font grid.
+            std.hash.autoHash(&h, @intFromPtr(self.font_grid));
+            h.update(std.mem.sliceAsBytes(glyph));
+            h.update(std.mem.sliceAsBytes(row_texts));
+            for (p.column..@as(usize, p.column) + p.columns()) |x| {
+                if (p.row >= self.cells.size.rows or x >= self.cells.size.columns) break;
+                h.update(std.mem.asBytes(self.cells.bgCell(p.row, x)));
+            }
+            std.hash.autoHash(&h, self.uniforms.cursor_color);
+            std.hash.autoHash(&h, self.uniforms.bg_color);
+            std.hash.autoHash(&h, @as(u32, @bitCast(self.uniforms.min_contrast)));
+            std.hash.autoHash(&h, self.uniforms.bools);
+            h.update(std.mem.sliceAsBytes(&self.uniforms.palette));
+            return h.final();
+        }
+
+        /// The IOSurface of a target, null where targets have none.
+        fn targetSurface(target: *const Target) ?*anyopaque {
+            return if (comptime @hasField(Target, "surface")) @ptrCast(target.surface) else null;
+        }
+
+        /// The window server shows the target's surface.
+        fn targetInUse(target: *const Target) bool {
+            return if (comptime @hasField(Target, "surface")) target.surface.isInUse() else false;
         }
 
         /// Call this any time the background image path changes.
@@ -3184,6 +3454,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             cursor: {
                 // Clear our cursor by default.
                 self.cells.setCursor(null, null);
+                self.cursor_placement = null;
                 self.uniforms.cursor_pos = .{
                     std.math.maxInt(u16),
                     std.math.maxInt(u16),
@@ -3248,17 +3519,37 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     break :cursor_color ColorBlend.Paint.entry(table, ColorBlend.Slot.foreground);
                 };
 
-                self.addCursor(
+                const glyph_ = self.cursorGlyph(
                     &state.cursor,
                     style,
                     cursor_color,
                 );
 
+                // An external cursor is drawn only into its own cell
+                // (drawCursorCell), with uniforms of its own.
+                const external = self.cursorExternal();
+                if (external) {
+                    const glyph = glyph_ orelse break :cursor;
+                    self.cursor_glyph = glyph;
+                    self.cursor_placement = .{
+                        .style = style,
+                        .column = glyph.grid_pos[0],
+                        .row = glyph.grid_pos[1],
+                        .wide = cursor_vp.wide_tail or state.cursor.cell.wide == .wide,
+                        .blinking = renderer.cursorBlinks(state, .{
+                            .preedit = false,
+                            .focused = self.focused,
+                        }),
+                    };
+                } else {
+                    self.cells.setCursor(glyph_, style);
+                }
+
                 // If the cursor is visible then we set our uniforms.
                 if (style == .block) {
                     const wide = state.cursor.cell.wide;
 
-                    self.uniforms.cursor_pos = .{
+                    if (!external) self.uniforms.cursor_pos = .{
                         // If we are a spacer tail of a wide cell, our cursor needs
                         // to move back one cell. The saturate is to ensure we don't
                         // overflow but this shouldn't happen with well-formed input.
@@ -3331,6 +3622,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // Update that our cells rebuilt
             self.cells_rebuilt = true;
+            if (self.cursor_external != null) self.cursor_cell_due = true;
 
             // Log some things
             // log.debug("rebuildCells complete cached_runs={}", .{
@@ -3953,13 +4245,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             });
         }
 
-        fn addCursor(
+        /// The cursor's glyph cell, null when it cannot be drawn.
+        fn cursorGlyph(
             self: *Self,
             cursor_state: *const terminal.RenderState.Cursor,
             cursor_style: renderer.CursorStyle,
             cursor_paint: ColorBlend.Paint,
-        ) void {
-            const cursor_vp = cursor_state.viewport orelse return;
+        ) ?shaderpkg.CellText {
+            const cursor_vp = cursor_state.viewport orelse return null;
 
             // Add the cursor. We render the cursor over the wide character if
             // we're on the wide character tail.
@@ -4004,7 +4297,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         },
                     ) catch |err| {
                         log.warn("error rendering cursor glyph err={}", .{err});
-                        return;
+                        return null;
                     };
                 },
 
@@ -4019,16 +4312,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     },
                 ) catch |err| {
                     log.warn("error rendering cursor glyph err={}", .{err});
-                    return;
+                    return null;
                 } orelse {
                     // This should never happen because we embed nerd
                     // fonts so we just log and return instead of fallback.
                     log.warn("failed to find lock symbol for cursor codepoint=0xF023", .{});
-                    return;
+                    return null;
                 },
             };
 
-            self.cells.setCursor(.{
+            return .{
                 .atlas = .grayscale,
                 .bools = .{ .is_cursor_glyph = true },
                 .grid_pos = .{ x, cursor_vp.y },
@@ -4040,7 +4333,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     @intCast(render.glyph.offset_x),
                     @intCast(render.glyph.offset_y),
                 },
-            }, cursor_style);
+            };
         }
 
         fn addPreeditCell(

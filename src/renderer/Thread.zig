@@ -16,7 +16,7 @@ const terminalpkg = @import("../terminal/main.zig");
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.renderer_thread);
 
-const CURSOR_BLINK_INTERVAL = 600;
+const CURSOR_BLINK_INTERVAL = @import("cursor.zig").blink_interval_ms;
 
 /// Whether calls to `drawFrame` must be done from the app thread.
 ///
@@ -253,8 +253,8 @@ fn threadMain_(self: *Thread) !void {
     // Send an initial wakeup message so that we render right away.
     try self.wakeup.notify();
 
-    // Start blinking the cursor.
-    self.cursor_h.run(
+    // Start blinking the cursor, unless the embedder blinks it.
+    if (!self.renderer.cursorExternal()) self.cursor_h.run(
         &self.loop,
         &self.cursor_c,
         cursorBlinkInterval(),
@@ -366,35 +366,9 @@ fn drainMailbox(self: *Thread) !void {
                 // the animation timer for the new state.
                 self.armAnimationTimer();
 
-                if (!v) {
-                    // If we're not focused, then we stop the cursor blink
-                    if (self.cursor_c.state() == .active and
-                        self.cursor_c_cancel.state() == .dead)
-                    {
-                        self.cursor_h.cancel(
-                            &self.loop,
-                            &self.cursor_c,
-                            &self.cursor_c_cancel,
-                            void,
-                            null,
-                            cursorCancelCallback,
-                        );
-                    }
-                } else {
-                    // If we're focused, we immediately show the cursor again
-                    // and then restart the timer.
-                    if (self.cursor_c.state() != .active) {
-                        self.flags.cursor_blink_visible = true;
-                        self.cursor_h.run(
-                            &self.loop,
-                            &self.cursor_c,
-                            cursorBlinkInterval(),
-                            Thread,
-                            self,
-                            cursorTimerCallback,
-                        );
-                    }
-                }
+                // Not focused: stop the cursor blink. Focused: show the
+                // cursor at once and restart the blink.
+                self.syncCursorTimer();
             },
 
             .reset_cursor_blink => {
@@ -433,6 +407,10 @@ fn drainMailbox(self: *Thread) !void {
                 // The config affects what animation wakes the
                 // renderer needs (custom shaders, animation mode).
                 self.armAnimationTimer();
+
+                // Custom shaders draw an external cursor in the frame,
+                // so they turn the blink timer on (and off again).
+                self.syncCursorTimer();
             },
 
             .search_viewport_matches => |v| {
@@ -727,6 +705,9 @@ fn cursorTimerCallback(
         return .disarm;
     };
 
+    // The embedder blinks an external cursor: the timer stops.
+    if (t.renderer.cursorExternal()) return .disarm;
+
     t.flags.cursor_blink_visible = !t.flags.cursor_blink_visible;
     // A tick changes pixels only when the cursor blinks and shows: a hidden
     // cursor (DECTCEM off, as agent TUIs keep it) or a steady one draws the
@@ -744,6 +725,50 @@ fn cursorTimerCallback(
         cursorTimerCallback,
     );
     return .disarm;
+}
+
+/// Run the cursor blink timer while it is wanted (`blinkTimerRuns`), stop
+/// it otherwise. Starting it shows the cursor at once.
+fn syncCursorTimer(self: *Thread) void {
+    if (blinkTimerRuns(self.flags.focused, self.renderer.cursorExternal())) {
+        if (self.cursor_c.state() == .active) return;
+        self.flags.cursor_blink_visible = true;
+        self.cursor_h.run(
+            &self.loop,
+            &self.cursor_c,
+            cursorBlinkInterval(),
+            Thread,
+            self,
+            cursorTimerCallback,
+        );
+    } else if (self.cursor_c.state() == .active and
+        self.cursor_c_cancel.state() == .dead)
+    {
+        self.cursor_h.cancel(
+            &self.loop,
+            &self.cursor_c,
+            &self.cursor_c_cancel,
+            void,
+            null,
+            cursorCancelCallback,
+        );
+    }
+}
+
+/// Whether the cursor blink timer runs: the surface is focused (an
+/// unfocused cursor is a steady hollow block) and the renderer draws the
+/// cursor. An external cursor (Renderer.cursorExternal) blinks in the
+/// embedder, so its blink never wakes this thread.
+fn blinkTimerRuns(focused: bool, cursor_external: bool) bool {
+    return focused and !cursor_external;
+}
+
+test "renderer thread: the blink timer runs only for a focused cursor the renderer draws" {
+    const testing = std.testing;
+    try testing.expect(blinkTimerRuns(true, false));
+    try testing.expect(!blinkTimerRuns(false, false));
+    try testing.expect(!blinkTimerRuns(true, true));
+    try testing.expect(!blinkTimerRuns(false, true));
 }
 
 /// Whether a frame update draws at once rather than at the next
