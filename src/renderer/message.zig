@@ -28,7 +28,7 @@ pub const Message = union(enum) {
 
     /// Draw a focused blinking cursor on its own layer, blinked by the
     /// compositor, so the renderer thread runs no blink timer
-    /// (`ghostty_surface_set_cursor_blink_layer`); false draws it in the
+    /// (`ghostty_app_set_cursor_blink_layer`); false draws it in the
     /// frame again. Graphics APIs without such a layer ignore it.
     cursor_blink_layer: bool,
 

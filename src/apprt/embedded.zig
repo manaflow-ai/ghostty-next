@@ -1868,6 +1868,17 @@ pub const CAPI = struct {
         app.focusEvent(focused);
     }
 
+    /// Draw the focused blinking cursor of every surface of the app,
+    /// current and future, on its own layer, blinked by a Core Animation
+    /// opacity animation, so renderer threads run no blink timer and wake
+    /// for no blink. Off by default. Main thread only. See ghostty.h.
+    export fn ghostty_app_set_cursor_blink_layer(
+        app: *App,
+        enabled: bool,
+    ) void {
+        app.core_app.cursorBlinkLayerEvent(enabled);
+    }
+
     /// Notify the app of a global keypress capture. This will return
     /// true if the key was captured by the app, in which case the caller
     /// should not process the key.
@@ -2417,15 +2428,6 @@ pub const CAPI = struct {
     /// Update the occlusion state of a surface.
     export fn ghostty_surface_set_occlusion(surface: *Surface, visible: bool) void {
         surface.occlusionCallback(visible);
-    }
-
-    /// Draw a focused blinking cursor on its own layer, blinked by a Core
-    /// Animation opacity animation, so the renderer thread runs no blink
-    /// timer and wakes for no blink. See ghostty.h.
-    export fn ghostty_surface_set_cursor_blink_layer(surface: *Surface, enabled: bool) void {
-        surface.core_surface.cursorBlinkLayerCallback(enabled) catch |err| {
-            log.err("error setting the cursor blink layer err={}", .{err});
-        };
     }
 
     /// Filter the mods if necessary. This handles settings such as
