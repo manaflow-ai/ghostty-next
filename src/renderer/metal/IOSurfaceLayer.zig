@@ -37,6 +37,8 @@ pub fn init() !IOSurfaceLayer {
     layer.setInstanceVariable("display_ctx", .{ .value = null });
     layer.setInstanceVariable("host_size", .{ .value = null });
     layer.setInstanceVariable("present_seq", .{ .value = null });
+    layer.setInstanceVariable("cursor_layer", .{ .value = null });
+    layer.setInstanceVariable("cursor_epoch", .{ .value = null });
 
     return .{ .layer = layer };
 }
@@ -93,15 +95,163 @@ fn hostSize(layer: objc.Object) u64 {
     return @as(u64, @intFromPtr(layer.getInstanceVariable("host_size").value)) >> 3;
 }
 
-/// Sets the layer's `contents` to the provided IOSurface.
+/// A blinking cursor shown over the contents on a sublayer, in the same
+/// Core Animation transaction as the frame it belongs to. A keyframe
+/// animation of the sublayer's opacity blinks it, so the render server runs
+/// the blink and the renderer wakes for none of it (renderer CursorLayer).
+pub const Cursor = extern struct {
+    /// The cursor's pixels; null: the frame shows no blinking cursor and
+    /// the sublayer hides.
+    surface: ?*IOSurface = null,
+    /// Where it goes, in pixels from the contents' top-left corner.
+    x: u32 = 0,
+    y: u32 = 0,
+    width: u32 = 0,
+    height: u32 = 0,
+    /// A new value restarts the blink in its shown phase (a key press).
+    epoch: u64 = 0,
+    /// One blink, shown then hidden, in seconds.
+    period: f64 = 1.2,
+};
+
+/// The animation key of the cursor sublayer's blink.
+const cursor_blink_key = "ghosttyCursorBlink";
+
+/// Shows `cursor` on the cursor sublayer, or hides it. Main thread, or
+/// inside an explicit transaction under the Core Animation lock (as
+/// `setSurfaceOffMain`).
+pub fn setCursorSync(self: *IOSurfaceLayer, cursor: Cursor) void {
+    applyCursor(self.layer, cursor);
+}
+
+fn applyCursor(layer: objc.Object, cursor: Cursor) void {
+    const existing = cursorSublayer(layer);
+    if (cursor.surface == null and existing == null) return;
+
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    const key = nsString(cursor_blink_key);
+
+    const surface = cursor.surface orelse {
+        const sub = existing.?;
+        sub.msgSend(void, objc.sel("removeAnimationForKey:"), .{key.value});
+        sub.setProperty("contents", @as(?*anyopaque, null));
+        sub.setProperty("hidden", true);
+        return;
+    };
+    const sub = existing orelse createCursorSublayer(layer) orelse return;
+
+    // The contents sit at the layer's top-left corner (contentsGravity):
+    // the cursor goes there too, whichever way the layer's y axis points.
+    const scale = layer.getProperty(f64, "contentsScale");
+    if (!(scale > 0)) return;
+    const bounds = layer.getProperty(macos.graphics.Rect, "bounds");
+    const flipped = layer.msgSend(bool, objc.sel("isGeometryFlipped"), .{});
+    const width = @as(f64, @floatFromInt(cursor.width)) / scale;
+    const height = @as(f64, @floatFromInt(cursor.height)) / scale;
+    const top = @as(f64, @floatFromInt(cursor.y)) / scale;
+    sub.setProperty("contentsScale", scale);
+    sub.setProperty("frame", macos.graphics.Rect{
+        .origin = .{
+            .x = bounds.origin.x + @as(f64, @floatFromInt(cursor.x)) / scale,
+            .y = bounds.origin.y + if (flipped) top else bounds.size.height - top - height,
+        },
+        .size = .{ .width = width, .height = height },
+    });
+    sub.setProperty("contents", surface);
+    sub.setProperty("hidden", false);
+
+    // A running blink keeps its phase across frames; a new epoch (a key
+    // press) or a cursor that was hidden starts it again, shown.
+    const running = sub.msgSend(?*anyopaque, objc.sel("animationForKey:"), .{key.value}) != null;
+    if (running and cursorEpoch(layer) == cursor.epoch) return;
+    setCursorEpoch(layer, cursor.epoch);
+    sub.msgSend(void, objc.sel("removeAnimationForKey:"), .{key.value});
+    sub.msgSend(void, objc.sel("addAnimation:forKey:"), .{ blinkAnimation(cursor.period).value, key.value });
+}
+
+/// Opacity 1 for the first half of `period`, 0 for the second, forever
+/// (discrete keyframes: no fade, as Ghostty's own blink).
+fn blinkAnimation(period: f64) objc.Object {
+    const CAKeyframeAnimation = objc.getClass("CAKeyframeAnimation").?;
+    const animation = CAKeyframeAnimation.msgSend(
+        objc.Object,
+        objc.sel("animationWithKeyPath:"),
+        .{nsString("opacity").value},
+    );
+    animation.setProperty("values", nsArray(&.{ nsNumber(1), nsNumber(0) }));
+    animation.setProperty("keyTimes", nsArray(&.{ nsNumber(0), nsNumber(0.5), nsNumber(1) }));
+    animation.setProperty("calculationMode", macos.animation.kCAAnimationDiscrete);
+    animation.setProperty("duration", period);
+    animation.setProperty("repeatCount", std.math.inf(f32));
+    animation.setProperty("removedOnCompletion", false);
+    return animation;
+}
+
+/// Autoreleased; callers hold a pool.
+fn nsString(comptime value: [:0]const u8) objc.Object {
+    const NSString = objc.getClass("NSString").?;
+    return NSString.msgSend(objc.Object, objc.sel("stringWithUTF8String:"), .{value.ptr});
+}
+
+/// Autoreleased; callers hold a pool.
+fn nsNumber(value: f64) objc.c.id {
+    const NSNumber = objc.getClass("NSNumber").?;
+    return NSNumber.msgSend(objc.c.id, objc.sel("numberWithDouble:"), .{value});
+}
+
+/// Autoreleased; callers hold a pool.
+fn nsArray(items: []const objc.c.id) objc.Object {
+    const NSArray = objc.getClass("NSArray").?;
+    return NSArray.msgSend(objc.Object, objc.sel("arrayWithObjects:count:"), .{
+        items.ptr,
+        @as(c_ulong, items.len),
+    });
+}
+
+/// The cursor sublayer, once `createCursorSublayer` made it. Its superlayer
+/// retains it; the ivar does not.
+fn cursorSublayer(layer: objc.Object) ?objc.Object {
+    const value = layer.getInstanceVariable("cursor_layer").value orelse return null;
+    return objc.Object.fromId(value);
+}
+
+fn createCursorSublayer(layer: objc.Object) ?objc.Object {
+    // The same subclass: no display callback (its ivars are nil), and no
+    // implicit animations, so moving or hiding it never fades.
+    const class = getSubclass() catch return null;
+    const sub = class.msgSend(objc.Object, objc.sel("new"), .{});
+    defer sub.release();
+    sub.setProperty("contentsGravity", macos.animation.kCAGravityTopLeft);
+    sub.setProperty("hidden", true);
+    layer.msgSend(void, objc.sel("addSublayer:"), .{sub.value});
+    layer.setInstanceVariable("cursor_layer", sub);
+    return sub;
+}
+
+/// The `Cursor.epoch` of the running blink. Stored shifted like
+/// `setHostSize`: the object-typed ivar holds an 8-aligned value, never
+/// retained.
+fn cursorEpoch(layer: objc.Object) u64 {
+    return @as(u64, @intFromPtr(layer.getInstanceVariable("cursor_epoch").value)) >> 3;
+}
+
+fn setCursorEpoch(layer: objc.Object, epoch: u64) void {
+    const stored: usize = @truncate(epoch << 3);
+    layer.setInstanceVariable("cursor_epoch", .{ .value = @ptrFromInt(stored) });
+}
+
+/// Sets the layer's `contents` to the provided IOSurface, and `cursor` on
+/// the cursor sublayer.
 ///
 /// Makes sure to do so on the main thread to avoid visual artifacts.
-pub inline fn setSurface(self: *IOSurfaceLayer, surface: *IOSurface, seq: u64) !void {
+pub inline fn setSurface(self: *IOSurfaceLayer, surface: *IOSurface, cursor: Cursor, seq: u64) !void {
     // We retain the surface to make sure it's not GC'd
     // before we can set it as the contents of the layer.
     //
     // We release in the callback after setting the contents.
     surface.retain();
+    if (cursor.surface) |cursor_surface| cursor_surface.retain();
     // NOTE: Since `self.layer` is passed as an `objc.c.id`, it's
     //       automatically retained when the block is copied, so we
     //       don't need to retain it ourselves like with the surface.
@@ -109,6 +259,7 @@ pub inline fn setSurface(self: *IOSurfaceLayer, surface: *IOSurface, seq: u64) !
     var block = SetSurfaceBlock.init(.{
         .layer = self.layer.value,
         .surface = surface,
+        .cursor = cursor,
         .seq = seq,
     }, &setSurfaceCallback);
 
@@ -138,6 +289,7 @@ pub inline fn setSurfaceSync(self: *IOSurfaceLayer, surface: *IOSurface) void {
 const SetSurfaceBlock = objc.Block(struct {
     layer: objc.c.id,
     surface: *IOSurface,
+    cursor: Cursor,
     seq: u64,
 }, .{}, void);
 
@@ -149,7 +301,7 @@ const SetSurfaceBlock = objc.Block(struct {
 /// thread is pending for it, and only if no newer frame was presented
 /// (`seq`). Returns false, and changes nothing, otherwise: the caller then
 /// presents it through the main thread (`setSurface`).
-pub fn setSurfaceOffMain(self: *IOSurfaceLayer, surface: *IOSurface, seq: u64) bool {
+pub fn setSurfaceOffMain(self: *IOSurfaceLayer, surface: *IOSurface, cursor: Cursor, seq: u64) bool {
     const width = surface.getWidth();
     const height = surface.getHeight();
     const host = hostSize(self.layer);
@@ -166,6 +318,7 @@ pub fn setSurfaceOffMain(self: *IOSurfaceLayer, surface: *IOSurface, seq: u64) b
     if (seq <= presentSeq(self.layer)) return true;
     setPresentSeq(self.layer, seq);
     self.layer.setProperty("contents", surface);
+    applyCursor(self.layer, cursor);
     return true;
 }
 
@@ -211,6 +364,7 @@ fn setSurfaceCallback(
 
     // See explanation of why we retain and release in `setSurface`.
     defer surface.release();
+    defer if (block.cursor.surface) |cursor_surface| cursor_surface.release();
 
     // We check to see if the surface is the appropriate size for
     // the layer, if it's not then we discard it. This is because
@@ -240,6 +394,7 @@ fn setSurfaceCallback(
     if (block.seq != 0 and block.seq <= presentSeq(layer)) return;
     if (block.seq != 0) setPresentSeq(layer, block.seq);
     layer.setProperty("contents", surface);
+    applyCursor(layer, block.cursor);
 }
 
 pub const DisplayCallback = ?*align(8) const fn (?*anyopaque) void;
@@ -273,6 +428,8 @@ fn getSubclass() error{ObjCFailed}!objc.Class {
     if (!subclass.addIvar("display_ctx")) return error.ObjCFailed;
     if (!subclass.addIvar("host_size")) return error.ObjCFailed;
     if (!subclass.addIvar("present_seq")) return error.ObjCFailed;
+    if (!subclass.addIvar("cursor_layer")) return error.ObjCFailed;
+    if (!subclass.addIvar("cursor_epoch")) return error.ObjCFailed;
 
     subclass.replaceMethod("display", struct {
         fn display(target: objc.c.id, sel: objc.c.SEL) callconv(.c) void {

@@ -169,6 +169,9 @@ focused: bool = true,
 /// visible so reporting remains conservative.
 visible: bool = true,
 
+/// A blinking cursor blinks on its own layer (`cursorBlinkLayerCallback`).
+cursor_blink_layer: bool = false,
+
 /// Used to determine whether to continuously scroll.
 selection_scroll_active: bool = false,
 
@@ -3828,6 +3831,19 @@ pub fn occlusionCallback(self: *Surface, visible: bool) !void {
         .visible = visible,
     }, .{ .forever = {} });
 
+    try self.queueRender();
+}
+
+/// Draw a focused blinking cursor on its own layer, blinked by the
+/// compositor with no renderer wake, or in the frame again
+/// (`renderer.Message.cursor_blink_layer`). Only a change reaches the
+/// renderer; it draws the cursor the new way at once.
+pub fn cursorBlinkLayerCallback(self: *Surface, enabled: bool) !void {
+    if (self.cursor_blink_layer == enabled) return;
+    self.cursor_blink_layer = enabled;
+    _ = self.renderer_thread.mailbox.push(global.io(), .{
+        .cursor_blink_layer = enabled,
+    }, .{ .forever = {} });
     try self.queueRender();
 }
 

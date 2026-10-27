@@ -165,6 +165,41 @@ pub const Contents = struct {
         return null;
     }
 
+    /// Moves the cursor into `out`, for a blinking cursor drawn on its own
+    /// layer: a block's glyph first, then the cells the block covers (the
+    /// glyphs and decorations at `block_pos`, and the next column when
+    /// `wide`), which the text shader paints in the cursor text color, then
+    /// any other cursor glyph. These contents keep the cells under the
+    /// cursor and lose its glyph. `block_pos` is null for a cursor that is
+    /// not a block. Returns false, with `out` empty, when there is no cursor.
+    pub fn moveCursorTo(
+        self: *Contents,
+        alloc: Allocator,
+        out: *CellTextRow,
+        block_pos: ?[2]u16,
+        wide: bool,
+    ) Allocator.Error!bool {
+        out.clearRetainingCapacity();
+        if (self.size.rows == 0) return false;
+        const before = &self.fg_rows[0];
+        const after = &self.fg_rows[self.size.rows + 1];
+        if (before.items.len == 0 and after.items.len == 0) return false;
+
+        try out.appendSlice(alloc, before.items);
+        if (block_pos) |pos| {
+            if (pos[1] < self.size.rows) {
+                for (self.fg_rows[@as(usize, pos[1]) + 1].items) |cell| {
+                    const x = cell.grid_pos[0];
+                    if (x == pos[0] or (wide and x == pos[0] +| 1)) try out.append(alloc, cell);
+                }
+            }
+        }
+        try out.appendSlice(alloc, after.items);
+        before.clearRetainingCapacity();
+        after.clearRetainingCapacity();
+        return true;
+    }
+
     /// Access a background cell. Prefer this function over direct indexing
     /// of `bg_cells` in order to avoid integer size bugs causing overflows.
     pub inline fn bgCell(
@@ -410,6 +445,56 @@ test Contents {
     c.setCursor(cursor_cell, .block_hollow);
     try testing.expectEqual(cursor_cell, c.fg_rows[rows + 1].items[0]);
     try testing.expectEqual(cursor_cell, c.getCursorGlyph().?);
+}
+
+test "Contents moves the cursor and the cells its block covers" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c: Contents = .{};
+    try c.resize(alloc, .{ .rows = 4, .columns = 8 });
+    defer c.deinit(alloc);
+
+    var out: CellTextRow = .empty;
+    defer out.deinit(alloc);
+
+    // No cursor: nothing moves.
+    try testing.expect(!try c.moveCursorTo(alloc, &out, null, false));
+    try testing.expectEqual(0, out.items.len);
+
+    const glyph = struct {
+        fn at(x: u16, y: u16) shaderpkg.CellText {
+            return .{ .atlas = .grayscale, .grid_pos = .{ x, y }, .color = .{ 1, 2, 3, 255 } };
+        }
+    };
+    try c.add(alloc, .text, glyph.at(1, 2));
+    try c.add(alloc, .text, glyph.at(2, 2));
+    try c.add(alloc, .underline, glyph.at(2, 2));
+    try c.add(alloc, .text, glyph.at(3, 2));
+    try c.add(alloc, .text, glyph.at(4, 2));
+    try c.add(alloc, .text, glyph.at(2, 1));
+
+    var cursor = glyph.at(2, 2);
+    cursor.bools.is_cursor_glyph = true;
+
+    // A wide block at column 2: its glyph, then columns 2 and 3 of row 2.
+    c.setCursor(cursor, .block);
+    try testing.expect(try c.moveCursorTo(alloc, &out, .{ 2, 2 }, true));
+    try testing.expectEqual(4, out.items.len);
+    try testing.expectEqual(cursor, out.items[0]);
+    try testing.expectEqual(glyph.at(2, 2), out.items[1]);
+    try testing.expectEqual(glyph.at(2, 2), out.items[2]);
+    try testing.expectEqual(glyph.at(3, 2), out.items[3]);
+    // The contents keep the text and lose the cursor.
+    try testing.expect(c.getCursorGlyph() == null);
+    try testing.expectEqual(5, c.fg_rows[3].items.len);
+
+    // A bar: only its glyph moves.
+    c.setCursor(cursor, .bar);
+    try testing.expect(try c.moveCursorTo(alloc, &out, null, false));
+    try testing.expectEqual(1, out.items.len);
+    try testing.expectEqual(cursor, out.items[0]);
+    try testing.expect(c.getCursorGlyph() == null);
 }
 
 test "Contents resize grows and shrinks" {

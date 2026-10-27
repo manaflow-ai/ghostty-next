@@ -26,6 +26,12 @@ pub const Message = union(enum) {
     /// restarting the timer.
     reset_cursor_blink,
 
+    /// Draw a focused blinking cursor on its own layer, blinked by the
+    /// compositor, so the renderer thread runs no blink timer
+    /// (`ghostty_surface_set_cursor_blink_layer`); false draws it in the
+    /// frame again. Graphics APIs without such a layer ignore it.
+    cursor_blink_layer: bool,
+
     /// Change the font grid. This can happen for any number of reasons
     /// including a font size change, family change, etc.
     font_grid: struct {

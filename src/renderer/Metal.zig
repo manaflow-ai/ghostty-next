@@ -39,6 +39,12 @@ pub const custom_shader_y_is_down = true;
 /// Triple buffering.
 pub const swap_chain_count = 3;
 
+/// A blinking cursor can show on a sublayer of the surface's layer, blinked
+/// by a Core Animation opacity animation (`Target.cursor_layer`,
+/// `IOSurfaceLayer.Cursor`). macOS only for now: on iOS the surface's layer
+/// is itself a sublayer of the embedder's view, with UIKit's geometry.
+pub const cursor_blink_layer = builtin.os.tag == .macos;
+
 const log = std.log.scoped(.metal);
 
 layer: IOSurfaceLayer,
@@ -406,6 +412,7 @@ pub fn initTarget(self: *const Metal, width: usize, height: usize) !Target {
 pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
     if (sync) {
         self.layer.setSurfaceSync(target.surface);
+        self.layer.setCursorSync(target.cursor_layer);
     } else {
         if (comptime builtin.os.tag == .macos) {
             if (target.cells_fresh and self.fresh.armed.load(.acquire) and
@@ -416,12 +423,12 @@ pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
         // A content-only frame of a host-sized surface goes to the screen from
         // this (completion) thread: a terminal echo does not wait for main.
         if (comptime builtin.os.tag == .macos) {
-            if (self.host_size.load(.acquire) != 0 and self.layer.setSurfaceOffMain(target.surface, seq)) {
+            if (self.host_size.load(.acquire) != 0 and self.layer.setSurfaceOffMain(target.surface, target.cursor_layer, seq)) {
                 _ = self.counters.off_main_presents.fetchAdd(1, .monotonic);
                 return;
             }
         }
-        try self.layer.setSurface(target.surface, seq);
+        try self.layer.setSurface(target.surface, target.cursor_layer, seq);
     }
 }
 

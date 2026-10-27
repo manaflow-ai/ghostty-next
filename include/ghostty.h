@@ -1444,6 +1444,12 @@ GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
 GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
+// macOS: draw a focused blinking cursor on a sublayer of the surface's layer
+// whose opacity a Core Animation keyframe animation blinks, so the renderer
+// thread runs no blink timer and wakes for no blink (off by default). A key
+// press or output restarts the blink shown. With custom shaders, or on other
+// platforms, the cursor stays in the frame and blinks as before.
+GHOSTTY_API void ghostty_surface_set_cursor_blink_layer(ghostty_surface_t, bool);
 // Install a per-surface callback for performed font binding actions. Call
 // once after ghostty_surface_new; a second call returns false. Not inherited
 // by child surfaces. userdata must stay valid until ghostty_surface_free

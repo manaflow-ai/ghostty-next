@@ -16,7 +16,7 @@ const terminalpkg = @import("../terminal/main.zig");
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.renderer_thread);
 
-const CURSOR_BLINK_INTERVAL = 600;
+const CURSOR_BLINK_INTERVAL = rendererpkg.cursor_blink_interval_ms;
 
 /// Whether calls to `drawFrame` must be done from the app thread.
 ///
@@ -254,14 +254,7 @@ fn threadMain_(self: *Thread) !void {
     try self.wakeup.notify();
 
     // Start blinking the cursor.
-    self.cursor_h.run(
-        &self.loop,
-        &self.cursor_c,
-        cursorBlinkInterval(),
-        Thread,
-        self,
-        cursorTimerCallback,
-    );
+    self.syncCursorTimer();
 
     // Arm the animation timer in case the renderer already needs
     // animation wakes (e.g. custom shaders loaded at startup).
@@ -366,39 +359,19 @@ fn drainMailbox(self: *Thread) !void {
                 // the animation timer for the new state.
                 self.armAnimationTimer();
 
-                if (!v) {
-                    // If we're not focused, then we stop the cursor blink
-                    if (self.cursor_c.state() == .active and
-                        self.cursor_c_cancel.state() == .dead)
-                    {
-                        self.cursor_h.cancel(
-                            &self.loop,
-                            &self.cursor_c,
-                            &self.cursor_c_cancel,
-                            void,
-                            null,
-                            cursorCancelCallback,
-                        );
-                    }
-                } else {
-                    // If we're focused, we immediately show the cursor again
-                    // and then restart the timer.
-                    if (self.cursor_c.state() != .active) {
-                        self.flags.cursor_blink_visible = true;
-                        self.cursor_h.run(
-                            &self.loop,
-                            &self.cursor_c,
-                            cursorBlinkInterval(),
-                            Thread,
-                            self,
-                            cursorTimerCallback,
-                        );
-                    }
-                }
+                // An unfocused cursor does not blink; a focused one shows
+                // at once and blinks again.
+                self.syncCursorTimer();
+            },
+
+            .cursor_blink_layer => |v| {
+                self.renderer.setCursorBlinkLayer(v);
+                self.syncCursorTimer();
             },
 
             .reset_cursor_blink => {
                 self.flags.cursor_blink_visible = true;
+                self.renderer.restartCursorBlink();
                 if (self.cursor_c.state() == .active) {
                     self.cursor_h.reset(
                         &self.loop,
@@ -433,6 +406,9 @@ fn drainMailbox(self: *Thread) !void {
                 // The config affects what animation wakes the
                 // renderer needs (custom shaders, animation mode).
                 self.armAnimationTimer();
+
+                // Custom shaders keep the cursor in the frame.
+                self.syncCursorTimer();
             },
 
             .search_viewport_matches => |v| {
@@ -744,6 +720,50 @@ fn cursorTimerCallback(
         cursorTimerCallback,
     );
     return .disarm;
+}
+
+/// Run the cursor blink timer only while a tick can change a frame, and
+/// stop it otherwise. A cursor that starts blinking again shows at once.
+fn syncCursorTimer(self: *Thread) void {
+    if (cursorTimerNeeded(self.flags.focused, self.renderer.cursorBlinksOnLayer())) {
+        if (self.cursor_c.state() != .active) {
+            self.flags.cursor_blink_visible = true;
+            self.cursor_h.run(
+                &self.loop,
+                &self.cursor_c,
+                cursorBlinkInterval(),
+                Thread,
+                self,
+                cursorTimerCallback,
+            );
+        }
+    } else if (self.cursor_c.state() == .active and
+        self.cursor_c_cancel.state() == .dead)
+    {
+        self.cursor_h.cancel(
+            &self.loop,
+            &self.cursor_c,
+            &self.cursor_c_cancel,
+            void,
+            null,
+            cursorCancelCallback,
+        );
+    }
+}
+
+/// Whether the renderer thread blinks the cursor with its timer: only a
+/// focused cursor blinks, and one on its own layer (renderer CursorLayer)
+/// is blinked by the compositor, with no renderer wake at all.
+fn cursorTimerNeeded(focused: bool, blinks_on_layer: bool) bool {
+    return focused and !blinks_on_layer;
+}
+
+test "renderer thread: the blink timer runs only for a focused cursor in the frame" {
+    const testing = std.testing;
+    try testing.expect(cursorTimerNeeded(true, false));
+    try testing.expect(!cursorTimerNeeded(false, false));
+    try testing.expect(!cursorTimerNeeded(true, true));
+    try testing.expect(!cursorTimerNeeded(false, true));
 }
 
 /// Whether a frame update draws at once rather than at the next

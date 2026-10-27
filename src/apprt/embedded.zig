@@ -2419,6 +2419,15 @@ pub const CAPI = struct {
         surface.occlusionCallback(visible);
     }
 
+    /// Draw a focused blinking cursor on its own layer, blinked by a Core
+    /// Animation opacity animation, so the renderer thread runs no blink
+    /// timer and wakes for no blink. See ghostty.h.
+    export fn ghostty_surface_set_cursor_blink_layer(surface: *Surface, enabled: bool) void {
+        surface.core_surface.cursorBlinkLayerCallback(enabled) catch |err| {
+            log.err("error setting the cursor blink layer err={}", .{err});
+        };
+    }
+
     /// Filter the mods if necessary. This handles settings such as
     /// `macos-option-as-alt`. The filtered mods should be used for
     /// key translation but should NOT be sent back via the `_key`

@@ -11,6 +11,7 @@ const graphics = macos.graphics;
 const IOSurface = macos.iosurface.IOSurface;
 
 const mtl = @import("api.zig");
+const IOSurfaceLayer = @import("IOSurfaceLayer.zig");
 
 const log = std.log.scoped(.metal);
 
@@ -49,6 +50,11 @@ cells_fresh: bool = false,
 /// The host size generation (`Metal.sizeGeneration`) when this frame's draw
 /// began: a frame publishes for a display pass only in its own generation.
 size_generation: u64 = 0,
+
+/// The blinking cursor this frame shows on its own layer, presented with
+/// the frame (`IOSurfaceLayer.Cursor`; no surface: none). Set before each
+/// draw.
+cursor_layer: IOSurfaceLayer.Cursor = .{},
 
 pub fn init(opts: Options) !Self {
     // We set our surface's color space to Display P3.
