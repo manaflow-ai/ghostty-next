@@ -934,10 +934,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 // Graphics API stuff
                 .api = api,
-                .vsync = .{ .external = if (comptime @hasField(apprt.Surface, "vsync_external"))
-                    options.rt_surface.vsync_external
-                else
-                    null },
+                .vsync = initVsync(&options),
                 .swap_chain = null,
                 .has_custom_shaders = has_custom_shaders,
                 .reinitialize_shaders = true,
@@ -1405,6 +1402,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 display_id,
                 DisplayLinkFactory{ .draw_now = draw_now },
             );
+        }
+
+        /// The pacing of a renderer made with `options`.
+        fn initVsync(options: *const renderer.Options) vsyncpkg.Pacer(DisplayLink) {
+            return .{ .external = options.vsync_external };
         }
 
         /// Makes this platform's display link, ticking `draw_now`. Only a
@@ -4246,4 +4248,51 @@ fn rowKey(
     std.hash.autoHash(&h, cursor_x);
     for (highlights.items) |hl| std.hash.autoHash(&h, hl);
     return h.final();
+}
+
+test "renderer external vsync: the options reach the pacer, syncing makes no display link" {
+    const testing = std.testing;
+    const R = renderer.Renderer;
+
+    const Embedder = struct {
+        calls: [4]bool = undefined,
+        len: usize = 0,
+
+        fn wanted(ud: ?*anyopaque, on: bool) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ud.?));
+            self.calls[self.len] = on;
+            self.len += 1;
+        }
+    };
+    var embedder: Embedder = .{};
+
+    // The renderer reads only the vsync option on this path.
+    var options: renderer.Options = undefined;
+    options.vsync_external = try .fromConfig(true, &Embedder.wanted, &embedder);
+
+    var draw_now = try xev.Async.init();
+    defer draw_now.deinit();
+
+    // Only the fields syncDisplayLink reads are set.
+    const r = try testing.allocator.create(R);
+    defer testing.allocator.destroy(r);
+    r.vsync = R.initVsync(&options);
+    r.config.vsync = true;
+    r.cells_rebuilt = true;
+
+    // A new frame on a visible surface: the embedder is asked for ticks,
+    // by the sync the thread-enter, display-realized and display-id paths
+    // run, with the factory they pass.
+    r.visible = true;
+    r.syncDisplayLink(7, &draw_now);
+    try testing.expect(r.hasVsync());
+
+    // Hidden: no more ticks.
+    r.visible = false;
+    r.syncDisplayLink(null, &draw_now);
+    try testing.expect(!r.hasVsync());
+
+    try testing.expectEqual(@as(u32, 0), r.vsync.link_creates);
+    try testing.expect(r.vsync.link == null);
+    try testing.expectEqualSlices(bool, &.{ true, false }, embedder.calls[0..embedder.len]);
 }

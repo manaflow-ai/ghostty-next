@@ -25,6 +25,22 @@ pub const External = struct {
     /// What the embedder was last told.
     wanted: bool = false,
 
+    /// The pacing a surface is configured with
+    /// (`ghostty_surface_config_s` `vsync_external`, `vsync_wanted_cb`,
+    /// `vsync_userdata`): null without the flag; the flag needs the
+    /// callback.
+    pub fn fromConfig(
+        enabled: bool,
+        wanted_cb: ?WantedCallback,
+        userdata: ?*anyopaque,
+    ) error{MissingVsyncWantedCallback}!?External {
+        if (!enabled) return null;
+        return .{
+            .wanted_cb = wanted_cb orelse return error.MissingVsyncWantedCallback,
+            .userdata = userdata,
+        };
+    }
+
     /// Tells the embedder on a change only, so calls alternate.
     fn want(self: *External, on: bool) void {
         if (self.wanted == on) return;
@@ -45,6 +61,10 @@ pub fn Pacer(comptime Link: type) type {
 
         /// Set when the embedder paces the renderer.
         external: ?External = null,
+
+        /// Display links made or tried (`factory.create()` calls). Stays 0
+        /// with `external` set.
+        link_creates: u32 = 0,
 
         /// Whether ticks are coming: the renderer then draws only on a
         /// tick or when it must draw now (renderer.Thread `drawFrame`).
@@ -77,6 +97,7 @@ pub fn Pacer(comptime Link: type) type {
 
             const link = self.link orelse link: {
                 if (!enabled) return;
+                self.link_creates += 1;
                 const created = factory.create() orelse return;
                 self.link = created;
                 break :link created;
@@ -206,6 +227,7 @@ test "vsync external: no display link is made, the embedder is asked on each edg
     pacer.releaseLink();
 
     try testing.expectEqual(@as(u32, 0), creates);
+    try testing.expectEqual(@as(u32, 0), pacer.link_creates);
     try testing.expectEqual(@as(u32, 0), link.starts + link.stops + link.releases);
     try testing.expectEqual(@as(?u32, null), link.display_id);
     try testing.expectEqualSlices(
@@ -246,6 +268,7 @@ test "vsync standalone: one link, made once, run while dirty" {
 
     pacer.sync(true, true, 3, factory);
     try testing.expectEqual(@as(u32, 1), creates);
+    try testing.expectEqual(@as(u32, 1), pacer.link_creates);
     try testing.expectEqual(@as(?u32, 3), link.display_id);
     try testing.expect(pacer.running());
 
@@ -311,4 +334,24 @@ test "vsync: no link type, no ticks unless external" {
     try testing.expect(external.running());
     external.stop();
     try testing.expectEqualSlices(bool, &.{ true, false }, embedder.received());
+}
+
+test "vsync external: the flag needs the wanted callback" {
+    const testing = std.testing;
+    var embedder: TestEmbedder = .{};
+
+    try testing.expectEqual(@as(?External, null), try External.fromConfig(false, null, null));
+    try testing.expectEqual(
+        @as(?External, null),
+        try External.fromConfig(false, &TestEmbedder.wanted, &embedder),
+    );
+    try testing.expectError(
+        error.MissingVsyncWantedCallback,
+        External.fromConfig(true, null, &embedder),
+    );
+
+    const external = (try External.fromConfig(true, &TestEmbedder.wanted, &embedder)).?;
+    try testing.expect(external.wanted_cb == &TestEmbedder.wanted);
+    try testing.expect(external.userdata == @as(?*anyopaque, &embedder));
+    try testing.expect(!external.wanted);
 }

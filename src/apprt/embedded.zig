@@ -563,9 +563,18 @@ pub const Surface = struct {
 
         /// Passed as the first argument of vsync_wanted_cb.
         vsync_userdata: ?*anyopaque = null,
+
+        /// The renderer's external vsync from these options; refuses
+        /// vsync_external without vsync_wanted_cb.
+        pub fn vsyncExternal(self: *const Options) error{MissingVsyncWantedCallback}!?vsync.External {
+            return .fromConfig(self.vsync_external, self.vsync_wanted_cb, self.vsync_userdata);
+        }
     };
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
+        // Refused before anything is made or registered.
+        const vsync_external = try opts.vsyncExternal();
+
         self.* = .{
             .app = app,
             .platform = try .init(opts.platform_tag, opts.platform),
@@ -583,10 +592,7 @@ pub const Surface = struct {
             ) orelse return error.InvalidIoMode,
             .io_write_cb = opts.io_write_cb,
             .io_write_userdata = opts.io_write_userdata,
-            .vsync_external = if (opts.vsync_external) .{
-                .wanted_cb = opts.vsync_wanted_cb orelse return error.MissingVsyncWantedCallback,
-                .userdata = opts.vsync_userdata,
-            } else null,
+            .vsync_external = vsync_external,
         };
 
         // Add ourselves to the list of surfaces on the app.
@@ -1393,6 +1399,32 @@ comptime {
             @sizeOf(O) != 136)
             @compileError("Surface.Options IO and vsync fields must match ghostty_surface_config_s");
     }
+}
+
+test "Surface.Options vsync_external without vsync_wanted_cb is refused" {
+    const testing = std.testing;
+    const Wanted = struct {
+        fn wanted(_: ?*anyopaque, _: bool) callconv(.c) void {}
+    };
+    var userdata: u8 = 0;
+
+    // Surface.init returns this error before it makes or registers anything.
+    try testing.expectError(
+        error.MissingVsyncWantedCallback,
+        (Surface.Options{ .vsync_external = true }).vsyncExternal(),
+    );
+    try testing.expectEqual(
+        @as(?vsync.External, null),
+        try (Surface.Options{ .vsync_wanted_cb = &Wanted.wanted }).vsyncExternal(),
+    );
+
+    const external = (try (Surface.Options{
+        .vsync_external = true,
+        .vsync_wanted_cb = &Wanted.wanted,
+        .vsync_userdata = &userdata,
+    }).vsyncExternal()).?;
+    try testing.expect(external.wanted_cb == &Wanted.wanted);
+    try testing.expect(external.userdata == @as(?*anyopaque, &userdata));
 }
 
 /// Inspector is the state required for the terminal inspector. A terminal
