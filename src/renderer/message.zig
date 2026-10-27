@@ -26,6 +26,11 @@ pub const Message = union(enum) {
     /// restarting the timer.
     reset_cursor_blink,
 
+    /// Draw the next frame even if nothing it shows changed: the apprt
+    /// asked for a frame (`ghostty_surface_refresh`). Without it a wake
+    /// that changes nothing draws nothing.
+    redraw,
+
     /// Change the font grid. This can happen for any number of reasons
     /// including a font size change, family change, etc.
     font_grid: struct {

@@ -3924,7 +3924,9 @@ pub fn refreshCallback(self: *Surface) !void {
     crash.sentry.thread_state = self.crashThreadState();
     defer crash.sentry.thread_state = null;
 
-    // The point of this callback is to schedule a render, so do that.
+    // The point of this callback is to schedule a render, so do that: a
+    // frame is drawn even if nothing it shows changed.
+    _ = self.renderer_thread.mailbox.push(global.io(), .redraw, .forever);
     try self.queueRender();
 }
 

@@ -207,10 +207,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// cells goes into a separate shader.
         cells: cellpkg.Contents,
 
-        /// Set to true after rebuildCells is called. This can be used
-        /// to determine if any possible changes have been made to the
-        /// cells for the draw call.
-        cells_rebuilt: bool = false,
+        /// What the next frame shows changed since the last draw: a frame
+        /// update changed a row, the cursor, the uniforms, the color
+        /// target, images or the overlay (`FrameShown`), or a setter
+        /// changed an input of the draw (config, font grid, screen size,
+        /// focus, shown again, `markFrameChanged`). Otherwise the next draw
+        /// draws nothing and the display link stops. Under `draw_mutex`.
+        frame_changed: bool = false,
 
         /// The screen size (packed width << 32 | height) the cells were
         /// last built for. Under `draw_mutex`.
@@ -1201,6 +1204,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.terminal_state.dirty = .full;
         }
 
+        /// The next draw draws a frame even if nothing it shows changed
+        /// (focus, shown again, or the apprt asked: `ghostty_surface_refresh`).
+        /// Takes the draw mutex.
+        pub fn markFrameChanged(self: *Self) void {
+            self.draw_mutex.lockUncancelable(global.io());
+            defer self.draw_mutex.unlock(global.io());
+            self.frame_changed = true;
+        }
+
         /// Called when we get an updated display ID for our display link.
         pub fn setMacOSDisplayID(
             self: *Self,
@@ -1309,6 +1321,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // Flag that we need to update our custom shaders
             self.custom_shader_focused_changed = true;
+            self.markFrameChanged();
 
             self.syncDisplayLink(null, null);
         }
@@ -1329,6 +1342,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Must be called on the render thread.
         pub fn setVisible(self: *Self, visible: bool) void {
             self.visible = visible;
+            // A surface shown again draws once even with nothing new: the
+            // apprt may have dropped what it showed while hidden.
+            if (visible) self.markFrameChanged();
             if (@hasDecl(GraphicsAPI, "setVisibleHint")) self.api.setVisibleHint(visible);
             self.syncDisplayLink(null, null);
 
@@ -1455,7 +1471,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Non-visible windows never vsync
                 self.visible and
                 // Only vsync if we have cell changes or animation
-                (self.cells_rebuilt or self.animationWake() != null);
+                (self.frame_changed or self.animationWake() != null);
 
             if (should_run) {
                 if (!display_link.isRunning()) {
@@ -1515,6 +1531,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // to be rendered.
             self.markDirty();
             self.full_rebuild_cause = .font;
+            self.frame_changed = true;
         }
 
         /// Update uniforms that are based on the font grid.
@@ -1526,6 +1543,39 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 @floatFromInt(self.grid_metrics.cell_height),
             };
         }
+
+        /// What a frame shows besides the cells of its rows: the cursor
+        /// cell, the uniforms (cursor position and width, background,
+        /// padding, grid), the block cursor's text color, the color
+        /// target and the screen size the cells were built for. Equal
+        /// before and after a frame update that built no row means the
+        /// frame on screen is still right. Chromium draws a frame only
+        /// for damage the same way: no damage, no draw
+        /// (cc/scheduler/scheduler_state_machine.cc, `ShouldDraw` needs
+        /// `needs_redraw_`).
+        const FrameShown = struct {
+            cursor: ?shaderpkg.CellText,
+            cursor_text: ColorBlend.Paint,
+            uniforms: shaderpkg.Uniforms,
+            colors: ColorBlend.Table,
+            has_colors: bool,
+            cells_screen: u64,
+
+            fn of(r: *Self) FrameShown {
+                return .{
+                    .cursor = r.cells.getCursorGlyph(),
+                    .cursor_text = r.cursor_text_paint,
+                    .uniforms = r.uniforms,
+                    .colors = r.color_blend.to,
+                    .has_colors = r.color_blend.has_colors,
+                    .cells_screen = r.cells_screen,
+                };
+            }
+
+            fn eql(a: *const FrameShown, b: *const FrameShown) bool {
+                return std.meta.eql(a.*, b.*);
+            }
+        };
 
         /// Update the frame data.
         pub fn updateFrame(
@@ -1577,6 +1627,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 swapped: bool,
                 resized: bool,
                 color_transition: ColorBlend.Spec,
+                kitty_updated: bool,
             };
 
             // Update all our data as tightly as possible within the mutex.
@@ -1721,7 +1772,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // If we have any virtual references, we must also rebuild our
                 // kitty state on every frame because any cell change can move
                 // an image.
-                if (self.images.kittyRequiresUpdate(drawn)) {
+                const kitty_updated = self.images.kittyRequiresUpdate(drawn);
+                if (kitty_updated) {
                     // We need to grab the draw mutex since this updates
                     // our image state that drawFrame uses.
                     self.draw_mutex.lockUncancelable(global.io());
@@ -1776,6 +1828,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .resized = resized,
                     .color_config_at = state.color_config_at,
                     .color_transition = state.color_transition,
+                    .kitty_updated = kitty_updated,
                 };
             };
 
@@ -1851,7 +1904,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             defer self.terminal_state.dirty = .false;
 
             // Rebuild the overlay image if we have one. We can do this
-            // outside of any critical areas.
+            // outside of any critical areas. An overlay shown now or before
+            // counts as a change: it is redrawn from the inspector each time.
+            const overlay_changed = self.overlay != null or critical.overlay_features.len > 0;
             self.rebuildOverlay(
                 critical.overlay_features,
             ) catch |err| {
@@ -1865,6 +1920,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             {
                 self.draw_mutex.lockUncancelable(global.io());
                 defer self.draw_mutex.unlock(global.io());
+
+                // What the frame shows outside its rows, as last drawn or
+                // updated: compared below to tell an update that changed
+                // nothing.
+                const shown_before: FrameShown = .of(self);
 
                 // A config color change this update (custom shader uniforms).
                 var colors_from_config = false;
@@ -1985,7 +2045,21 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 // Update custom shader uniforms that depend on terminal
                 // state (or on a config color change, which marks no row).
-                self.updateCustomShaderUniformsFromState(colors_from_config);
+                const custom_changed = self.updateCustomShaderUniformsFromState(colors_from_config);
+
+                // The next draw shows a new frame only if this update
+                // changed one: a wake with no dirty row, no cursor change
+                // and no size change (a blink tick of a steady cursor,
+                // output that sets only a title) draws nothing, and the
+                // display link stops (G7). A change not drawn yet stays
+                // set until a draw takes it.
+                const shown_after: FrameShown = .of(self);
+                if (self.rebuilt_rows > 0 or self.rebuilt_full or
+                    critical.kitty_updated or overlay_changed or custom_changed or
+                    !shown_before.eql(&shown_after))
+                {
+                    self.frame_changed = true;
+                }
             }
 
             // Start the display link now that the rebuilt frame is ready.
@@ -2077,7 +2151,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const needs_redraw =
                 size_changed or
                 swap_chain_rebuilt or
-                self.cells_rebuilt or
+                self.frame_changed or
                 self.animationWake() != null or
                 sync;
 
@@ -2087,7 +2161,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // display link at this point.
                 return true;
             }
-            self.cells_rebuilt = false;
+            self.frame_changed = false;
 
             // Wait for a frame to be available.
             const frame = swap_chain.nextFrame();
@@ -2566,6 +2640,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             if (custom_shaders_changed) {
                 self.reinitialize_shaders = true;
             }
+
+            // Contrast, color space, blending, images and shaders are read
+            // by the draw, not by the rows.
+            self.frame_changed = true;
         }
 
         /// Resize the screen.
@@ -2586,6 +2664,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.size = size;
             self.size.cell = cell;
             self.updateScreenSizeUniforms();
+            self.frame_changed = true;
 
             // Some graphics APIs need to manually update their viewport,
             // like OpenGL. Do so here.
@@ -2671,13 +2750,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Update custom shader uniforms that depend on terminal state.
         ///
         /// This should be called in `updateFrame` when terminal state changes.
-        fn updateCustomShaderUniformsFromState(self: *Self, colors_changed: bool) void {
+        ///
+        /// Returns whether it updated them.
+        fn updateCustomShaderUniformsFromState(self: *Self, colors_changed: bool) bool {
             // We only need to do this if we have custom shaders.
-            if (!self.has_custom_shaders) return;
+            if (!self.has_custom_shaders) return false;
 
             // Only update when terminal state is dirty or a config color
             // change moved the colors.
-            if (self.terminal_state.dirty == .false and !colors_changed) return;
+            if (self.terminal_state.dirty == .false and !colors_changed) return false;
 
             const uniforms: *shadertoy.Uniforms = &self.custom_shader_uniforms;
             const colors: *const terminal.RenderState.Colors = &self.terminal_state.colors;
@@ -2759,6 +2840,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const cursor_style: renderer.CursorStyle = .fromTerminal(self.terminal_state.cursor.visual_style);
             uniforms.previous_cursor_style = uniforms.current_cursor_style;
             uniforms.current_cursor_style = @as(i32, @intFromEnum(cursor_style));
+            return true;
         }
 
         /// Update per-frame custom shader uniforms.
@@ -3328,9 +3410,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     x += if (cp.wide) 2 else 1;
                 }
             }
-
-            // Update that our cells rebuilt
-            self.cells_rebuilt = true;
 
             // Log some things
             // log.debug("rebuildCells complete cached_runs={}", .{
