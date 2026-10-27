@@ -1983,19 +1983,28 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // mutex. The display link is synced only after the mutex is
             // released; see `syncDisplayLink` for why it must never be
             // called with the draw mutex held.
-            //
-            // A frame drawn off the main thread may need something to present
-            // into (a Metal drawable) that can take a while to get: it is
-            // taken before the mutex, so a main-thread draw never waits for it.
-            if (!sync and @hasDecl(GraphicsAPI, "acquirePresentable")) self.api.acquirePresentable();
-            defer if (!sync and @hasDecl(GraphicsAPI, "releasePresentable")) self.api.releasePresentable();
-            const sync_display_link = locked: {
-                self.draw_mutex.lockUncancelable(global.io());
-                defer self.draw_mutex.unlock(global.io());
-                break :locked try self.drawFrameLocked(sync);
-            };
+            var sync_display_link = try self.drawFrameOnce(sync);
+            // The frame was dropped because the drawable taken for it had
+            // the size from before a resize: draw it again now, once.
+            if (comptime @hasDecl(GraphicsAPI, "redrawPending")) {
+                if (!sync and self.api.redrawPending()) {
+                    sync_display_link = (try self.drawFrameOnce(false)) or sync_display_link;
+                }
+            }
 
             if (sync_display_link) self.syncDisplayLink(null, null);
+        }
+
+        /// One `drawFrameLocked` under the draw mutex. A frame drawn off the
+        /// main thread may need something to present into (a Metal drawable)
+        /// that can take a while to get: it is taken before the mutex, so a
+        /// main-thread draw never waits for it.
+        fn drawFrameOnce(self: *Self, sync: bool) !bool {
+            if (!sync and @hasDecl(GraphicsAPI, "acquirePresentable")) self.api.acquirePresentable();
+            defer if (!sync and @hasDecl(GraphicsAPI, "releasePresentable")) self.api.releasePresentable();
+            self.draw_mutex.lockUncancelable(global.io());
+            defer self.draw_mutex.unlock(global.io());
+            return try self.drawFrameLocked(sync);
         }
 
         /// The body of `drawFrame`. Must be called with `draw_mutex` held.
@@ -2058,8 +2067,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // don't need to since the previous frame should be identical.
             //
             // While any animation is in progress (a pending animation wake)
-            // every draw must actually render.
+            // every draw must actually render. The graphics API may ask for
+            // a frame it dropped to be drawn again (taken first, so the
+            // request is always cleared).
+            const redraw_requested = if (comptime @hasDecl(GraphicsAPI, "takeRedraw"))
+                self.api.takeRedraw()
+            else
+                false;
             const needs_redraw =
+                redraw_requested or
                 size_changed or
                 swap_chain_rebuilt or
                 self.cells_rebuilt or

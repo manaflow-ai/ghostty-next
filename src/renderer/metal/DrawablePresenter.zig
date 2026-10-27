@@ -9,9 +9,11 @@
 //! (gpu/ipc/service/image_transport_surface_overlay_mac.h).
 //!
 //! Writers (PresentState has the protocol):
-//!   * renderer thread: drawables only (`nextDrawable`, `presentDrawable:`);
-//!   * main thread: the overlay's `hidden`, `drawableSize`, `frame` and
-//!     `contentsScale`, and the root layer's `contents`.
+//!   * renderer thread: drawables only (`nextDrawable`, `presentDrawable:`),
+//!     never while it holds the draw lock;
+//!   * main thread: the overlay's `hidden`, `opaque`, `contents`,
+//!     `drawableSize`, `frame` and `contentsScale`, and the root layer's
+//!     `contents`.
 //!
 //! Teardown: `Metal` holds its reference to the overlay until `deinit`,
 //! which runs after the renderer thread stopped and its frames completed. A
@@ -46,6 +48,11 @@ sink: *PresentedSink,
 /// (`acquire`, before the draw lock). Retained. Renderer thread only.
 pending: ?objc.Object = null,
 
+/// A frame was dropped because its drawable was taken before main changed
+/// the size: the renderer draws it again (`takeRedraw`) with a drawable it
+/// takes outside the draw lock. Set under the draw lock.
+redraw: std.atomic.Value(bool) = .init(false),
+
 stats: Stats = .{},
 
 pub const Stats = struct {
@@ -53,6 +60,8 @@ pub const Stats = struct {
     /// Frames that did not go to a drawable: no drawable, a size other than
     /// the drawable size, or a hidden presentation.
     dropped: std.atomic.Value(u64) = .init(0),
+    /// Of `dropped`: the drawable was taken before main changed the size.
+    stale_drawables: std.atomic.Value(u64) = .init(0),
     main_presents: std.atomic.Value(u64) = .init(0),
     reveals: std.atomic.Value(u64) = .init(0),
     /// The renderer thread's wait in `nextDrawable`.
@@ -65,6 +74,7 @@ pub fn init(
     device: objc.Object,
     pixel_format: mtl.MTLPixelFormat,
     scale: f64,
+    is_opaque: bool,
     sink: *PresentedSink,
 ) !DrawablePresenter {
     const CAMetalLayer = objc.getClass("CAMetalLayer") orelse return error.ObjCFailed;
@@ -77,6 +87,9 @@ pub fn init(
     layer.setProperty("framebufferOnly", false);
     layer.setProperty("presentsWithTransaction", false);
     layer.setProperty("maximumDrawableCount", @as(c_ulong, 3));
+    // A CAMetalLayer is opaque by default; a translucent background needs
+    // the frame's alpha (`opaqueOverlay`).
+    layer.setProperty("opaque", is_opaque);
     if (layer.msgSend(bool, objc.sel("respondsToSelector:"), .{objc.sel("setColorspace:")})) {
         // The swap chain's IOSurfaces are Display P3 (Target.init).
         const colorspace = try graphics.ColorSpace.createNamed(.displayP3);
@@ -105,11 +118,12 @@ pub fn deinit(self: *DrawablePresenter) void {
     const s = &self.stats;
     // scripts/cmux-next/ghostty-present-form-bench.py reads this line.
     log.info(
-        "present form metal_layer: offmain={d} refused={d} main_hops=0 main_presents={d} reveals={d} " ++
-            "wait_n={d} wait_sum_ns={d} wait_max_ns={d} wait_buckets_us={any}",
+        "present form metal_layer: offmain={d} refused={d} stale_drawables={d} main_hops=0 main_presents={d} " ++
+            "reveals={d} wait_n={d} wait_sum_ns={d} wait_max_ns={d} wait_buckets_us={any}",
         .{
             s.offmain_presents.load(.monotonic),
             s.dropped.load(.monotonic),
+            s.stale_drawables.load(.monotonic),
             s.main_presents.load(.monotonic),
             s.reveals.load(.monotonic),
             s.wait.count.load(.monotonic),
@@ -139,11 +153,23 @@ pub fn setDrawableSize(self: *DrawablePresenter, size: u64) void {
 }
 
 /// A purged presentation: the renderer takes no drawable until main sets a
-/// size again, and the layer's drawables shrink to one pixel so their
-/// memory goes. Main thread.
+/// size again, the drawable on the overlay goes, and the layer's drawables
+/// shrink to one pixel so their memory goes. Main thread.
 pub fn purgeDrawables(self: *DrawablePresenter) void {
     self.state.drawable_size.store(0, .release);
+    self.overlay.setProperty("contents", @as(?*anyopaque, null));
     self.overlay.setProperty("drawableSize", graphics.Size{ .width = 1, .height = 1 });
+}
+
+/// Whether the overlay is opaque (`PresentState.opaqueOverlay`), in its own
+/// transaction: Core Animation otherwise applies a change to `opaque` only
+/// at the next resize. Main thread.
+pub fn setOpaque(self: *DrawablePresenter, is_opaque: bool) void {
+    if (self.overlay.getProperty(bool, "opaque") == is_opaque) return;
+    const CATransaction = objc.getClass("CATransaction") orelse return;
+    CATransaction.msgSend(void, objc.sel("begin"), .{});
+    defer CATransaction.msgSend(void, objc.sel("commit"), .{});
+    self.overlay.setProperty("opaque", is_opaque);
 }
 
 /// Places the overlay on the root's bounds at its scale. Main thread.
@@ -191,12 +217,36 @@ pub fn shownSize(self: *const DrawablePresenter, root: objc.Object) u64 {
 
 /// Renderer thread, before it takes the draw lock: takes the drawable for
 /// the next frame, so a wait for one never holds the lock that a main
-/// thread draw takes.
+/// thread draw takes. A drawable of a size main has since replaced goes
+/// back, and one of the new size is taken, still outside the lock.
 pub fn acquire(self: *DrawablePresenter) void {
-    if (self.pending != null) return;
-    if (!self.state.presenting.load(.acquire)) return;
+    if (!self.state.presenting.load(.acquire)) return self.releaseUnused();
+    if (self.pending) |held| {
+        if (drawableSize(held) == self.state.drawable_size.load(.acquire)) return;
+        self.releaseUnused();
+    }
     if (self.state.drawable_size.load(.acquire) == 0) return;
+    const d = self.nextDrawable() orelse return;
+    if (drawableSize(d) == self.state.drawable_size.load(.acquire)) {
+        self.pending = d;
+        return;
+    }
+    // Main set a new size while this thread waited for the drawable.
+    d.release();
     self.pending = self.nextDrawable();
+}
+
+/// Under the draw lock: whether the last frame was dropped for a drawable
+/// of an old size, so this frame must draw even with nothing changed.
+/// Clears the request.
+pub fn takeRedraw(self: *DrawablePresenter) bool {
+    return self.redraw.swap(false, .acq_rel);
+}
+
+/// Renderer thread, after the draw lock is released: a frame was dropped
+/// for a drawable of an old size and is not drawn again yet.
+pub fn redrawPending(self: *const DrawablePresenter) bool {
+    return self.redraw.load(.acquire);
 }
 
 /// Renderer thread, after the draw lock is released: a drawable the frame
@@ -233,17 +283,16 @@ pub fn encode(
     if (!self.state.accepts(width, height, width, height)) return self.drop(ticket);
     // None taken before the lock (no size yet, a hidden presentation, or
     // nextDrawable timed out): never wait for one under the lock.
-    var drawable = self.pending orelse return self.drop(ticket);
+    const drawable = self.pending orelse return self.drop(ticket);
     self.pending = null;
-    if (!self.state.accepts(width, height, drawableWidth(drawable), drawableHeight(drawable))) {
-        // Taken before main set the new size (a resize): this frame is the
-        // first of that size, so take one of the new size now, under the
-        // draw lock, rather than lose it.
-        drawable.release();
-        drawable = self.nextDrawable() orelse return self.drop(ticket);
-    }
     defer drawable.release();
-    if (!self.state.accepts(width, height, drawableWidth(drawable), drawableHeight(drawable))) {
+    const size = PresentState.pack(width, height);
+    if (drawableSize(drawable) != size) {
+        // Taken before main set the new size (a resize): this frame is the
+        // first of that size. Never take another under the lock: the
+        // renderer draws it again once the lock is released (`takeRedraw`).
+        _ = self.stats.stale_drawables.fetchAdd(1, .monotonic);
+        self.redraw.store(true, .release);
         return self.drop(ticket);
     }
     const target = drawable.getProperty(objc.Object, "texture");
@@ -255,6 +304,8 @@ pub fn encode(
     var handler = PresentedBlock.init(.{
         .sink = self.sink.retain(),
         .frame_id = ticket.sequence,
+        .generation = ticket.generation,
+        .size = size,
     }, &presentedCallback);
     drawable.msgSend(void, objc.sel("addPresentedHandler:"), .{&handler});
     buffer.msgSend(void, objc.sel("presentDrawable:"), .{drawable});
@@ -267,24 +318,35 @@ fn drop(self: *DrawablePresenter, ticket: PresentState.Ticket) PresentState.Tick
     return ticket;
 }
 
-fn drawableWidth(drawable: objc.Object) usize {
-    return @intCast(drawable.getProperty(objc.Object, "texture").getProperty(c_ulong, "width"));
+/// The drawable's pixel size, packed.
+fn drawableSize(drawable: objc.Object) u64 {
+    const texture = drawable.getProperty(objc.Object, "texture");
+    return PresentState.pack(
+        @intCast(texture.getProperty(c_ulong, "width")),
+        @intCast(texture.getProperty(c_ulong, "height")),
+    );
 }
 
-fn drawableHeight(drawable: objc.Object) usize {
-    return @intCast(drawable.getProperty(objc.Object, "texture").getProperty(c_ulong, "height"));
-}
-
-/// GPU completion thread, for a healthy frame whose present `encode`
-/// encoded. True when the renderer must ask main to show the overlay.
-pub fn presented(self: *DrawablePresenter, ticket: PresentState.Ticket, size: u64) bool {
-    _ = self.stats.offmain_presents.fetchAdd(1, .monotonic);
-    return self.state.presented(ticket, size);
+/// A drawable's presented handler (the sink's observer, so never after
+/// `deinit`): the drawable is on the overlay, or a newer one replaced it.
+/// True when the renderer must ask main to show the overlay; every drawable
+/// older than this one is past, so the overlay cannot show one of them after
+/// main's reveal.
+pub fn presented(self: *DrawablePresenter, p: PresentedSink.Presented) bool {
+    const shown = p.presented_time > 0;
+    if (shown) _ = self.stats.offmain_presents.fetchAdd(1, .monotonic);
+    return self.state.presented(
+        .{ .sequence = p.frame_id, .generation = p.generation, .encoded = true },
+        p.size,
+        shown,
+    );
 }
 
 const PresentedBlock = objc.Block(struct {
     sink: *PresentedSink,
     frame_id: u64,
+    generation: u64,
+    size: u64,
 }, .{
     objc.c.id, // id<MTLDrawable>
 }, void);
@@ -294,8 +356,13 @@ const PresentedBlock = objc.Block(struct {
 fn presentedCallback(block: *const PresentedBlock.Context, drawable_id: objc.c.id) callconv(.c) void {
     const sink = block.sink;
     defer sink.release();
-    const presented_time = objc.Object.fromId(drawable_id).getProperty(f64, "presentedTime");
-    sink.deliver(block.frame_id, mach_absolute_time(), presented_time);
+    sink.deliver(.{
+        .frame_id = block.frame_id,
+        .generation = block.generation,
+        .size = block.size,
+        .host_time = mach_absolute_time(),
+        .presented_time = objc.Object.fromId(drawable_id).getProperty(f64, "presentedTime"),
+    });
 }
 
 /// An `actions` dictionary with no animation for the keys main changes.
@@ -308,6 +375,7 @@ fn noActions() !objc.Object {
     const keys = [_][:0]const u8{
         "bounds",        "position",    "frame",     "hidden",    "contents",
         "contentsScale", "anchorPoint", "sublayers", "onOrderIn", "onOrderOut",
+        "opaque",
     };
     for (keys) |key| {
         const name = NSString.msgSend(objc.Object, objc.sel("stringWithUTF8String:"), .{key.ptr});

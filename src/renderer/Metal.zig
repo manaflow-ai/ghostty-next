@@ -229,6 +229,7 @@ pub fn init(
         mtl_device,
         targetPixelFormat(opts.config.blending),
         info.scaleFactor,
+        overlayOpaque(opts.config.background_opacity, opts.config.background_blur),
         sink,
     );
     errdefer presenter.deinit();
@@ -240,6 +241,26 @@ pub fn init(
         .queue = queue,
         .blending = opts.config.blending,
     };
+}
+
+/// Whether the overlay may be opaque for this background (PresentState.opaqueOverlay).
+fn overlayOpaque(background_opacity: f64, blur: configpkg.Config.BackgroundBlur) bool {
+    const glass = switch (blur) {
+        .@"macos-glass-regular", .@"macos-glass-clear" => true,
+        else => false,
+    };
+    return PresentState.opaqueOverlay(background_opacity, glass);
+}
+
+/// The surface's configuration changed (`Surface.updateConfig`): what
+/// shows in the layers changes here, in this transaction. Main thread: the
+/// layers are main's (DrawablePresenter); the renderer thread's config
+/// change never writes them.
+pub fn updateLayerConfig(self: *Metal, config: *const configpkg.Config) void {
+    self.presenter.setOpaque(overlayOpaque(
+        @max(0, @min(1, config.@"background-opacity")),
+        config.@"background-blur",
+    ));
 }
 
 fn targetPixelFormat(blending: configpkg.Config.AlphaBlending) mtl.MTLPixelFormat {
@@ -292,6 +313,19 @@ pub fn setHostedLayerSize(
         },
     });
     self.presenter.syncGeometry(layer);
+    self.syncDrawableSize();
+}
+
+/// macOS: the embedder reported a size or a scale
+/// (`ghostty_surface_set_size`, `ghostty_surface_set_content_scale`, after
+/// it set the root layer's `contentsScale`). The overlay takes the root's
+/// bounds and scale, and the drawables the size the renderer draws at
+/// (`surfaceSize`): a scale change keeps the bounds in points, so no bounds
+/// change follows to do it, and the renderer's frames at the new scale would
+/// otherwise be dropped as the wrong size. Main thread.
+pub fn syncPresentGeometry(self: *Metal) void {
+    if (comptime builtin.os.tag != .macos) return;
+    self.presenter.syncGeometry(self.layer.layer);
     self.syncDrawableSize();
 }
 
@@ -360,6 +394,10 @@ pub fn prepareDeinit(self: *Metal) void {
 }
 
 pub fn loopEnter(self: *Metal) void {
+    // Before the first frame this thread encodes: `self` is at its final
+    // address now (in the renderer), and the sink's close in `deinit` stops
+    // the observer before that memory goes.
+    self.presenter.sink.observe(&drawablePresented, self);
     const renderer: *align(1) Renderer = @fieldParentPtr("api", self);
     self.layer.setDisplayCallback(
         @ptrCast(&displayCallback),
@@ -431,15 +469,16 @@ pub fn surfaceSize(self: *const Metal) !struct { width: u32, height: u32 } {
     // We need to clamp our runtime surface size to the maximum
     // possible texture size since we can't create a screen buffer (texture)
     // larger than that.
+    const size = PresentState.targetSize(
+        0,
+        bounds.size.width,
+        bounds.size.height,
+        scale,
+        self.device.max_texture_size,
+    );
     return .{
-        .width = @min(
-            @as(u32, @intFromFloat(bounds.size.width * scale)),
-            self.device.max_texture_size,
-        ),
-        .height = @min(
-            @as(u32, @intFromFloat(bounds.size.height * scale)),
-            self.device.max_texture_size,
-        ),
+        .width = @intCast(PresentState.packedWidth(size)),
+        .height = @intCast(PresentState.packedHeight(size)),
     };
 }
 
@@ -466,6 +505,18 @@ pub fn releasePresentable(self: *Metal) void {
     self.presenter.releaseUnused();
 }
 
+/// Under the draw lock: the last frame was dropped for a drawable taken
+/// before a resize, so this one draws even with nothing changed.
+pub fn takeRedraw(self: *Metal) bool {
+    return self.presenter.takeRedraw();
+}
+
+/// Renderer thread, after the draw lock is released: draw again now, with a
+/// drawable taken outside the lock (DrawablePresenter.encode).
+pub fn redrawPending(self: *const Metal) bool {
+    return self.presenter.redrawPending();
+}
+
 /// Renderer thread, before the frame's command buffer commits: encodes the
 /// frame's copy into a drawable and its present (DrawablePresenter.encode).
 pub fn encodePresent(self: *Metal, buffer: objc.Object, target: *const Target) PresentState.Ticket {
@@ -475,7 +526,8 @@ pub fn encodePresent(self: *Metal, buffer: objc.Object, target: *const Target) P
 /// Present the provided target. `sync`: a frame drawn on the main thread,
 /// shown in its transaction. Otherwise the GPU completion thread, with the
 /// `ticket` that `encodePresent` returned: the drawable present is already
-/// encoded, so nothing is posted to the main thread for the frame.
+/// encoded, so nothing is posted to the main thread for the frame (the
+/// drawable's presented handler asks for a reveal, `drawablePresented`).
 pub inline fn present(self: *Metal, target: Target, sync: bool, ticket: PresentState.Ticket) !void {
     if (sync) {
         self.presentOnMain(target.surface);
@@ -487,15 +539,24 @@ pub inline fn present(self: *Metal, target: Target, sync: bool, ticket: PresentS
             self.host_size.load(.acquire) != 0) self.publishFresh(target.surface);
     }
     if (!ticket.encoded) return;
+    // Encoded before a main present, a hide or a purge: not the frame on
+    // screen (main's is newer, or the presentation shows none).
+    if (!self.presenter.state.current(ticket)) return;
     self.setLastFrame(target.surface);
-    const size = PresentState.pack(target.surface.getWidth(), target.surface.getHeight());
-    if (!self.presenter.presented(ticket, size)) return;
-    // The overlay is hidden behind a frame main presented: ask the main
-    // thread to show it through the app mailbox, which the embedder drains
-    // at its own tick. Never wait on this thread.
+}
+
+/// The sink's observer for each drawable's presented handler (Core
+/// Animation's thread; never after `deinit`, PresentedSink.close). The
+/// overlay is hidden behind a frame main presented and this drawable, the
+/// first encoded after it, is on the overlay: ask the main thread to show
+/// it through the app mailbox, which the embedder drains at its own tick.
+/// Never wait on this thread.
+fn drawablePresented(ctx: *anyopaque, p: PresentedSink.Presented) void {
+    const self: *Metal = @ptrCast(@alignCast(ctx));
+    if (!self.presenter.presented(p)) return;
     const renderer: *align(1) Renderer = @fieldParentPtr("api", self);
     if (renderer.surface_mailbox.push(.present_reveal, .instant) == 0) {
-        self.presenter.state.revealPostFailed(ticket.generation);
+        self.presenter.state.revealPostFailed(p.generation);
     }
 }
 
@@ -642,8 +703,11 @@ pub fn presentHostSized(self: *Metal) bool {
     const host = self.host_size.load(.acquire);
     if (host == 0) return false;
     // Hidden: nothing to draw now (the renderer draws when shown again),
-    // and drawing here would rebuild the released swap chain.
+    // and drawing here would rebuild the released swap chain. A hidden or
+    // purged presentation (`setPresentation`) shows nothing either: a frame
+    // drawn here would come back on show with the old text at the new size.
     if (!self.visible_hint.load(.acquire)) return true;
+    if (!self.presenter.state.presenting.load(.acquire)) return true;
     const width: usize = @intCast(host >> 32);
     const height: usize = @intCast(host & 0xffff_ffff);
     const shown = self.shownSize();

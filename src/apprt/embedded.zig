@@ -1120,7 +1120,8 @@ pub const Surface = struct {
     /// does not follow its bounds, so the surface keeps it at the size the
     /// embedder reported. See `Metal.setHostedLayerSize`.
     /// macOS: a host-sized surface's target follows the reported size
-    /// (`Metal.setHostDrawableSize`).
+    /// (`Metal.setHostDrawableSize`), and the present overlay and its
+    /// drawables follow the reported size and scale (`Metal.syncPresentGeometry`).
     fn syncHostedLayer(self: *Surface) void {
         if (comptime builtin.os.tag == .ios) {
             self.core_surface.renderer.api.setHostedLayerSize(
@@ -1137,6 +1138,11 @@ pub const Surface = struct {
                 self.size.width,
                 self.size.height,
             );
+        }
+        if (comptime builtin.os.tag == .macos and
+            @hasDecl(@TypeOf(self.core_surface.renderer.api), "syncPresentGeometry"))
+        {
+            self.core_surface.renderer.api.syncPresentGeometry();
         }
     }
 

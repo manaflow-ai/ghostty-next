@@ -1929,6 +1929,12 @@ pub fn updateConfig(
     self.config.deinit();
     self.config = derived;
 
+    // What shows in the renderer's layers (the Metal overlay's opacity)
+    // changes on this thread, which owns them, in this transaction.
+    if (comptime @hasDecl(@TypeOf(self.renderer.api), "updateLayerConfig")) {
+        self.renderer.api.updateLayerConfig(config);
+    }
+
     // If our mouse is hidden but we disabled mouse hiding, then show it again.
     if (!self.config.mouse_hide_while_typing and self.mouse.hidden) {
         self.showMouse();
