@@ -9,6 +9,12 @@
 //! sequences and updating terminal state.
 //!
 //! This thread state can only be used by one thread at a time.
+//!
+//! A manual backend has no PTY to service, so its surface spawns no thread
+//! for this: the handlers run on the surface's renderer thread loop
+//! (`Mode.hosted`, `loopGuest`). Chromium does the same with sequences:
+//! work that needs ordering, not a thread of its own, posts to a
+//! SequencedTaskRunner on a shared thread (base/task/sequenced_task_runner.h).
 pub const Thread = @This();
 
 const std = @import("std");
@@ -40,21 +46,42 @@ const sync_reset_ms = 1000;
 /// The number of milliseconds between each movement during selection scrolling.
 const selection_scroll_ms = 15;
 
+/// Where the handlers of a Thread run.
+pub const Mode = enum {
+    /// `threadMain` runs an event loop of its own on a thread the caller
+    /// spawns.
+    own,
+
+    /// Another thread's event loop runs the handlers between `attach` and
+    /// `detach`; no thread is spawned. For backends with no PTY (manual).
+    hosted,
+};
+
 /// Allocator used for some state
 alloc: std.mem.Allocator,
 
-/// The main event loop for the thread. The user data of this loop
-/// is always the allocator used to create the loop. This is a convenience
-/// so that users of the loop always have an allocator.
-loop: xev.Loop,
+/// The event loop the handlers run on. For `.own` this thread owns the
+/// loop. For `.hosted` it is the host's loop, null until `attach`.
+loop: union(Mode) {
+    own: xev.Loop,
+    hosted: ?*xev.Loop,
+},
 
 /// The completion to use for the wakeup async handle that is present
 /// on the termio.Writer.
 wakeup_c: xev.Completion = .{},
 
 /// This can be used to stop the thread on the next loop iteration.
-stop: xev.Async,
+/// Null for `.hosted`: the host stops its own loop.
+stop: ?xev.Async,
 stop_c: xev.Completion = .{},
+
+/// The callback data of a hosted thread, which has no stack frame of its
+/// own to keep it in. Set by `loopGuest`.
+hosted_cb: ?CallbackData = null,
+
+/// A hosted thread's backend started (`attach`), so `detach` stops it.
+hosted_entered: bool = false,
 
 /// This is used for timer-based selection scrolling.
 scroll: xev.Timer,
@@ -87,18 +114,29 @@ flags: packed struct {
 } = .{},
 
 /// Initialize the thread. This does not START the thread. This only sets
-/// up all the internal state necessary prior to starting the thread. It
-/// is up to the caller to start the thread with the threadMain entrypoint.
+/// up all the internal state necessary prior to starting the thread. For
+/// `.own` the caller starts the thread with the threadMain entrypoint; for
+/// `.hosted` a host loop runs the handlers (`loopGuest`).
 pub fn init(
     alloc: Allocator,
+    mode: Mode,
 ) !Thread {
-    // Create our event loop.
-    var loop = try xev.Loop.init(.{});
-    errdefer loop.deinit();
+    // Create our event loop, and the async handle used to stop it and
+    // force the thread to end. A hosted thread has neither.
+    var loop: @FieldType(Thread, "loop") = switch (mode) {
+        .own => .{ .own = try xev.Loop.init(.{}) },
+        .hosted => .{ .hosted = null },
+    };
+    errdefer switch (loop) {
+        .own => |*l| l.deinit(),
+        .hosted => {},
+    };
 
-    // This async handle is used to stop the loop and force the thread to end.
-    var stop_h = try xev.Async.init();
-    errdefer stop_h.deinit();
+    var stop_h: ?xev.Async = switch (mode) {
+        .own => try xev.Async.init(),
+        .hosted => null,
+    };
+    errdefer if (stop_h) |*h| h.deinit();
 
     // This timer is used for selection scrolling.
     var scroll_h = try xev.Timer.init();
@@ -123,13 +161,76 @@ pub fn init(
 }
 
 /// Clean up the thread. This is only safe to call once the thread
-/// completes executing; the caller must join prior to this.
+/// completes executing; the caller must join prior to this (for
+/// `.hosted`, the host has called `detach`).
 pub fn deinit(self: *Thread) void {
     self.scroll.deinit();
     self.coalesce.deinit();
     self.sync_reset.deinit();
-    self.stop.deinit();
-    self.loop.deinit();
+    if (self.stop) |*h| h.deinit();
+    switch (self.loop) {
+        .own => |*l| l.deinit(),
+        .hosted => {},
+    }
+}
+
+/// The event loop the handlers run on.
+pub fn eventLoop(self: *Thread) *xev.Loop {
+    return switch (self.loop) {
+        .own => |*l| l,
+        .hosted => |l| l.?,
+    };
+}
+
+/// The hook that runs a `.hosted` thread's handlers on the renderer
+/// thread's loop for the surface's lifetime. `self` and `io` must not move
+/// until the renderer thread has exited.
+pub fn loopGuest(self: *Thread, io: *termio.Termio) renderer.Thread.LoopGuest {
+    std.debug.assert(self.loop == .hosted);
+    self.hosted_cb = .{ .self = self, .io = io };
+    return .{
+        .ctx = self,
+        .enter = guestEnter,
+        .exit = guestExit,
+    };
+}
+
+fn guestEnter(ctx: *anyopaque, loop: *xev.Loop) void {
+    const self: *Thread = @ptrCast(@alignCast(ctx));
+    self.attach(loop);
+}
+
+fn guestExit(ctx: *anyopaque) void {
+    const self: *Thread = @ptrCast(@alignCast(ctx));
+    self.detach();
+}
+
+/// Start the handlers of a `.hosted` thread on `loop`, on the thread that
+/// runs that loop. If the backend fails to start, the terminal shows the
+/// error and the mailbox is only drained, as `threadMain` does.
+pub fn attach(self: *Thread, loop: *xev.Loop) void {
+    const cb = &self.hosted_cb.?;
+    self.loop = .{ .hosted = loop };
+    if (cb.io.threadEnter(self, &cb.data)) {
+        self.hosted_entered = true;
+    } else |err| {
+        log.warn("error in hosted io err={}", .{err});
+        showStartError(self.alloc, cb.io, err);
+        self.flags.drain = true;
+    }
+
+    cb.io.mailbox.spsc.wakeup.wait(loop, &self.wakeup_c, CallbackData, cb, wakeupCallback);
+}
+
+/// Stop the handlers of a `.hosted` thread. Called on the host thread once
+/// its loop has stopped; timers still armed on it never fire again.
+pub fn detach(self: *Thread) void {
+    const cb = &self.hosted_cb.?;
+    if (self.hosted_entered) {
+        cb.io.threadExit(&cb.data);
+        cb.data.deinit();
+        self.hosted_entered = false;
+    }
 }
 
 /// The main entrypoint for the thread.
@@ -137,100 +238,95 @@ pub fn threadMain(self: *Thread, io: *termio.Termio) void {
     // Call child function so we can use errors...
     self.threadMain_(io) catch |err| {
         log.warn("error in io thread err={}", .{err});
-
-        // Use an arena to simplify memory management below
-        var arena = ArenaAllocator.init(self.alloc);
-        defer arena.deinit();
-        const alloc = arena.allocator();
-
-        // If there is an error, we replace our terminal screen with
-        // the error message. It might be better in the future to send
-        // the error to the surface thread and let the apprt deal with it
-        // in some way but this works for now. Without this, the user would
-        // just see a blank terminal window.
-        io.renderer_state.mutex.lockUncancelable(global.io());
-        defer io.renderer_state.mutex.unlock(global.io());
-        const t = io.renderer_state.terminal;
-
-        // Hide the cursor
-        t.modes.set(.cursor_visible, false);
-
-        // This is weird but just ensures that no matter what our underlying
-        // implementation we have the errors below. For example, Windows doesn't
-        // have "OpenptyFailed".
-        const Err = @TypeOf(err) || error{
-            OpenptyFailed,
-            InputNotFound,
-            InputFailed,
-        };
-
-        switch (@as(Err, @errorCast(err))) {
-            error.OpenptyFailed => {
-                const str =
-                    \\Your system cannot allocate any more pty devices.
-                    \\
-                    \\Ghostty requires a pty device to launch a new terminal.
-                    \\This error is usually due to having too many terminal
-                    \\windows open or having another program that is using too
-                    \\many pty devices.
-                    \\
-                    \\Please free up some pty devices and try again.
-                ;
-
-                t.eraseDisplay(.complete, false);
-                t.printString(str) catch {};
-            },
-
-            error.InputNotFound,
-            error.InputFailed,
-            => {
-                const str =
-                    \\A configured `input` path was not found, was not readable,
-                    \\was too large, or the underlying pty failed to accept
-                    \\the write.
-                    \\
-                    \\Ghostty can't continue since it can't guarantee that
-                    \\initial terminal state will be as desired. Please review
-                    \\the value of `input` in your configuration file and
-                    \\ensure that all the path values exist and are readable.
-                ;
-
-                t.eraseDisplay(.complete, false);
-                t.printString(str) catch {};
-            },
-
-            else => {
-                const str = std.fmt.allocPrint(
-                    alloc,
-                    \\error starting IO thread: {}
-                    \\
-                    \\The underlying shell or command was unable to be started.
-                    \\This error is usually due to exhausting a system resource.
-                    \\If this looks like a bug, please report it.
-                    \\
-                    \\This terminal is non-functional. Please close it and try again.
-                ,
-                    .{err},
-                ) catch
-                    \\Out of memory. This terminal is non-functional. Please close it and try again.
-                ;
-
-                t.eraseDisplay(.complete, false);
-                t.printString(str) catch {};
-            },
-        }
+        showStartError(self.alloc, io, err);
     };
 
     // If our loop is not stopped, then we need to keep running so that
     // messages are drained and we can wait for the surface to send a stop
     // message.
-    if (!self.loop.stopped()) {
+    const loop = &self.loop.own;
+    if (!loop.stopped()) {
         log.warn("abrupt io thread exit detected, starting xev to drain mailbox", .{});
         defer log.debug("io thread fully exiting after abnormal failure", .{});
         self.flags.drain = true;
-        self.loop.run(.until_done) catch |err| {
+        loop.run(.until_done) catch |err| {
             log.err("failed to start xev loop for draining err={}", .{err});
         };
+    }
+}
+
+/// Replace the terminal screen with the error that stopped the IO
+/// handlers from starting. It might be better in the future to send the
+/// error to the surface thread and let the apprt deal with it in some way
+/// but this works for now. Without this, the user would just see a blank
+/// terminal window.
+fn showStartError(gpa: Allocator, io: *termio.Termio, err: anyerror) void {
+    // Use an arena to simplify memory management below
+    var arena = ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    io.renderer_state.mutex.lockUncancelable(global.io());
+    defer io.renderer_state.mutex.unlock(global.io());
+    const t = io.renderer_state.terminal;
+
+    // Hide the cursor
+    t.modes.set(.cursor_visible, false);
+
+    switch (err) {
+        error.OpenptyFailed => {
+            const str =
+                \\Your system cannot allocate any more pty devices.
+                \\
+                \\Ghostty requires a pty device to launch a new terminal.
+                \\This error is usually due to having too many terminal
+                \\windows open or having another program that is using too
+                \\many pty devices.
+                \\
+                \\Please free up some pty devices and try again.
+            ;
+
+            t.eraseDisplay(.complete, false);
+            t.printString(str) catch {};
+        },
+
+        error.InputNotFound,
+        error.InputFailed,
+        => {
+            const str =
+                \\A configured `input` path was not found, was not readable,
+                \\was too large, or the underlying pty failed to accept
+                \\the write.
+                \\
+                \\Ghostty can't continue since it can't guarantee that
+                \\initial terminal state will be as desired. Please review
+                \\the value of `input` in your configuration file and
+                \\ensure that all the path values exist and are readable.
+            ;
+
+            t.eraseDisplay(.complete, false);
+            t.printString(str) catch {};
+        },
+
+        else => {
+            const str = std.fmt.allocPrint(
+                alloc,
+                \\error starting IO thread: {}
+                \\
+                \\The underlying shell or command was unable to be started.
+                \\This error is usually due to exhausting a system resource.
+                \\If this looks like a bug, please report it.
+                \\
+                \\This terminal is non-functional. Please close it and try again.
+            ,
+                .{err},
+            ) catch
+                \\Out of memory. This terminal is non-functional. Please close it and try again.
+            ;
+
+            t.eraseDisplay(.complete, false);
+            t.printString(str) catch {};
+        },
     }
 }
 
@@ -270,13 +366,13 @@ fn threadMain_(self: *Thread, io: *termio.Termio) !void {
     defer io.threadExit(&cb.data);
 
     // Start the async handlers.
-    mailbox.wakeup.wait(&self.loop, &self.wakeup_c, CallbackData, &cb, wakeupCallback);
-    self.stop.wait(&self.loop, &self.stop_c, CallbackData, &cb, stopCallback);
+    mailbox.wakeup.wait(&self.loop.own, &self.wakeup_c, CallbackData, &cb, wakeupCallback);
+    self.stop.?.wait(&self.loop.own, &self.stop_c, CallbackData, &cb, stopCallback);
 
     // Run
     log.debug("starting IO thread", .{});
     defer log.debug("starting IO thread shutdown", .{});
-    try self.loop.run(.until_done);
+    try self.loop.own.run(.until_done);
 }
 
 /// This is the data passed to xev callbacks on the thread.
@@ -378,7 +474,7 @@ fn drainMailbox(
 
 fn startSynchronizedOutput(self: *Thread, cb: *CallbackData) void {
     self.sync_reset.reset(
-        &self.loop,
+        self.eventLoop(),
         &self.sync_reset_c,
         &self.sync_reset_cancel_c,
         sync_reset_ms,
@@ -397,7 +493,7 @@ fn handleResize(self: *Thread, cb: *CallbackData, resize: renderer.Size) void {
     if (self.coalesce_c.state() == .active) return;
 
     self.coalesce.reset(
-        &self.loop,
+        self.eventLoop(),
         &self.coalesce_c,
         &self.coalesce_cancel_c,
         Coalesce.min_ms,
@@ -479,7 +575,7 @@ fn stopCallback(
     r: xev.Async.WaitError!void,
 ) xev.CallbackAction {
     _ = r catch unreachable;
-    cb_.?.self.loop.stop();
+    cb_.?.self.loop.own.stop();
     return .disarm;
 }
 
@@ -495,7 +591,7 @@ fn startScrollTimer(self: *Thread, cb: *CallbackData) void {
 
         // If the completion is not active then we need to start it.
         .dead => self.scroll.run(
-            &self.loop,
+            self.eventLoop(),
             &self.scroll_c,
             selection_scroll_ms,
             CallbackData,
@@ -534,7 +630,7 @@ fn selectionScrollCallback(
     );
 
     if (self.scroll_active) self.scroll.run(
-        &self.loop,
+        self.eventLoop(),
         &self.scroll_c,
         selection_scroll_ms,
         CallbackData,

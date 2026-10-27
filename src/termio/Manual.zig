@@ -1,6 +1,9 @@
 //! Manual is a termio backend for embedders that own the byte transport,
 //! for example a session host on another machine that owns the PTY. It
-//! starts no subprocess, opens no PTY and has no read thread.
+//! starts no subprocess, opens no PTY and has no read thread. It has no
+//! termio thread either: the surface's renderer thread runs the termio
+//! mailbox and timers on its loop (termio.Thread `.hosted`), so a manual
+//! surface spawns one thread.
 //!
 //! The embedder feeds terminal output with `Termio.processOutput`. Bytes
 //! that Ghostty would write to a PTY (encoded keys, text, paste, mouse
@@ -44,7 +47,8 @@ write_cb: ?WriteCallback,
 write_userdata: ?*anyopaque,
 
 /// Serializes calls to write_cb. Writes come from the thread that calls
-/// the surface input APIs and from the termio thread, and the embedder
+/// the surface input APIs and from the renderer thread (the termio mailbox
+/// handlers it hosts), and the embedder
 /// must see them one at a time.
 write_mutex: std.Io.Mutex = .init,
 

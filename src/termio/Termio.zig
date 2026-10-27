@@ -89,7 +89,6 @@ grid_locked: std.atomic.Value(bool) = .init(false),
 /// behind output.
 pending_size: PendingSize = .{},
 
-
 /// A snapshot whose history is still arriving after its READY prefix
 /// was restored (see `restoreSnapshot`). Only the output queue uses it.
 snapshot_restore: ?SnapshotRestore = null,
@@ -554,7 +553,7 @@ pub fn threadEnter(
 
     data.* = .{
         .alloc = self.alloc,
-        .loop = &thread.loop,
+        .loop = thread.eventLoop(),
         .renderer_state = self.renderer_state,
         .surface_mailbox = self.surface_mailbox,
         .mailbox = &self.mailbox,
@@ -2319,6 +2318,69 @@ test "manual: resize applies before queueMessage returns" {
 
     try testManualTermio(false, body);
     try testManualTermio(true, body);
+}
+
+test "manual: the termio handlers run on the host loop, with no thread of their own" {
+    const body = struct {
+        fn guardFired(
+            fired: ?*bool,
+            _: *xev.Loop,
+            _: *xev.Completion,
+            _: xev.Timer.RunError!void,
+        ) xev.CallbackAction {
+            fired.?.* = true;
+            return .disarm;
+        }
+
+        fn run(io: *Termio, sink: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            const alloc = testing.allocator;
+
+            // A hosted thread has no loop or stop handle of its own.
+            var thread = try termio.Thread.init(alloc, .hosted);
+            defer thread.deinit();
+            try testing.expect(thread.stop == null);
+
+            // The renderer thread's loop; this test thread runs it.
+            var loop = try xev.Loop.init(.{});
+            defer loop.deinit();
+            const guest = thread.loopGuest(io);
+            guest.enter(guest.ctx, &loop);
+            try testing.expectEqual(&loop, thread.eventLoop());
+
+            // With the lock held, a focus report and a resize take the
+            // mailbox. Nothing runs them until the host loop does.
+            io.terminal.modes.set(.focus_event, true);
+            {
+                io.renderer_state.mutex.lockUncancelable(global.io());
+                defer io.renderer_state.mutex.unlock(global.io());
+                io.queueMessage(.{ .focused = true }, .locked);
+                io.queueMessage(.{ .resize = .{
+                    .screen = .{ .width = 400, .height = 480 },
+                    .cell = .{ .width = 10, .height = 20 },
+                    .padding = .{},
+                } }, .locked);
+            }
+            try sink.expect("");
+            try testing.expectEqual(@as(usize, 80), io.terminal.cols);
+
+            // The host loop drains the mailbox and runs the resize
+            // coalescing timer.
+            var guard = try xev.Timer.init();
+            defer guard.deinit();
+            var guard_c: xev.Completion = .{};
+            var timed_out = false;
+            guard.run(&loop, &guard_c, 5000, bool, &timed_out, guardFired);
+            while (io.terminal.cols != 40 and !timed_out) try loop.run(.once);
+            try testing.expect(!timed_out);
+            try testing.expectEqual(@as(usize, 40), io.terminal.cols);
+            try sink.expect("\x1b[I");
+
+            guest.exit(guest.ctx);
+        }
+    }.run;
+
+    try testManualTermio(false, body);
 }
 
 test "manual: set_grid locks the grid and resizes change only pixels" {

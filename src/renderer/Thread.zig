@@ -82,6 +82,11 @@ mailbox: *Mailbox,
 /// Configuration we need derived from the main config.
 config: DerivedConfig,
 
+/// Other work of the surface that runs on this loop instead of a thread of
+/// its own: a manual-IO surface's termio handlers (termio.Thread `.hosted`).
+/// Set before the thread starts.
+guest: ?LoopGuest = null,
+
 flags: packed struct {
     /// This is true when a blinking cursor should be visible and false
     /// when it should not be visible. This is toggled on a timer by the
@@ -116,6 +121,15 @@ flags: packed struct {
     /// The last display-link tick drew a frame.
     last_tick_drew: bool = false,
 } = .{},
+
+/// Work hosted on the renderer thread's loop. `enter` runs on the renderer
+/// thread before its loop runs and registers the guest's handlers on
+/// `loop`; `exit` runs on the renderer thread after the loop stopped.
+pub const LoopGuest = struct {
+    ctx: *anyopaque,
+    enter: *const fn (ctx: *anyopaque, loop: *xev.Loop) void,
+    exit: *const fn (ctx: *anyopaque) void,
+};
 
 pub const DerivedConfig = struct {
     scrollback_compression: bool,
@@ -207,11 +221,31 @@ pub fn deinit(self: *Thread) void {
 
 /// The main entrypoint for the thread.
 pub fn threadMain(self: *Thread) void {
+    // Hosted work starts before the renderer and stops after it.
+    if (self.guest) |g| g.enter(g.ctx, &self.loop);
+    defer if (self.guest) |g| g.exit(g.ctx);
+
     // Call child function so we can use errors...
     self.threadMain_() catch |err| {
         // In the future, we should expose this on the thread struct.
         log.warn("error in renderer err={}", .{err});
+
+        // Hosted work outlives a renderer that failed to start: a manual
+        // surface's termio mailbox must keep draining, or a full mailbox
+        // blocks its producer, until the surface stops this thread.
+        if (self.guest != null) self.runGuestOnly();
     };
+}
+
+/// Run the loop for the guest alone until the surface stops this thread,
+/// after the renderer failed to start (loopEnter, threadEnter). A failure
+/// after the renderer's own handlers were registered leaves the loop alone:
+/// those handlers must not run on a renderer that has exited.
+fn runGuestOnly(self: *Thread) void {
+    if (self.loop.stopped() or self.wakeup_c.state() != .dead) return;
+    self.stop.wait(&self.loop, &self.stop_c, Thread, self, stopCallback);
+    self.loop.run(.until_done) catch |err|
+        log.err("error running the loop for hosted work err={}", .{err});
 }
 
 fn threadMain_(self: *Thread) !void {

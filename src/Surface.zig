@@ -137,7 +137,9 @@ last_binding_trigger: u64 = 0,
 /// The terminal IO handler.
 io: termio.Termio,
 io_thread: termio.Thread,
-io_thr: std.Thread,
+/// The IO thread. Null for a manual backend, whose termio handlers run on
+/// the renderer thread (termio.Thread `.hosted`).
+io_thr: ?std.Thread,
 
 /// Terminal inspector
 inspector: ?*inspectorpkg.Inspector = null,
@@ -698,8 +700,16 @@ pub fn init(
     );
     errdefer render_thread.deinit();
 
-    // Create the IO thread
-    var io_thread = try termio.Thread.init(alloc);
+    // An apprt surface whose embedder owns the byte transport asks for a
+    // manual backend: no subprocess, no pty, no read thread, and no IO
+    // thread: its termio handlers run on the renderer thread.
+    const manual_io: ?termio.Manual.Config = if (comptime @hasDecl(
+        apprt.runtime.Surface,
+        "manualIo",
+    )) rt_surface.manualIo() else null;
+
+    // Create the IO thread state
+    var io_thread = try termio.Thread.init(alloc, ioThreadMode(manual_io != null));
     errdefer io_thread.deinit();
 
     self.* = .{
@@ -734,7 +744,7 @@ pub fn init(
         .keyboard = .{},
         .io = undefined,
         .io_thread = io_thread,
-        .io_thr = undefined,
+        .io_thr = null,
         .size = size,
         .config = derived_config,
 
@@ -757,13 +767,6 @@ pub fn init(
     // This separate block ({}) is important because our errdefers must
     // be scoped here to be valid.
     {
-        // An apprt surface whose embedder owns the byte transport asks
-        // for a manual backend: no subprocess, no pty, no read thread.
-        const manual_io: ?termio.Manual.Config = if (comptime @hasDecl(
-            apprt.runtime.Surface,
-            "manualIo",
-        )) rt_surface.manualIo() else null;
-
         // Initialize our IO backend
         var io_backend: termio.Backend = if (manual_io) |manual_config|
             .{ .manual = try termio.Manual.init(alloc, manual_config) }
@@ -848,6 +851,12 @@ pub fn init(
     // to duplicate.
     try self.resize(self.size.screen);
 
+    // A hosted IO thread runs on the renderer thread's loop.
+    switch (self.io_thread.loop) {
+        .own => {},
+        .hosted => self.renderer_thread.guest = self.io_thread.loopGuest(&self.io),
+    }
+
     // Start our renderer thread
     self.renderer_thr = try std.Thread.spawn(
         .{},
@@ -856,13 +865,19 @@ pub fn init(
     );
     self.renderer_thr.setName(global.io(), "renderer") catch {};
 
-    // Start our IO thread
-    self.io_thr = try std.Thread.spawn(
-        .{},
-        termio.Thread.threadMain,
-        .{ &self.io_thread, &self.io },
-    );
-    self.io_thr.setName(global.io(), "io") catch {};
+    // Start our IO thread, unless the renderer thread hosts it.
+    switch (self.io_thread.loop) {
+        .own => {
+            const io_thr = try std.Thread.spawn(
+                .{},
+                termio.Thread.threadMain,
+                .{ &self.io_thread, &self.io },
+            );
+            io_thr.setName(global.io(), "io") catch {};
+            self.io_thr = io_thr;
+        },
+        .hosted => {},
+    }
 
     // Determine our initial window size if configured. We need to do this
     // quite late in the process because our height/width are in grid dimensions,
@@ -935,11 +950,11 @@ pub fn deinit(self: *Surface) void {
         self.renderer_thr.join();
     }
 
-    // Stop our IO thread
-    {
-        self.io_thread.stop.notify() catch |err|
+    // Stop our IO thread. A hosted one stopped with the renderer thread.
+    if (self.io_thr) |io_thr| {
+        self.io_thread.stop.?.notify() catch |err|
             log.err("error notifying io thread to stop, may stall err={}", .{err});
-        self.io_thr.join();
+        io_thr.join();
     }
 
     // We need to deinit AFTER everything is stopped, since there are
@@ -969,6 +984,18 @@ pub fn deinit(self: *Surface) void {
     self.config.deinit();
 
     log.info("surface closed id={x}", .{self.id});
+}
+
+/// Where a surface's termio handlers run. A manual backend has no PTY to
+/// service, so the renderer thread hosts them and the surface spawns one
+/// thread, not two.
+fn ioThreadMode(manual: bool) termio.Thread.Mode {
+    return if (manual) .hosted else .own;
+}
+
+test "a manual surface spawns no IO thread" {
+    try std.testing.expectEqual(termio.Thread.Mode.hosted, ioThreadMode(true));
+    try std.testing.expectEqual(termio.Thread.Mode.own, ioThreadMode(false));
 }
 
 /// Close this surface. This will trigger the runtime to start the
