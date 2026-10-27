@@ -636,8 +636,8 @@ typedef struct {
   // would draw the cell with the cursor (a block holds the cell background
   // and the character in the cursor text color; a bar, underline, hollow
   // block or lock is transparent around the cursor). NULL when not visible.
-  // Valid during the call: retain it to keep it. Ghostty never draws into
-  // a surface after publishing it.
+  // Valid during the call: retain it to keep it. Each cell has a new
+  // surface; Ghostty never draws into a surface after publishing it.
   void* surface;
   // The cell (two cells for a wide character) in the surface's pixels,
   // from the top-left corner of its frames.

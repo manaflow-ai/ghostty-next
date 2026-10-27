@@ -362,9 +362,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         cursor_placement: ?cursorpkg.Placement = null,
         cursor_glyph: shaderpkg.CellText = undefined,
         cursor_publisher: cursorpkg.Publisher = .{},
-        /// The surface of the last cell handed to a frame: the embedder
-        /// shows it, so no later frame draws into it. Under `draw_mutex`.
-        cursor_shown_surface: ?*anyopaque = null,
         /// A frame with a cursor cell failed (`frameCompleted`, on the GPU
         /// completion thread): the next frame draws and publishes it again.
         cursor_republish: std.atomic.Value(bool) = .init(false),
@@ -620,24 +617,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     return .{ &self.uniforms.?, &self.cells.? };
                 }
 
-                /// A target of the cell's size to draw into: the last one
-                /// unless its size changed or the embedder may show it
-                /// (`shown`, the surface of the last published cell, or
-                /// one the window server uses).
-                fn targetFor(
+                /// A new target of the cell's size. A published surface
+                /// belongs to the embedder (it may still show it), so no
+                /// cell is drawn into an earlier one: this frame's last
+                /// target is released, and the embedder's retain keeps it.
+                fn newTarget(
                     self: *CursorFrame,
                     api: GraphicsAPI,
                     width: u32,
                     height: u32,
-                    shown: ?*anyopaque,
                 ) !*Target {
-                    if (self.target) |*t| {
-                        const may_show = shown != null and targetSurface(t) == shown;
-                        if (t.width == width and t.height == height and
-                            !may_show and !targetInUse(t)) return t;
-                        t.deinit();
-                        self.target = null;
-                    }
+                    if (self.target) |*t| t.deinit();
+                    self.target = null;
                     self.target = try api.initTarget(width, height);
                     return &self.target.?;
                 }
@@ -2534,7 +2525,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             const p = placement orelse {
                 frame.cursor.publish = .{ .serial = self.cursor_publisher.commit(key) };
-                self.cursor_shown_surface = null;
                 return;
             };
 
@@ -2544,7 +2534,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             if (rect.width == 0 or rect.height == 0) return;
 
             const uniforms, const cells = try frame.cursor.buffers(self.api);
-            const target = try frame.cursor.targetFor(self.api, rect.width, rect.height, self.cursor_shown_surface);
+            const target = try frame.cursor.newTarget(self.api, rect.width, rect.height);
             try uniforms.sync(&.{cursorpkg.cellUniforms(
                 shaderpkg.Uniforms,
                 self.uniforms,
@@ -2588,11 +2578,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 });
             }
 
-            const surface = targetSurface(target);
-            self.cursor_shown_surface = surface;
             frame.cursor.publish = .{
                 .serial = self.cursor_publisher.commit(key),
-                .surface = surface,
+                .surface = targetSurface(target),
                 .x = rect.x,
                 .y = rect.y,
                 .width = rect.width,
@@ -2640,11 +2628,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// The IOSurface of a target, null where targets have none.
         fn targetSurface(target: *const Target) ?*anyopaque {
             return if (comptime @hasField(Target, "surface")) @ptrCast(target.surface) else null;
-        }
-
-        /// The window server shows the target's surface.
-        fn targetInUse(target: *const Target) bool {
-            return if (comptime @hasField(Target, "surface")) target.surface.isInUse() else false;
         }
 
         /// Call this any time the background image path changes.

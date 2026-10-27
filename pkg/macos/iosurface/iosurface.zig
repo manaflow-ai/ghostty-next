@@ -96,11 +96,6 @@ pub const IOSurface = opaque {
         );
     }
 
-    /// The window server shows the surface (a layer's contents on screen).
-    pub inline fn isInUse(self: *IOSurface) bool {
-        return c.IOSurfaceIsInUse(@ptrCast(self)) != 0;
-    }
-
     pub inline fn getAllocSize(self: *IOSurface) usize {
         return c.IOSurfaceGetAllocSize(@ptrCast(self));
     }
