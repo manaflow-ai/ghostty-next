@@ -474,6 +474,13 @@ fn syncOutputWakes(self: *Thread) void {
     self.state.output_wakes.store(needed, .release);
 }
 
+/// Count a wake of this thread (RenderCounters.thread_wakes).
+fn countWake(self: *Thread) void {
+    const counters = &self.renderer.counters;
+    _ = counters.thread_wakes.fetchAdd(1, .monotonic);
+    if (!self.flags.visible) _ = counters.hidden_thread_wakes.fetchAdd(1, .monotonic);
+}
+
 fn changeConfig(self: *Thread, config: *const DerivedConfig) !void {
     // A newly enabled scheduler must reconsider existing history even when no
     // terminal activity occurred while compression was disabled.
@@ -515,6 +522,7 @@ fn wakeupCallback(
     };
 
     const t = self_.?;
+    t.countWake();
 
     // When we wake up, we check the mailbox. Mailbox producers should
     // wake up our thread after publishing.
@@ -562,6 +570,7 @@ fn drawNowCallback(
 
     // Draw immediately
     const t = self_.?;
+    t.countWake();
     const before = t.renderer.counters.frames.load(.monotonic);
     t.drawFrame(true);
     t.flags.last_tick_drew = t.renderer.counters.frames.load(.monotonic) != before;
@@ -679,6 +688,7 @@ fn animationTimerCallback(
         log.warn("animation callback fired without data set", .{});
         return .disarm;
     };
+    t.countWake();
 
     // Animations pause entirely while we're invisible; the .visible
     // mailbox message re-arms us when we can be seen again.
@@ -727,13 +737,13 @@ fn cursorTimerCallback(
         return .disarm;
     };
 
+    t.countWake();
+
     t.flags.cursor_blink_visible = !t.flags.cursor_blink_visible;
-    // A tick changes pixels only when the cursor blinks and shows: a hidden
-    // cursor (DECTCEM off, as agent TUIs keep it) or a steady one draws the
-    // same frame, so the tick wakes nothing (no frame update, no draw). The
-    // renderer thread owns `terminal_state`; the next update after output
-    // that turns blinking on picks the ticks up again.
-    if (blinkTickDraws(&t.renderer.terminal_state)) t.wakeup.notify() catch {};
+    switch (blinkTick(t.flags.visible, &t.renderer.terminal_state)) {
+        .draw => t.wakeup.notify() catch {},
+        .quiet, .stop => {},
+    }
 
     t.cursor_h.run(
         &t.loop,
@@ -765,8 +775,30 @@ test "renderer thread: an early frame only after a quiet interval while the link
     try testing.expect(!drawsNow(true, false, true, false));
 }
 
+/// What a cursor blink tick does.
+const BlinkTick = enum {
+    /// The tick changes pixels: wake the thread for a frame.
+    draw,
+    /// The frame stays the same; the timer runs on.
+    quiet,
+    /// The surface is hidden: no frame, and the timer stops until the
+    /// surface is shown (`.visible`).
+    stop,
+};
+
+/// The blink tick of a surface (`visible`) whose last frame update is
+/// `state`.
+fn blinkTick(visible: bool, state: *const terminalpkg.RenderState) BlinkTick {
+    _ = visible;
+    return if (blinkTickDraws(state)) .draw else .quiet;
+}
+
 /// Whether a cursor blink tick can change the frame of `state` (the
-/// renderer's last frame update): the cursor blinks and is visible.
+/// renderer's last frame update): the cursor blinks and is visible. A
+/// hidden cursor (DECTCEM off, as agent TUIs keep it) or a steady one draws
+/// the same frame, so the tick wakes nothing (no frame update, no draw).
+/// The renderer thread owns `terminal_state`; the next update after output
+/// that turns blinking on picks the ticks up again.
 fn blinkTickDraws(state: *const terminalpkg.RenderState) bool {
     return state.cursor.blinking and state.cursor.visible;
 }
@@ -782,6 +814,19 @@ test "renderer thread: a blink tick draws only a visible blinking cursor" {
     state.cursor.visible = true;
     state.cursor.blinking = false;
     try testing.expect(!blinkTickDraws(&state));
+}
+
+test "renderer thread: a hidden surface's blink tick stops its timer" {
+    const testing = std.testing;
+    var state: terminalpkg.RenderState = .empty;
+    state.cursor.blinking = true;
+    state.cursor.visible = true;
+    try testing.expectEqual(BlinkTick.draw, blinkTick(true, &state));
+    // Hidden: no frame, and no further ticks until the surface is shown.
+    try testing.expectEqual(BlinkTick.stop, blinkTick(false, &state));
+    state.cursor.blinking = false;
+    try testing.expectEqual(BlinkTick.quiet, blinkTick(true, &state));
+    try testing.expectEqual(BlinkTick.stop, blinkTick(false, &state));
 }
 
 fn cursorCancelCallback(
@@ -930,6 +975,7 @@ const Compression = struct {
             },
         };
 
+        thread.countWake();
         const self = &thread.compression;
 
         if (self.step(thread)) |delay| {

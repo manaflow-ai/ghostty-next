@@ -2260,6 +2260,8 @@ pub const CAPI = struct {
         host_main_draws: u64,
         host_fresh_presents: u64,
         host_late_presents: u64,
+        thread_wakes: u64,
+        hidden_thread_wakes: u64,
     };
 
     /// The renderer's frame counters. See ghostty.h.
@@ -2281,6 +2283,8 @@ pub const CAPI = struct {
             .host_main_draws = hostCounter(surface, "main_draws"),
             .host_fresh_presents = hostCounter(surface, "fresh_presents"),
             .host_late_presents = hostCounter(surface, "late"),
+            .thread_wakes = c.thread_wakes.load(.monotonic),
+            .hidden_thread_wakes = c.hidden_thread_wakes.load(.monotonic),
         };
     }
 

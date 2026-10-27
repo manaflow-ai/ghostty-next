@@ -45,6 +45,11 @@ pub const RenderCounters = struct {
     full_swap: std.atomic.Value(u64) = .init(0),
     /// The drawn terminal's grid changed size.
     full_resize: std.atomic.Value(u64) = .init(0),
+    /// Renderer thread wakes (renderer.Thread): an async wake, a forced
+    /// draw, or a timer (animation, cursor blink, scrollback compression).
+    thread_wakes: std.atomic.Value(u64) = .init(0),
+    /// The part of `thread_wakes` that came while the surface was hidden.
+    hidden_thread_wakes: std.atomic.Value(u64) = .init(0),
 };
 const imagepkg = @import("image.zig");
 const ImageState = imagepkg.State;

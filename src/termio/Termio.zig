@@ -3952,6 +3952,31 @@ test "manual: output does not wake a renderer that asked for no output wakes" {
     try testManualTermio(true, body);
 }
 
+test "manual: output to a renderer that takes no output wakes queues nothing for it" {
+    const body = struct {
+        fn run(io: *Termio, _: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            // A hidden renderer: output only marks the terminal dirty.
+            io.renderer_state.output_wakes.store(false, .release);
+            io.last_cursor_reset = null;
+            const pages = &io.terminal.screens.active.pages;
+            pages.clearDirty();
+            const row: u32 = @intCast(io.terminal.screens.active.cursor.y);
+            io.processOutput("hidden\r\n");
+            try testing.expectEqual(@as(u64, 1), io.renderer_state.output_wakes_skipped.load(.monotonic));
+            try testing.expect(io.renderer_mailbox.pop(global.io()) == null);
+            try testing.expect(pages.isDirty(.{ .screen = .{ .x = 0, .y = row } }));
+
+            // Shown again: output resets the cursor blink as before.
+            io.renderer_state.output_wakes.store(true, .release);
+            io.processOutput("shown\r\n");
+            const message = io.renderer_mailbox.pop(global.io()) orelse return error.TestExpectedMessage;
+            try testing.expect(message == .reset_cursor_blink);
+        }
+    }.run;
+    try testManualTermio(true, body);
+}
+
 test "manual: a handed-over wheel scroll follows the mode the terminal has when applied" {
     const body = struct {
         fn run(io: *Termio, sink: *TestSink, _: bool) !void {

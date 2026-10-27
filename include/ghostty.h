@@ -758,6 +758,11 @@ typedef struct {
   uint64_t host_main_draws;
   uint64_t host_fresh_presents;
   uint64_t host_late_presents;
+  // Renderer thread wakes (an async wake, a forced draw, an animation,
+  // cursor blink or scrollback-compression timer), and those of them that
+  // came while the surface was hidden (ghostty_surface_set_occlusion).
+  uint64_t thread_wakes;
+  uint64_t hidden_thread_wakes;
 } ghostty_surface_render_counters_s;
 
 // Config types
