@@ -2936,7 +2936,8 @@ fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
 /// The grid a screen of `screen` pixels fits: the grid `resize` would
 /// give it, from the configured padding (balanced padding is computed
 /// after the grid, so it never changes it). Null for a zero cell or a
-/// screen with no whole cell. Main thread, like `resize`.
+/// screen with no whole cell after padding, where `resize` would clamp
+/// the grid to one column or row. Main thread, like `resize`.
 pub fn fitGrid(self: *const Surface, screen: rendererpkg.ScreenSize) ?rendererpkg.GridSize {
     if (self.size.cell.width == 0 or self.size.cell.height == 0) return null;
     const content_scale = self.rt_surface.getContentScale() catch return null;
@@ -2947,9 +2948,12 @@ pub fn fitGrid(self: *const Surface, screen: rendererpkg.ScreenSize) ?rendererpk
 }
 
 fn fitGridSize(screen: rendererpkg.ScreenSize, cell: rendererpkg.CellSize, padding: rendererpkg.Padding) ?rendererpkg.GridSize {
-    const grid: rendererpkg.GridSize = .init(screen.subPadding(padding), cell);
-    if (grid.columns == 0 or grid.rows == 0) return null;
-    return grid;
+    if (cell.width == 0 or cell.height == 0) return null;
+    const content = screen.subPadding(padding);
+    // GridSize.init clamps to at least one column and one row, so its
+    // result cannot say that no whole cell fits: check the pixels here.
+    if (content.width < cell.width or content.height < cell.height) return null;
+    return .init(content, cell);
 }
 
 test "fitGrid gives the grid resize gives the same screen" {
@@ -2965,8 +2969,17 @@ test "fitGrid gives the grid resize gives the same screen" {
     // Balanced padding is computed after the grid and keeps it.
     size.balancePadding(padding, .true);
     try testing.expectEqual(size.grid(), fit);
-    // A screen smaller than one cell after padding fits no grid.
+    // A screen smaller than one cell after padding fits no grid, in
+    // either direction, though resize clamps it to one column or row.
     try testing.expect(fitGridSize(.{ .width = 19, .height = 419 }, cell, padding) == null);
+    try testing.expect(fitGridSize(.{ .width = 809, .height = 29 }, cell, padding) == null);
+    try testing.expect(fitGridSize(.{ .width = 0, .height = 0 }, cell, padding) == null);
+    // Exactly one whole cell after padding fits a one-cell grid.
+    const one = fitGridSize(.{ .width = 20, .height = 30 }, cell, padding).?;
+    try testing.expectEqual(@as(rendererpkg.GridSize.Unit, 1), one.columns);
+    try testing.expectEqual(@as(rendererpkg.GridSize.Unit, 1), one.rows);
+    // A zero cell (no font yet) fits no grid.
+    try testing.expect(fitGridSize(screen, .{ .width = 0, .height = 20 }, padding) == null);
 }
 
 /// Recalculate the balanced padding if needed.
