@@ -12,6 +12,7 @@ const rendererpkg = @import("../renderer.zig");
 const apprt = @import("../apprt.zig");
 const configpkg = @import("../config.zig");
 const terminalpkg = @import("../terminal/main.zig");
+const RenderCounters = @import("generic.zig").RenderCounters;
 
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.renderer_thread);
@@ -331,8 +332,9 @@ fn drainMailbox(self: *Thread) !void {
                 self.setQosClass();
 
                 // A hidden surface's first blink tick stopped the timer
-                // (blinkTick); a focused surface shown again blinks at once.
-                if (v and self.flags.focused) self.startCursorBlink();
+                // (blinkRearms); a focused surface shown again blinks at
+                // once.
+                self.syncCursorBlink();
 
                 // If we became visible then we immediately rebuild cells
                 // (renderCallback skips updateFrame while invisible) and
@@ -345,12 +347,9 @@ fn drainMailbox(self: *Thread) !void {
                 self.renderer.setVisible(v);
                 self.syncOutputWakes();
 
-                // Note that we're explicitly today not stopping any
-                // cursor timers, draw timers, etc. These things have very
-                // little resource cost and properly maintaining their active
-                // state across different transitions is going to be bug-prone,
-                // so its easier to just let them keep firing and have them
-                // check the visible state themselves to control their behavior.
+                // Hiding cancels no timer here: each one sees the hidden
+                // state at its next tick and does not re-arm (blink,
+                // animation) or waits longer (compression).
             },
 
             .focus => |v| focus: {
@@ -370,25 +369,10 @@ fn drainMailbox(self: *Thread) !void {
                 // the animation timer for the new state.
                 self.armAnimationTimer();
 
-                if (!v) {
-                    // If we're not focused, then we stop the cursor blink
-                    if (self.cursor_c.state() == .active and
-                        self.cursor_c_cancel.state() == .dead)
-                    {
-                        self.cursor_h.cancel(
-                            &self.loop,
-                            &self.cursor_c,
-                            &self.cursor_c_cancel,
-                            void,
-                            null,
-                            cursorCancelCallback,
-                        );
-                    }
-                } else if (self.flags.visible) {
-                    // A hidden surface's blink timer stays stopped; the
-                    // .visible message starts it.
-                    self.startCursorBlink();
-                }
+                // Losing focus stops the cursor blink; gaining it starts
+                // the blink only on a visible surface (a hidden one's
+                // timer waits for .visible).
+                self.syncCursorBlink();
             },
 
             .reset_cursor_blink => {
@@ -468,25 +452,52 @@ fn syncOutputWakes(self: *Thread) void {
     self.state.output_wakes.store(needed, .release);
 }
 
-/// Show the cursor and start its blink timer, unless it is running.
-fn startCursorBlink(self: *Thread) void {
-    if (self.cursor_c.state() == .active) return;
-    self.flags.cursor_blink_visible = true;
-    self.cursor_h.run(
-        &self.loop,
-        &self.cursor_c,
-        cursorBlinkInterval(),
-        Thread,
-        self,
-        cursorTimerCallback,
-    );
+/// Start or stop the cursor blink timer for the surface's visibility and
+/// focus (blinkChange).
+fn syncCursorBlink(self: *Thread) void {
+    switch (blinkChange(
+        self.flags.visible,
+        self.flags.focused,
+        self.cursor_c.state() == .active,
+    )) {
+        .none => {},
+        .start => {
+            // The cursor shows first, so a surface shown or focused again
+            // never waits a blink interval for it.
+            self.flags.cursor_blink_visible = true;
+            self.cursor_h.run(
+                &self.loop,
+                &self.cursor_c,
+                cursorBlinkInterval(),
+                Thread,
+                self,
+                cursorTimerCallback,
+            );
+        },
+        .cancel => if (self.cursor_c_cancel.state() == .dead) {
+            self.cursor_h.cancel(
+                &self.loop,
+                &self.cursor_c,
+                &self.cursor_c_cancel,
+                void,
+                null,
+                cursorCancelCallback,
+            );
+        },
+    }
 }
 
-/// Count a wake of this thread (RenderCounters.thread_wakes).
+/// Count a wake of this thread (countWakeOf).
 fn countWake(self: *Thread) void {
-    const counters = &self.renderer.counters;
+    countWakeOf(&self.renderer.counters, self.flags.visible);
+}
+
+/// Count one renderer thread wake of a surface (`visible`) in `counters`:
+/// every wake in `thread_wakes`, a hidden surface's also in
+/// `hidden_thread_wakes`.
+fn countWakeOf(counters: *RenderCounters, visible: bool) void {
     _ = counters.thread_wakes.fetchAdd(1, .monotonic);
-    if (!self.flags.visible) _ = counters.hidden_thread_wakes.fetchAdd(1, .monotonic);
+    if (!visible) _ = counters.hidden_thread_wakes.fetchAdd(1, .monotonic);
 }
 
 fn changeConfig(self: *Thread, config: *const DerivedConfig) !void {
@@ -748,11 +759,9 @@ fn cursorTimerCallback(
     t.countWake();
 
     t.flags.cursor_blink_visible = !t.flags.cursor_blink_visible;
-    switch (blinkTick(t.flags.visible, &t.renderer.terminal_state)) {
-        .draw => t.wakeup.notify() catch {},
-        .quiet => {},
-        .stop => return .disarm,
-    }
+    const tick = blinkTick(t.flags.visible, &t.renderer.terminal_state);
+    if (tick == .draw) t.wakeup.notify() catch {};
+    if (!blinkRearms(tick)) return .disarm;
 
     t.cursor_h.run(
         &t.loop,
@@ -802,6 +811,31 @@ fn blinkTick(visible: bool, state: *const terminalpkg.RenderState) BlinkTick {
     return if (blinkTickDraws(state)) .draw else .quiet;
 }
 
+/// Whether the blink timer runs again after `tick`: a hidden surface's
+/// timer stops until `.visible` starts it again (blinkChange).
+fn blinkRearms(tick: BlinkTick) bool {
+    return tick != .stop;
+}
+
+/// What a visibility or focus change does to the cursor blink timer.
+const BlinkChange = enum {
+    none,
+    /// Start the stopped timer, the cursor shown.
+    start,
+    /// Cancel the running timer.
+    cancel,
+};
+
+/// The blink timer runs only while the surface is visible and focused. An
+/// unfocused surface cancels it; a hidden one leaves it to stop at its next
+/// tick (blinkRearms); a visible focused surface starts it when it is not
+/// running (`active`).
+fn blinkChange(visible: bool, focused: bool, active: bool) BlinkChange {
+    if (!focused) return if (active) .cancel else .none;
+    if (!visible or active) return .none;
+    return .start;
+}
+
 /// Whether a cursor blink tick can change the frame of `state` (the
 /// renderer's last frame update): the cursor blinks and is visible. A
 /// hidden cursor (DECTCEM off, as agent TUIs keep it) or a steady one draws
@@ -831,11 +865,51 @@ test "renderer thread: a hidden surface's blink tick stops its timer" {
     state.cursor.blinking = true;
     state.cursor.visible = true;
     try testing.expectEqual(BlinkTick.draw, blinkTick(true, &state));
-    // Hidden: no frame, and no further ticks until the surface is shown.
+    try testing.expect(blinkRearms(blinkTick(true, &state)));
+    // Hidden: no frame, and the timer is not re-armed until the surface is
+    // shown.
     try testing.expectEqual(BlinkTick.stop, blinkTick(false, &state));
+    try testing.expect(!blinkRearms(blinkTick(false, &state)));
     state.cursor.blinking = false;
     try testing.expectEqual(BlinkTick.quiet, blinkTick(true, &state));
+    try testing.expect(blinkRearms(blinkTick(true, &state)));
     try testing.expectEqual(BlinkTick.stop, blinkTick(false, &state));
+    try testing.expect(!blinkRearms(blinkTick(false, &state)));
+}
+
+test "renderer thread: a focused surface shown again restarts its stopped blink" {
+    const testing = std.testing;
+    // .visible(true) on a focused surface whose hidden tick stopped the
+    // timer: it starts (syncCursorBlink shows the cursor first).
+    try testing.expectEqual(BlinkChange.start, blinkChange(true, true, false));
+    // Already running: nothing to start.
+    try testing.expectEqual(BlinkChange.none, blinkChange(true, true, true));
+    // .visible(true) on an unfocused surface: no blink.
+    try testing.expectEqual(BlinkChange.none, blinkChange(true, false, false));
+}
+
+test "renderer thread: focus on a hidden surface starts no blink" {
+    const testing = std.testing;
+    // .focus(true) while hidden: the timer stays stopped until .visible.
+    try testing.expectEqual(BlinkChange.none, blinkChange(false, true, false));
+    // Hiding a running timer leaves it to stop at its next tick.
+    try testing.expectEqual(BlinkChange.none, blinkChange(false, true, true));
+    // .focus(false) cancels a running timer, shown or hidden.
+    try testing.expectEqual(BlinkChange.cancel, blinkChange(true, false, true));
+    try testing.expectEqual(BlinkChange.cancel, blinkChange(false, false, true));
+    try testing.expectEqual(BlinkChange.none, blinkChange(false, false, false));
+}
+
+test "renderer thread: a hidden surface's wake counts as hidden" {
+    const testing = std.testing;
+    var counters: RenderCounters = .{};
+    countWakeOf(&counters, true);
+    try testing.expectEqual(@as(u64, 1), counters.thread_wakes.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), counters.hidden_thread_wakes.load(.monotonic));
+    // A hidden blink tick (the one that stops the timer) is a hidden wake.
+    countWakeOf(&counters, false);
+    try testing.expectEqual(@as(u64, 2), counters.thread_wakes.load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), counters.hidden_thread_wakes.load(.monotonic));
 }
 
 fn cursorCancelCallback(
