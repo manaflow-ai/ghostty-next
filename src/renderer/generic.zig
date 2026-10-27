@@ -73,6 +73,8 @@ const DisplayLink = switch (builtin.os.tag) {
     else => void,
 };
 
+const vsyncpkg = @import("vsync.zig");
+
 const log = std.log.scoped(.generic_renderer);
 
 /// Create a renderer type with the provided graphics API wrapper.
@@ -258,10 +260,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Graphics API state.
         api: GraphicsAPI,
 
-        /// The CVDisplayLink used to drive the rendering loop in
-        /// sync with the display. This is void on platforms that
-        /// don't support a display link.
-        display_link: ?DisplayLink = null,
+        /// What paces the rendering loop to the display: our own display
+        /// link (CVDisplayLink on macOS, CADisplayLink on iOS, none
+        /// elsewhere) or, with external vsync, the embedder.
+        vsync: vsyncpkg.Pacer(DisplayLink) = .{},
 
         /// Health of the most recently completed frame.
         health: std.atomic.Value(Health) = .{ .raw = .healthy },
@@ -932,6 +934,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 // Graphics API stuff
                 .api = api,
+                .vsync = initVsync(&options),
                 .swap_chain = null,
                 .has_custom_shaders = has_custom_shaders,
                 .reinitialize_shaders = true,
@@ -967,12 +970,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             self.latest_frame.deinit(global.io());
 
-            if (DisplayLink != void) {
-                if (self.display_link) |display_link| {
-                    display_link.stop() catch {};
-                    display_link.release();
-                }
-            }
+            self.vsync.releaseLink();
 
             self.cells.deinit(self.alloc);
             self.row_keys.deinit(self.alloc);
@@ -1058,9 +1056,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.api.loopEnter();
             }
 
-            // If we don't support a display link we have no work to do.
-            if (comptime DisplayLink == void) return;
-
             self.syncDisplayLink(null, &thr.draw_now);
         }
 
@@ -1071,21 +1066,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.api.loopExit();
             }
 
-            // If we don't support a display link we have no work to do.
-            if (comptime DisplayLink == void) return;
-
-            // Stop our display link. If this fails its okay it just means
-            // that we either never started it or the view its attached to
-            // is gone which is fine.
-            const display_link = self.display_link orelse return;
-            display_link.stop() catch {};
+            // Nothing ticks this thread's draw_now anymore: our display
+            // link stops, or the embedder is told we want no vsync.
+            self.vsync.stop();
 
             // An iOS link ticks this thread's draw_now, which goes away
             // with the thread: release it now, not in deinit.
-            if (comptime builtin.os.tag == .ios) {
-                display_link.release();
-                self.display_link = null;
-            }
+            if (comptime builtin.os.tag == .ios) self.vsync.releaseLink();
         }
 
         /// This is called by the GTK apprt after the surface is
@@ -1207,7 +1194,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             id: u32,
             draw_now: *xev.Async,
         ) !void {
-            if (comptime DisplayLink == void) return;
             self.syncDisplayLink(id, draw_now);
         }
 
@@ -1294,9 +1280,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// is responsible for triggering draw_now calls to the render thread.
         /// That is the only way to trigger a drawFrame.
         pub fn hasVsync(self: *const Self) bool {
-            if (comptime DisplayLink == void) return false;
-            const display_link = self.display_link orelse return false;
-            return display_link.isRunning();
+            return self.vsync.running();
         }
 
         /// Callback when the focus changes for the terminal this is rendering.
@@ -1392,8 +1376,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
         }
 
-        /// Create or update the display link and match it to the current
-        /// surface state.
+        /// Create or update the display link (or, with external vsync, ask
+        /// the embedder for ticks) and match it to the current surface
+        /// state.
         ///
         /// Must be called on the render thread and must NOT be called
         /// while holding `draw_mutex`. Stopping a CVDisplayLink is a
@@ -1405,66 +1390,59 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             display_id: ?u32,
             draw_now: ?*xev.Async,
         ) void {
-            if (comptime DisplayLink == void) return;
-
-            const display_link = self.display_link orelse display_link: {
-                if (!self.config.vsync) return;
-                const callback = draw_now orelse return;
-                if (comptime builtin.os.tag == .ios) {
-                    const result = @import("IosDisplayLink.zig").create(callback) catch |err| {
-                        log.warn("error creating display link; using fallback rendering err={}", .{err});
-                        return;
-                    };
-                    self.display_link = result;
-                    log.info("created display link", .{});
-                    break :display_link result;
-                } else {
-                    const result = macos.video.DisplayLink.createWithActiveCGDisplays() catch |err| {
-                        // A locked macOS session can temporarily have no active
-                        // displays. Rendering can continue without vsync and a
-                        // later display update will retry this method.
-                        log.warn("error creating display link; using fallback rendering err={}", .{err});
-                        return;
-                    };
-                    result.setOutputCallback(
-                        xev.Async,
-                        &displayLinkCallback,
-                        callback,
-                    ) catch |err| {
-                        log.warn("error configuring display link err={}", .{err});
-                        result.release();
-                        return;
-                    };
-
-                    self.display_link = result;
-                    log.info("created display link", .{});
-                    break :display_link result;
-                }
-            };
-
-            if (comptime builtin.os.tag == .macos) {
-                if (display_id) |id| {
-                    log.info("updating display link display id={}", .{id});
-                    display_link.setCurrentCGDisplay(id) catch |err| {
-                        log.warn("error setting display link display id err={}", .{err});
-                    };
-                }
-            }
-
             const should_run =
                 // Non-visible windows never vsync
                 self.visible and
                 // Only vsync if we have cell changes or animation
                 (self.cells_rebuilt or self.animationWake() != null);
 
-            if (should_run) {
-                if (!display_link.isRunning()) {
-                    display_link.start() catch {};
-                }
-            } else {
-                display_link.stop() catch {};
-            }
+            self.vsync.sync(
+                self.config.vsync,
+                should_run,
+                display_id,
+                DisplayLinkFactory{ .draw_now = draw_now },
+            );
         }
+
+        /// The pacing of a renderer made with `options`.
+        fn initVsync(options: *const renderer.Options) vsyncpkg.Pacer(DisplayLink) {
+            return .{ .external = options.vsync_external };
+        }
+
+        /// Makes this platform's display link, ticking `draw_now`. Only a
+        /// standalone renderer makes one (vsyncpkg.Pacer.sync).
+        const DisplayLinkFactory = struct {
+            draw_now: ?*xev.Async,
+
+            pub fn create(self: DisplayLinkFactory) ?DisplayLink {
+                if (comptime DisplayLink == void) return null;
+                const callback = self.draw_now orelse return null;
+                const result = switch (comptime builtin.os.tag) {
+                    .ios => @import("IosDisplayLink.zig").create(callback),
+                    .macos => createMacOS(callback),
+                    else => comptime unreachable,
+                } catch |err| {
+                    // A locked macOS session can temporarily have no active
+                    // displays. Rendering can continue without vsync and a
+                    // later display update will retry this method.
+                    log.warn("error creating display link; using fallback rendering err={}", .{err});
+                    return null;
+                };
+                log.info("created display link", .{});
+                return result;
+            }
+
+            fn createMacOS(callback: *xev.Async) !*macos.video.DisplayLink {
+                const result = try macos.video.DisplayLink.createWithActiveCGDisplays();
+                errdefer result.release();
+                try result.setOutputCallback(
+                    xev.Async,
+                    &displayLinkCallback,
+                    callback,
+                );
+                return result;
+            }
+        };
 
         /// Set the new font grid.
         ///
@@ -4270,4 +4248,51 @@ fn rowKey(
     std.hash.autoHash(&h, cursor_x);
     for (highlights.items) |hl| std.hash.autoHash(&h, hl);
     return h.final();
+}
+
+test "renderer external vsync: the options reach the pacer, syncing makes no display link" {
+    const testing = std.testing;
+    const R = renderer.Renderer;
+
+    const Embedder = struct {
+        calls: [4]bool = undefined,
+        len: usize = 0,
+
+        fn wanted(ud: ?*anyopaque, on: bool) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ud.?));
+            self.calls[self.len] = on;
+            self.len += 1;
+        }
+    };
+    var embedder: Embedder = .{};
+
+    // The renderer reads only the vsync option on this path.
+    var options: renderer.Options = undefined;
+    options.vsync_external = try .fromConfig(true, &Embedder.wanted, &embedder);
+
+    var draw_now = try xev.Async.init();
+    defer draw_now.deinit();
+
+    // Only the fields syncDisplayLink reads are set.
+    const r = try testing.allocator.create(R);
+    defer testing.allocator.destroy(r);
+    r.vsync = R.initVsync(&options);
+    r.config.vsync = true;
+    r.cells_rebuilt = true;
+
+    // A new frame on a visible surface: the embedder is asked for ticks,
+    // by the sync the thread-enter, display-realized and display-id paths
+    // run, with the factory they pass.
+    r.visible = true;
+    r.syncDisplayLink(7, &draw_now);
+    try testing.expect(r.hasVsync());
+
+    // Hidden: no more ticks.
+    r.visible = false;
+    r.syncDisplayLink(null, &draw_now);
+    try testing.expect(!r.hasVsync());
+
+    try testing.expectEqual(@as(u32, 0), r.vsync.link_creates);
+    try testing.expect(r.vsync.link == null);
+    try testing.expectEqualSlices(bool, &.{ true, false }, embedder.calls[0..embedder.len]);
 }

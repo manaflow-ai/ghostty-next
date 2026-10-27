@@ -59,6 +59,7 @@ pub const Surface = runtime.Surface;
 test {
     _ = Runtime;
     _ = runtime;
+    _ = embedded;
     _ = action;
     _ = structs;
     _ = @import("apprt/grid_metrics.zig");

@@ -372,5 +372,22 @@ test "ghostty.h surface config IO fields" {
     try testing.expectEqual(@as(usize, 88), @offsetOf(T, "io_mode"));
     try testing.expectEqual(@as(usize, 96), @offsetOf(T, "io_write_cb"));
     try testing.expectEqual(@as(usize, 104), @offsetOf(T, "io_write_userdata"));
-    try testing.expectEqual(@as(usize, 112), @sizeOf(T));
+    try testing.expectEqual(@as(usize, 112), @offsetOf(T, "vsync_external"));
+    try testing.expectEqual(@as(usize, 120), @offsetOf(T, "vsync_wanted_cb"));
+    try testing.expectEqual(@as(usize, 128), @offsetOf(T, "vsync_userdata"));
+    try testing.expectEqual(@as(usize, 136), @sizeOf(T));
+}
+
+test "ghostty.h external vsync API" {
+    const testing = std.testing;
+    const c = @import("ghostty.h");
+    try testing.expect(@hasDecl(c, "ghostty_surface_vsync"));
+    try testing.expect(@hasDecl(c, "ghostty_surface_vsync_wanted_cb"));
+
+    // The header's callback type is the one the renderer calls.
+    const Wanted = @import("../renderer/vsync.zig").WantedCallback;
+    const header: c.ghostty_surface_vsync_wanted_cb = @as(Wanted, &struct {
+        fn wanted(_: ?*anyopaque, _: bool) callconv(.c) void {}
+    }.wanted);
+    try testing.expect(header != null);
 }

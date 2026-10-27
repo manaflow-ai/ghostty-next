@@ -3,6 +3,7 @@
 const apprt = @import("../apprt.zig");
 const font = @import("../font/main.zig");
 const renderer = @import("../renderer.zig");
+const vsync = @import("vsync.zig");
 
 /// The device state that corresponds to the physical GPU
 /// we'd like to render to.
@@ -26,3 +27,8 @@ rt_surface: *apprt.Surface,
 
 /// The renderer thread.
 thread: *renderer.Thread,
+
+/// Set when the embedder paces this renderer
+/// (`ghostty_surface_config_s.vsync_external`): the renderer makes no
+/// display link of its own.
+vsync_external: ?vsync.External = null,

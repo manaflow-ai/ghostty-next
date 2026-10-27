@@ -616,6 +616,22 @@ typedef enum {
 // into the surface. It can be called until ghostty_surface_free returns.
 typedef void (*ghostty_io_write_cb)(void*, const char*, uintptr_t);
 
+// External vsync (ghostty_surface_config_s.vsync_external). Called when the
+// surface starts or stops wanting vsync ticks: true while it is visible and
+// has a new frame or an animation to show, false when it is idle or hidden,
+// and false once more while ghostty_surface_free stops the renderer (if the
+// last call was true). While the last call was true, call
+// ghostty_surface_vsync once per refresh of the surface's display. Calls
+// alternate true and false, starting with true.
+//
+// Runs on the surface's renderer thread, never the main thread, and can run
+// before ghostty_surface_new returns. Calls for one surface never overlap.
+// It must return quickly and never block or wait for the main thread
+// (ghostty_surface_free waits for the renderer thread to exit); it may call
+// ghostty_surface_vsync and nothing else in Ghostty. No call starts after
+// ghostty_surface_free returned.
+typedef void (*ghostty_surface_vsync_wanted_cb)(void* userdata, bool wanted);
+
 // Font binding actions reported after Ghostty applied them (increase,
 // decrease, reset, set). The callback runs synchronously on the surface's
 // GUI thread and must not free or reenter the surface.
@@ -662,6 +678,17 @@ typedef struct {
   ghostty_surface_io_mode_e io_mode;
   ghostty_io_write_cb io_write_cb;
   void* io_write_userdata;
+  // External vsync. True: the surface's renderer makes no display link of
+  // its own (standalone, each surface runs a CVDisplayLink on macOS or a
+  // CADisplayLink on iOS); the embedder paces it with one clock per display.
+  // vsync_wanted_cb (required: ghostty_surface_new fails without it) says
+  // when the surface wants ticks, and ghostty_surface_vsync delivers them.
+  // With the window-vsync config off the surface never asks for ticks and
+  // draws each frame when it is ready. Not inherited by the surfaces
+  // Ghostty asks the embedder to create.
+  bool vsync_external;
+  ghostty_surface_vsync_wanted_cb vsync_wanted_cb;
+  void* vsync_userdata;
 } ghostty_surface_config_s;
 
 typedef struct {
@@ -1444,6 +1471,11 @@ GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
 GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
+// External vsync: one refresh of the surface's display (see
+// ghostty_surface_vsync_wanted_cb). The renderer thread draws the pending
+// frame. Any thread, from ghostty_surface_new until ghostty_surface_free is
+// called. No effect on a surface made without vsync_external.
+GHOSTTY_API void ghostty_surface_vsync(ghostty_surface_t);
 // Install a per-surface callback for performed font binding actions. Call
 // once after ghostty_surface_new; a second call returns false. Not inherited
 // by child surfaces. userdata must stay valid until ghostty_surface_free
