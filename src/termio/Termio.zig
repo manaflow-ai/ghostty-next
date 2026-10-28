@@ -2465,6 +2465,16 @@ test "manual: snapshot restore and encode round trip" {
         var complete: std.ArrayListUnmanaged(u8) = .empty;
         var ready: std.ArrayListUnmanaged(u8) = .empty;
         var history: std.ArrayListUnmanaged(u8) = .empty;
+        /// The history arrives in slices of this many bytes; 0: one
+        /// record per slice (a sender that flushes per record).
+        var slice: usize = 997;
+
+        /// The length of the record at the start of `bytes` (or all of
+        /// them when its header is cut).
+        fn recordLen(bytes: []const u8) usize {
+            if (bytes.len < 10) return bytes.len;
+            return @min(bytes.len, 10 + @as(usize, std.mem.readInt(u32, bytes[2..6], .little)));
+        }
 
         fn encode(io: *Termio, phase: apprt.SurfaceSnapshotPhase) ![]u8 {
             const alloc = std.testing.allocator;
@@ -2510,7 +2520,7 @@ test "manual: snapshot restore and encode round trip" {
             try io.restoreSnapshot(ready.items, .ready);
             var rest = history.items;
             while (rest.len > 0) {
-                const n = @min(rest.len, 997);
+                const n = if (slice == 0) recordLen(rest) else @min(rest.len, slice);
                 try io.restoreSnapshot(rest[0..n], .history);
                 rest = rest[n..];
             }
@@ -2546,7 +2556,13 @@ test "manual: snapshot restore and encode round trip" {
     const joined = try std.mem.concat(alloc, u8, &.{ S.ready.items, S.history.items });
     defer alloc.free(joined);
     try std.testing.expectEqualSlices(u8, S.complete.items, joined);
-    try testManualTermio(true, S.restore);
+    // Uneven slices, single bytes, and one record per slice: the decoder
+    // reads a header ahead after each page (Ghostty 1.4), so a slice that
+    // ends at a record boundary must not end the restore.
+    for ([_]usize{ 997, 1, 0 }) |slice| {
+        S.slice = slice;
+        try testManualTermio(true, S.restore);
+    }
 }
 
 /// Change the surface config's scrollback byte limit the way
