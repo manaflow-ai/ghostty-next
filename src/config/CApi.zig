@@ -166,16 +166,16 @@ const Diagnostic = extern struct {
 /// set; internal fields excluded). With `ghostty_config_key_name` an
 /// embedder can enumerate the keys of the libghostty it links.
 export fn ghostty_config_key_count() usize {
-    return std.meta.fields(Key).len;
+    return @typeInfo(Key).@"enum".field_names.len;
 }
 
 /// The name of key `index` (0 ..< `ghostty_config_key_count()`), a static
 /// NUL-terminated string; null when the index is out of range.
 export fn ghostty_config_key_name(index: usize) ?[*:0]const u8 {
     const names = comptime names: {
-        const fields = std.meta.fields(Key);
+        const fields = @typeInfo(Key).@"enum".field_names;
         var result: [fields.len][*:0]const u8 = undefined;
-        for (fields, 0..) |field, i| result[i] = field.name;
+        for (fields, 0..) |field, i| result[i] = field;
         break :names result;
     };
     if (index >= names.len) return null;
@@ -203,7 +203,7 @@ export fn ghostty_config_key_source(
     switch (location) {
         .file => |file| {
             const arena = self._arena.?.allocator();
-            const path = arena.dupeZ(u8, file.path) catch return false;
+            const path = arena.dupeSentinel(u8, file.path, 0) catch return false;
             out.* = .{ .path = path.ptr, .line = file.line };
             return true;
         },
@@ -361,7 +361,7 @@ test "ghostty_config_trigger: default keybind" {
 test "ghostty_config_key_name: every key, then null" {
     const testing = std.testing;
     const count = ghostty_config_key_count();
-    try testing.expectEqual(std.meta.fields(Key).len, count);
+    try testing.expectEqual(@typeInfo(Key).@"enum".field_names.len, count);
     var saw_font_size = false;
     for (0..count) |i| {
         const name = std.mem.span(ghostty_config_key_name(i).?);
@@ -391,4 +391,3 @@ test "ghostty_config_key_source and ghostty_config_loaded_file" {
     try testing.expectEqual(@as(usize, 0), ghostty_config_loaded_file_count(&cfg));
     try testing.expect(ghostty_config_loaded_file(&cfg, 0) == null);
 }
-

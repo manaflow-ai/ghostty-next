@@ -27,10 +27,10 @@ pub fn init(
     deps: Deps,
 ) !Ghostty {
     const xc_config = switch (config.optimize) {
-        .Debug => "Debug",
-        .ReleaseSafe,
-        .ReleaseSmall,
-        .ReleaseFast,
+        .debug => "Debug",
+        .safe,
+        .small,
+        .fast,
         => "ReleaseLocal",
     };
 
@@ -42,7 +42,7 @@ pub fn init(
         // Native we need to override the architecture in the Xcode
         // project with the -arch flag. The ios target carries only a
         // native macOS slice, so it needs the same override.
-        .native, .ios => switch (builtin.cpu.arch) {
+        .native, .ios => switch (builtin.target.cpu.arch) {
             .aarch64 => "arm64",
             .x86_64 => "x86_64",
             else => @panic("unsupported macOS arch"),
@@ -158,10 +158,7 @@ pub fn init(
 
         // Configure how we're launching
         open.setEnvironmentVariable("GHOSTTY_MAC_LAUNCH_SOURCE", "zig_run");
-
-        if (b.args) |args| {
-            open.addArgs(args);
-        }
+        open.addPassthruArgs();
 
         break :open open;
     };
@@ -173,7 +170,7 @@ pub fn init(
         const step = RunStep.create(b, "copy app bundle");
         step.addArgs(&.{ "cp", "-R" });
         step.addFileArg(b.path(app_path));
-        step.addArg(b.fmt("{s}", .{b.install_path}));
+        step.addDirectoryArg2(b.graph.path(.install_prefix, ""), .{});
         step.step.dependOn(&build.step);
         break :copy step;
     };

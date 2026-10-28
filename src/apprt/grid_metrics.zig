@@ -224,7 +224,6 @@ test "grid metrics resolve a spacer-head cursor to its wrapped glyph" {
     try testing.expectEqual(@as(u16, 2), snapshot.cursor_width_cells);
 }
 
-
 test "grid metrics follow a host-locked grid that differs from the view" {
     const testing = std.testing;
     const alloc = testing.allocator;

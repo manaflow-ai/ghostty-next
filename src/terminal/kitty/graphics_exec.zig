@@ -761,14 +761,22 @@ fn completeAnimationFrame(
         // composes into the existing buffer in place and storage
         // usage cannot change. Kitty likewise exempts frame edits
         // from its quota check.
+        //
+        // A frame whose pixels have not arrived yet, such as one
+        // restored from a snapshot, has no buffer to draw into. The
+        // edit is refused before anything about the frame changes.
+        //
+        // The frame data is owned by this storage, so the const cast
+        // is safe (same reasoning as the renderer's image uploads).
+        const dst = @constCast(img.frameData(number) orelse {
+            result.message = "EINVAL: frame data incomplete";
+            return result;
+        });
         if (f.gap_ms != 0) anim.setGapAt(
             number - 1,
             if (f.gap_ms > 0) @intCast(f.gap_ms) else 0,
         );
 
-        // The frame data is owned by this storage, so the const cast
-        // is safe (same reasoning as the renderer's image uploads).
-        const dst = @constCast(img.frameData(number).?);
         pixel.composeRect(
             dst,
             img.width,
@@ -2557,7 +2565,7 @@ test "kittygfx relative placement chain depth limit" {
         var buf: [64]u8 = undefined;
         const cmd = try command.Parser.parseString(
             alloc,
-            try std.fmt.bufPrint(&buf, "a=p,i=1,p={},P=1,Q={}", .{ id, id - 1 }),
+            try std.mem.print(&buf, "a=p,i=1,p={},P=1,Q={}", .{ id, id - 1 }),
         );
         defer cmd.deinit(alloc);
         try testing.expect(execute(io, alloc, &t, &cmd).?.ok());

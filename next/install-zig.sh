@@ -10,7 +10,24 @@ source "$here/toolchain.env"
 [ "$(uname -m)" = arm64 ] || { echo "install-zig.sh: arm64 only" >&2; exit 1; }
 root="${1:-${RUNNER_TEMP:-/tmp}}/zig-$ZIG_VERSION"
 name="zig-aarch64-macos-$ZIG_VERSION"
+
+# The std fix named in toolchain.env (Zig 0bfd34342b), applied once and
+# checked by hash before and after, so a cached or fresh install is the same.
+patch_std() {
+  local file="$root/$name/lib/std/Io/Threaded.zig" sum
+  [ -n "${ZIG_STD_THREADED_PATCHED_SHA256:-}" ] || return 0
+  sum="$(shasum -a 256 "$file" | cut -d' ' -f1)"
+  [ "$sum" = "$ZIG_STD_THREADED_PATCHED_SHA256" ] && return 0
+  [ "$sum" = "$ZIG_STD_THREADED_SHA256" ] || { echo "install-zig.sh: unexpected $file sha256 $sum" >&2; exit 1; }
+  # Portable in place edit (BSD and GNU sed differ on -i).
+  sed 's/^    if (is_darwin) if (t.spawnDarwin($/    if (is_darwin and process.can_spawn) if (t.spawnDarwin(/' "$file" > "$file.patched"
+  mv "$file.patched" "$file"
+  sum="$(shasum -a 256 "$file" | cut -d' ' -f1)"
+  [ "$sum" = "$ZIG_STD_THREADED_PATCHED_SHA256" ] || { echo "install-zig.sh: std patch gave sha256 $sum" >&2; exit 1; }
+}
+
 if [ -x "$root/$name/zig" ] && [ "$("$root/$name/zig" version)" = "$ZIG_VERSION" ]; then
+  patch_std
   echo "$root/$name/zig"; exit 0
 fi
 mkdir -p "$root"
@@ -30,4 +47,5 @@ done
 [ "$ok" = 1 ] || { echo "install-zig.sh: no verified Zig $ZIG_VERSION download" >&2; exit 1; }
 tar -xf "$tarball" -C "$root"
 rm -f "$tarball"
+patch_std
 echo "$root/$name/zig"

@@ -89,7 +89,6 @@ grid_locked: std.atomic.Value(bool) = .init(false),
 /// behind output.
 pending_size: PendingSize = .{},
 
-
 /// A snapshot whose history is still arriving after its READY prefix
 /// was restored (see `restoreSnapshot`). Only the output queue uses it.
 snapshot_restore: ?SnapshotRestore = null,
@@ -174,27 +173,64 @@ const PendingScroll = struct {
     /// The last move to an absolute place (top, bottom, a row), if any.
     base: ?terminalpkg.Terminal.ScrollViewport = null,
 
-    /// Rows moved after `base` (up is negative).
-    delta: isize = 0,
+    /// The relative moves after `base`, in order: row moves (`.delta`)
+    /// and prompt jumps (`.delta_prompt`, Ghostty 1.4). Neighbors of one
+    /// kind merge; a prompt jump depends on where the prompts are, so the
+    /// two kinds keep their order. More than `max_moves` alternations
+    /// between the two swaps of one restore (a few milliseconds) keep the
+    /// first `max_moves`.
+    moves: [max_moves]terminalpkg.Terminal.ScrollViewport = undefined,
+    len: usize = 0,
+
+    const max_moves = 32;
 
     fn add(self: *PendingScroll, scroll: terminalpkg.Terminal.ScrollViewport) void {
         switch (scroll) {
-            .delta => |rows| self.delta +|= rows,
+            .delta, .delta_prompt => {
+                if (self.len > 0) {
+                    const last = &self.moves[self.len - 1];
+                    switch (last.*) {
+                        .delta => |*rows| if (scroll == .delta) {
+                            rows.* +|= scroll.delta;
+                            return;
+                        },
+                        // Prompt jumps merge only in one direction: a jump
+                        // past the last prompt does nothing, so +1 then -1
+                        // is not 0.
+                        .delta_prompt => |*prompts| if (scroll == .delta_prompt and
+                            (prompts.* < 0) == (scroll.delta_prompt < 0))
+                        {
+                            prompts.* +|= scroll.delta_prompt;
+                            return;
+                        },
+                        else => unreachable,
+                    }
+                }
+                if (self.len == max_moves) {
+                    log.warn("restore scroll moves past {d} alternations dropped", .{max_moves});
+                    return;
+                }
+                self.moves[self.len] = scroll;
+                self.len += 1;
+            },
             else => {
                 self.base = scroll;
-                self.delta = 0;
+                self.len = 0;
             },
         }
     }
 
     fn apply(self: PendingScroll, t: *terminalpkg.Terminal) void {
         if (self.base) |base| t.scrollViewport(base);
-        if (self.delta != 0) t.scrollViewport(.{ .delta = self.delta });
+        for (self.moves[0..self.len]) |move| t.scrollViewport(move);
     }
 
     /// `keep` after these moves, in the row space of the old terminal
     /// (`total` rows, `rows` of them on screen), for a terminal whose
-    /// history is still to come. Null: follow the active area.
+    /// history is still to come. Null: follow the active area. A prompt
+    /// jump needs the prompts, which that row space cannot say before the
+    /// history arrives: the place stays where the moves before it left it,
+    /// and `apply` replays every move on the restored terminal.
     fn adjust(self: PendingScroll, keep: ?ViewportKeep, total: usize, rows: usize) ?ViewportKeep {
         const last = total -| rows;
         var place = keep;
@@ -203,22 +239,34 @@ const PendingScroll = struct {
                 .bottom => null,
                 .top => .{ .row = 0, .from_bottom = total },
                 .row => |row| .{ .row = @min(row, last), .from_bottom = total - @min(row, last) },
-                .delta => unreachable,
+                .delta, .delta_prompt => unreachable,
             };
         }
-        if (self.delta == 0) return place;
-        if (place == null and self.delta > 0) return null;
-        var p: ViewportKeep = place orelse .{ .row = last, .from_bottom = total - last };
-        const n = @abs(self.delta);
-        if (self.delta < 0) {
-            p.row -|= n;
-            p.from_bottom = @min(p.from_bottom +| n, total);
-        } else {
-            p.row +|= n;
-            if (p.row >= last) return null;
-            p.from_bottom -|= n;
+        for (self.moves[0..self.len]) |move| {
+            const delta = switch (move) {
+                .delta => |d| d,
+                .delta_prompt => return place,
+                else => unreachable,
+            };
+            if (delta == 0) continue;
+            if (place == null and delta > 0) continue;
+            var p: ViewportKeep = place orelse .{ .row = last, .from_bottom = total - last };
+            const n = @abs(delta);
+            if (delta < 0) {
+                p.row -|= n;
+                p.from_bottom = @min(p.from_bottom +| n, total);
+                place = p;
+            } else {
+                p.row +|= n;
+                if (p.row >= last) {
+                    place = null;
+                } else {
+                    p.from_bottom -|= n;
+                    place = p;
+                }
+            }
         }
-        return p;
+        return place;
     }
 };
 
@@ -337,6 +385,20 @@ const ThreadEnterState = struct {
 /// The configuration for this IO that is derived from the main
 /// configuration. This must be exported so that we don't need to
 /// pass around Config pointers which makes memory management a pain.
+/// Convert the vt-xt-checksum-extension config, whose values are named for
+/// what they turn on, to the XTCHECKSUM bits, which turn things off.
+fn xtChecksumFlags(
+    ext: configpkg.Config.XtChecksumExtension,
+) terminalpkg.xt_checksum.Flags {
+    return .{
+        .positive = !ext.negate,
+        .no_attributes = !ext.attributes,
+        .no_trim = !ext.trim,
+        .undrawn = ext.undrawn,
+        .full = ext.full,
+    };
+}
+
 pub const DerivedConfig = struct {
     arena: ArenaAllocator,
 
@@ -353,6 +415,8 @@ pub const DerivedConfig = struct {
     clipboard_write: configpkg.ClipboardAccess,
     clipboard_write_limit: usize,
     enquiry_response: []const u8,
+    xt_checksum_report: bool,
+    xt_checksum_extension: terminalpkg.xt_checksum.Flags,
 
     pub fn init(
         alloc_gpa: Allocator,
@@ -391,6 +455,8 @@ pub const DerivedConfig = struct {
             .clipboard_write = config.@"clipboard-write",
             .clipboard_write_limit = config.@"clipboard-write-limit-bytes".value,
             .enquiry_response = try alloc.dupe(u8, config.@"enquiry-response"),
+            .xt_checksum_report = config.@"vt-xt-checksum-report",
+            .xt_checksum_extension = xtChecksumFlags(config.@"vt-xt-checksum-extension"),
 
             // This has to be last so that we copy AFTER the arena allocations
             // above happen (Zig assigns in order).
@@ -436,6 +502,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
             .default_modes = default_modes,
             .default_cursor_style = opts.config.cursor_style,
             .default_cursor_blink = opts.config.cursor_blink,
+            .default_xt_checksum = opts.config.xt_checksum_extension,
             .colors = .{
                 .background = .init(opts.config.background.toTerminalRGB()),
                 .foreground = .init(opts.config.foreground.toTerminalRGB()),
@@ -481,6 +548,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .enquiry_response = opts.config.enquiry_response,
         .suppress_terminal_responses = opts.suppress_terminal_responses,
         .pwd_raw_url = opts.backend == .manual,
+        .xt_checksum_report = opts.config.xt_checksum_report,
     };
 
     const thread_enter_state = try ThreadEnterState.create(
@@ -783,6 +851,14 @@ pub fn changeConfig(self: *Termio, td: *ThreadData, config: *DerivedConfig) !voi
         self.terminal.setScrollbackMaxBytes(config.scrollback_limit_bytes);
         self.terminal.setScrollbackMaxLines(config.scrollback_limit_lines);
     }
+
+    // The config could have changed any of our colors so update mode 2031.
+    // This is written directly rather than queued as a color_scheme_report
+    // message because we're on the io thread, the only reader of our
+    // mailbox: if the mailbox were full, queueing would wait forever.
+    self.colorSchemeReportLocked(td, false) catch |err| {
+        log.warn("error sending color scheme report err={}", .{err});
+    };
 }
 
 /// Update report state synchronously with the surface appearance callback.
@@ -817,9 +893,6 @@ pub fn resize(
     td: *ThreadData,
     size: renderer.Size,
 ) !void {
-    // Update the size of our pty. A manual backend has none.
-    try self.backend.resize(size.grid(), size.terminal());
-
     // A mirror with a locked grid: a resize changes only the pixel size,
     // which nothing in the terminal reads (the owner answers size reports)
     // unless the cell size changed with it (a font size change). The
@@ -858,6 +931,12 @@ pub fn resize(
         // and a manual backend resizes from the caller's thread.
         self.size = size;
         self.live_epoch +%= 1;
+
+        // Resizing the pty can immediately wake the shell with SIGWINCH.
+        // Hold the same lock used by processOutput before notifying it, so
+        // its redraw cannot be parsed against the old terminal dimensions.
+        // A manual backend has no pty.
+        try self.backend.resize(size.grid(), size.terminal());
 
         // Update the size of our terminal state
         const grid_size = self.gridSizeLocked();
@@ -1180,7 +1259,7 @@ fn swapTerminalLocked(
     self.terminal.flags.dirty.clear = true;
     if (comptime terminalpkg.options.kitty_graphics) {
         var it = self.terminal.screens.all.iterator();
-        while (it.next()) |entry| entry.value.*.kitty_images.dirty = true;
+        while (it.next()) |entry| entry.value.*.kitty_images.markDirty();
     }
     self.terminal_stream.handler.queueRender() catch {};
     return old;
@@ -1425,7 +1504,7 @@ pub fn applyKittyReplay(self: *Termio, bytes: []const u8) !void {
     defer self.renderer_state.mutex.unlock(global.io());
     defer {
         var it = self.terminal.screens.all.iterator();
-        while (it.next()) |entry| entry.value.*.kitty_images.dirty = true;
+        while (it.next()) |entry| entry.value.*.kitty_images.markDirty();
         self.terminal_stream.handler.queueRender() catch {};
     }
     try terminalpkg.kitty.graphics.replay.apply(global.io(), self.alloc, &self.terminal, bytes);
@@ -1597,6 +1676,14 @@ fn resetStreamLocked(self: *Termio) void {
 
 /// Apply the complete history records in `bytes` (after any pending
 /// bytes) and keep the start of an incomplete record for the next call.
+///
+/// The decoder reads one record header ahead after each PAGE (upstream
+/// 1.4: to find the page's Kitty placements) and keeps it, or the error
+/// reading it, for its next step. So each step reads from complete records
+/// only: a read ahead then either takes a whole record's header (the
+/// decoder holds it and its payload starts the kept bytes) or finds the end
+/// of the complete records, which only means more bytes are coming, so that
+/// EndOfStream is cleared rather than kept.
 fn applySnapshotHistory(self: *Termio, bytes: []const u8) !void {
     const restore: *SnapshotRestore = if (self.snapshot_restore) |*v| v else return;
     errdefer self.abandonSnapshotRestore();
@@ -1619,9 +1706,14 @@ fn applySnapshotHistory(self: *Termio, bytes: []const u8) !void {
         // The bytes come from another machine: refuse a record that
         // claims more than any history record holds, and tell a record
         // that is still arriving from one that is malformed (below).
-        const complete_records = try completeSnapshotRecords(
+        const complete = try completeSnapshotRecords(
             restore.pending.items[start..],
+            snapshotHeldHeader(&restore.decoder),
         );
+
+        // The decoder sees the complete records only.
+        reader = .fixed(restore.pending.items[0 .. start + complete.bytes]);
+        reader.seek = start;
 
         const progress = progress: {
             self.renderer_state.mutex.lockUncancelable(global.io());
@@ -1634,11 +1726,15 @@ fn applySnapshotHistory(self: *Termio, bytes: []const u8) !void {
             break :progress step;
         } catch |err| switch (err) {
             error.EndOfStream => {
-                // One step reads at most two HISTORY manifests and a
-                // PAGE or FINISH record. With that many complete records
-                // buffered, running out of bytes means a record's
-                // payload is shorter than its contents: malformed.
-                if (complete_records >= max_records_per_history_step) {
+                // The reader holds complete records only, so a step that
+                // needs a record still arriving stops at their end. Running
+                // out of bytes before that end means a record's payload is
+                // shorter than its contents: malformed. So does running
+                // out with as many complete records as one step reads (two
+                // HISTORY manifests, a PAGE or FINISH, its placements).
+                if (reader.seek < start + complete.bytes or
+                    complete.count >= max_records_per_history_step)
+                {
                     return error.MalformedSnapshot;
                 }
                 restore.decoder = saved;
@@ -1648,15 +1744,28 @@ fn applySnapshotHistory(self: *Termio, bytes: []const u8) !void {
             else => return err,
         };
 
+        // The read ahead after a page reached the end of the complete
+        // records: nothing was consumed, and the next bytes may hold the
+        // record, so it is not an error yet.
+        clearSnapshotLookaheadEnd(&restore.decoder);
+
         // FINISH: the snapshot is complete.
         const page = progress orelse {
             self.abandonSnapshotRestore();
             return;
         };
-        if (page.rows > 0) applied = true;
+        switch (page) {
+            .page => |p| if (p.rows > 0) {
+                applied = true;
+            },
+            // Kitty image pixels: a manual surface's snapshot history
+            // carries none (encodeSnapshot passes no Kitty plan).
+            .image => {},
+        }
     }
 
-    // Keep only the incomplete record.
+    // Keep only the incomplete record (after a header the decoder holds,
+    // its payload).
     const consumed = reader.seek;
     const rest = restore.pending.items.len - consumed;
     @memmove(
@@ -1666,32 +1775,106 @@ fn applySnapshotHistory(self: *Termio, bytes: []const u8) !void {
     restore.pending.shrinkRetainingCapacity(rest);
 }
 
+/// The record header the decoder read ahead and holds for its next step.
+fn snapshotHeldHeader(decoder: *const terminalpkg.snapshot.Decoder) ?terminalpkg.snapshot.record.Header {
+    return switch (decoder.state) {
+        .history => |history| history.pending_header,
+        else => null,
+    };
+}
+
+/// Clear a read-ahead EndOfStream (see `applySnapshotHistory`).
+fn clearSnapshotLookaheadEnd(decoder: *terminalpkg.snapshot.Decoder) void {
+    switch (decoder.state) {
+        .history => |*history| if (history.pending_error) |err| {
+            if (err == error.EndOfStream) history.pending_error = null;
+        },
+        else => {},
+    }
+}
+
 /// The most records one `Decoder.next` call reads: the HISTORY manifests
-/// of both screens (when the first has no pages) and one PAGE or FINISH.
-const max_records_per_history_step = 3;
+/// of both screens (when the first has no pages), one PAGE or FINISH, and
+/// the Kitty placements pinned to that PAGE.
+const max_records_per_history_step = 4;
 
 /// The largest snapshot record payload a restore accepts. PAGE records
 /// are the largest (one terminal page); this bounds the bytes a restore
 /// buffers for an incomplete record.
 const max_snapshot_record_payload = 64 * 1024 * 1024;
 
+const CompleteSnapshotRecords = struct {
+    /// Complete records, up to `max_records_per_history_step`.
+    count: usize,
+    /// Their bytes from the start of the buffer.
+    bytes: usize,
+};
+
 /// Count the complete records at the start of `bytes`, up to
 /// `max_records_per_history_step`, from their headers (u16 tag, u32
-/// payload length, u32 CRC32C, little-endian). Fails for a payload length
-/// over `max_snapshot_record_payload`.
-fn completeSnapshotRecords(bytes: []const u8) error{SnapshotRecordTooLarge}!usize {
+/// payload length, u32 CRC32C, little-endian). `held` is the header of a
+/// record the decoder already read: its payload starts `bytes`. A PAGE
+/// counts only once what follows it is known: the decoder reads the next
+/// header right after a PAGE and, when it is the PAGE's Kitty placements
+/// (`kitty_image_page_placements`), decodes them in the same step, so the
+/// PAGE waits for that header and those placements. Fails for a payload
+/// length over `max_snapshot_record_payload`.
+fn completeSnapshotRecords(
+    bytes: []const u8,
+    held: ?terminalpkg.snapshot.record.Header,
+) error{SnapshotRecordTooLarge}!CompleteSnapshotRecords {
     const header_len = 10;
-    var rest = bytes;
-    var count: usize = 0;
-    while (count < max_records_per_history_step and rest.len >= header_len) {
-        const payload_len = std.mem.readInt(u32, rest[2..6], .little);
-        if (payload_len > max_snapshot_record_payload) return error.SnapshotRecordTooLarge;
-        const record_len = header_len + @as(usize, payload_len);
-        if (rest.len < record_len) break;
-        rest = rest[record_len..];
-        count += 1;
+    const page_tag: u16 = @backingInt(terminalpkg.snapshot.record.Tag.page);
+    const placements_tag: u16 = @backingInt(terminalpkg.snapshot.record.Tag.kitty_image_page_placements);
+    const tag_known = struct {
+        fn f(tag: u16) bool {
+            const t: terminalpkg.snapshot.record.Tag = @fromBackingInt(tag);
+            return t.known();
+        }
+    }.f;
+    var end: CompleteSnapshotRecords = .{ .count = 0, .bytes = 0 };
+    // The last end where the decoder may stop: not right after a PAGE whose
+    // follow-up header is unknown or is its placements.
+    var safe = end;
+    var last_tag: ?u16 = null;
+    if (held) |header| {
+        if (header.payload_len > max_snapshot_record_payload) return error.SnapshotRecordTooLarge;
+        if (bytes.len < header.payload_len) return safe;
+        end = .{ .count = 1, .bytes = header.payload_len };
+        last_tag = @backingInt(header.tag);
     }
-    return count;
+    while (true) {
+        // Records of tags this build does not know (a newer sender's) are
+        // skipped by the decoder wherever it reads a header, so they
+        // neither count nor say what follows a PAGE.
+        var skipped: usize = 0;
+        var next_tag: ?u16 = null;
+        var next_len: usize = 0;
+        while (true) {
+            const rest = bytes[end.bytes + skipped ..];
+            if (rest.len < header_len) break;
+            const payload_len = std.mem.readInt(u32, rest[2..6], .little);
+            if (payload_len > max_snapshot_record_payload) return error.SnapshotRecordTooLarge;
+            const record_len = header_len + @as(usize, payload_len);
+            const tag = std.mem.readInt(u16, rest[0..2], .little);
+            if (tag_known(tag)) {
+                next_tag = tag;
+                next_len = record_len;
+                break;
+            }
+            if (rest.len < record_len) break;
+            skipped += record_len;
+        }
+        const stops_cleanly = last_tag != page_tag or
+            (next_tag != null and next_tag.? != placements_tag);
+        if (stops_cleanly) safe = end;
+        if (end.count >= max_records_per_history_step or next_tag == null) break;
+        if (bytes.len - end.bytes - skipped < next_len) break;
+        end.bytes += skipped + next_len;
+        end.count += 1;
+        last_tag = next_tag;
+    }
+    return safe;
 }
 
 /// Forget a snapshot whose history is still arriving.
@@ -1747,9 +1930,9 @@ pub fn encodeSnapshot(
     }
 
     if (phase != .ready) {
-        try snapshot.history.encode(t.screens.get(.primary).?, .primary, &stream);
+        try snapshot.history.encode(t.screens.get(.primary).?, .primary, &stream, null);
         if (t.screens.get(.alternate)) |alternate| {
-            try snapshot.history.encode(alternate, .alternate, &stream);
+            try snapshot.history.encode(alternate, .alternate, &stream, null);
         }
         try snapshot.checkpoint.encode(.finish, &stream);
     }
@@ -2244,7 +2427,7 @@ test "manual: queueMessage delivers input on the calling thread" {
 
             // An allocated write is delivered and freed (the testing
             // allocator checks for leaks).
-            const long: []const u8 = "0123456789" ** 8;
+            const long: []const u8 = &@as([80]u8, std.simd.repeat(80, "0123456789".*));
             io.queueMessage(try termio.Message.writeReq(alloc, long), .unlocked);
             try sink.expect(long);
 
@@ -2423,6 +2606,20 @@ test "manual: snapshot restore and encode round trip" {
         var complete: std.ArrayListUnmanaged(u8) = .empty;
         var ready: std.ArrayListUnmanaged(u8) = .empty;
         var history: std.ArrayListUnmanaged(u8) = .empty;
+        /// The history arrives in slices of this many bytes; 0: one
+        /// record per slice (a sender that flushes per record).
+        var slice: usize = 997;
+        /// The history bytes the restore receives (`history`, or it with a
+        /// record of an unknown tag after each PAGE).
+        var sent: []const u8 = &.{};
+        var with_unknown: std.ArrayListUnmanaged(u8) = .empty;
+
+        /// The length of the record at the start of `bytes` (or all of
+        /// them when its header is cut).
+        fn recordLen(bytes: []const u8) usize {
+            if (bytes.len < 10) return bytes.len;
+            return @min(bytes.len, 10 + @as(usize, std.mem.readInt(u32, bytes[2..6], .little)));
+        }
 
         fn encode(io: *Termio, phase: apprt.SurfaceSnapshotPhase) ![]u8 {
             const alloc = std.testing.allocator;
@@ -2466,9 +2663,9 @@ test "manual: snapshot restore and encode round trip" {
 
             io.processOutput("\x1b[2Jother content\x1b[5");
             try io.restoreSnapshot(ready.items, .ready);
-            var rest = history.items;
+            var rest = sent;
             while (rest.len > 0) {
-                const n = @min(rest.len, 997);
+                const n = if (slice == 0) recordLen(rest) else @min(rest.len, slice);
                 try io.restoreSnapshot(rest[0..n], .history);
                 rest = rest[n..];
             }
@@ -2504,7 +2701,39 @@ test "manual: snapshot restore and encode round trip" {
     const joined = try std.mem.concat(alloc, u8, &.{ S.ready.items, S.history.items });
     defer alloc.free(joined);
     try std.testing.expectEqualSlices(u8, S.complete.items, joined);
-    try testManualTermio(true, S.restore);
+    // Uneven slices, single bytes, and one record per slice: the decoder
+    // reads a header ahead after each page (Ghostty 1.4), so a slice that
+    // ends at a record boundary must not end the restore.
+    S.sent = S.history.items;
+    for ([_]usize{ 997, 1, 0 }) |slice| {
+        S.slice = slice;
+        try testManualTermio(true, S.restore);
+    }
+
+    // A record of a tag this build does not know (a newer sender's) after
+    // every PAGE is skipped, whatever the slicing.
+    defer S.with_unknown.deinit(alloc);
+    const record = terminalpkg.snapshot.record;
+    const unknown_tag: record.Tag = @fromBackingInt(0x4000);
+    var unknown: [10]u8 = undefined;
+    std.mem.writeInt(u16, unknown[0..2], 0x4000, .little);
+    std.mem.writeInt(u32, unknown[2..6], 0, .little);
+    var checksum: record.Checksum = .init(unknown_tag, 0);
+    std.mem.writeInt(u32, unknown[6..10], checksum.final(), .little);
+    var rest: []const u8 = S.history.items;
+    while (rest.len > 0) {
+        const n = S.recordLen(rest);
+        try S.with_unknown.appendSlice(alloc, rest[0..n]);
+        if (std.mem.readInt(u16, rest[0..2], .little) == @backingInt(record.Tag.page)) {
+            try S.with_unknown.appendSlice(alloc, &unknown);
+        }
+        rest = rest[n..];
+    }
+    S.sent = S.with_unknown.items;
+    for ([_]usize{ 997, 1, 0 }) |slice| {
+        S.slice = slice;
+        try testManualTermio(true, S.restore);
+    }
 }
 
 /// Change the surface config's scrollback byte limit the way
@@ -2601,9 +2830,9 @@ const TestOwner = struct {
         {
             var stream: snapshot.record.Writer = .init(alloc, &out.writer);
             defer stream.deinit();
-            try snapshot.history.encode(self.t.screens.get(.primary).?, .primary, &stream);
+            try snapshot.history.encode(self.t.screens.get(.primary).?, .primary, &stream, null);
             if (self.t.screens.get(.alternate)) |alternate| {
-                try snapshot.history.encode(alternate, .alternate, &stream);
+                try snapshot.history.encode(alternate, .alternate, &stream, null);
             }
             try snapshot.checkpoint.encode(.finish, &stream);
         }
@@ -2645,7 +2874,7 @@ fn testFeedLines(io: *Termio, owner: *TestOwner, first: usize, count: usize) !vo
     var buf: [160]u8 = undefined;
     for (first..first + count) |i| {
         const line = if (i % 3 == 0)
-            try std.fmt.bufPrint(&buf, "\x1b[1mline {d:0>4}\x1b[m " ++ ("abcdefghij" ** 6) ++ "\r\n", .{i})
+            try std.fmt.bufPrint(&buf, "\x1b[1mline {d:0>4}\x1b[m " ++ @as([60]u8, std.simd.repeat(60, "abcdefghij".*)) ++ "\r\n", .{i})
         else
             try std.fmt.bufPrint(&buf, "\x1b[3{d}mline {d:0>4}\x1b[m short\r\n", .{ i % 8, i });
         testFeedBoth(io, owner, line);
@@ -2770,7 +2999,7 @@ test "manual: snapshot local history restore with the alternate screen active" {
             try testFeedLines(io, &owner, 0, 3000);
             // vim: alternate screen with a full-width status line.
             testFeedBoth(io, &owner, "\x1b[?1049h\x1b[H\x1b[2J~\r\n~\r\n\x1b[10;1H\x1b[7m" ++
-                ("-- INSERT --" ++ " " ** 28) ++ "\x1b[m\x1b[1;1H");
+                ("-- INSERT --" ++ @as([28]u8, @splat(' '))) ++ "\x1b[m\x1b[1;1H");
 
             const ready, const digest = try owner.resizeAndEncode(25, 12);
             defer alloc.free(ready);
@@ -2854,7 +3083,7 @@ test "manual: snapshot local history restore with a smaller viewer scrollback li
             for (0..2000) |i| {
                 testFeedBoth(io, &owner, try std.fmt.bufPrint(
                     &buf,
-                    "\x1b[3{d}mline {d:0>4}\x1b[m " ++ ("abcdefghij" ** 6) ++ "\r\n",
+                    "\x1b[3{d}mline {d:0>4}\x1b[m " ++ @as([60]u8, std.simd.repeat(60, "abcdefghij".*)) ++ "\r\n",
                     .{ i % 8, i },
                 ));
             }
@@ -2920,7 +3149,7 @@ test "manual: snapshot local history restore reflows with the owner's prompt red
                     const bytes = try std.fmt.bufPrint(
                         &buf,
                         "\x1b]133;A\x07~/src $ \x1b]133;B\x07make {d}\r\n\x1b]133;C\x07" ++
-                            ("output abcdefghij" ** 3) ++ "\r\n\x1b]133;D;0\x07",
+                            @as([51]u8, std.simd.repeat(51, "output abcdefghij".*)) ++ "\r\n\x1b]133;D;0\x07",
                         .{i},
                     );
                     viewer.nextSlice(bytes);
@@ -3467,7 +3696,7 @@ test "manual: snapshot local history restore refuses a diverged history" {
 
             for (0..100) |_| {
                 testFeedBoth(io, &owner, "family \u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467} " ++
-                    ("abcdefghij" ** 4) ++ "\r\n");
+                    @as([40]u8, std.simd.repeat(40, "abcdefghij".*)) ++ "\r\n");
             }
 
             const ready, const digest = try owner.resizeAndEncode(25, 10);
@@ -3521,7 +3750,7 @@ fn testFeedWrapped(io: *Termio, owner: *TestOwner, first: usize, count: usize) !
     for (first..first + count) |i| {
         testFeedBoth(io, owner, try std.fmt.bufPrint(
             &buf,
-            "\x1b[3{d}mline {d:0>4}\x1b[m " ++ ("abcdefghij" ** 6) ++ "\r\n",
+            "\x1b[3{d}mline {d:0>4}\x1b[m " ++ @as([60]u8, std.simd.repeat(60, "abcdefghij".*)) ++ "\r\n",
             .{ i % 8, i },
         ));
     }
@@ -4087,7 +4316,7 @@ fn testFeedLinesAll(io: *Termio, owner: *TestOwner, ref: *TestReference, first: 
     var buf: [160]u8 = undefined;
     for (first..first + count) |i| {
         const line = if (i % 3 == 0)
-            try std.fmt.bufPrint(&buf, "\x1b[1mline {d:0>4}\x1b[m " ++ ("abcdefghij" ** 6) ++ "\r\n", .{i})
+            try std.fmt.bufPrint(&buf, "\x1b[1mline {d:0>4}\x1b[m " ++ @as([60]u8, std.simd.repeat(60, "abcdefghij".*)) ++ "\r\n", .{i})
         else
             try std.fmt.bufPrint(&buf, "\x1b[3{d}mline {d:0>4}\x1b[m short\r\n", .{ i % 8, i });
         testFeedAll(io, owner, ref, line);
@@ -4645,6 +4874,81 @@ test "manual: a config scrollback limit change trims the live terminal" {
     try testManualTermio(true, body);
 }
 
+test "manual: moves made during a local history restore replay in order, prompt jumps included" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const Moves = [_]terminalpkg.Terminal.ScrollViewport{
+        .{ .delta = -10 },
+        .{ .delta_prompt = -1 },
+        .{ .delta = 3 },
+        .{ .delta_prompt = -1 },
+        .{ .delta_prompt = -1 },
+    };
+
+    // Two terminals with the same prompts in their history: one gets the
+    // moves directly, the other through PendingScroll.
+    var direct = try terminalpkg.Terminal.init(testing.io, alloc, .{ .cols = 20, .rows = 5 });
+    defer direct.deinit(alloc);
+    var replayed = try terminalpkg.Terminal.init(testing.io, alloc, .{ .cols = 20, .rows = 5 });
+    defer replayed.deinit(alloc);
+    for ([_]*terminalpkg.Terminal{ &direct, &replayed }) |t| {
+        for (0..40) |i| {
+            if (i % 8 == 0) {
+                try t.semanticPrompt(.init(.prompt_start));
+                try t.printString("$ cmd");
+                try t.semanticPrompt(.init(.end_prompt_start_input));
+            } else try t.printString("output");
+            t.carriageReturn();
+            try t.linefeed();
+        }
+    }
+
+    var pending: PendingScroll = .{};
+    for (Moves) |move| {
+        direct.scrollViewport(move);
+        pending.add(move);
+    }
+    pending.apply(&replayed);
+
+    const want = direct.screens.active.pages.scrollbar();
+    const got = replayed.screens.active.pages.scrollbar();
+    try testing.expectEqual(want.offset, got.offset);
+}
+
+test "manual: snapshot history scan skips records of unknown tags" {
+    const testing = std.testing;
+    const Tag = terminalpkg.snapshot.record.Tag;
+    const header = struct {
+        fn of(tag: u16, payload_len: u32) [10]u8 {
+            var h: [10]u8 = @splat(0);
+            std.mem.writeInt(u16, h[0..2], tag, .little);
+            std.mem.writeInt(u32, h[2..6], payload_len, .little);
+            return h;
+        }
+    }.of;
+    const page = header(@backingInt(Tag.page), 0);
+    const unknown = header(0x4000, 0);
+    const placements = header(@backingInt(Tag.kitty_image_page_placements), 0);
+
+    // A PAGE and then a record a newer sender added: what follows the PAGE
+    // (its Kitty placements or not) is still unknown, so the PAGE waits.
+    const waiting = page ++ unknown;
+    const r1 = try completeSnapshotRecords(&waiting, null);
+    try testing.expectEqual(@as(usize, 0), r1.bytes);
+
+    // Its placements arrive after the unknown record: one step takes the
+    // PAGE, the unknown record and the placements.
+    const complete = page ++ unknown ++ placements;
+    const r2 = try completeSnapshotRecords(&complete, null);
+    try testing.expectEqual(complete.len, r2.bytes);
+
+    // Unknown records do not count toward the records one step reads.
+    const many = unknown ++ unknown ++ unknown ++ unknown ++ page ++ placements;
+    const r3 = try completeSnapshotRecords(&many, null);
+    try testing.expectEqual(many.len, r3.bytes);
+    try testing.expectEqual(@as(usize, 2), r3.count);
+}
+
 test "manual: snapshot history refuses malformed and oversized records" {
     const body = struct {
         fn run(io: *Termio, _: *TestSink, _: bool) !void {
@@ -4669,7 +4973,7 @@ test "manual: snapshot history refuses malformed and oversized records" {
             // Complete records whose payloads are too short for their
             // contents: malformed, not "still arriving".
             try io.restoreSnapshot(out.written(), .ready);
-            const short = [_]u8{ 4, 0, 0, 0, 0, 0, 0, 0, 0, 0 } ** 3;
+            const short: [30]u8 = std.simd.repeat(30, [_]u8{ 4, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
             if (io.restoreSnapshot(&short, .history)) |_| {
                 return error.TestExpectedError;
             } else |_| {}

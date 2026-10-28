@@ -310,7 +310,7 @@ fn kitty(
             const alt_prevents_text = if (consumed_alt_keeps_text and
                 event.consumed_mods.alt)
                 false
-            else if (comptime builtin.os.tag == .macos)
+            else if (comptime builtin.target.os.tag == .macos)
                 switch (opts.macos_option_as_alt) {
                     .left => all_mods.sides.alt == .left,
                     .right => all_mods.sides.alt == .right,
@@ -555,7 +555,7 @@ fn legacy(
     // For Linux, we continue to encode text because it is typical.
     // For example on Gnome Console Super+b will encode a "b" character
     // with legacy encoding.
-    if ((comptime builtin.os.tag == .macos) and all_mods.super) {
+    if ((comptime builtin.target.os.tag == .macos) and all_mods.super) {
         return;
     }
 
@@ -575,7 +575,7 @@ fn legacyAltPrefix(
     // On macOS, we only handle option like alt in certain
     // circumstances. Otherwise, macOS does a unicode translation
     // and we allow that to happen.
-    if (comptime builtin.os.tag == .macos) {
+    if (comptime builtin.target.os.tag == .macos) {
         switch (opts.macos_option_as_alt) {
             .false => return false,
             .left => if (mods.sides.alt == .right) return false,
@@ -598,7 +598,7 @@ fn legacyAltPrefix(
         // On macOS, Option may translate the text into a different Unicode
         // value. When Option is configured as Alt, use the physical key's
         // unshifted codepoint just as the single-byte implementation did.
-        if (comptime builtin.os.tag == .macos) {
+        if (comptime builtin.target.os.tag == .macos) {
             if (event.unshifted_codepoint > 0) {
                 const len = std.unicode.utf8Encode(
                     event.unshifted_codepoint,
@@ -1068,7 +1068,7 @@ const KittySequence = struct {
         if (self.event != .none and self.event != .press) {
             try writer.print(
                 ";{d}:{d}",
-                .{ mods, @intFromEnum(self.event) },
+                .{ mods, @backingInt(self.event) },
             );
             emit_prior = true;
         } else if (mods > 1) {
@@ -1113,7 +1113,7 @@ const KittySequence = struct {
         if (self.event != .none) {
             return try writer.print("\x1B[1;{d}:{d}{c}", .{
                 mods,
-                @intFromEnum(self.event),
+                @backingInt(self.event),
                 self.final,
             });
         }
@@ -2305,6 +2305,22 @@ test "legacy: ctrl+shift+backspace" {
     try testing.expectEqualStrings("\x08", writer.buffered());
 }
 
+test "legacy: ctrl+alt+shift+backspace" {
+    const event: key.KeyEvent = .{
+        .key = .backspace,
+        .mods = .{ .ctrl = true, .alt = true, .shift = true },
+    };
+
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try legacy(&writer, event, .{});
+    try testing.expectEqualStrings("\x1b\x08", writer.buffered());
+
+    writer = .fixed(&buf);
+    try legacy(&writer, event, .{ .modify_other_keys_state_2 = true });
+    try testing.expectEqualStrings("\x1b[27;8;127~", writer.buffered());
+}
+
 test "legacy: backspace (DECBKM reset)" {
     var buf: [128]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buf);
@@ -2416,7 +2432,7 @@ test "legacy: alt+digit with modify other state 2" {
 }
 
 test "legacy: alt+digit with modify other state 2 and macos-option-as-alt = false" {
-    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag != .macos) return error.SkipZigTest;
     var buf: [128]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buf);
     try legacy(&writer, .{
@@ -2677,7 +2693,7 @@ test "legacy: f13 through f25" {
         {
             var writer: std.Io.Writer = .fixed(&buf);
             try legacy(&writer, .{ .key = case.key }, .{});
-            const expected = try std.fmt.bufPrint(
+            const expected = try std.mem.print(
                 &expected_buf,
                 "\x1b[{}~",
                 .{case.code},
@@ -2691,7 +2707,7 @@ test "legacy: f13 through f25" {
                 .key = case.key,
                 .mods = .{ .ctrl = true },
             }, .{ .modify_other_keys_state_2 = true });
-            const expected = try std.fmt.bufPrint(
+            const expected = try std.mem.print(
                 &expected_buf,
                 "\x1b[{};5~",
                 .{case.code},
@@ -2714,7 +2730,7 @@ test "legacy: help and context menu" {
         {
             var writer: std.Io.Writer = .fixed(&buf);
             try legacy(&writer, .{ .key = case.key }, .{});
-            const expected = try std.fmt.bufPrint(
+            const expected = try std.mem.print(
                 &expected_buf,
                 "\x1b[{}~",
                 .{case.code},
@@ -2728,7 +2744,7 @@ test "legacy: help and context menu" {
                 .key = case.key,
                 .mods = .{ .ctrl = true },
             }, .{ .modify_other_keys_state_2 = true });
-            const expected = try std.fmt.bufPrint(
+            const expected = try std.mem.print(
                 &expected_buf,
                 "\x1b[{};5~",
                 .{case.code},
@@ -2778,7 +2794,7 @@ test "legacy: hu layout ctrl+ő sends proper codepoint" {
 }
 
 test "legacy: super-only on macOS with text" {
-    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag != .macos) return error.SkipZigTest;
 
     var buf: [128]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buf);
@@ -2791,7 +2807,7 @@ test "legacy: super-only on macOS with text" {
 }
 
 test "legacy: super and other mods on macOS with text" {
-    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag != .macos) return error.SkipZigTest;
 
     var buf: [128]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buf);

@@ -29,7 +29,7 @@ pub const Face = switch (options.backend) {
 ///
 /// Apple platforms (macOS and iOS) measure fonts in points at 72 per
 /// inch; the content scale supplies the pixel density.
-pub const default_dpi = if (builtin.os.tag.isDarwin()) 72 else 96;
+pub const default_dpi = if (builtin.target.os.tag.isDarwin()) 72 else 96;
 
 /// These are the flags to customize how freetype loads fonts. This is
 /// only non-void if the freetype backend is enabled.

@@ -13,10 +13,10 @@
 //! A ProMotion iPhone also needs `CADisableMinimumFrameDurationOnPhone` in
 //! the app's Info.plist, or iOS caps every link at 60.
 //!
-//! Threads: the renderer thread calls `create`, `start`, `stop`,
-//! `isRunning` and `release`; every CADisplayLink call happens on the main
+//! Threads: the renderer thread calls `create`, `setRunning`,
+//! `isRunning` and `close`; every CADisplayLink call happens on the main
 //! queue (`dispatch_async_f`), in that order, and the ticks arrive on the
-//! main thread. `release` detaches `draw_now` under `mutex` before it
+//! main thread. `close` detaches `draw_now` under `mutex` before it
 //! returns, so no tick touches the renderer thread's `xev.Async` after the
 //! thread exits; the link and this struct are freed later, on main.
 const IosDisplayLink = @This();
@@ -60,22 +60,29 @@ link: ?objc.Object = null,
 target: ?objc.Object = null,
 
 /// Creates the link for `draw_now`, paused. The CADisplayLink itself is
-/// made on the main queue.
-pub fn create(draw_now: *xev.Async) !*IosDisplayLink {
+/// made on the main queue. Same signature as `DisplayLink.create` (macOS):
+/// a tick notifies `draw_now` directly, so `callbackFn` is not called and
+/// `alloc` is unused (the struct is freed on main, after the last tick).
+pub fn create(
+    alloc: std.mem.Allocator,
+    comptime Userdata: type,
+    comptime callbackFn: anytype,
+    draw_now: ?*Userdata,
+) !*IosDisplayLink {
+    _ = alloc;
+    _ = callbackFn;
+    comptime std.debug.assert(Userdata == xev.Async);
     const self = try std.heap.c_allocator.create(IosDisplayLink);
-    self.* = .{ .draw_now = draw_now };
+    self.* = .{ .draw_now = draw_now orelse return error.NoDrawNow };
     dispatch_async_f(macos.dispatch.queue.getMain(), self, &createOnMain);
     return self;
 }
 
-/// Ticks resume (on main, at the next display refresh).
-pub fn start(self: *IosDisplayLink) !void {
-    self.setRunning(true);
-}
-
-/// Ticks pause.
-pub fn stop(self: *IosDisplayLink) !void {
-    self.setRunning(false);
+/// A display change: a CADisplayLink follows the screen it is on, so
+/// there is nothing to do (`DisplayLink.setDisplay` on macOS).
+pub fn setDisplay(self: *IosDisplayLink, display_id: u32) void {
+    _ = self;
+    _ = display_id;
 }
 
 /// Whether the renderer asked for ticks: while true the renderer thread
@@ -85,8 +92,9 @@ pub fn isRunning(self: *IosDisplayLink) bool {
 }
 
 /// Detaches `draw_now` now (no tick wakes it after this returns) and
-/// invalidates and frees the link on the main queue.
-pub fn release(self: *IosDisplayLink) void {
+/// invalidates and frees the link on the main queue. The pointer is
+/// invalid after this call (`DisplayLink.close` on macOS).
+pub fn close(self: *IosDisplayLink) void {
     self.want_running.store(false, .release);
     {
         self.mutex.lockUncancelable(global.io());
@@ -96,7 +104,9 @@ pub fn release(self: *IosDisplayLink) void {
     dispatch_async_f(macos.dispatch.queue.getMain(), self, &destroyOnMain);
 }
 
-fn setRunning(self: *IosDisplayLink, running: bool) void {
+/// Ticks resume (true) or pause (false), applied on main at the next
+/// display refresh. Never blocks (`DisplayLink.setRunning` on macOS).
+pub fn setRunning(self: *IosDisplayLink, running: bool) void {
     if (self.want_running.swap(running, .acq_rel) == running) return;
     // One queued apply reads the latest wish, however many changes come
     // before it runs.

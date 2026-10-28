@@ -74,7 +74,6 @@ pub fn linewise(screen: *const Screen, sel: Selection) Selection {
     return Selection.init(start, end, false);
 }
 
-
 test "keyboard selection: a cell selection resolves a wide tail to its lead" {
     const testing = std.testing;
     var s = try Screen.init(testing.io, testing.allocator, .{ .cols = 6, .rows = 2, .max_scrollback_bytes = 0 });

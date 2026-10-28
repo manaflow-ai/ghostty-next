@@ -54,4 +54,5 @@ python3 "$here/package_xcframework.py" \
   --flavor "$GHOSTTYKIT_FLAVOR" \
   --zig-version "$ZIG_VERSION" \
   --zig-sha256 "$ZIG_AARCH64_MACOS_SHA256" \
+  --zig-std-patch-sha256 "${ZIG_STD_THREADED_PATCHED_SHA256:-}" \
   --flags "${flags[*]}"

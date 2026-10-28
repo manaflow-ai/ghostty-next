@@ -298,10 +298,12 @@ fn applyCommand(
         .primary => .primary,
         .alternate => .alternate,
     } else t.screens.active_key;
-    touched[switch (key) {
-        .primary => 0,
-        .alternate => 1,
-    }] = true;
+    touched[
+        switch (key) {
+            .primary => 0,
+            .alternate => 1,
+        }
+    ] = true;
 
     switch (cmd.control) {
         .delete => {
