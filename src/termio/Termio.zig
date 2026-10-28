@@ -173,27 +173,56 @@ const PendingScroll = struct {
     /// The last move to an absolute place (top, bottom, a row), if any.
     base: ?terminalpkg.Terminal.ScrollViewport = null,
 
-    /// Rows moved after `base` (up is negative).
-    delta: isize = 0,
+    /// The relative moves after `base`, in order: row moves (`.delta`)
+    /// and prompt jumps (`.delta_prompt`, Ghostty 1.4). Neighbors of one
+    /// kind merge; a prompt jump depends on where the prompts are, so the
+    /// two kinds keep their order. More than `max_moves` alternations
+    /// between the two swaps of one restore (a few milliseconds) keep the
+    /// first `max_moves`.
+    moves: [max_moves]terminalpkg.Terminal.ScrollViewport = undefined,
+    len: usize = 0,
+
+    const max_moves = 32;
 
     fn add(self: *PendingScroll, scroll: terminalpkg.Terminal.ScrollViewport) void {
         switch (scroll) {
-            .delta => |rows| self.delta +|= rows,
+            .delta, .delta_prompt => {
+                if (self.len > 0) {
+                    const last = &self.moves[self.len - 1];
+                    switch (last.*) {
+                        .delta => |*rows| if (scroll == .delta) {
+                            rows.* +|= scroll.delta;
+                            return;
+                        },
+                        .delta_prompt => |*prompts| if (scroll == .delta_prompt) {
+                            prompts.* +|= scroll.delta_prompt;
+                            return;
+                        },
+                        else => unreachable,
+                    }
+                }
+                if (self.len == max_moves) return;
+                self.moves[self.len] = scroll;
+                self.len += 1;
+            },
             else => {
                 self.base = scroll;
-                self.delta = 0;
+                self.len = 0;
             },
         }
     }
 
     fn apply(self: PendingScroll, t: *terminalpkg.Terminal) void {
         if (self.base) |base| t.scrollViewport(base);
-        if (self.delta != 0) t.scrollViewport(.{ .delta = self.delta });
+        for (self.moves[0..self.len]) |move| t.scrollViewport(move);
     }
 
     /// `keep` after these moves, in the row space of the old terminal
     /// (`total` rows, `rows` of them on screen), for a terminal whose
-    /// history is still to come. Null: follow the active area.
+    /// history is still to come. Null: follow the active area. A prompt
+    /// jump needs the prompts, which that row space cannot say before the
+    /// history arrives: the place stays where the moves before it left it,
+    /// and `apply` replays every move on the restored terminal.
     fn adjust(self: PendingScroll, keep: ?ViewportKeep, total: usize, rows: usize) ?ViewportKeep {
         const last = total -| rows;
         var place = keep;
@@ -202,27 +231,34 @@ const PendingScroll = struct {
                 .bottom => null,
                 .top => .{ .row = 0, .from_bottom = total },
                 .row => |row| .{ .row = @min(row, last), .from_bottom = total - @min(row, last) },
-                // A jump to a prompt (Ghostty 1.4) depends on where the
-                // prompts are, which the old terminal's row space cannot
-                // say before the history arrives: keep the current place;
-                // `apply` replays the jump on the restored terminal.
-                .delta_prompt => keep,
-                .delta => unreachable,
+                .delta, .delta_prompt => unreachable,
             };
         }
-        if (self.delta == 0) return place;
-        if (place == null and self.delta > 0) return null;
-        var p: ViewportKeep = place orelse .{ .row = last, .from_bottom = total - last };
-        const n = @abs(self.delta);
-        if (self.delta < 0) {
-            p.row -|= n;
-            p.from_bottom = @min(p.from_bottom +| n, total);
-        } else {
-            p.row +|= n;
-            if (p.row >= last) return null;
-            p.from_bottom -|= n;
+        for (self.moves[0..self.len]) |move| {
+            const delta = switch (move) {
+                .delta => |d| d,
+                .delta_prompt => return place,
+                else => unreachable,
+            };
+            if (delta == 0) continue;
+            if (place == null and delta > 0) continue;
+            var p: ViewportKeep = place orelse .{ .row = last, .from_bottom = total - last };
+            const n = @abs(delta);
+            if (delta < 0) {
+                p.row -|= n;
+                p.from_bottom = @min(p.from_bottom +| n, total);
+                place = p;
+            } else {
+                p.row +|= n;
+                if (p.row >= last) {
+                    place = null;
+                } else {
+                    p.from_bottom -|= n;
+                    place = p;
+                }
+            }
         }
-        return p;
+        return place;
     }
 };
 
@@ -1632,6 +1668,14 @@ fn resetStreamLocked(self: *Termio) void {
 
 /// Apply the complete history records in `bytes` (after any pending
 /// bytes) and keep the start of an incomplete record for the next call.
+///
+/// The decoder reads one record header ahead after each PAGE (upstream
+/// 1.4: to find the page's Kitty placements) and keeps it, or the error
+/// reading it, for its next step. So each step reads from complete records
+/// only: a read ahead then either takes a whole record's header (the
+/// decoder holds it and its payload starts the kept bytes) or finds the end
+/// of the complete records, which only means more bytes are coming, so that
+/// EndOfStream is cleared rather than kept.
 fn applySnapshotHistory(self: *Termio, bytes: []const u8) !void {
     const restore: *SnapshotRestore = if (self.snapshot_restore) |*v| v else return;
     errdefer self.abandonSnapshotRestore();
@@ -1654,9 +1698,14 @@ fn applySnapshotHistory(self: *Termio, bytes: []const u8) !void {
         // The bytes come from another machine: refuse a record that
         // claims more than any history record holds, and tell a record
         // that is still arriving from one that is malformed (below).
-        const complete_records = try completeSnapshotRecords(
+        const complete = try completeSnapshotRecords(
             restore.pending.items[start..],
+            snapshotHeldHeader(&restore.decoder),
         );
+
+        // The decoder sees the complete records only.
+        reader = .fixed(restore.pending.items[0 .. start + complete.bytes]);
+        reader.seek = start;
 
         const progress = progress: {
             self.renderer_state.mutex.lockUncancelable(global.io());
@@ -1669,11 +1718,15 @@ fn applySnapshotHistory(self: *Termio, bytes: []const u8) !void {
             break :progress step;
         } catch |err| switch (err) {
             error.EndOfStream => {
-                // One step reads at most two HISTORY manifests and a
-                // PAGE or FINISH record. With that many complete records
-                // buffered, running out of bytes means a record's
-                // payload is shorter than its contents: malformed.
-                if (complete_records >= max_records_per_history_step) {
+                // The reader holds complete records only, so a step that
+                // needs a record still arriving stops at their end. Running
+                // out of bytes before that end means a record's payload is
+                // shorter than its contents: malformed. So does running
+                // out with as many complete records as one step reads (two
+                // HISTORY manifests, a PAGE or FINISH, its placements).
+                if (reader.seek < start + complete.bytes or
+                    complete.count >= max_records_per_history_step)
+                {
                     return error.MalformedSnapshot;
                 }
                 restore.decoder = saved;
@@ -1682,6 +1735,11 @@ fn applySnapshotHistory(self: *Termio, bytes: []const u8) !void {
             },
             else => return err,
         };
+
+        // The read ahead after a page reached the end of the complete
+        // records: nothing was consumed, and the next bytes may hold the
+        // record, so it is not an error yet.
+        clearSnapshotLookaheadEnd(&restore.decoder);
 
         // FINISH: the snapshot is complete.
         const page = progress orelse {
@@ -1698,7 +1756,8 @@ fn applySnapshotHistory(self: *Termio, bytes: []const u8) !void {
         }
     }
 
-    // Keep only the incomplete record.
+    // Keep only the incomplete record (after a header the decoder holds,
+    // its payload).
     const consumed = reader.seek;
     const rest = restore.pending.items.len - consumed;
     @memmove(
@@ -1708,32 +1767,84 @@ fn applySnapshotHistory(self: *Termio, bytes: []const u8) !void {
     restore.pending.shrinkRetainingCapacity(rest);
 }
 
+/// The record header the decoder read ahead and holds for its next step.
+fn snapshotHeldHeader(decoder: *const terminalpkg.snapshot.Decoder) ?terminalpkg.snapshot.record.Header {
+    return switch (decoder.state) {
+        .history => |history| history.pending_header,
+        else => null,
+    };
+}
+
+/// Clear a read-ahead EndOfStream (see `applySnapshotHistory`).
+fn clearSnapshotLookaheadEnd(decoder: *terminalpkg.snapshot.Decoder) void {
+    switch (decoder.state) {
+        .history => |*history| if (history.pending_error) |err| {
+            if (err == error.EndOfStream) history.pending_error = null;
+        },
+        else => {},
+    }
+}
+
 /// The most records one `Decoder.next` call reads: the HISTORY manifests
-/// of both screens (when the first has no pages) and one PAGE or FINISH.
-const max_records_per_history_step = 3;
+/// of both screens (when the first has no pages), one PAGE or FINISH, and
+/// the Kitty placements pinned to that PAGE.
+const max_records_per_history_step = 4;
 
 /// The largest snapshot record payload a restore accepts. PAGE records
 /// are the largest (one terminal page); this bounds the bytes a restore
 /// buffers for an incomplete record.
 const max_snapshot_record_payload = 64 * 1024 * 1024;
 
+const CompleteSnapshotRecords = struct {
+    /// Complete records, up to `max_records_per_history_step`.
+    count: usize,
+    /// Their bytes from the start of the buffer.
+    bytes: usize,
+};
+
 /// Count the complete records at the start of `bytes`, up to
 /// `max_records_per_history_step`, from their headers (u16 tag, u32
-/// payload length, u32 CRC32C, little-endian). Fails for a payload length
-/// over `max_snapshot_record_payload`.
-fn completeSnapshotRecords(bytes: []const u8) error{SnapshotRecordTooLarge}!usize {
+/// payload length, u32 CRC32C, little-endian). `held` is the header of a
+/// record the decoder already read: its payload starts `bytes`. A PAGE
+/// counts only once what follows it is known: the decoder reads the next
+/// header right after a PAGE and, when it is the PAGE's Kitty placements
+/// (`kitty_image_page_placements`), decodes them in the same step, so the
+/// PAGE waits for that header and those placements. Fails for a payload
+/// length over `max_snapshot_record_payload`.
+fn completeSnapshotRecords(
+    bytes: []const u8,
+    held: ?terminalpkg.snapshot.record.Header,
+) error{SnapshotRecordTooLarge}!CompleteSnapshotRecords {
     const header_len = 10;
-    var rest = bytes;
-    var count: usize = 0;
-    while (count < max_records_per_history_step and rest.len >= header_len) {
+    const page_tag: u16 = @backingInt(terminalpkg.snapshot.record.Tag.page);
+    const placements_tag: u16 = @backingInt(terminalpkg.snapshot.record.Tag.kitty_image_page_placements);
+    var end: CompleteSnapshotRecords = .{ .count = 0, .bytes = 0 };
+    // The last end where the decoder may stop: not right after a PAGE whose
+    // follow-up header is unknown or is its placements.
+    var safe = end;
+    var last_tag: ?u16 = null;
+    if (held) |header| {
+        if (header.payload_len > max_snapshot_record_payload) return error.SnapshotRecordTooLarge;
+        if (bytes.len < header.payload_len) return safe;
+        end = .{ .count = 1, .bytes = header.payload_len };
+        last_tag = @backingInt(header.tag);
+    }
+    while (true) {
+        const rest = bytes[end.bytes..];
+        const next_tag: ?u16 = if (rest.len >= header_len) std.mem.readInt(u16, rest[0..2], .little) else null;
+        const stops_cleanly = last_tag != page_tag or
+            (next_tag != null and next_tag.? != placements_tag);
+        if (stops_cleanly) safe = end;
+        if (end.count >= max_records_per_history_step or next_tag == null) break;
         const payload_len = std.mem.readInt(u32, rest[2..6], .little);
         if (payload_len > max_snapshot_record_payload) return error.SnapshotRecordTooLarge;
         const record_len = header_len + @as(usize, payload_len);
         if (rest.len < record_len) break;
-        rest = rest[record_len..];
-        count += 1;
+        end.bytes += record_len;
+        end.count += 1;
+        last_tag = next_tag;
     }
-    return count;
+    return safe;
 }
 
 /// Forget a snapshot whose history is still arriving.

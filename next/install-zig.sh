@@ -19,7 +19,9 @@ patch_std() {
   sum="$(shasum -a 256 "$file" | cut -d' ' -f1)"
   [ "$sum" = "$ZIG_STD_THREADED_PATCHED_SHA256" ] && return 0
   [ "$sum" = "$ZIG_STD_THREADED_SHA256" ] || { echo "install-zig.sh: unexpected $file sha256 $sum" >&2; exit 1; }
-  sed -i '' 's/^    if (is_darwin) if (t.spawnDarwin($/    if (is_darwin and process.can_spawn) if (t.spawnDarwin(/' "$file"
+  # Portable in place edit (BSD and GNU sed differ on -i).
+  sed 's/^    if (is_darwin) if (t.spawnDarwin($/    if (is_darwin and process.can_spawn) if (t.spawnDarwin(/' "$file" > "$file.patched"
+  mv "$file.patched" "$file"
   sum="$(shasum -a 256 "$file" | cut -d' ' -f1)"
   [ "$sum" = "$ZIG_STD_THREADED_PATCHED_SHA256" ] || { echo "install-zig.sh: std patch gave sha256 $sum" >&2; exit 1; }
 }

@@ -3345,8 +3345,9 @@ typedef enum GHOSTTY_ENUM_TYPED {
   GHOSTTY_TERMINAL_DATA_MEMORY_USAGE = 42,
 
   /*
-   * manaflow-ai additions. They follow upstream's values so upstream data
-   * numbers stay identical; new values are appended here.
+   * manaflow-ai additions. They start at 1024 so an upstream value can
+   * never take their numbers; new values are appended here. Before the
+   * Ghostty 1.4.0 merge they were 43 through 48.
    */
 
   /**
@@ -3358,14 +3359,14 @@ typedef enum GHOSTTY_ENUM_TYPED {
    *
    * Output type: GhosttyTerminalCursorStyle *
    */
-  GHOSTTY_TERMINAL_DATA_CURSOR_VISUAL_STYLE = 43,
+  GHOSTTY_TERMINAL_DATA_CURSOR_VISUAL_STYLE = 1024,
 
   /**
    * Whether the effective cursor visual is blinking (DEC mode 12).
    *
    * Output type: bool *
    */
-  GHOSTTY_TERMINAL_DATA_CURSOR_BLINKING = 44,
+  GHOSTTY_TERMINAL_DATA_CURSOR_BLINKING = 1025,
 
   /**
    * An opaque activity token for cursor-semantic continuity.
@@ -3381,7 +3382,7 @@ typedef enum GHOSTTY_ENUM_TYPED {
    *
    * Output type: uint64_t *
    */
-  GHOSTTY_TERMINAL_DATA_CURSOR_ACTIVITY = 45,
+  GHOSTTY_TERMINAL_DATA_CURSOR_ACTIVITY = 1026,
 
   /**
    * The stored Kitty graphics image count limit for the active screen.
@@ -3390,7 +3391,7 @@ typedef enum GHOSTTY_ENUM_TYPED {
    *
    * Output type: uint64_t *
    */
-  GHOSTTY_TERMINAL_DATA_KITTY_IMAGE_COUNT_LIMIT = 46,
+  GHOSTTY_TERMINAL_DATA_KITTY_IMAGE_COUNT_LIMIT = 1027,
 
   /**
    * The Kitty graphics placement count limit for the active screen.
@@ -3399,7 +3400,7 @@ typedef enum GHOSTTY_ENUM_TYPED {
    *
    * Output type: uint64_t *
    */
-  GHOSTTY_TERMINAL_DATA_KITTY_PLACEMENT_COUNT_LIMIT = 47,
+  GHOSTTY_TERMINAL_DATA_KITTY_PLACEMENT_COUNT_LIMIT = 1028,
 
   /**
    * Exact automatic Kitty image-ID replay and steady-state cursors for both
@@ -3409,7 +3410,7 @@ typedef enum GHOSTTY_ENUM_TYPED {
    *
    * Output type: GhosttyTerminalKittyImageIdCursorState*
    */
-  GHOSTTY_TERMINAL_DATA_KITTY_IMAGE_ID_CURSORS = 48,
+  GHOSTTY_TERMINAL_DATA_KITTY_IMAGE_ID_CURSORS = 1029,
   GHOSTTY_TERMINAL_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalData;
 

@@ -2212,14 +2212,16 @@ pub const TerminalData = enum(c_int) {
     mouse_shape = 41,
     memory_usage = 42,
 
-    // manaflow-ai additions follow upstream's values. Append new values
-    // here so upstream data numbers stay identical.
-    cursor_visual_style = 43,
-    cursor_blinking = 44,
-    cursor_activity = 45,
-    kitty_image_count_limit = 46,
-    kitty_placement_count_limit = 47,
-    kitty_image_id_cursors = 48,
+    // manaflow-ai additions live at 1024 and up, so a later upstream
+    // value can never take one of their numbers (upstream 1.4.0 took the
+    // option numbers the fork had used). Append new values here. (Before
+    // the 1.4.0 merge they were 43-48.)
+    cursor_visual_style = 1024,
+    cursor_blinking = 1025,
+    cursor_activity = 1026,
+    kitty_image_count_limit = 1027,
+    kitty_placement_count_limit = 1028,
+    kitty_image_id_cursors = 1029,
 
     /// Output type expected for querying the data of the given kind.
     pub fn OutType(comptime self: TerminalData) type {
