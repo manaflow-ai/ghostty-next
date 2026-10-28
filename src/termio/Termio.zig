@@ -2579,6 +2579,10 @@ test "manual: snapshot restore and encode round trip" {
         /// The history arrives in slices of this many bytes; 0: one
         /// record per slice (a sender that flushes per record).
         var slice: usize = 997;
+        /// The history bytes the restore receives (`history`, or it with a
+        /// record of an unknown tag after each PAGE).
+        var sent: []const u8 = &.{};
+        var with_unknown: std.ArrayListUnmanaged(u8) = .empty;
 
         /// The length of the record at the start of `bytes` (or all of
         /// them when its header is cut).
@@ -2629,7 +2633,7 @@ test "manual: snapshot restore and encode round trip" {
 
             io.processOutput("\x1b[2Jother content\x1b[5");
             try io.restoreSnapshot(ready.items, .ready);
-            var rest = history.items;
+            var rest = sent;
             while (rest.len > 0) {
                 const n = if (slice == 0) recordLen(rest) else @min(rest.len, slice);
                 try io.restoreSnapshot(rest[0..n], .history);
@@ -2670,6 +2674,32 @@ test "manual: snapshot restore and encode round trip" {
     // Uneven slices, single bytes, and one record per slice: the decoder
     // reads a header ahead after each page (Ghostty 1.4), so a slice that
     // ends at a record boundary must not end the restore.
+    S.sent = S.history.items;
+    for ([_]usize{ 997, 1, 0 }) |slice| {
+        S.slice = slice;
+        try testManualTermio(true, S.restore);
+    }
+
+    // A record of a tag this build does not know (a newer sender's) after
+    // every PAGE is skipped, whatever the slicing.
+    defer S.with_unknown.deinit(alloc);
+    const record = terminalpkg.snapshot.record;
+    const unknown_tag: record.Tag = @fromBackingInt(0x4000);
+    var unknown: [10]u8 = undefined;
+    std.mem.writeInt(u16, unknown[0..2], 0x4000, .little);
+    std.mem.writeInt(u32, unknown[2..6], 0, .little);
+    var checksum: record.Checksum = .init(unknown_tag, 0);
+    std.mem.writeInt(u32, unknown[6..10], checksum.final(), .little);
+    var rest: []const u8 = S.history.items;
+    while (rest.len > 0) {
+        const n = S.recordLen(rest);
+        try S.with_unknown.appendSlice(alloc, rest[0..n]);
+        if (std.mem.readInt(u16, rest[0..2], .little) == @backingInt(record.Tag.page)) {
+            try S.with_unknown.appendSlice(alloc, &unknown);
+        }
+        rest = rest[n..];
+    }
+    S.sent = S.with_unknown.items;
     for ([_]usize{ 997, 1, 0 }) |slice| {
         S.slice = slice;
         try testManualTermio(true, S.restore);
@@ -4853,6 +4883,40 @@ test "manual: moves made during a local history restore replay in order, prompt 
     const want = direct.screens.active.pages.scrollbar();
     const got = replayed.screens.active.pages.scrollbar();
     try testing.expectEqual(want.offset, got.offset);
+}
+
+test "manual: snapshot history scan skips records of unknown tags" {
+    const testing = std.testing;
+    const Tag = terminalpkg.snapshot.record.Tag;
+    const header = struct {
+        fn of(tag: u16, payload_len: u32) [10]u8 {
+            var h: [10]u8 = @splat(0);
+            std.mem.writeInt(u16, h[0..2], tag, .little);
+            std.mem.writeInt(u32, h[2..6], payload_len, .little);
+            return h;
+        }
+    }.of;
+    const page = header(@backingInt(Tag.page), 0);
+    const unknown = header(0x4000, 0);
+    const placements = header(@backingInt(Tag.kitty_image_page_placements), 0);
+
+    // A PAGE and then a record a newer sender added: what follows the PAGE
+    // (its Kitty placements or not) is still unknown, so the PAGE waits.
+    const waiting = page ++ unknown;
+    const r1 = try completeSnapshotRecords(&waiting, null);
+    try testing.expectEqual(@as(usize, 0), r1.bytes);
+
+    // Its placements arrive after the unknown record: one step takes the
+    // PAGE, the unknown record and the placements.
+    const complete = page ++ unknown ++ placements;
+    const r2 = try completeSnapshotRecords(&complete, null);
+    try testing.expectEqual(complete.len, r2.bytes);
+
+    // Unknown records do not count toward the records one step reads.
+    const many = unknown ++ unknown ++ unknown ++ unknown ++ page ++ placements;
+    const r3 = try completeSnapshotRecords(&many, null);
+    try testing.expectEqual(many.len, r3.bytes);
+    try testing.expectEqual(@as(usize, 2), r3.count);
 }
 
 test "manual: snapshot history refuses malformed and oversized records" {
