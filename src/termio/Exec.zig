@@ -581,7 +581,7 @@ pub const Config = struct {
 };
 
 const Subprocess = struct {
-    const c = @import("posix_c");
+    const c = if (builtin.os.tag != .windows) @import("posix_c") else {};
 
     arena: std.heap.ArenaAllocator,
     cwd: ?[:0]const u8,

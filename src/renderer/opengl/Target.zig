@@ -23,7 +23,13 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const gl = @import("opengl");
 const egl = gl.egl;
-const Dmabuf = @import("../Dmabuf.zig");
+const builtin = @import("builtin");
+// DMABUF export is Linux-only; Windows presents CPU pixels (OpenGL.zig present).
+const Dmabuf = if (builtin.os.tag != .windows) @import("../Dmabuf.zig") else struct {
+    pub const max_planes = 0;
+    pub const Planes = struct {};
+    pub fn deinit(_: Dmabuf) void {}
+};
 
 const log = std.log.scoped(.opengl);
 
@@ -150,6 +156,7 @@ pub fn exportDmabuf(
     display: *egl.Display,
     context: *egl.Context,
 ) !Dmabuf {
+    if (comptime builtin.os.tag == .windows) @compileError("DMABUF export is not available on Windows");
     // We disable GL_FRAMEBUFFER_SRGB while doing this blit, otherwise
     // the values may be linearized as they're copied, but even though
     // the draw framebuffer has a linear internal format, the values in

@@ -2,6 +2,7 @@
 pub const OpenGL = @This();
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const gl = @import("opengl");
 const egl = gl.egl;
@@ -11,7 +12,9 @@ const font = @import("../font/main.zig");
 const configpkg = @import("../config.zig");
 const rendererpkg = @import("../renderer.zig");
 const Renderer = rendererpkg.GenericRenderer(OpenGL);
-const Dmabuf = @import("Dmabuf.zig");
+const Dmabuf = if (builtin.os.tag != .windows) @import("Dmabuf.zig") else struct {
+    pub fn deinit(_: @This()) void {}
+};
 pub const Device = @import("opengl/Device.zig");
 
 pub const GraphicsAPI = OpenGL;
@@ -281,13 +284,15 @@ pub fn present(
 ) !ExportedFrame {
     // We only export DMABUFs when the apprt can present them.
     // Otherwise, use CPU buffers.
-    if (presentation_health == .healthy) {
+    // DMABUF is a Linux file-descriptor path. Windows has no fds to export, so it
+    // always presents CPU pixels here.
+    if (comptime builtin.os.tag != .windows) if (presentation_health == .healthy) {
         if (target.exportDmabuf(self.device.display, self.egl_context)) |dmabuf| {
             return .{ .dmabuf = dmabuf };
         } else |_| {
             log.warn("failed to export DMABUF, falling back to CPU presentation", .{});
         }
-    }
+    };
 
     return .{ .memory = .{
         .width = @intCast(target.width),

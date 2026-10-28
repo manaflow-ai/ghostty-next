@@ -54,7 +54,7 @@ pub const Binding = struct {
         const info = dataInfo(data);
         glad.context.BufferData.?(
             @intFromEnum(b.target),
-            info.size,
+            @intCast(info.size),
             info.ptr,
             @intFromEnum(usage),
         );
@@ -72,7 +72,7 @@ pub const Binding = struct {
         glad.context.BufferSubData.?(
             @intFromEnum(b.target),
             @intCast(offset),
-            info.size,
+            @intCast(info.size),
             info.ptr,
         );
         try errors.getError();

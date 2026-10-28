@@ -215,18 +215,21 @@ pub fn add(
 
     // POSIX C imports that are used throughout Ghostty on a general basis.
     // (note: errno is C stdlib but we just include it here because that's
-    // where it's generally included otherwise)
-    try translate_c.addImportToModule(b, "posix_c", step.root_module, .{
-        .source = .{ .includes = .{ .files = &.{
-            .{ .path = "errno.h" },
-            .{ .path = "pwd.h" },
-            .{ .path = "signal.h" },
-            .{ .path = "sys/types.h" },
-            .{ .path = "unistd.h" },
-        } } },
-        .target = target,
-        .optimize = optimize,
-    });
+    // where it's generally included otherwise). Windows has no POSIX headers
+    // (pwd.h, signal.h, unistd.h), so the import is not generated there.
+    if (target.result.os.tag != .windows) {
+        try translate_c.addImportToModule(b, "posix_c", step.root_module, .{
+            .source = .{ .includes = .{ .files = &.{
+                .{ .path = "errno.h" },
+                .{ .path = "pwd.h" },
+                .{ .path = "signal.h" },
+                .{ .path = "sys/types.h" },
+                .{ .path = "unistd.h" },
+            } } },
+            .target = target,
+            .optimize = optimize,
+        });
+    }
 
     // Freetype. We always include this even if our font backend doesn't
     // use it because Dear Imgui uses Freetype.
@@ -657,6 +660,21 @@ pub fn add(
                 .{ .root_source_file = nf_symbols.path("SymbolsNerdFont-Regular.ttf") },
             );
         }
+    }
+
+    // The Windows embedded lib is a DLL, which must resolve every symbol when
+    // it is linked. pkg/opengl calls into glad and EGL, so compile the loaders
+    // into it. Other embedded libs leave these symbols to the host process.
+    if (step.kind == .lib and target.result.os.tag == .windows) {
+        step.root_module.addIncludePath(b.path("vendor/glad/include/"));
+        step.root_module.addCSourceFile(.{
+            .file = b.path("vendor/glad/src/gl.c"),
+            .flags = &.{},
+        });
+        step.root_module.addCSourceFile(.{
+            .file = b.path("vendor/glad/src/glad_egl.c"),
+            .flags = &.{},
+        });
     }
 
     // If we're building an exe then we have additional dependencies.
