@@ -4703,6 +4703,47 @@ test "manual: a config scrollback limit change trims the live terminal" {
     try testManualTermio(true, body);
 }
 
+test "manual: moves made during a local history restore replay in order, prompt jumps included" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const Moves = [_]terminalpkg.Terminal.ScrollViewport{
+        .{ .delta = -10 },
+        .{ .delta_prompt = -1 },
+        .{ .delta = 3 },
+        .{ .delta_prompt = -1 },
+        .{ .delta_prompt = -1 },
+    };
+
+    // Two terminals with the same prompts in their history: one gets the
+    // moves directly, the other through PendingScroll.
+    var direct = try terminalpkg.Terminal.init(testing.io, alloc, .{ .cols = 20, .rows = 5 });
+    defer direct.deinit(alloc);
+    var replayed = try terminalpkg.Terminal.init(testing.io, alloc, .{ .cols = 20, .rows = 5 });
+    defer replayed.deinit(alloc);
+    for ([_]*terminalpkg.Terminal{ &direct, &replayed }) |t| {
+        for (0..40) |i| {
+            if (i % 8 == 0) {
+                try t.semanticPrompt(.init(.prompt_start));
+                try t.printString("$ cmd");
+                try t.semanticPrompt(.init(.end_prompt_start_input));
+            } else try t.printString("output");
+            t.carriageReturn();
+            try t.linefeed();
+        }
+    }
+
+    var pending: PendingScroll = .{};
+    for (Moves) |move| {
+        direct.scrollViewport(move);
+        pending.add(move);
+    }
+    pending.apply(&replayed);
+
+    const want = direct.screens.active.pages.scrollbar();
+    const got = replayed.screens.active.pages.scrollbar();
+    try testing.expectEqual(want.offset, got.offset);
+}
+
 test "manual: snapshot history refuses malformed and oversized records" {
     const body = struct {
         fn run(io: *Termio, _: *TestSink, _: bool) !void {
