@@ -227,6 +227,16 @@ Conflicts and how each was resolved (45 files):
   `xt_checksum_report`, `pasteText` / `ghostty_surface_paste_text`).
 - `src/build/*.zig`, `src/font/face.zig`, `src/input/*.zig`: fork logic
   with upstream's Zig 0.17 spelling (`builtin.target.os`, `.source_tree`).
+- Zig 0.17.0's std cannot build an iOS slice: `Io.Threaded.processReplace`
+  reaches `spawnDarwin`, whose `getDevNullFd` reads a `NullFile.fd` iOS does
+  not have. Zig master fixed it in 0bfd34342b (2026-10-03, after 0.17.0);
+  `next/install-zig.sh` applies that one-line change to the pinned Zig's
+  `lib/std/Io/Threaded.zig`, checked by sha256 before and after
+  (`toolchain.env`), and the manifest records the patched file's sha256.
+  Drop it at the first Zig release that has 0bfd34342b.
+- Zig 0.17 atomics: `futexWait`/`futexWake` take plain `u32`s, so the fork's
+  host-frame wait in `renderer/Metal.zig` waits on `fresh.seq.raw` (upstream
+  did the same in ef349f7f6).
 - Zig 0.17 in fork-only code: `**` on arrays is gone (tests use
   `std.simd.repeat`/`@splat`), `dupeZ` is `dupeSentinel`, `std.meta.fields`
   is `@typeInfo(T).@"enum".field_names`.

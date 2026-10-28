@@ -1460,7 +1460,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 const result = DisplayLink.create(
                     self.alloc,
                     xev.Async,
-                    &displayLinkCallback,
+                    // An iOS link notifies `draw_now` itself; its callback
+                    // type names macOS's CVDisplayLink, which iOS lacks.
+                    if (comptime builtin.target.os.tag == .ios) {} else &displayLinkCallback,
                     callback,
                 ) catch |err| {
                     // A locked macOS session can temporarily have no active

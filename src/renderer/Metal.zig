@@ -439,7 +439,7 @@ fn publishFresh(self: *Metal, surface: *IOSurface) void {
     };
     if (old) |o| o.release();
     _ = self.fresh.seq.fetchAdd(1, .release);
-    io.futexWake(@TypeOf(self.fresh.seq), &self.fresh.seq, std.math.maxInt(u32));
+    io.futexWake(u32, &self.fresh.seq.raw, std.math.maxInt(u32));
 }
 
 /// Releases the kept fresh frame, if any. Main thread.
@@ -515,10 +515,11 @@ pub fn presentHostSizedWait(self: *Metal, wait: bool) bool {
         const waited: i96 = set_at.durationTo(now).nanoseconds;
         if (waited >= host_frame_wait_ns) break;
         const remaining: u64 = @intCast(@as(i96, host_frame_wait_ns) - waited);
+        // Zig 0.17: futex values are plain u32s, not atomics (upstream ef349f7f6).
         io.futexWaitTimeout(
-            @TypeOf(self.fresh.seq),
-            &self.fresh.seq,
-            .init(seq),
+            u32,
+            &self.fresh.seq.raw,
+            seq,
             .{ .duration = .{ .raw = .fromNanoseconds(remaining), .clock = .awake } },
         ) catch {};
     }
@@ -556,7 +557,7 @@ pub fn setFramesHeld(self: *Metal, held: bool) void {
 /// Wakes a display pass waiting for a fresh frame, so it re-reads the hold and visibility.
 fn wakePresent(self: *Metal) void {
     _ = self.fresh.seq.fetchAdd(1, .release);
-    global.io().futexWake(@TypeOf(self.fresh.seq), &self.fresh.seq, std.math.maxInt(u32));
+    global.io().futexWake(u32, &self.fresh.seq.raw, std.math.maxInt(u32));
 }
 
 /// The renderer started or stopped drawing (`setVisible`). Renderer thread.

@@ -119,6 +119,8 @@ def main() -> int:
     parser.add_argument("--flavor", required=True)
     parser.add_argument("--zig-version", required=True)
     parser.add_argument("--zig-sha256", required=True)
+    parser.add_argument("--zig-std-patch-sha256", default="",
+                        help="sha256 of the patched lib/std/Io/Threaded.zig (toolchain.env), empty when none")
     parser.add_argument("--flags", required=True)
     args = parser.parse_args()
 
@@ -145,6 +147,7 @@ def main() -> int:
         "toolchain": {
             "zig": args.zig_version,
             "zig_sha256": args.zig_sha256,
+            "zig_std_threaded_patched_sha256": args.zig_std_patch_sha256,
             "xcode": run("xcodebuild", "-version").replace("\n", " "),
             "iphoneos_sdk": run("xcrun", "--sdk", "iphoneos", "--show-sdk-version"),
             "iphonesimulator_sdk": run("xcrun", "--sdk", "iphonesimulator", "--show-sdk-version"),
