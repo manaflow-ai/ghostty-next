@@ -1595,6 +1595,7 @@ GHOSTTY_API void ghostty_surface_text(ghostty_surface_t, const char*, uintptr_t)
 GHOSTTY_API void ghostty_surface_text_input(ghostty_surface_t,
                                             const char*,
                                             uintptr_t);
+GHOSTTY_API void ghostty_surface_paste_text(ghostty_surface_t, const char*, uintptr_t);
 GHOSTTY_API void ghostty_surface_preedit(ghostty_surface_t, const char*, uintptr_t);
 // Parse terminal output as if it was read from the pty and render it.
 // This is how a MANUAL or MANUAL_MIRROR surface receives output; for an

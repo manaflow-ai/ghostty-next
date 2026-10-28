@@ -102,7 +102,7 @@ thread. New tab and split surfaces do not inherit the IO fields.
 | lib-vt + embedded: Kitty image replay after a snapshot | GHOSTSNP v1 carries no images. `ghostty_terminal_kitty_replay_encode(terminal, max_image_bytes, writer, stats)` writes a quiet (q=2) Kitty APC stream: a reset per screen (clear images, placements and upload; owner's implicit ID cursor), every owner image oldest first (pixels for the images that showing placements use, as zlib o=z RGB/RGBA in 4096-byte chunks, newest first under a cap on decoded bytes; metadata only for the rest, so IDs stay equal), then the placements that show on the primary active area and the alternate screen with the same IDs, numbers, z, offsets, source rects and sizes. The viewer applies it ONLY with `ghostty_terminal_kitty_replay_apply` (lib-vt) or `ghostty_surface_apply_kitty_replay` (MANUAL surfaces, output lane, under the lock): a trusted parser per command, only a=t (inline), a=p and the reset, no replies, the VT parser and a restored continuation untouched. The private keys (E screen, J number, B/L position, R reset, M metadata) are ignored in program output. `ghostty_terminal_kitty_image_generation` changes on any image or placement change (process-local values). A local-history match moves the old terminal's images and reflowed placements into the restored terminal; a mismatch drops them. Resend rule in ghostty.h: always after a plain READY or a MISMATCH when the owner has images; after a match only when the viewer's Kitty limits are smaller. |
 | renderer: a texture marked for unload comes back with its image | `prepImage` returned early on an equal image generation even when an earlier update had marked the entry for unload, so the next upload freed the texture of an image that is placed again. A local-history restore does this: its first swap shows the READY terminal without images, its second swap brings the moved images back with their generations, and a renderer update between the swaps hid the image until it changed (cmux-next S3k dogfood). `Image.cancelUnload` takes the entry back. |
 | renderer + embedded: no frame between the two local-history swaps | `renderer.State.hold_frames` (checked with synchronized output in `State.renderable()`) is set at the first swap of `restoreSnapshotLocalHistory` and cleared under the lock at the result (restored or mismatch, every path), followed by a full redraw. The renderer keeps its last frame meanwhile, so no frame shows the READY terminal without the local history and images. Frames are held only when such a frame would show less: the viewport is in the history (or a kept place waits) or a screen has Kitty images. At the bottom with no images the READY terminal is exactly the reflowed screen, so frames keep drawing while the old history reflows off the lock (a resize used to freeze the terminal for a whole-scrollback reflow at every owner grid step). The lock is still held only for the two swaps. Test: `manual: a local history restore at the bottom draws the READY terminal between the swaps`. |
-| libghostty-vt: program status protocol (OSC 7501) | Port of upstream ghostty-org/ghostty#14560 (bae2c3cdb, merged as a4aacd918) before the next upstream sync: the OSC parser, the `program_status` stream action and Handler effect, the C API (`GHOSTTY_OSC_COMMAND_PROGRAM_STATUS`, `GhosttyTerminalProgramStatus`, `GhosttyTerminalProgramStatusFn`). The fork appends `GHOSTTY_TERMINAL_OPT_PROGRAM_STATUS = 47` because upstream's 46 is taken by the Kitty additions (upstream 44 and 45 are the XTCHECKSUM options, already on upstream main and not yet synced into this fork; the fork's Kitty additions 44-46 already collide with them); the next upstream sync renumbers the four fork options 44-47. cmux-tui keeps the per-terminal records. |
+| libghostty-vt: program status protocol (OSC 7501) | Dropped at the v1.4.0 merge: upstream 1.4.0 ships the protocol (bae2c3cdb, revision 0.4 in b7207b2ef, id checks in dcaf6984e), so the merge takes upstream's parser, handler and C API whole. `GHOSTTY_TERMINAL_OPT_PROGRAM_STATUS` is upstream's 46 again (the fork had 47), and the support query now answers `?:states=...:kinds=...` as revision 0.4 says. The terminfo `Pst` capability (97f843dd9) stays. |
 | renderer: minimum contrast uses the glass background | With a macOS glass style (`background-blur = macos-glass-regular` or `macos-glass-clear`) `updateFrame` zeroes the background uniform's alpha so the host paints it, and the Metal `cell_text` vertex shader premultiplied that to black before `minimum-contrast` ran: on a light theme dark text failed the check against black and was drawn white (invisible). `updateFrame` now sets a Metal-only `bools.host_paints_background` uniform where it zeroes the alpha, and the text shader treats `bg_color` as opaque for contrast and linear correction when it is set; the fill is still skipped. `bools` stays the last member of `Uniforms` (size 144) with the same field order in Zig and MSL; GLSL is unchanged (`@hasField` guards OpenGL). Ported from manaflow-ai/ghostty 2b3fdc58e (#269); this fork has no `macos-background-from-layer`. The next row extends the flag to `background-opacity = 0`. Covered by cmux-next `GhosttyGlassMinimumContrastTests`. |
 | renderer: minimum contrast uses the background at background-opacity 0 | cmux-next draws a translucent window (`background-opacity` below 1, no glass) by giving its surfaces `background-opacity = 0` and painting the background itself, so the text shader again ran `minimum-contrast` against black and turned dark text white on a light theme (cmux-next cx-d07pp). `bools.host_paints_background` is now set whenever the background uniform's alpha is zero on macOS (glass, or an opacity that rounds to 0), not only for the glass styles. See "Behavior that differs from upstream". Covered by cmux-next `GhosttyGlassMinimumContrastTests`. |
 | renderer + embedded: a host-sized macOS target holds its last frame while the view resizes | `ghostty_surface_set_host_sized(surface, true)` (macOS; default false): the Metal target follows the size of the last `ghostty_surface_set_size`, not the layer bounds (`Metal.surfaceSize`), the layer stops redrawing on a bounds change (`needsDisplayOnBoundsChange` false) and `setSurfaceCallback` checks frames against that size. While cmux-next holds a pane's size during a divider drag, no frame allocates or draws: the layer shows the last frame from its top-left corner (`contentsGravity`), clipped by the view, and new output still draws at the held size. Each new size draws at once on the renderer thread (`Thread.flags.resized`: not at the next display-link tick) with the cells rebuilt for that size (the reflow preview included; `Target.cells_fresh` records whether a frame's cells were built at its size). The display pass of the new size never draws on the main thread with the previous size's cells (that frame showed the old text at the new size and blocked main on the GPU per surface): `Metal.presentHostSized` presents the renderer thread's fresh frame at that size in the same Core Animation transaction, waiting for it on a futex at most 4 ms after the size was set (the renderer started when the size was set, so N surfaces build in parallel and main waits once), and otherwise keeps the last frame, which the late frame replaces at the next pass. The main thread draws only the first frame (nothing presented yet). A hidden surface's display pass draws nothing (it used to rebuild the released swap chain). `ghostty_surface_render_counters` reports `host_display_passes`, `host_present_calls`, `host_main_draws`, `host_fresh_presents` and `host_late_presents`. An embedder whose layer gets no display pass for a size change (cmux-next measured 0 display passes in a divider drag) calls `ghostty_surface_present_host_frame` from a run-loop observer ahead of Core Animation's commit: the same present, outside a display pass. iOS is unchanged (its target already follows `set_size`). |
@@ -126,6 +126,110 @@ thread. New tab and split surfaces do not inherit the IO fields.
 Next in the stack (tracked in the design): presentation callbacks for
 frame-exact acknowledgment, Kitty image replay after a snapshot, and a
 local scrollback window limit for restored snapshots.
+
+## Upstream sync to v1.4.0 (2026-10-28)
+
+`main` merged upstream tag `v1.4.0` (83fb95624) with a merge commit, not a
+rebase: every pinned commit stays an ancestor. `next/UPSTREAM_BASE` is
+83fb95624; the previous base was f96c9711b (2026-10-04). Upstream 1.4.0
+needs Zig 0.17, so `next/toolchain.env` pins Zig 0.17.0 (aarch64-macos
+sha256 from ziglang.org's index) and the flavor stays `apple-v6`: the
+source and the toolchain changed, not the build flags.
+
+Patches dropped because upstream now has them:
+- OSC 7501 program status (see the table above).
+- Hidden GPU release and display link sleep were never fork patches on
+  `main`: c4e16970a (release GPU resources for hidden surfaces), 6688aa072
+  (park the display link while idle) and 72cf50855 were already in the
+  f96c9711b base. The open fork branch `cp/p07-memory-036`
+  (`ghostty_surface_set_gpu_resident`, PR 56) duplicates c4e16970a for an
+  occluded surface; cmux keeps one owner, Ghostty's occlusion release
+  (cmux `docs/ghostty-fork.md`).
+
+Conflicts and how each was resolved (45 files):
+- 12 upstream workflows (`flatpak`, `nix`, `release-tag`, `release-tip`,
+  `snap`, `test`, `update-colorschemes`, five `vouch-*`): upstream changed
+  them, this repo deleted them (patch "ci: ghostty-next GhosttyKit
+  pipeline"). Kept deleted.
+- `build.zig.zon`, `build.zig.zon.json`, `.nix`, `.txt`,
+  `flatpak/zig-packages.json`, `pkg/fontconfig` and `pkg/translate-c`
+  zon: the fork pointed codeberg, codeload and freedesktop dependencies at
+  the `deps-mirror-2026-10-05` release (7416ba07d). Upstream 1.4.0 moved
+  every one of them (uucode, arocc, translate-c 2.0, fontconfig) to new
+  versions on `deps.files.ghostty.org`, which the mirror does not hold, so
+  the merge takes upstream's manifests whole. The mirror is unused until
+  it is refreshed for the new versions.
+- `include/ghostty/vt/terminal.h`, `src/terminal/c/terminal.zig`: upstream
+  1.4.0 assigned options 44-47 (`XT_CHECKSUM_REPORT`,
+  `XT_CHECKSUM_EXTENSION`, `PROGRAM_STATUS`, `RESIZE_WINDOW`), the numbers
+  the fork's additions used. The fork's options moved to 1024 and up so an
+  upstream number never collides again: `KITTY_IMAGE_COUNT_LIMIT` 1024,
+  `KITTY_PLACEMENT_COUNT_LIMIT` 1025, `KITTY_IMAGE_ID_CURSORS` 1026,
+  `SHELL_REDRAWS_PROMPT` 1027. This is an ABI change for libghostty-vt
+  embedders: cmux-tui's bindgen reads the names from the header, so a
+  rebuild against the new header is enough; nothing may hard-code the
+  numbers.
+- `include/ghostty/vt/kitty_graphics.h`, `src/terminal/c/main.zig`,
+  `src/lib_vt.zig`, `src/terminal/c/render.zig`, `src/terminal/Terminal.zig`,
+  `src/terminal/formatter.zig` (tests): both sides added declarations,
+  exports or tests at the same place; kept both.
+- `src/terminal/kitty/graphics_storage.zig`, `src/terminal/Screen.zig`:
+  upstream made `ImageStorage.dirty` a change counter (88fb0f8f6) and added
+  pending images; the fork added count limits. Kept both. The C API's
+  `GHOSTTY_KITTY_GRAPHICS_DATA_DIRTY` / `OPTION_DIRTY` keep their bool
+  contract on top of the counter: `c_dirty_cleared` remembers the counter
+  value the embedder cleared, and the storage reads dirty while they differ.
+  Fork callers that set `dirty = true` call `markDirty()`.
+- `src/renderer/image.zig`, `src/renderer/generic.zig`: upstream positions
+  Kitty placements in the render state (`kittyUpdate(alloc, t,
+  render_state)`); the fork renders `drawn` (the live terminal or its reflow
+  preview). The merge passes `drawn` and the render state, and the
+  animation tick reads `drawn`'s storage. The fork's image test now updates
+  a render state first.
+- `src/renderer/generic.zig` display link: upstream moved CVDisplayLink
+  start, stop and retarget to the main thread (ffaaf5d7a,
+  `renderer/DisplayLink.zig`). The fork's iOS CADisplayLink
+  (`IosDisplayLink.zig`) now has the same surface (`create(alloc,
+  Userdata, callback, draw_now)`, `setRunning`, `setDisplay`, `isRunning`,
+  `close`) and `DisplayLink` selects it on iOS; `loopExit` still closes the
+  iOS link because it ticks the thread's `draw_now`.
+- `src/renderer/generic.zig` other hunks: kept the fork's `cells_screen`
+  and upstream's `images_rebuilt`; kept the fork's glass/opacity-0 block
+  with `builtin.target`.
+- `src/terminal/stream.zig`, `src/terminal/stream_terminal.zig`: took
+  upstream's action list (xt_checksum, soft_reset, resize_window) and
+  upstream's origin-relative CHA/VPA/HPR/VPR (82df0be2c), keeping the fork's
+  `recordCursorActivity` on cursor style.
+- `src/terminal/formatter.zig`: upstream added origin-mode CUP replay
+  (`cursor_origin`, x/y); the fork had its own (top/left, `cursorOrigin()`).
+  Took upstream's, dropped the fork's. Blank rows keep both rules (the
+  fork's styled blank row and upstream's background-only row), and blank
+  cells close both the open style (fork) and the open hyperlink (upstream).
+  Two fork tests asserted the old bytes (spaces); upstream now steps over a
+  gap with CUF and erases a background run with ECH, so they check the
+  replayed cells instead.
+- `src/Surface.zig`: upstream scoped the exec env's errdefer
+  (`termio_env`) and takes `DerivedConfig` before `Termio.init`; kept the
+  fork's manual backend switch around it.
+- `src/termio/Termio.zig`: `changeConfig` keeps the fork's Kitty loading
+  limits and manual scrollback limits and takes upstream's direct mode 2031
+  report (297507f49, no self-queued message); the report still reads the
+  surface's `color_scheme` (fork behavior, CSI 996 below), so upstream's
+  `DerivedConfig.conditional_state` was not added. `resize` resizes the pty
+  under the terminal lock (upstream f2571a3ec) after the fork's mirror
+  pixel-only path. Snapshot callers pass upstream's new Kitty plan argument
+  (null: a manual surface's snapshot carries no Kitty pixels) and read the
+  decoder's new `Progress` union; a viewport jump to a prompt
+  (`delta_prompt`) keeps the place until the history lands.
+- `src/termio/stream_handler.zig`, `src/apprt/embedded.zig`,
+  `include/ghostty.h`: kept both sides (fork `pwd_raw_url`,
+  `suppress_terminal_responses`, `textInputCallback`; upstream
+  `xt_checksum_report`, `pasteText` / `ghostty_surface_paste_text`).
+- `src/build/*.zig`, `src/font/face.zig`, `src/input/*.zig`: fork logic
+  with upstream's Zig 0.17 spelling (`builtin.target.os`, `.source_tree`).
+- Zig 0.17 in fork-only code: `**` on arrays is gone (tests use
+  `std.simd.repeat`/`@splat`), `dupeZ` is `dupeSentinel`, `std.meta.fields`
+  is `@typeInfo(T).@"enum".field_names`.
 
 ## Behavior that differs from upstream
 

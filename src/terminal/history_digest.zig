@@ -122,7 +122,7 @@ pub fn pagesAtSeam(list: *const PageList, seam_rows: u64) Digest {
             hash.update(&.{flags});
 
             for (pin.cells(.all)) |*cell| {
-                hash.update(&.{@intFromEnum(cell.wide)});
+                hash.update(&.{@backingInt(cell.wide)});
                 const cp: u32 = switch (cell.content_tag) {
                     .codepoint, .codepoint_grapheme => cell.content.codepoint.data,
                     .bg_color_palette, .bg_color_rgb => 0,
@@ -210,7 +210,7 @@ test "history digest: equal after the same bytes and resize, changes with one ro
     var buf: [128]u8 = undefined;
     for (0..200) |i| {
         // Long soft-wrapping lines, a wide character and a grapheme.
-        const line = try std.fmt.bufPrint(&buf, "\x1b[3{d}m{d:0>3} " ++ ("abcdefghij" ** 6) ++ " 漢 e\u{301}\x1b[m\r\n", .{ i % 8, i });
+        const line = try std.fmt.bufPrint(&buf, "\x1b[3{d}m{d:0>3} " ++ @as([60]u8, std.simd.repeat(60, "abcdefghij".*)) ++ " 漢 e\u{301}\x1b[m\r\n", .{ i % 8, i });
         testFeed(&a, line);
         testFeed(&b, line);
         // c differs from a and b in one character of one old line.

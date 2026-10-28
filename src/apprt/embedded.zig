@@ -245,7 +245,7 @@ pub const App = struct {
     /// to run on every keypress.
     pub fn keyboardLayout(self: *App) input.KeyboardLayout {
         // We only support keyboard layout detection on macOS.
-        if (comptime builtin.os.tag != .macos) return .unknown;
+        if (comptime builtin.target.os.tag != .macos) return .unknown;
 
         // Lazily initialize the keymap.
         const keymap: *input.Keymap = keymap: {
@@ -340,7 +340,7 @@ pub const App = struct {
                     // error we just ignore it, since this only breaks a few minor things.
                     const alloc = self.core_app.alloc;
                     if (surface.rt_surface.title) |v| alloc.free(v);
-                    surface.rt_surface.title = alloc.dupeZ(u8, value.title) catch null;
+                    surface.rt_surface.title = alloc.dupeSentinel(u8, value.title, 0) catch null;
                 },
             },
 
@@ -535,7 +535,7 @@ pub const Surface = struct {
         /// Stored as a c_int so an invalid value from C is an error, not
         /// undefined behavior. In the manual modes there is no subprocess
         /// and command, working_directory and env_vars are ignored.
-        io_mode: c_int = @intFromEnum(apprt.SurfaceIoMode.exec),
+        io_mode: c_int = @backingInt(apprt.SurfaceIoMode.exec),
 
         /// Receives the bytes Ghostty would write to a pty in the manual
         /// modes. See ghostty_io_write_cb in ghostty.h for the threading
@@ -632,8 +632,8 @@ pub const Surface = struct {
                 const value = std.mem.sliceTo(env_var.value, 0);
                 try config.env.map.put(
                     alloc,
-                    try alloc.dupeZ(u8, key),
-                    try alloc.dupeZ(u8, value),
+                    try alloc.dupeSentinel(u8, key, 0),
+                    try alloc.dupeSentinel(u8, value, 0),
                 );
             }
         }
@@ -862,7 +862,7 @@ pub const Surface = struct {
 
         const result = self.app.opts.read_clipboard(
             self.userdata,
-            @intCast(@intFromEnum(clipboard_type)),
+            @intCast(@backingInt(clipboard_type)),
             state_ptr,
             mimes.ptr,
             mimes.len,
@@ -893,8 +893,9 @@ pub const Surface = struct {
             error.UnauthorizedPaste => {
                 // Convert the would-be contents so the permission
                 // prompt can display exactly what would be written.
-                var stack = std.heap.stackFallback(1024, alloc);
-                const conv_alloc = stack.get();
+                var stack_buf: [1024]u8 = undefined;
+                var stack: std.heap.BufferFirstAllocator = .init(&stack_buf, alloc);
+                const conv_alloc = stack.allocator();
                 const contents = conv_alloc.alloc(
                     CAPI.ClipboardContent,
                     kitty.contents.len,
@@ -945,8 +946,9 @@ pub const Surface = struct {
 
         // Convert the C representations to the core types. Everything
         // remains borrowed from the caller for the duration of the call.
-        var stack = std.heap.stackFallback(1024, alloc);
-        const conv_alloc = stack.get();
+        var stack_buf: [1024]u8 = undefined;
+        var stack: std.heap.BufferFirstAllocator = .init(&stack_buf, alloc);
+        const conv_alloc = stack.allocator();
 
         const raw_contents: []const CAPI.ClipboardContent =
             if (complete.contents) |v| v[0..complete.contents_len] else &.{};
@@ -1052,7 +1054,7 @@ pub const Surface = struct {
 
         self.app.opts.write_clipboard(
             self.userdata,
-            @intCast(@intFromEnum(clipboard_type)),
+            @intCast(@backingInt(clipboard_type)),
             array.ptr,
             array.len,
             confirm,
@@ -1253,6 +1255,38 @@ pub const Surface = struct {
         };
     }
 
+    /// Paste explicit text into the surface as if it came from the
+    /// clipboard, regardless of the actual clipboard contents. Unlike
+    /// textCallback, this honors paste protection: unsafe text routes
+    /// through the confirm_read_clipboard callback before it is sent.
+    pub fn pasteText(self: *Surface, text: [:0]const u8) void {
+        if (text.len == 0) return;
+
+        // The request state must be heap allocated because it outlives
+        // this call if confirmation is required. completeClipboardRequest
+        // takes ownership of it in every path.
+        const alloc = self.app.core_app.alloc;
+        const state = alloc.create(apprt.ClipboardRequest) catch |err| {
+            log.err("error allocating paste request err={}", .{err});
+            return;
+        };
+        state.* = .{ .paste = .standard };
+
+        const contents = [_]CAPI.ClipboardContent{.{
+            .mime = "text/plain",
+            .data = text.ptr,
+            .len = text.len,
+        }};
+        self.completeClipboardRequest(&.{
+            .contents = &contents,
+            .contents_len = contents.len,
+            .available = null,
+            .available_len = 0,
+            .confirmed = false,
+            .remember = false,
+        }, state);
+    }
+
     pub fn focusCallback(self: *Surface, focused: bool) void {
         self.core_surface.focusCallback(focused) catch |err| {
             log.err("error in focus callback err={}", .{err});
@@ -1292,7 +1326,7 @@ pub const Surface = struct {
             if (self.io_mode != .exec) break :wd null;
             const cwd = self.core_surface.pwd(self.app.core_app.alloc) catch null orelse break :wd null;
             defer self.app.core_app.alloc.free(cwd);
-            break :wd self.app.core_app.alloc.dupeZ(u8, cwd) catch null;
+            break :wd self.app.core_app.alloc.dupeSentinel(u8, cwd, 0) catch null;
         };
 
         return .{
@@ -1351,6 +1385,12 @@ pub const Surface = struct {
     fn cursorPosToPixels(self: *const Surface, pos: apprt.CursorPos) !apprt.CursorPos {
         const scale = try self.getContentScale();
         return .{ .x = pos.x * scale.x, .y = pos.y * scale.y };
+    }
+
+    pub fn renderDeviceOptions(self: *const Surface) !renderer.Device.Options {
+        // The Metal renderer currently does not have any options
+        _ = self;
+        return .{};
     }
 };
 
@@ -1660,7 +1700,6 @@ pub const CAPI = struct {
         cell_width_px: u32,
         cell_height_px: u32,
     };
-
 
     // ghostty_clipboard_content_s
     //
@@ -2390,7 +2429,7 @@ pub const CAPI = struct {
     /// freed by the caller via ghostty_string_free.
     export fn ghostty_surface_tty_name(surface: *Surface) String {
         const tty_name = surface.core_surface.getProcessInfo(.tty_name) orelse return .empty;
-        const copy = surface.app.core_app.alloc.dupeZ(u8, tty_name) catch |err| {
+        const copy = surface.app.core_app.alloc.dupeSentinel(u8, tty_name, 0) catch |err| {
             log.err("error allocating tty name err={}", .{err});
             return .empty;
         };
@@ -2484,6 +2523,19 @@ pub const CAPI = struct {
         len: usize,
     ) void {
         surface.textCallback(ptr[0..len]);
+    }
+
+    /// Paste text into the terminal as if it came from the clipboard.
+    /// Unlike ghostty_surface_text, this applies paste protection, so
+    /// unsafe text (e.g. containing newlines) requests confirmation via
+    /// the confirm_read_clipboard callback. The text must be null
+    /// terminated and is copied as needed before this returns.
+    export fn ghostty_surface_paste_text(
+        surface: *Surface,
+        ptr: [*:0]const u8,
+        len: usize,
+    ) void {
+        surface.pasteText(ptr[0..len :0]);
     }
 
     /// Set the preedit text for the surface. This is used for IME

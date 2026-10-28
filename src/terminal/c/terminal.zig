@@ -8,6 +8,7 @@ pub const ZigTerminal = @import("../Terminal.zig");
 const Action = @import("../stream.zig").Action;
 const osc = @import("../osc.zig");
 const Stream = @import("../stream_terminal.zig").Stream;
+const StreamBoundary = @import("../stream.zig").Boundary;
 const Screen = @import("../Screen.zig");
 const ScreenSet = @import("../ScreenSet.zig");
 const PageList = @import("../PageList.zig");
@@ -42,7 +43,7 @@ const assert = @import("../../quirks.zig").inlineAssert;
 
 const Handler = @import("../stream_terminal.zig").Handler;
 
-const max_path_bytes = if (builtin.os.tag == .freestanding) 4096 else std.fs.max_path_bytes;
+const max_path_bytes = if (builtin.target.os.tag == .freestanding) 4096 else std.Io.Dir.max_path_bytes;
 
 const log = std.log.scoped(.terminal_c);
 
@@ -249,6 +250,36 @@ pub const SemanticPrompt = extern struct {
     @"error": lib.String,
 };
 
+/// A request to resize the window's text area to a size in rows and columns.
+///
+/// C: GhosttyTerminalResizeWindowGrid
+pub const ResizeWindowGrid = extern struct {
+    rows: u16,
+    columns: u16,
+};
+
+/// A request from the running program to resize the window.
+///
+/// C: GhosttyTerminalResizeWindow
+pub const ResizeWindow = union(Tag) {
+    grid: ResizeWindowGrid,
+
+    /// C: GhosttyTerminalResizeWindowTag
+    pub const Tag = lib.Enum(lib.target, &.{"grid"});
+
+    const c_union = lib.TaggedUnion(
+        lib.target,
+        @This(),
+        // Padding: the largest variant is 4 bytes. Use [2]u64 (16 bytes)
+        // so that other kinds of resize requests can be added without an
+        // ABI break.
+        .{ .padding = [2]u64 },
+    );
+    pub const C = c_union.C;
+    pub const CValue = c_union.CValue;
+    pub const cval = c_union.cval;
+};
+
 /// A borrowed unsupported string sequence.
 ///
 /// C: GhosttyTerminalUnknownStringSequence
@@ -334,6 +365,7 @@ const Effects = struct {
     clipboard_read: ?ClipboardReadFn = null,
     unknown_sequence: ?UnknownSequenceFn = null,
     render_hold: ?RenderHoldFn = null,
+    resize_window: ?ResizeWindowFn = null,
 
     /// Scratch buffer for DA1 feature codes. The device attributes
     /// trampoline converts C feature codes into this buffer and returns
@@ -383,6 +415,9 @@ const Effects = struct {
 
     /// C function pointer type for the render_hold callback.
     pub const RenderHoldFn = *const fn (Terminal, ?*anyopaque, bool) callconv(lib.calling_conv) void;
+
+    /// C function pointer type for the resize_window callback.
+    pub const ResizeWindowFn = *const fn (Terminal, ?*anyopaque, *const ResizeWindow.C) callconv(lib.calling_conv) void;
 
     /// C function pointer type for the pwd_changed callback.
     pub const PwdChangedFn = *const fn (Terminal, ?*anyopaque) callconv(lib.calling_conv) void;
@@ -524,8 +559,9 @@ const Effects = struct {
         // Requests carry a handful of MIME types, so keep the common case
         // allocation-free. On OOM the request goes unanswered and the
         // handler replies with an empty clipboard.
-        var sfa = std.heap.stackFallback(128, wrapper.terminal.gpa());
-        const alloc = sfa.get();
+        var sfa_buf: [128]u8 = undefined;
+        var sfa: std.heap.BufferFirstAllocator = .init(&sfa_buf, wrapper.terminal.gpa());
+        const alloc = sfa.allocator();
         const mimes = alloc.alloc(lib.String, read.mimes.len) catch {
             log.warn("out of memory converting clipboard read request", .{});
             return;
@@ -578,8 +614,9 @@ const Effects = struct {
         // allocation-free while supporting arbitrary multi-MIME replies.
         // On OOM we don't reply and the handler answers with an empty
         // clipboard.
-        var sfa = std.heap.stackFallback(256, ctx.wrapper.terminal.gpa());
-        const alloc = sfa.get();
+        var sfa_buf: [256]u8 = undefined;
+        var sfa: std.heap.BufferFirstAllocator = .init(&sfa_buf, ctx.wrapper.terminal.gpa());
+        const alloc = sfa.allocator();
         const contents = alloc.alloc(clipboard.Content, c_contents.len) catch {
             log.warn("out of memory converting clipboard read reply", .{});
             return;
@@ -641,15 +678,15 @@ const Effects = struct {
         // because all our types are non-exhaustive enums.
 
         const n: usize = @min(c_attrs.primary.num_features, 64);
-        for (0..n) |i| wrapper.effects.da_features_buf[i] = @enumFromInt(c_attrs.primary.features[i]);
+        for (0..n) |i| wrapper.effects.da_features_buf[i] = @fromBackingInt(c_attrs.primary.features[i]);
 
         return .{
             .primary = .{
-                .conformance_level = @enumFromInt(c_attrs.primary.conformance_level),
+                .conformance_level = @fromBackingInt(c_attrs.primary.conformance_level),
                 .features = wrapper.effects.da_features_buf[0..n],
             },
             .secondary = .{
-                .device_type = @enumFromInt(c_attrs.secondary.device_type),
+                .device_type = @fromBackingInt(c_attrs.secondary.device_type),
                 .firmware_version = c_attrs.secondary.firmware_version,
                 .rom_cartridge = c_attrs.secondary.rom_cartridge,
             },
@@ -701,7 +738,7 @@ const Effects = struct {
         const func = wrapper.effects.progress_report orelse return;
         const c_report: ProgressReport = .{
             .size = @sizeOf(ProgressReport),
-            .state = @enumFromInt(@intFromEnum(report.state)),
+            .state = @fromBackingInt(@backingInt(report.state)),
             .progress = if (report.progress) |value| @intCast(value) else -1,
         };
         func(@ptrCast(wrapper), wrapper.effects.userdata, &c_report);
@@ -760,6 +797,21 @@ const Effects = struct {
         const wrapper = TerminalWrapper.fromHandler(handler);
         const func = wrapper.effects.reset orelse return;
         func(@ptrCast(wrapper), wrapper.effects.userdata);
+    }
+
+    fn resizeWindowTrampoline(
+        handler: *Handler,
+        request: Handler.ResizeWindow,
+    ) void {
+        const wrapper = TerminalWrapper.fromHandler(handler);
+        const func = wrapper.effects.resize_window orelse return;
+        const value = ResizeWindow.cval(switch (request) {
+            .grid => |grid| .{ .grid = .{
+                .rows = grid.rows,
+                .columns = grid.columns,
+            } },
+        });
+        func(@ptrCast(wrapper), wrapper.effects.userdata, &value);
     }
 
     fn unknownSequenceTrampoline(
@@ -832,6 +884,7 @@ fn wrap(
         .reset = &Effects.resetTrampoline,
         .size = &Effects.sizeTrampoline,
         .render_hold = &Effects.renderHoldTrampoline,
+        .resize_window = &Effects.resizeWindowTrampoline,
 
         // Installed dynamically when the callback is set; see Effects.
         .clipboard_write = null,
@@ -1019,14 +1072,98 @@ pub fn vt_write(
     wrapper.stream.nextSlice(ptr[0..len]);
 }
 
-pub fn vt_write_until_ground(
+/// A boundary as a C bit flag. The C API takes and reports boundaries as a
+/// bitmask, so each value is the bit for the stream boundary of the same
+/// name.
+///
+/// C: GhosttyTerminalBoundary
+pub const Boundary = enum(c_int) {
+    ground = 1 << 0,
+    apc_start = 1 << 1,
+    apc_end = 1 << 2,
+    dcs_start = 1 << 3,
+    dcs_end = 1 << 4,
+    osc_start = 1 << 5,
+    osc_end = 1 << 6,
+    _,
+
+    comptime {
+        // Each bit must match the stream boundary's position in the enum,
+        // so the conversions below can shift instead of switching.
+        for (@typeInfo(StreamBoundary).@"enum".field_names) |name| {
+            const zig = @field(StreamBoundary, name);
+            assert(@backingInt(@field(Boundary, name)) == 1 << @backingInt(zig));
+        }
+    }
+
+    const all: u32 = (1 << @typeInfo(StreamBoundary).@"enum".field_names.len) - 1;
+
+    /// Convert a bitmask from C to a set. Returns null if the mask is
+    /// empty or has bits that aren't boundaries.
+    fn setFromBits(bits: u32) ?StreamBoundary.Set {
+        if (bits == 0 or bits & ~all != 0) return null;
+        var result: StreamBoundary.Set = .empty;
+        for (std.enums.values(StreamBoundary)) |b| {
+            if (bits & bit(b) != 0) result.insert(b);
+        }
+        return result;
+    }
+
+    /// Convert a set to a bitmask for C.
+    fn bitsFromSet(set_: StreamBoundary.Set) u32 {
+        var bits: u32 = 0;
+        var it = set_.iterator();
+        while (it.next()) |b| bits |= bit(b);
+        return bits;
+    }
+
+    fn bit(b: StreamBoundary) u32 {
+        return @as(u32, 1) << @intCast(@backingInt(b));
+    }
+};
+
+/// C: GhosttyTerminalStringKind
+pub const StringKind = StreamBoundary.StringKind;
+
+/// C: GhosttyTerminalStringIntroducer
+pub const StringIntroducer = StreamBoundary.Introducer;
+
+/// C: GhosttyTerminalStringEnd
+pub const StringEnd = StreamBoundary.EndReason;
+
+/// Where `vt_write_until` stopped. This flattens `StreamBoundary.Stop`
+/// for C. Fields that don't apply to a stop are zero, and `reached` tells
+/// the caller which fields apply.
+///
+/// A stop can be both a string end and a string start, when an 8-bit
+/// introducer of another kind arrives inside an APC or a DCS header. The
+/// Zig stop carries a kind for each. This struct has one `kind` field, so
+/// it holds the kind of the string that ended, and the start flag in
+/// `reached` names the kind that started.
+///
+/// C: GhosttyTerminalWriteStop
+pub const WriteStop = extern struct {
+    size: usize = @sizeOf(WriteStop),
+    consumed: usize = 0,
+    reached: u32 = 0,
+    kind: StringKind = .apc,
+    introducer: StringIntroducer = .esc,
+    end: StringEnd = .st_esc,
+    byte: u8 = 0,
+};
+
+pub fn vt_write_until(
     terminal_: Terminal,
     ptr_: ?[*]const u8,
     len: usize,
-    out_consumed_: ?*usize,
+    boundaries: u32,
+    out_: ?*WriteStop,
 ) callconv(lib.calling_conv) Result {
-    const out_consumed = out_consumed_ orelse return .invalid_value;
-    out_consumed.* = 0;
+    const out = out_ orelse return .invalid_value;
+    if (out.size < @sizeOf(WriteStop)) return .invalid_value;
+
+    // Reset every field so a reused struct never carries a previous stop.
+    out.* = .{};
 
     const wrapper = terminal_ orelse return .invalid_value;
     const input: []const u8 = if (ptr_) |ptr|
@@ -1035,14 +1172,30 @@ pub fn vt_write_until_ground(
         ""
     else
         return .invalid_value;
+    const requested = Boundary.setFromBits(boundaries) orelse
+        return .invalid_value;
 
-    if (wrapper.stream.nextSliceUntilGround(input)) |consumed| {
-        out_consumed.* = consumed;
-        return .success;
+    const stop = wrapper.stream.nextSliceUntil(input, requested) orelse {
+        out.consumed = len;
+        return .no_value;
+    };
+
+    out.consumed = stop.consumed;
+    out.reached = Boundary.bitsFromSet(stop.reached);
+    if (stop.start) |start| {
+        out.kind = start.kind;
+        out.introducer = start.introducer;
+        out.byte = start.byte;
+    }
+    // When a byte both ends and starts a string, the end's kind wins;
+    // see WriteStop.
+    if (stop.end) |end| {
+        out.kind = end.kind;
+        out.end = end.reason;
+        out.byte = end.byte;
     }
 
-    out_consumed.* = len;
-    return .no_value;
+    return .success;
 }
 
 pub const ContinuationWriteError = error{
@@ -1337,16 +1490,19 @@ pub const Option = enum(c_int) {
     render_hold = 41,
     semantic_prompt = 42,
     reset = 43,
+    xt_checksum_report = 44,
+    xt_checksum_extension = 45,
+    program_status = 46,
+    resize_window = 47,
 
-    // manaflow-ai additions follow upstream's values. Append new values
-    // here so upstream option numbers stay identical.
-    kitty_image_count_limit = 44,
-    kitty_placement_count_limit = 45,
-    kitty_image_id_cursors = 46,
-    // Upstream value is 46 (collides with kitty_image_id_cursors); see
-    // GHOSTTY_TERMINAL_OPT_PROGRAM_STATUS in terminal.h.
-    program_status = 47,
-    shell_redraws_prompt = 48,
+    // manaflow-ai additions live at 1024 and up, so a later upstream
+    // option can never take one of their numbers. Append new values here.
+    // (Before the 1.4.0 merge they were 44-46 and 48, and program_status
+    // was 47; upstream assigned 44-47 in 1.4.0.)
+    kitty_image_count_limit = 1024,
+    kitty_placement_count_limit = 1025,
+    kitty_image_id_cursors = 1026,
+    shell_redraws_prompt = 1027,
 
     /// Input type expected for setting the option.
     pub fn InType(comptime self: Option) type {
@@ -1370,6 +1526,7 @@ pub const Option = enum(c_int) {
             .render_hold => ?Effects.RenderHoldFn,
             .semantic_prompt => ?Effects.SemanticPromptFn,
             .reset => ?Effects.ResetFn,
+            .resize_window => ?Effects.ResizeWindowFn,
             .title, .pwd, .terminfo_name => ?*const lib.String,
             .color_foreground, .color_background, .color_cursor => ?*const color.RGB.C,
             .color_palette => ?*const color.PaletteC,
@@ -1378,10 +1535,12 @@ pub const Option = enum(c_int) {
             .kitty_placement_count_limit,
             => ?*const u64,
             .kitty_image_id_cursors => ?*const KittyImageIdCursors,
+            .xt_checksum_extension => ?*const u8,
             .kitty_image_medium_file,
             .kitty_image_medium_shared_mem,
             .glyph_protocol,
             .title_report,
+            .xt_checksum_report,
             .resize_pull_scrollback,
             .shell_redraws_prompt,
             => ?*const bool,
@@ -1408,8 +1567,8 @@ pub fn set(
     value: ?*const anyopaque,
 ) callconv(lib.calling_conv) Result {
     if (comptime std.debug.runtime_safety) {
-        _ = std.enums.fromInt(Option, @intFromEnum(option)) orelse {
-            log.warn("terminal_set invalid option value={d}", .{@intFromEnum(option)});
+        _ = std.enums.fromInt(Option, @backingInt(option)) orelse {
+            log.warn("terminal_set invalid option value={d}", .{@backingInt(option)});
             return .invalid_value;
         };
     }
@@ -1442,6 +1601,7 @@ fn setTyped(
         .title_changed => wrapper.effects.title_changed = value,
         .pwd_changed => wrapper.effects.pwd_changed = value,
         .progress_report => wrapper.effects.progress_report = value,
+        .resize_window => wrapper.effects.resize_window = value,
         .size_cb => wrapper.effects.size_cb = value,
         .render_hold => wrapper.effects.render_hold = value,
         .semantic_prompt => wrapper.effects.semantic_prompt = value,
@@ -1477,6 +1637,10 @@ fn setTyped(
                 null;
         },
         .title_report => wrapper.stream.handler.title_report = if (value) |ptr|
+            ptr.*
+        else
+            false,
+        .xt_checksum_report => wrapper.stream.handler.xt_checksum_report = if (value) |ptr|
             ptr.*
         else
             false,
@@ -1667,6 +1831,11 @@ fn setTyped(
             if (value) |ptr| ptr.* else true,
         .shell_redraws_prompt => wrapper.terminal.flags.shell_redraws_prompt =
             if (value) |ptr| (if (ptr.*) .true else .false) else .false,
+        .xt_checksum_extension => {
+            const bits = if (value) |ptr| ptr.* else 0;
+            const flags = std.math.cast(u5, bits) orelse return .invalid_value;
+            wrapper.terminal.setDefaultXtChecksum(@bitCast(flags));
+        },
         .mode, .mode_default => {
             const config = (value orelse return .invalid_value).*;
             const mode = config.toMode() orelse return .invalid_value;
@@ -1774,6 +1943,7 @@ pub fn scroll_viewport(
         .bottom => .bottom,
         .delta => .{ .delta = behavior.value.delta },
         .row => .{ .row = behavior.value.row },
+        .delta_prompt => .{ .delta_prompt = behavior.value.delta_prompt },
     });
 }
 
@@ -2112,8 +2282,8 @@ pub fn get(
     out: ?*anyopaque,
 ) callconv(lib.calling_conv) Result {
     if (comptime std.debug.runtime_safety) {
-        _ = std.enums.fromInt(TerminalData, @intFromEnum(data)) orelse {
-            log.warn("terminal_get invalid data value={d}", .{@intFromEnum(data)});
+        _ = std.enums.fromInt(TerminalData, @backingInt(data)) orelse {
+            log.warn("terminal_get invalid data value={d}", .{@backingInt(data)});
             return .invalid_value;
         };
     }
@@ -2949,6 +3119,142 @@ test "scroll_viewport row alt screen" {
     try testing.expectEqual(@as(u64, 2), scrollbar_data.len);
 }
 
+test "scroll_viewport delta_prompt" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        2,
+    ));
+    defer free(t);
+
+    const transcript =
+        "\x1b]133;P;k=i\x07p1\r\n" ++
+        "\x1b]133;B\x07cmd1\r\n" ++
+        "\x1b]133;C\x07out1\r\n" ++
+        "\x1b]133;P;k=i\x07p2\r\n" ++
+        "\x1b]133;B\x07cmd2\r\n" ++
+        "\x1b]133;C\x07out2\r\n" ++
+        "\x1b]133;P;k=i\x07p3\r\n" ++
+        "\x1b]133;B\x07cmd3\r\n" ++
+        "\x1b]133;C\x07out3\r\n" ++
+        "\x1b]133;P;k=i\x07p4";
+    vt_write(t, transcript, transcript.len);
+
+    var scrollbar_data: TerminalScrollbar = undefined;
+
+    // A negative count goes to the previous prompt, and a positive count
+    // returns to the next prompt relative to the current viewport top.
+    scroll_viewport(t, .{ .tag = .delta_prompt, .value = .{ .delta_prompt = -1 } });
+    try testing.expectEqual(Result.success, get(t, .scrollbar, @ptrCast(&scrollbar_data)));
+    try testing.expectEqual(@as(u64, 6), scrollbar_data.offset);
+    scroll_viewport(t, .{ .tag = .delta_prompt, .value = .{ .delta_prompt = -1 } });
+    try testing.expectEqual(Result.success, get(t, .scrollbar, @ptrCast(&scrollbar_data)));
+    try testing.expectEqual(@as(u64, 3), scrollbar_data.offset);
+    scroll_viewport(t, .{ .tag = .delta_prompt, .value = .{ .delta_prompt = 1 } });
+    try testing.expectEqual(Result.success, get(t, .scrollbar, @ptrCast(&scrollbar_data)));
+    try testing.expectEqual(@as(u64, 6), scrollbar_data.offset);
+
+    // Counts beyond the retained prompt history clamp to the oldest or
+    // newest matching prompt, including the signed minimum boundary.
+    scroll_viewport(t, .{ .tag = .delta_prompt, .value = .{ .delta_prompt = std.math.minInt(isize) } });
+    try testing.expectEqual(Result.success, get(t, .scrollbar, @ptrCast(&scrollbar_data)));
+    try testing.expectEqual(@as(u64, 0), scrollbar_data.offset);
+    scroll_viewport(t, .{ .tag = .delta_prompt, .value = .{ .delta_prompt = std.math.maxInt(isize) } });
+    try testing.expectEqual(Result.success, get(t, .scrollbar, @ptrCast(&scrollbar_data)));
+    try testing.expectEqual(@as(u64, 8), scrollbar_data.offset);
+
+    // A zero count leaves the selected prompt unchanged.
+    scroll_viewport(t, .{ .tag = .delta_prompt, .value = .{ .delta_prompt = 0 } });
+    try testing.expectEqual(Result.success, get(t, .scrollbar, @ptrCast(&scrollbar_data)));
+    try testing.expectEqual(@as(u64, 8), scrollbar_data.offset);
+}
+
+test "scroll_viewport delta_prompt continuation" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        2,
+    ));
+    defer free(t);
+
+    const transcript =
+        "\x1b]133;P;k=i\x07p1\r\n" ++
+        "\x1b]133;P;k=c\x07p1-continued\r\n" ++
+        "\x1b]133;B\x07cmd1\r\n" ++
+        "\x1b]133;C\x07out1\r\n" ++
+        "\x1b]133;P;k=i\x07p2\r\n" ++
+        "\x1b]133;B\x07cmd2\r\n" ++
+        "\x1b]133;C\x07out2";
+    vt_write(t, transcript, transcript.len);
+
+    // The continuation row belongs to the first prompt group. Moving
+    // forward from that group lands on the second prompt.
+    scroll_viewport(t, .{ .tag = .row, .value = .{ .row = 0 } });
+    scroll_viewport(t, .{ .tag = .delta_prompt, .value = .{ .delta_prompt = 1 } });
+
+    var scrollbar_data: TerminalScrollbar = undefined;
+    try testing.expectEqual(Result.success, get(t, .scrollbar, @ptrCast(&scrollbar_data)));
+    try testing.expectEqual(@as(u64, 4), scrollbar_data.offset);
+}
+
+test "scroll_viewport delta_prompt final continuation snaps to active" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        3,
+    ));
+    defer free(t);
+
+    const transcript =
+        "\x1b]133;P;k=i\x07prompt\r\n" ++
+        "\x1b]133;P;k=c\x07continued\r\n" ++
+        "continued\r\ncontinued\r\ncontinued\r\ncontinued\r\ncontinued";
+    vt_write(t, transcript, transcript.len);
+    scroll_viewport(t, .{ .tag = .row, .value = .{ .row = 1 } });
+
+    var scrollbar_data: TerminalScrollbar = undefined;
+    try testing.expectEqual(Result.success, get(t, .scrollbar, @ptrCast(&scrollbar_data)));
+    try testing.expectEqual(@as(u64, 1), scrollbar_data.offset);
+
+    scroll_viewport(t, .{ .tag = .delta_prompt, .value = .{ .delta_prompt = 1 } });
+    try testing.expectEqual(Result.success, get(t, .scrollbar, @ptrCast(&scrollbar_data)));
+    try testing.expectEqual(@as(u64, 4), scrollbar_data.offset);
+}
+
+test "scroll_viewport delta_prompt no markers and alternate screen" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        2,
+    ));
+    defer free(t);
+
+    const history = "one\r\ntwo\r\nthree\r\nfour";
+    vt_write(t, history, history.len);
+    scroll_viewport(t, .{ .tag = .row, .value = .{ .row = 0 } });
+
+    // Without OSC 133 prompt markers, a request leaves the viewport alone.
+    scroll_viewport(t, .{ .tag = .delta_prompt, .value = .{ .delta_prompt = 1 } });
+    var scrollbar_data: TerminalScrollbar = undefined;
+    try testing.expectEqual(Result.success, get(t, .scrollbar, @ptrCast(&scrollbar_data)));
+    try testing.expectEqual(@as(u64, 0), scrollbar_data.offset);
+
+    const alternate_screen = "\x1b[?1049h";
+    vt_write(t, alternate_screen, alternate_screen.len);
+    scroll_viewport(t, .{ .tag = .delta_prompt, .value = .{ .delta_prompt = -1 } });
+    try testing.expectEqual(Result.success, get(t, .scrollbar, @ptrCast(&scrollbar_data)));
+    try testing.expectEqual(@as(u64, 0), scrollbar_data.offset);
+    try testing.expectEqual(@as(u64, 2), scrollbar_data.total);
+}
+
 test "get memory_usage" {
     var t: Terminal = null;
     try testing.expectEqual(Result.success, new(
@@ -2995,7 +3301,7 @@ test "get memory_usage" {
     var compression_result: CompressionResult = undefined;
     try testing.expectEqual(
         Result.success,
-        compress(t, @intFromEnum(CompressionMode.full), &compression_result),
+        compress(t, @backingInt(CompressionMode.full), &compression_result),
     );
     try testing.expectEqual(
         history.compression_supported,
@@ -3096,7 +3402,7 @@ test "compression invalid arguments" {
     );
     try testing.expectEqual(
         Result.invalid_value,
-        compress(null, @intFromEnum(CompressionMode.incremental), &compression_result),
+        compress(null, @backingInt(CompressionMode.incremental), &compression_result),
     );
 
     var t: Terminal = null;
@@ -3114,7 +3420,7 @@ test "compression invalid arguments" {
     );
     try testing.expectEqual(
         Result.invalid_value,
-        compress(t, @intFromEnum(CompressionMode.incremental), null),
+        compress(t, @backingInt(CompressionMode.incremental), null),
     );
     try testing.expectEqual(
         Result.invalid_value,
@@ -3159,7 +3465,7 @@ test "compression activity and incremental scheduling" {
             Result.success,
             compress(
                 t,
-                @intFromEnum(CompressionMode.incremental),
+                @backingInt(CompressionMode.incremental),
                 &compression_result,
             ),
         );
@@ -3181,7 +3487,7 @@ test "compression activity and incremental scheduling" {
 
     try testing.expectEqual(
         Result.success,
-        compress(t, @intFromEnum(CompressionMode.full), &compression_result),
+        compress(t, @backingInt(CompressionMode.full), &compression_result),
     );
     try testing.expectEqual(CompressionResult.complete, compression_result);
 }
@@ -3310,7 +3616,7 @@ test "history digest" {
     try testing.expectEqual(Result.success, new(&lib.alloc.test_allocator, &b, 40, 5));
     defer free(b);
 
-    const line = "\x1b[31m" ++ ("0123456789" ** 7) ++ "\x1b[m\r\n";
+    const line = "\x1b[31m" ++ @as([70]u8, std.simd.repeat(70, "0123456789".*)) ++ "\x1b[m\r\n";
     for (0..50) |_| {
         vt_write(a, line.ptr, line.len);
         vt_write(b, line.ptr, line.len);
@@ -3544,7 +3850,7 @@ test "vt_write" {
     try testing.expectEqualStrings("Hello", str);
 }
 
-test "vt_write_until_ground result contract" {
+test "vt_write_until ground stops at the first ground byte" {
     var t: Terminal = null;
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
@@ -3554,23 +3860,25 @@ test "vt_write_until_ground result contract" {
     ));
     defer free(t);
 
+    const ground: u32 = @backingInt(Boundary.ground);
+
     // Input remains untouched when the stream is already at ground.
-    var consumed: usize = 99;
+    var stop: WriteStop = .{};
     const untouched = "unprocessed";
     try testing.expectEqual(
         Result.success,
-        vt_write_until_ground(t, untouched, untouched.len, &consumed),
+        vt_write_until(t, untouched, untouched.len, ground, &stop),
     );
-    try testing.expectEqual(@as(usize, 0), consumed);
+    try testing.expectEqual(@as(usize, 0), stop.consumed);
 
     // Complete a split CSI and stop before inspecting the printable suffix.
     vt_write(t, "\x1b[31", 4);
     const input = "mABC\x1b[";
     try testing.expectEqual(
         Result.success,
-        vt_write_until_ground(t, input, input.len, &consumed),
+        vt_write_until(t, input, input.len, ground, &stop),
     );
-    try testing.expectEqual(@as(usize, 1), consumed);
+    try testing.expectEqual(@as(usize, 1), stop.consumed);
     try testing.expect(t.?.stream.ground());
 
     var str = try t.?.terminal.plainString(testing.allocator);
@@ -3578,7 +3886,7 @@ test "vt_write_until_ground result contract" {
     testing.allocator.free(str);
 
     // The untouched suffix can be processed after work at the boundary.
-    vt_write(t, input.ptr + consumed, input.len - consumed);
+    vt_write(t, input.ptr + stop.consumed, input.len - stop.consumed);
     str = try t.?.terminal.plainString(testing.allocator);
     defer testing.allocator.free(str);
     try testing.expectEqualStrings("ABC", str);
@@ -3588,20 +3896,20 @@ test "vt_write_until_ground result contract" {
     // the final byte, even though both consume the entire input.
     try testing.expectEqual(
         Result.no_value,
-        vt_write_until_ground(t, "123", 3, &consumed),
+        vt_write_until(t, "123", 3, ground, &stop),
     );
-    try testing.expectEqual(@as(usize, 3), consumed);
+    try testing.expectEqual(@as(usize, 3), stop.consumed);
     try testing.expect(!t.?.stream.ground());
 
     try testing.expectEqual(
         Result.success,
-        vt_write_until_ground(t, "m", 1, &consumed),
+        vt_write_until(t, "m", 1, ground, &stop),
     );
-    try testing.expectEqual(@as(usize, 1), consumed);
+    try testing.expectEqual(@as(usize, 1), stop.consumed);
     try testing.expect(t.?.stream.ground());
 }
 
-test "vt_write_until_ground handles UTF-8 and abort boundaries" {
+test "vt_write_until ground handles UTF-8 and abort boundaries" {
     var t: Terminal = null;
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
@@ -3611,27 +3919,29 @@ test "vt_write_until_ground handles UTF-8 and abort boundaries" {
     ));
     defer free(t);
 
-    var ground: bool = false;
+    const ground: u32 = @backingInt(Boundary.ground);
+
+    var at_ground: bool = false;
     try testing.expectEqual(
         Result.success,
-        get(t, .vt_ground, @ptrCast(&ground)),
+        get(t, .vt_ground, @ptrCast(&at_ground)),
     );
-    try testing.expect(ground);
+    try testing.expect(at_ground);
 
     vt_write(t, &.{0xF0}, 1);
     try testing.expectEqual(
         Result.success,
-        get(t, .vt_ground, @ptrCast(&ground)),
+        get(t, .vt_ground, @ptrCast(&at_ground)),
     );
-    try testing.expect(!ground);
+    try testing.expect(!at_ground);
 
     const utf8_suffix = [_]u8{ 0x9F, 0x98, 0x84 };
-    var consumed: usize = 99;
+    var stop: WriteStop = .{};
     try testing.expectEqual(
         Result.success,
-        vt_write_until_ground(t, &utf8_suffix, utf8_suffix.len, &consumed),
+        vt_write_until(t, &utf8_suffix, utf8_suffix.len, ground, &stop),
     );
-    try testing.expectEqual(utf8_suffix.len, consumed);
+    try testing.expectEqual(utf8_suffix.len, stop.consumed);
     try testing.expect(t.?.stream.ground());
 
     // A malformed continuation resets the decoder and reaches ground after
@@ -3639,21 +3949,21 @@ test "vt_write_until_ground handles UTF-8 and abort boundaries" {
     vt_write(t, &.{ 0xE0, 0xA0 }, 2);
     try testing.expectEqual(
         Result.success,
-        vt_write_until_ground(t, "A", 1, &consumed),
+        vt_write_until(t, "A", 1, ground, &stop),
     );
-    try testing.expectEqual(@as(usize, 1), consumed);
+    try testing.expectEqual(@as(usize, 1), stop.consumed);
     try testing.expect(t.?.stream.ground());
 
     vt_write(t, "\x1b[123", 5);
     try testing.expectEqual(
         Result.success,
-        vt_write_until_ground(t, &.{0x18}, 1, &consumed),
+        vt_write_until(t, &.{0x18}, 1, ground, &stop),
     );
-    try testing.expectEqual(@as(usize, 1), consumed);
+    try testing.expectEqual(@as(usize, 1), stop.consumed);
     try testing.expect(t.?.stream.ground());
 }
 
-test "vt_write_until_ground invokes effects only for consumed input" {
+test "vt_write_until invokes effects only for consumed input" {
     var t: Terminal = null;
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
@@ -3662,6 +3972,8 @@ test "vt_write_until_ground invokes effects only for consumed input" {
         24,
     ));
     defer free(t);
+
+    const ground: u32 = @backingInt(Boundary.ground);
 
     const S = struct {
         var bell_count: usize = 0;
@@ -3675,19 +3987,19 @@ test "vt_write_until_ground invokes effects only for consumed input" {
 
     vt_write(t, "\x1b[31", 4);
     const input = "m\x07";
-    var consumed: usize = 99;
+    var stop: WriteStop = .{};
     try testing.expectEqual(
         Result.success,
-        vt_write_until_ground(t, input, input.len, &consumed),
+        vt_write_until(t, input, input.len, ground, &stop),
     );
-    try testing.expectEqual(@as(usize, 1), consumed);
+    try testing.expectEqual(@as(usize, 1), stop.consumed);
     try testing.expectEqual(@as(usize, 0), S.bell_count);
 
-    vt_write(t, input.ptr + consumed, input.len - consumed);
+    vt_write(t, input.ptr + stop.consumed, input.len - stop.consumed);
     try testing.expectEqual(@as(usize, 1), S.bell_count);
 }
 
-test "vt_write_until_ground validates arguments" {
+test "vt_write_until result contract" {
     var t: Terminal = null;
     try testing.expectEqual(Result.success, new(
         &lib.alloc.test_allocator,
@@ -3697,34 +4009,414 @@ test "vt_write_until_ground validates arguments" {
     ));
     defer free(t);
 
-    var consumed: usize = 99;
+    const ground: u32 = @backingInt(Boundary.ground);
+    const apc_start: u32 = @backingInt(Boundary.apc_start);
+    const apc_end: u32 = @backingInt(Boundary.apc_end);
+
+    // Fill every field so each invalid call below must reset them.
+    const stale: WriteStop = .{
+        .consumed = 99,
+        .reached = 99,
+        .kind = .osc,
+        .introducer = .c1,
+        .end = .aborted,
+        .byte = 99,
+    };
+
+    var stop: WriteStop = stale;
     try testing.expectEqual(
         Result.invalid_value,
-        vt_write_until_ground(null, "x", 1, &consumed),
+        vt_write_until(null, "x", 1, ground, &stop),
     );
-    try testing.expectEqual(@as(usize, 0), consumed);
+    try testing.expectEqual(WriteStop{}, stop);
 
-    consumed = 99;
+    stop = stale;
     try testing.expectEqual(
         Result.invalid_value,
-        vt_write_until_ground(t, null, 1, &consumed),
+        vt_write_until(t, null, 1, ground, &stop),
     );
-    try testing.expectEqual(@as(usize, 0), consumed);
+    try testing.expectEqual(WriteStop{}, stop);
+
+    for ([_]u32{ 0, 1 << 7, 1 << 31, ground | 1 << 7 }) |bits| {
+        stop = stale;
+        try testing.expectEqual(
+            Result.invalid_value,
+            vt_write_until(t, "x", 1, bits, &stop),
+        );
+        try testing.expectEqual(WriteStop{}, stop);
+    }
 
     try testing.expectEqual(
         Result.invalid_value,
-        vt_write_until_ground(t, "", 0, null),
+        vt_write_until(t, "x", 1, ground, null),
     );
 
-    // NULL represents a valid empty slice. While unfinished it consumes zero
-    // bytes and reports that no ground boundary was found.
-    vt_write(t, "\x1b[", 2);
-    consumed = 99;
+    // A struct one byte short is rejected and left untouched.
+    stop = stale;
+    stop.size = @sizeOf(WriteStop) - 1;
+    try testing.expectEqual(
+        Result.invalid_value,
+        vt_write_until(t, "x", 1, ground, &stop),
+    );
+    try testing.expectEqual(@as(usize, 99), stop.consumed);
+
+    // Already at ground with ground requested consumes nothing.
+    stop = stale;
+    try testing.expectEqual(
+        Result.success,
+        vt_write_until(t, "x", 1, ground | apc_end, &stop),
+    );
+    try testing.expectEqual(WriteStop{ .reached = ground }, stop);
+
+    // No boundary in the whole slice fills consumed and zeroes reached.
+    stop = stale;
+    const text = "hello";
     try testing.expectEqual(
         Result.no_value,
-        vt_write_until_ground(t, null, 0, &consumed),
+        vt_write_until(t, text, text.len, apc_start | apc_end, &stop),
     );
-    try testing.expectEqual(@as(usize, 0), consumed);
+    try testing.expectEqual(WriteStop{ .consumed = text.len }, stop);
+
+    // NULL with len 0 is an empty slice.
+    try testing.expectEqual(
+        Result.no_value,
+        vt_write_until(t, null, 0, apc_start, &stop),
+    );
+    try testing.expectEqual(WriteStop{}, stop);
+}
+
+test "vt_write_until kitty apc start and end" {
+    const apc_start: u32 = @backingInt(Boundary.apc_start);
+    const apc_end: u32 = @backingInt(Boundary.apc_end);
+    const ground: u32 = @backingInt(Boundary.ground);
+    const input = "\x1b_Gf=100,s=1,v=1;AAAA\x1b\\";
+    const content = "Gf=100,s=1,v=1;AAAA";
+
+    for ([_]bool{ false, true }) |with_ground| {
+        var t: Terminal = null;
+        try testing.expectEqual(Result.success, new(
+            &lib.alloc.test_allocator,
+            &t,
+            80,
+            24,
+        ));
+        defer free(t);
+
+        // The start stop covers ESC and '_'.
+        var stop: WriteStop = .{};
+        try testing.expectEqual(
+            Result.success,
+            vt_write_until(t, input, input.len, apc_start | apc_end, &stop),
+        );
+        try testing.expectEqual(WriteStop{
+            .consumed = 2,
+            .reached = apc_start,
+            .kind = .apc,
+            .introducer = .esc,
+            .byte = '_',
+        }, stop);
+        var off: usize = stop.consumed;
+        try testing.expectEqual(@as(u8, 'G'), input[off]);
+
+        // The end stop consumes the ESC of ESC \ but not the backslash.
+        try testing.expectEqual(
+            Result.success,
+            vt_write_until(t, input[off..].ptr, input.len - off, apc_start | apc_end, &stop),
+        );
+        try testing.expectEqual(WriteStop{
+            .consumed = content.len + 1,
+            .reached = apc_end,
+            .kind = .apc,
+            .end = .st_esc,
+            .byte = 0x1B,
+        }, stop);
+        try testing.expectEqualStrings(content, input[off..][0..content.len]);
+        off += stop.consumed;
+        try testing.expectEqual(@as(usize, input.len - 1), off);
+
+        // The backslash completes the escape, reaching ground only.
+        if (with_ground) {
+            try testing.expectEqual(
+                Result.success,
+                vt_write_until(t, "\\", 1, ground | apc_start | apc_end, &stop),
+            );
+            try testing.expectEqual(WriteStop{ .consumed = 1, .reached = ground }, stop);
+        } else {
+            try testing.expectEqual(
+                Result.no_value,
+                vt_write_until(t, "\\", 1, apc_start | apc_end, &stop),
+            );
+            try testing.expectEqual(WriteStop{ .consumed = 1 }, stop);
+        }
+        try testing.expect(t.?.stream.ground());
+    }
+}
+
+test "vt_write_until split introducer" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    const apc_start: u32 = @backingInt(Boundary.apc_start);
+    var stop: WriteStop = .{};
+    try testing.expectEqual(
+        Result.no_value,
+        vt_write_until(t, "\x1b", 1, apc_start, &stop),
+    );
+    try testing.expectEqual(WriteStop{ .consumed = 1 }, stop);
+
+    try testing.expectEqual(
+        Result.success,
+        vt_write_until(t, "_G", 2, apc_start, &stop),
+    );
+    try testing.expectEqual(WriteStop{
+        .consumed = 1,
+        .reached = apc_start,
+        .kind = .apc,
+        .introducer = .esc,
+        .byte = '_',
+    }, stop);
+}
+
+test "vt_write_until c1 introducer" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    // At ground a raw C1 byte goes through the UTF-8 decoder, so the
+    // introducer is only recognized from inside another sequence.
+    vt_write(t, "\x1b[1", 3);
+
+    const apc_start: u32 = @backingInt(Boundary.apc_start);
+    var stop: WriteStop = .{};
+    try testing.expectEqual(
+        Result.success,
+        vt_write_until(t, &.{ 0x9F, 'G' }, 2, apc_start, &stop),
+    );
+    try testing.expectEqual(WriteStop{
+        .consumed = 1,
+        .reached = apc_start,
+        .kind = .apc,
+        .introducer = .c1,
+        .byte = 0x9F,
+    }, stop);
+}
+
+test "vt_write_until string end that reaches ground" {
+    const ground: u32 = @backingInt(Boundary.ground);
+    const apc_end: u32 = @backingInt(Boundary.apc_end);
+
+    for ([_]struct { byte: u8, end: StringEnd }{
+        .{ .byte = 0x18, .end = .cancelled },
+        .{ .byte = 0x9C, .end = .st_c1 },
+    }) |case| {
+        var t: Terminal = null;
+        try testing.expectEqual(Result.success, new(
+            &lib.alloc.test_allocator,
+            &t,
+            80,
+            24,
+        ));
+        defer free(t);
+
+        vt_write(t, "\x1b_Gab", 5);
+        const input = [_]u8{ case.byte, 'x' };
+        var stop: WriteStop = .{};
+        try testing.expectEqual(
+            Result.success,
+            vt_write_until(t, &input, input.len, ground | apc_end, &stop),
+        );
+        try testing.expectEqual(WriteStop{
+            .consumed = 1,
+            .reached = ground | apc_end,
+            .kind = .apc,
+            .end = case.end,
+            .byte = case.byte,
+        }, stop);
+    }
+}
+
+test "vt_write_until sos and pm report as apc" {
+    const apc_start: u32 = @backingInt(Boundary.apc_start);
+
+    for ("X^") |final| {
+        var t: Terminal = null;
+        try testing.expectEqual(Result.success, new(
+            &lib.alloc.test_allocator,
+            &t,
+            80,
+            24,
+        ));
+        defer free(t);
+
+        const input = [_]u8{ 0x1B, final, 'a' };
+        var stop: WriteStop = .{};
+        try testing.expectEqual(
+            Result.success,
+            vt_write_until(t, &input, input.len, apc_start, &stop),
+        );
+        try testing.expectEqual(WriteStop{
+            .consumed = 2,
+            .reached = apc_start,
+            .kind = .apc,
+            .introducer = .esc,
+            .byte = final,
+        }, stop);
+    }
+}
+
+test "vt_write_until osc start and bel end" {
+    const osc_start: u32 = @backingInt(Boundary.osc_start);
+    const osc_end: u32 = @backingInt(Boundary.osc_end);
+    const ground: u32 = @backingInt(Boundary.ground);
+
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    // The start stop covers ESC and ']'.
+    const input = "\x1b]2;title\x07x";
+    var stop: WriteStop = .{};
+    try testing.expectEqual(
+        Result.success,
+        vt_write_until(t, input, input.len, osc_start | osc_end, &stop),
+    );
+    try testing.expectEqual(WriteStop{
+        .consumed = 2,
+        .reached = osc_start,
+        .kind = .osc,
+        .introducer = .esc,
+        .byte = ']',
+    }, stop);
+    var off: usize = stop.consumed;
+
+    // BEL ends the string and reaches ground on the same byte.
+    try testing.expectEqual(
+        Result.success,
+        vt_write_until(t, input[off..].ptr, input.len - off, ground | osc_end, &stop),
+    );
+    try testing.expectEqual(WriteStop{
+        .consumed = "2;title".len + 1,
+        .reached = ground | osc_end,
+        .kind = .osc,
+        .end = .bel,
+        .byte = 0x07,
+    }, stop);
+    off += stop.consumed;
+    try testing.expectEqual(@as(usize, input.len - 1), off);
+    try testing.expect(t.?.stream.ground());
+}
+
+test "vt_write_until dcs start and end" {
+    const dcs_start: u32 = @backingInt(Boundary.dcs_start);
+    const dcs_end: u32 = @backingInt(Boundary.dcs_end);
+
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    // The start stop covers ESC and 'P', before the header.
+    const input = "\x1bP1;2|data\x1b\\";
+    var stop: WriteStop = .{};
+    try testing.expectEqual(
+        Result.success,
+        vt_write_until(t, input, input.len, dcs_start | dcs_end, &stop),
+    );
+    try testing.expectEqual(WriteStop{
+        .consumed = 2,
+        .reached = dcs_start,
+        .kind = .dcs,
+        .introducer = .esc,
+        .byte = 'P',
+    }, stop);
+    var off: usize = stop.consumed;
+    try testing.expectEqual(@as(u8, '1'), input[off]);
+
+    // The end stop consumes the ESC of ESC \ but not the backslash.
+    try testing.expectEqual(
+        Result.success,
+        vt_write_until(t, input[off..].ptr, input.len - off, dcs_start | dcs_end, &stop),
+    );
+    try testing.expectEqual(WriteStop{
+        .consumed = "1;2|data".len + 1,
+        .reached = dcs_end,
+        .kind = .dcs,
+        .end = .st_esc,
+        .byte = 0x1B,
+    }, stop);
+    off += stop.consumed;
+    try testing.expectEqual(@as(usize, input.len - 1), off);
+
+    try testing.expectEqual(
+        Result.no_value,
+        vt_write_until(t, "\\", 1, dcs_start | dcs_end, &stop),
+    );
+    try testing.expect(t.?.stream.ground());
+}
+
+test "vt_write_until string end that is also a string start" {
+    const apc_end: u32 = @backingInt(Boundary.apc_end);
+    const osc_start: u32 = @backingInt(Boundary.osc_start);
+    const osc_end: u32 = @backingInt(Boundary.osc_end);
+
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    // 0x9D inside an APC ends it and starts an OSC on the same byte.
+    // The end's kind is reported; the OSC_START flag names the start.
+    vt_write(t, "\x1b_a", 3);
+    const input = "\x9d0;x\x07";
+    var stop: WriteStop = .{};
+    try testing.expectEqual(
+        Result.success,
+        vt_write_until(t, input, input.len, apc_end | osc_start | osc_end, &stop),
+    );
+    try testing.expectEqual(WriteStop{
+        .consumed = 1,
+        .reached = apc_end | osc_start,
+        .kind = .apc,
+        .introducer = .c1,
+        .end = .aborted,
+        .byte = 0x9D,
+    }, stop);
+
+    try testing.expectEqual(
+        Result.success,
+        vt_write_until(t, input[1..].ptr, input.len - 1, apc_end | osc_start | osc_end, &stop),
+    );
+    try testing.expectEqual(WriteStop{
+        .consumed = 4,
+        .reached = osc_end,
+        .kind = .osc,
+        .end = .bel,
+        .byte = 0x07,
+    }, stop);
 }
 
 test "vt_write split escape sequence" {
@@ -5304,6 +5996,58 @@ test "set desktop_notification callback" {
     try testing.expectEqual(@as(usize, 2), S.count);
 }
 
+test "set resize_window callback" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    const S = struct {
+        var count: usize = 0;
+        var last_userdata: ?*anyopaque = null;
+        var last_tag: ResizeWindow.Tag = .grid;
+        var last: ResizeWindowGrid = .{ .rows = 0, .columns = 0 };
+
+        fn resizeWindow(
+            _: Terminal,
+            ud: ?*anyopaque,
+            request: *const ResizeWindow.C,
+        ) callconv(lib.calling_conv) void {
+            count += 1;
+            last_userdata = ud;
+            last_tag = request.tag;
+            last = request.value.grid;
+        }
+    };
+    S.count = 0;
+    S.last_userdata = null;
+
+    var sentinel: u8 = 44;
+    try testing.expectEqual(Result.success, set(t, .userdata, @ptrCast(&sentinel)));
+    try testing.expectEqual(Result.success, set(
+        t,
+        .resize_window,
+        @ptrCast(&S.resizeWindow),
+    ));
+
+    const seq = "\x1B[8;30;100t";
+    vt_write(t, seq, seq.len);
+    try testing.expectEqual(@as(usize, 1), S.count);
+    try testing.expectEqual(@as(?*anyopaque, @ptrCast(&sentinel)), S.last_userdata);
+    try testing.expectEqual(ResizeWindow.Tag.grid, S.last_tag);
+    try testing.expectEqual(@as(u16, 30), S.last.rows);
+    try testing.expectEqual(@as(u16, 100), S.last.columns);
+
+    // Removing the callback takes effect immediately.
+    try testing.expectEqual(Result.success, set(t, .resize_window, null));
+    vt_write(t, seq, seq.len);
+    try testing.expectEqual(@as(usize, 1), S.count);
+}
+
 test "set progress_report callback" {
     var t: Terminal = null;
     try testing.expectEqual(Result.success, new(
@@ -5402,7 +6146,7 @@ test "set program_status callback" {
         var last_title_len: usize = 0;
         var last_message: [64]u8 = undefined;
         var last_message_len: usize = 0;
-        var written: [64]u8 = undefined;
+        var written: [128]u8 = undefined;
         var written_len: usize = 0;
 
         fn programStatus(
@@ -5455,9 +6199,14 @@ test "set program_status callback" {
         @ptrCast(&S.programStatus),
     ));
 
-    // With the callback, it is.
+    // With the callback, it is answered with the states and kinds we
+    // accept and the same terminator.
     vt_write(t, query, query.len);
-    try testing.expectEqualStrings(query, S.written[0..S.written_len]);
+    try testing.expectEqualStrings(
+        "\x1B]7501;?:states=idle,working,done,blocked,error" ++
+            ":kinds=permission,question,auth\x1B\\",
+        S.written[0..S.written_len],
+    );
     try testing.expectEqual(@as(usize, 0), S.count);
 
     // "Plan" and "Apply?"
@@ -6678,10 +7427,14 @@ test "set device_attributes callback primary" {
         }
 
         fn da(_: Terminal, _: ?*anyopaque, out: *Effects.CDeviceAttributes) callconv(lib.calling_conv) bool {
+            var features: [64]u16 = @splat(0);
+            features[0] = 22;
+            features[1] = 52;
+
             out.* = .{
                 .primary = .{
                     .conformance_level = 64,
-                    .features = .{ 22, 52 } ++ .{0} ** 62,
+                    .features = features,
                     .num_features = 2,
                 },
                 .secondary = .{
@@ -6729,10 +7482,13 @@ test "set device_attributes callback secondary" {
         }
 
         fn da(_: Terminal, _: ?*anyopaque, out: *Effects.CDeviceAttributes) callconv(lib.calling_conv) bool {
+            var features: [64]u16 = @splat(0);
+            features[0] = 22;
+
             out.* = .{
                 .primary = .{
                     .conformance_level = 62,
-                    .features = .{22} ++ .{0} ** 63,
+                    .features = features,
                     .num_features = 1,
                 },
                 .secondary = .{
@@ -6783,7 +7539,7 @@ test "set device_attributes callback tertiary" {
             out.* = .{
                 .primary = .{
                     .conformance_level = 62,
-                    .features = .{0} ** 64,
+                    .features = @splat(0),
                     .num_features = 0,
                 },
                 .secondary = .{
@@ -7018,6 +7774,125 @@ test "title report requires explicit opt in" {
     try testing.expectEqual(Result.success, set(t, .title_report, null));
     vt_write(t, query_title, query_title.len);
     try testing.expect(S.last_data == null);
+}
+
+test "checksum report requires explicit opt in" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    const S = struct {
+        var last_data: ?[]u8 = null;
+
+        fn deinit() void {
+            if (last_data) |data| testing.allocator.free(data);
+            last_data = null;
+        }
+
+        fn writePty(
+            _: Terminal,
+            _: ?*anyopaque,
+            ptr: [*]const u8,
+            len: usize,
+        ) callconv(lib.calling_conv) void {
+            if (last_data) |data| testing.allocator.free(data);
+            last_data = testing.allocator.dupe(u8, ptr[0..len]) catch @panic("OOM");
+        }
+    };
+    S.last_data = null;
+    defer S.deinit();
+
+    try testing.expectEqual(
+        Result.success,
+        set(t, .write_pty, @ptrCast(&S.writePty)),
+    );
+
+    const text = "hello";
+    const query = "\x1B[1;1;1;1;1;5*y";
+    vt_write(t, text, text.len);
+
+    // WRITE_PTY alone must not enable the security-sensitive response.
+    vt_write(t, query, query.len);
+    try testing.expect(S.last_data == null);
+
+    const enabled = true;
+    try testing.expectEqual(Result.success, set(t, .xt_checksum_report, &enabled));
+    vt_write(t, query, query.len);
+    try testing.expectEqualStrings("\x1bP1!~FDEC\x1b\\", S.last_data.?);
+
+    // NULL restores the secure default.
+    S.deinit();
+    try testing.expectEqual(Result.success, set(t, .xt_checksum_report, null));
+    vt_write(t, query, query.len);
+    try testing.expect(S.last_data == null);
+}
+
+test "checksum extension survives resets" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        80,
+        24,
+    ));
+    defer free(t);
+
+    const S = struct {
+        var last_data: ?[]u8 = null;
+
+        fn deinit() void {
+            if (last_data) |data| testing.allocator.free(data);
+            last_data = null;
+        }
+
+        fn writePty(
+            _: Terminal,
+            _: ?*anyopaque,
+            ptr: [*]const u8,
+            len: usize,
+        ) callconv(lib.calling_conv) void {
+            if (last_data) |data| testing.allocator.free(data);
+            last_data = testing.allocator.dupe(u8, ptr[0..len]) catch @panic("OOM");
+        }
+    };
+    S.last_data = null;
+    defer S.deinit();
+
+    const enabled = true;
+    try testing.expectEqual(Result.success, set(t, .write_pty, @ptrCast(&S.writePty)));
+    try testing.expectEqual(Result.success, set(t, .xt_checksum_report, &enabled));
+
+    // Don't negate the result.
+    const positive: u8 = 1;
+    try testing.expectEqual(Result.success, set(t, .xt_checksum_extension, &positive));
+
+    const text = "hello";
+    const query = "\x1B[1;1;1;1;1;5*y";
+    vt_write(t, text, text.len);
+    vt_write(t, query, query.len);
+    try testing.expectEqualStrings("\x1bP1!~0214\x1b\\", S.last_data.?);
+
+    // A reset restores the configured calculation, not the DEC one.
+    const negate = "\x1B[0#y";
+    const ris = "\x1Bc";
+    vt_write(t, negate, negate.len);
+    vt_write(t, ris, ris.len);
+    vt_write(t, text, text.len);
+    vt_write(t, query, query.len);
+    try testing.expectEqualStrings("\x1bP1!~0214\x1b\\", S.last_data.?);
+
+    // NULL restores the DEC calculation.
+    try testing.expectEqual(Result.success, set(t, .xt_checksum_extension, null));
+    vt_write(t, query, query.len);
+    try testing.expectEqualStrings("\x1bP1!~FDEC\x1b\\", S.last_data.?);
+
+    const invalid: u8 = 32;
+    try testing.expectEqual(Result.invalid_value, set(t, .xt_checksum_extension, &invalid));
 }
 
 test "resize updates pixel dimensions" {

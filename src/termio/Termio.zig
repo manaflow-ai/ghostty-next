@@ -89,7 +89,6 @@ grid_locked: std.atomic.Value(bool) = .init(false),
 /// behind output.
 pending_size: PendingSize = .{},
 
-
 /// A snapshot whose history is still arriving after its READY prefix
 /// was restored (see `restoreSnapshot`). Only the output queue uses it.
 snapshot_restore: ?SnapshotRestore = null,
@@ -203,6 +202,11 @@ const PendingScroll = struct {
                 .bottom => null,
                 .top => .{ .row = 0, .from_bottom = total },
                 .row => |row| .{ .row = @min(row, last), .from_bottom = total - @min(row, last) },
+                // A jump to a prompt (Ghostty 1.4) depends on where the
+                // prompts are, which the old terminal's row space cannot
+                // say before the history arrives: keep the current place;
+                // `apply` replays the jump on the restored terminal.
+                .delta_prompt => keep,
                 .delta => unreachable,
             };
         }
@@ -337,6 +341,20 @@ const ThreadEnterState = struct {
 /// The configuration for this IO that is derived from the main
 /// configuration. This must be exported so that we don't need to
 /// pass around Config pointers which makes memory management a pain.
+/// Convert the vt-xt-checksum-extension config, whose values are named for
+/// what they turn on, to the XTCHECKSUM bits, which turn things off.
+fn xtChecksumFlags(
+    ext: configpkg.Config.XtChecksumExtension,
+) terminalpkg.xt_checksum.Flags {
+    return .{
+        .positive = !ext.negate,
+        .no_attributes = !ext.attributes,
+        .no_trim = !ext.trim,
+        .undrawn = ext.undrawn,
+        .full = ext.full,
+    };
+}
+
 pub const DerivedConfig = struct {
     arena: ArenaAllocator,
 
@@ -353,6 +371,8 @@ pub const DerivedConfig = struct {
     clipboard_write: configpkg.ClipboardAccess,
     clipboard_write_limit: usize,
     enquiry_response: []const u8,
+    xt_checksum_report: bool,
+    xt_checksum_extension: terminalpkg.xt_checksum.Flags,
 
     pub fn init(
         alloc_gpa: Allocator,
@@ -391,6 +411,8 @@ pub const DerivedConfig = struct {
             .clipboard_write = config.@"clipboard-write",
             .clipboard_write_limit = config.@"clipboard-write-limit-bytes".value,
             .enquiry_response = try alloc.dupe(u8, config.@"enquiry-response"),
+            .xt_checksum_report = config.@"vt-xt-checksum-report",
+            .xt_checksum_extension = xtChecksumFlags(config.@"vt-xt-checksum-extension"),
 
             // This has to be last so that we copy AFTER the arena allocations
             // above happen (Zig assigns in order).
@@ -436,6 +458,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
             .default_modes = default_modes,
             .default_cursor_style = opts.config.cursor_style,
             .default_cursor_blink = opts.config.cursor_blink,
+            .default_xt_checksum = opts.config.xt_checksum_extension,
             .colors = .{
                 .background = .init(opts.config.background.toTerminalRGB()),
                 .foreground = .init(opts.config.foreground.toTerminalRGB()),
@@ -481,6 +504,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .enquiry_response = opts.config.enquiry_response,
         .suppress_terminal_responses = opts.suppress_terminal_responses,
         .pwd_raw_url = opts.backend == .manual,
+        .xt_checksum_report = opts.config.xt_checksum_report,
     };
 
     const thread_enter_state = try ThreadEnterState.create(
@@ -783,6 +807,14 @@ pub fn changeConfig(self: *Termio, td: *ThreadData, config: *DerivedConfig) !voi
         self.terminal.setScrollbackMaxBytes(config.scrollback_limit_bytes);
         self.terminal.setScrollbackMaxLines(config.scrollback_limit_lines);
     }
+
+    // The config could have changed any of our colors so update mode 2031.
+    // This is written directly rather than queued as a color_scheme_report
+    // message because we're on the io thread, the only reader of our
+    // mailbox: if the mailbox were full, queueing would wait forever.
+    self.colorSchemeReportLocked(td, false) catch |err| {
+        log.warn("error sending color scheme report err={}", .{err});
+    };
 }
 
 /// Update report state synchronously with the surface appearance callback.
@@ -817,9 +849,6 @@ pub fn resize(
     td: *ThreadData,
     size: renderer.Size,
 ) !void {
-    // Update the size of our pty. A manual backend has none.
-    try self.backend.resize(size.grid(), size.terminal());
-
     // A mirror with a locked grid: a resize changes only the pixel size,
     // which nothing in the terminal reads (the owner answers size reports)
     // unless the cell size changed with it (a font size change). The
@@ -858,6 +887,12 @@ pub fn resize(
         // and a manual backend resizes from the caller's thread.
         self.size = size;
         self.live_epoch +%= 1;
+
+        // Resizing the pty can immediately wake the shell with SIGWINCH.
+        // Hold the same lock used by processOutput before notifying it, so
+        // its redraw cannot be parsed against the old terminal dimensions.
+        // A manual backend has no pty.
+        try self.backend.resize(size.grid(), size.terminal());
 
         // Update the size of our terminal state
         const grid_size = self.gridSizeLocked();
@@ -1180,7 +1215,7 @@ fn swapTerminalLocked(
     self.terminal.flags.dirty.clear = true;
     if (comptime terminalpkg.options.kitty_graphics) {
         var it = self.terminal.screens.all.iterator();
-        while (it.next()) |entry| entry.value.*.kitty_images.dirty = true;
+        while (it.next()) |entry| entry.value.*.kitty_images.markDirty();
     }
     self.terminal_stream.handler.queueRender() catch {};
     return old;
@@ -1425,7 +1460,7 @@ pub fn applyKittyReplay(self: *Termio, bytes: []const u8) !void {
     defer self.renderer_state.mutex.unlock(global.io());
     defer {
         var it = self.terminal.screens.all.iterator();
-        while (it.next()) |entry| entry.value.*.kitty_images.dirty = true;
+        while (it.next()) |entry| entry.value.*.kitty_images.markDirty();
         self.terminal_stream.handler.queueRender() catch {};
     }
     try terminalpkg.kitty.graphics.replay.apply(global.io(), self.alloc, &self.terminal, bytes);
@@ -1653,7 +1688,14 @@ fn applySnapshotHistory(self: *Termio, bytes: []const u8) !void {
             self.abandonSnapshotRestore();
             return;
         };
-        if (page.rows > 0) applied = true;
+        switch (page) {
+            .page => |p| if (p.rows > 0) {
+                applied = true;
+            },
+            // Kitty image pixels: a manual surface's snapshot history
+            // carries none (encodeSnapshot passes no Kitty plan).
+            .image => {},
+        }
     }
 
     // Keep only the incomplete record.
@@ -1747,9 +1789,9 @@ pub fn encodeSnapshot(
     }
 
     if (phase != .ready) {
-        try snapshot.history.encode(t.screens.get(.primary).?, .primary, &stream);
+        try snapshot.history.encode(t.screens.get(.primary).?, .primary, &stream, null);
         if (t.screens.get(.alternate)) |alternate| {
-            try snapshot.history.encode(alternate, .alternate, &stream);
+            try snapshot.history.encode(alternate, .alternate, &stream, null);
         }
         try snapshot.checkpoint.encode(.finish, &stream);
     }
@@ -2244,7 +2286,7 @@ test "manual: queueMessage delivers input on the calling thread" {
 
             // An allocated write is delivered and freed (the testing
             // allocator checks for leaks).
-            const long: []const u8 = "0123456789" ** 8;
+            const long: []const u8 = &@as([80]u8, std.simd.repeat(80, "0123456789".*));
             io.queueMessage(try termio.Message.writeReq(alloc, long), .unlocked);
             try sink.expect(long);
 
@@ -2601,9 +2643,9 @@ const TestOwner = struct {
         {
             var stream: snapshot.record.Writer = .init(alloc, &out.writer);
             defer stream.deinit();
-            try snapshot.history.encode(self.t.screens.get(.primary).?, .primary, &stream);
+            try snapshot.history.encode(self.t.screens.get(.primary).?, .primary, &stream, null);
             if (self.t.screens.get(.alternate)) |alternate| {
-                try snapshot.history.encode(alternate, .alternate, &stream);
+                try snapshot.history.encode(alternate, .alternate, &stream, null);
             }
             try snapshot.checkpoint.encode(.finish, &stream);
         }
@@ -2645,7 +2687,7 @@ fn testFeedLines(io: *Termio, owner: *TestOwner, first: usize, count: usize) !vo
     var buf: [160]u8 = undefined;
     for (first..first + count) |i| {
         const line = if (i % 3 == 0)
-            try std.fmt.bufPrint(&buf, "\x1b[1mline {d:0>4}\x1b[m " ++ ("abcdefghij" ** 6) ++ "\r\n", .{i})
+            try std.fmt.bufPrint(&buf, "\x1b[1mline {d:0>4}\x1b[m " ++ @as([60]u8, std.simd.repeat(60, "abcdefghij".*)) ++ "\r\n", .{i})
         else
             try std.fmt.bufPrint(&buf, "\x1b[3{d}mline {d:0>4}\x1b[m short\r\n", .{ i % 8, i });
         testFeedBoth(io, owner, line);
@@ -2770,7 +2812,7 @@ test "manual: snapshot local history restore with the alternate screen active" {
             try testFeedLines(io, &owner, 0, 3000);
             // vim: alternate screen with a full-width status line.
             testFeedBoth(io, &owner, "\x1b[?1049h\x1b[H\x1b[2J~\r\n~\r\n\x1b[10;1H\x1b[7m" ++
-                ("-- INSERT --" ++ " " ** 28) ++ "\x1b[m\x1b[1;1H");
+                ("-- INSERT --" ++ @as([28]u8, @splat(' '))) ++ "\x1b[m\x1b[1;1H");
 
             const ready, const digest = try owner.resizeAndEncode(25, 12);
             defer alloc.free(ready);
@@ -2854,7 +2896,7 @@ test "manual: snapshot local history restore with a smaller viewer scrollback li
             for (0..2000) |i| {
                 testFeedBoth(io, &owner, try std.fmt.bufPrint(
                     &buf,
-                    "\x1b[3{d}mline {d:0>4}\x1b[m " ++ ("abcdefghij" ** 6) ++ "\r\n",
+                    "\x1b[3{d}mline {d:0>4}\x1b[m " ++ @as([60]u8, std.simd.repeat(60, "abcdefghij".*)) ++ "\r\n",
                     .{ i % 8, i },
                 ));
             }
@@ -2920,7 +2962,7 @@ test "manual: snapshot local history restore reflows with the owner's prompt red
                     const bytes = try std.fmt.bufPrint(
                         &buf,
                         "\x1b]133;A\x07~/src $ \x1b]133;B\x07make {d}\r\n\x1b]133;C\x07" ++
-                            ("output abcdefghij" ** 3) ++ "\r\n\x1b]133;D;0\x07",
+                            @as([51]u8, std.simd.repeat(51, "output abcdefghij".*)) ++ "\r\n\x1b]133;D;0\x07",
                         .{i},
                     );
                     viewer.nextSlice(bytes);
@@ -3467,7 +3509,7 @@ test "manual: snapshot local history restore refuses a diverged history" {
 
             for (0..100) |_| {
                 testFeedBoth(io, &owner, "family \u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467} " ++
-                    ("abcdefghij" ** 4) ++ "\r\n");
+                    @as([40]u8, std.simd.repeat(40, "abcdefghij".*)) ++ "\r\n");
             }
 
             const ready, const digest = try owner.resizeAndEncode(25, 10);
@@ -3521,7 +3563,7 @@ fn testFeedWrapped(io: *Termio, owner: *TestOwner, first: usize, count: usize) !
     for (first..first + count) |i| {
         testFeedBoth(io, owner, try std.fmt.bufPrint(
             &buf,
-            "\x1b[3{d}mline {d:0>4}\x1b[m " ++ ("abcdefghij" ** 6) ++ "\r\n",
+            "\x1b[3{d}mline {d:0>4}\x1b[m " ++ @as([60]u8, std.simd.repeat(60, "abcdefghij".*)) ++ "\r\n",
             .{ i % 8, i },
         ));
     }
@@ -4087,7 +4129,7 @@ fn testFeedLinesAll(io: *Termio, owner: *TestOwner, ref: *TestReference, first: 
     var buf: [160]u8 = undefined;
     for (first..first + count) |i| {
         const line = if (i % 3 == 0)
-            try std.fmt.bufPrint(&buf, "\x1b[1mline {d:0>4}\x1b[m " ++ ("abcdefghij" ** 6) ++ "\r\n", .{i})
+            try std.fmt.bufPrint(&buf, "\x1b[1mline {d:0>4}\x1b[m " ++ @as([60]u8, std.simd.repeat(60, "abcdefghij".*)) ++ "\r\n", .{i})
         else
             try std.fmt.bufPrint(&buf, "\x1b[3{d}mline {d:0>4}\x1b[m short\r\n", .{ i % 8, i });
         testFeedAll(io, owner, ref, line);
@@ -4669,7 +4711,7 @@ test "manual: snapshot history refuses malformed and oversized records" {
             // Complete records whose payloads are too short for their
             // contents: malformed, not "still arriving".
             try io.restoreSnapshot(out.written(), .ready);
-            const short = [_]u8{ 4, 0, 0, 0, 0, 0, 0, 0, 0, 0 } ** 3;
+            const short: [30]u8 = std.simd.repeat(30, [_]u8{ 4, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
             if (io.restoreSnapshot(&short, .history)) |_| {
                 return error.TestExpectedError;
             } else |_| {}

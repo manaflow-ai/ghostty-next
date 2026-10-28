@@ -7,7 +7,7 @@ const builtin = @import("builtin");
 const Key = @import("key.zig").Key;
 
 /// The full list of entries for the current platform.
-pub const entries: []const Entry = entriesFor(builtin.os.tag);
+pub const entries: []const Entry = entriesFor(builtin.target.os.tag);
 
 /// The entries with the native keycode of `os`.
 ///
