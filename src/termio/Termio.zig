@@ -194,14 +194,22 @@ const PendingScroll = struct {
                             rows.* +|= scroll.delta;
                             return;
                         },
-                        .delta_prompt => |*prompts| if (scroll == .delta_prompt) {
+                        // Prompt jumps merge only in one direction: a jump
+                        // past the last prompt does nothing, so +1 then -1
+                        // is not 0.
+                        .delta_prompt => |*prompts| if (scroll == .delta_prompt and
+                            (prompts.* < 0) == (scroll.delta_prompt < 0))
+                        {
                             prompts.* +|= scroll.delta_prompt;
                             return;
                         },
                         else => unreachable,
                     }
                 }
-                if (self.len == max_moves) return;
+                if (self.len == max_moves) {
+                    log.warn("restore scroll moves past {d} alternations dropped", .{max_moves});
+                    return;
+                }
                 self.moves[self.len] = scroll;
                 self.len += 1;
             },
@@ -1818,6 +1826,12 @@ fn completeSnapshotRecords(
     const header_len = 10;
     const page_tag: u16 = @backingInt(terminalpkg.snapshot.record.Tag.page);
     const placements_tag: u16 = @backingInt(terminalpkg.snapshot.record.Tag.kitty_image_page_placements);
+    const tag_known = struct {
+        fn f(tag: u16) bool {
+            const t: terminalpkg.snapshot.record.Tag = @fromBackingInt(tag);
+            return t.known();
+        }
+    }.f;
     var end: CompleteSnapshotRecords = .{ .count = 0, .bytes = 0 };
     // The last end where the decoder may stop: not right after a PAGE whose
     // follow-up header is unknown or is its placements.
@@ -1830,17 +1844,33 @@ fn completeSnapshotRecords(
         last_tag = @backingInt(header.tag);
     }
     while (true) {
-        const rest = bytes[end.bytes..];
-        const next_tag: ?u16 = if (rest.len >= header_len) std.mem.readInt(u16, rest[0..2], .little) else null;
+        // Records of tags this build does not know (a newer sender's) are
+        // skipped by the decoder wherever it reads a header, so they
+        // neither count nor say what follows a PAGE.
+        var skipped: usize = 0;
+        var next_tag: ?u16 = null;
+        var next_len: usize = 0;
+        while (true) {
+            const rest = bytes[end.bytes + skipped ..];
+            if (rest.len < header_len) break;
+            const payload_len = std.mem.readInt(u32, rest[2..6], .little);
+            if (payload_len > max_snapshot_record_payload) return error.SnapshotRecordTooLarge;
+            const record_len = header_len + @as(usize, payload_len);
+            const tag = std.mem.readInt(u16, rest[0..2], .little);
+            if (tag_known(tag)) {
+                next_tag = tag;
+                next_len = record_len;
+                break;
+            }
+            if (rest.len < record_len) break;
+            skipped += record_len;
+        }
         const stops_cleanly = last_tag != page_tag or
             (next_tag != null and next_tag.? != placements_tag);
         if (stops_cleanly) safe = end;
         if (end.count >= max_records_per_history_step or next_tag == null) break;
-        const payload_len = std.mem.readInt(u32, rest[2..6], .little);
-        if (payload_len > max_snapshot_record_payload) return error.SnapshotRecordTooLarge;
-        const record_len = header_len + @as(usize, payload_len);
-        if (rest.len < record_len) break;
-        end.bytes += record_len;
+        if (bytes.len - end.bytes - skipped < next_len) break;
+        end.bytes += skipped + next_len;
         end.count += 1;
         last_tag = next_tag;
     }
