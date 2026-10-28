@@ -165,10 +165,11 @@ Conflicts and how each was resolved (45 files):
   the fork's additions used. The fork's options moved to 1024 and up so an
   upstream number never collides again: `KITTY_IMAGE_COUNT_LIMIT` 1024,
   `KITTY_PLACEMENT_COUNT_LIMIT` 1025, `KITTY_IMAGE_ID_CURSORS` 1026,
-  `SHELL_REDRAWS_PROMPT` 1027. This is an ABI change for libghostty-vt
-  embedders: cmux-tui's bindgen reads the names from the header, so a
-  rebuild against the new header is enough; nothing may hard-code the
-  numbers.
+  `SHELL_REDRAWS_PROMPT` 1027. The fork's `GhosttyTerminalData` values
+  moved the same way, 43-48 to 1024-1029. This is an ABI change for
+  libghostty-vt embedders: cmux-tui's bindgen reads the names from the
+  header, so a rebuild against the new header is enough; nothing may
+  hard-code the numbers.
 - `include/ghostty/vt/kitty_graphics.h`, `src/terminal/c/main.zig`,
   `src/lib_vt.zig`, `src/terminal/c/render.zig`, `src/terminal/Terminal.zig`,
   `src/terminal/formatter.zig` (tests): both sides added declarations,
@@ -219,8 +220,15 @@ Conflicts and how each was resolved (45 files):
   under the terminal lock (upstream f2571a3ec) after the fork's mirror
   pixel-only path. Snapshot callers pass upstream's new Kitty plan argument
   (null: a manual surface's snapshot carries no Kitty pixels) and read the
-  decoder's new `Progress` union; a viewport jump to a prompt
-  (`delta_prompt`) keeps the place until the history lands.
+  decoder's new `Progress` union. Upstream's decoder reads one record
+  header ahead after each PAGE and keeps it (or the error reading it) for
+  its next step, so `applySnapshotHistory` gives each step complete records
+  only (a PAGE counts once the known header after it is in), counts a held
+  header's payload as a record, skips records of unknown tags in its scan
+  as the decoder does, and clears a read-ahead `EndOfStream` at the end of
+  the complete records. Restore scroll moves (`PendingScroll`) keep row
+  moves and prompt jumps (`delta_prompt`, new in 1.4) in order. (Review of
+  PR 64: the merge failed a history sent one record or one byte at a time.)
 - `src/termio/stream_handler.zig`, `src/apprt/embedded.zig`,
   `include/ghostty.h`: kept both sides (fork `pwd_raw_url`,
   `suppress_terminal_responses`, `textInputCallback`; upstream
