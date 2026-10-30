@@ -2267,14 +2267,13 @@ pub fn dumpTextLocked(
         };
 
         // Utilize viewport sizing to convert to offsets
-        const start = tl_coord.y * self.io.terminal.screens.active.pages.cols + tl_coord.x;
-        const end = br_coord.y * self.io.terminal.screens.active.pages.cols + br_coord.x;
+        const offsets = viewportOffsets(tl_coord, br_coord, self.io.terminal.screens.active.pages.cols);
 
         break :viewport .{
             .tl_px_x = x,
             .tl_px_y = y,
-            .offset_start = start,
-            .offset_len = end - start,
+            .offset_start = offsets.start,
+            .offset_len = offsets.len,
         };
     };
 
@@ -2993,6 +2992,37 @@ fn fitGridSize(screen: rendererpkg.ScreenSize, cell: rendererpkg.CellSize, paddi
     // result cannot say that no whole cell fits: check the pixels here.
     if (content.width < cell.width or content.height < cell.height) return null;
     return .init(content, cell);
+}
+
+/// The linear offset and length, in cells of the flattened viewport, of a
+/// selection from `tl` to `br`. Both corners are cells of the selection
+/// (`br` is inclusive), so the length counts both: a one-cell selection has
+/// length 1.
+fn viewportOffsets(
+    tl: terminal.point.Coordinate,
+    br: terminal.point.Coordinate,
+    cols: terminal.size.CellCountInt,
+) struct { start: u32, len: u32 } {
+    const start = tl.y * cols + tl.x;
+    const end = br.y * cols + br.x;
+    return .{ .start = start, .len = end - start + 1 };
+}
+
+test "viewportOffsets counts both corners of the selection" {
+    const testing = std.testing;
+    const Coord = terminal.point.Coordinate;
+    // A 15-cell selection on the first row of an 80-column viewport.
+    const one_row = viewportOffsets(Coord{ .x = 0, .y = 0 }, Coord{ .x = 14, .y = 0 }, 80);
+    try testing.expectEqual(@as(u32, 0), one_row.start);
+    try testing.expectEqual(@as(u32, 15), one_row.len);
+    // A single cell has length 1.
+    const cell = viewportOffsets(Coord{ .x = 5, .y = 2 }, Coord{ .x = 5, .y = 2 }, 80);
+    try testing.expectEqual(@as(u32, 165), cell.start);
+    try testing.expectEqual(@as(u32, 1), cell.len);
+    // Across a row break: columns 78..79 of row 0 and 0..1 of row 1.
+    const wrap = viewportOffsets(Coord{ .x = 78, .y = 0 }, Coord{ .x = 1, .y = 1 }, 80);
+    try testing.expectEqual(@as(u32, 78), wrap.start);
+    try testing.expectEqual(@as(u32, 4), wrap.len);
 }
 
 test "fitGrid gives the grid resize gives the same screen" {
