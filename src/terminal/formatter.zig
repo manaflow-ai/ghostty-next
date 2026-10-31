@@ -3123,6 +3123,40 @@ test "Page plain with prior trailing state cells with wrap continuation" {
     );
 }
 
+test "Page plain wrap continuation after a row that does not wrap keeps its column" {
+    // A row marked as continuing a wrap while the row before it does not
+    // wrap (cmux VT fuzz finding E2): the line break goes out, and the prior
+    // row's trailing blank cells must not be printed after it.
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 80,
+        .rows = 24,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+
+    s.nextSlice("abc\r\nu");
+
+    const pages = &t.screens.active.pages;
+    const page = pages.pages.last.?.page();
+
+    // Row 0 does not wrap; row 1 keeps a stale continuation flag.
+    try testing.expect(!page.getRow(0).wrap);
+    page.getRow(1).wrap_continuation = true;
+
+    var formatter: PageFormatter = .init(page, .{ .emit = .plain, .unwrap = true });
+    try formatter.format(&builder.writer);
+    try testing.expectEqualStrings("abc\nu", builder.writer.buffered());
+}
+
 test "Page plain soft-wrapped without unwrap" {
     const testing = std.testing;
     const alloc = testing.allocator;
