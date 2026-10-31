@@ -125,55 +125,13 @@ jobs:
           # libghostty-vt patches (VT replay formatter, terminal and Kitty
           # graphics C API). These live in the lib-vt test modules.
           zig build test-lib-vt \
-            -Dtest-filter="Terminal: OSC133" \
-            -Dtest-filter="Terminal: narrowing a multi-line prompt" \
-            -Dtest-filter="set shell redraws prompt" \
-            -Dtest-filter="PageList resize reflow" \
-            -Dtest-filter="Screen: resize" \
-            -Dtest-filter="Terminal vt restores cursor" \
-            -Dtest-filter="Terminal vt clamps an outside origin cursor" \
-            -Dtest-filter="Terminal vt cursor is absolute when origin mode is omitted" \
-            -Dtest-filter="Terminal vt cursor uses default margins" \
-            -Dtest-filter="Terminal vt trailing blank rows" \
-            -Dtest-filter="Page vt preserved trailing blank rows" \
-            -Dtest-filter="Page VT preserves a fully styled blank row" \
-            -Dtest-filter="Page VT unstyled blank cells" \
-            -Dtest-filter="Page plain wrap continuation" \
-            -Dtest-filter="breaks the wrap" \
-            -Dtest-filter="print wrap at the scroll region bottom" \
-            -Dtest-filter="leave a compressed history page compressed" \
-            -Dtest-filter="the cleared rows' edges" \
-            -Dtest-filter="from a history row into the" \
-            -Dtest-filter="from the cleared rows into the cursor row" \
-            -Dtest-filter="render: OSC dynamic color resets" \
-            -Dtest-filter="get cursor visual" \
-            -Dtest-filter="cursor activity" \
-            -Dtest-filter="count limit" \
-            -Dtest-filter="kitty graphics dirty state" \
-            -Dtest-filter="placement iterator exposes internal" \
-            -Dtest-filter="image_get_handle_by_number" \
-            -Dtest-filter="image_set_number" \
-            -Dtest-filter="image iterator visits" \
-            -Dtest-filter="image ID cursor" \
-            -Dtest-filter="deferred clipboard" \
-            -Dtest-filter="Kitty automatic image ID cursors" \
-            -Dtest-filter="RIS preserves configured byte and count limits" \
-            -Dtest-filter="cell offsets" \
-            -Dtest-filter="kittygfx display clamps cell offsets" \
-            -Dtest-filter="placement_pixel_size keeps the c/r size with cell offsets" \
-            -Dtest-filter="report associated text produced by consumed alt" \
-            -Dtest-filter="select word on a wrapped" \
-            -Dtest-filter="select word ending in a wide glyph" \
-            -Dtest-filter="Terminal vt restores pending wrap with origin mode" \
-            -Dtest-filter="Terminal vt selection after earlier rows keeps its rows with tabstops" \
-            -Dtest-filter="Terminal vt with tabstops" \
-            -Dtest-filter="history digest" \
-            -Dtest-filter="PageList prependHistoryFrom" \
+            -Dtest-filter="Terminal: " \
+            -Dtest-filter="Screen: " \
+            -Dtest-filter="PageList" \
+            -Dtest-filter="Page " \
+            -Dtest-filter="formatter" \
+            -Dtest-filter="Terminal vt" \
             -Dtest-filter="replay: " \
-            -Dtest-filter="kitty replay encode" \
-            -Dtest-filter="OSC 7501" \
-            -Dtest-filter="program_status effect callback" \
-            -Dtest-filter="set program_status callback" \
             --summary all
 
       - name: Build and package
