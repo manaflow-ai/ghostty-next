@@ -3021,12 +3021,15 @@ fn invalidateFullWidthRowRange(
 /// After insertLines or deleteLines with a full-width scroll region: the
 /// rows from `top` to the region bottom moved, the rows above and below
 /// them did not, so no soft wrap may join a row outside to one inside.
-fn breakWrapAtLineEdges(self: *Terminal, top: size.CellCountInt) void {
+/// `top_joined` is the top row's wrap_continuation before the scroll (the
+/// row above `top` may be a compressed history row; see breakWrapAbove).
+fn breakWrapAtLineEdges(self: *Terminal, top: size.CellCountInt, top_joined: bool) void {
     const screen: *Screen = self.screens.active;
-    screen.breakWrapAbove(screen.pages.pin(.{ .active = .{ .y = top } }).?);
+    screen.breakWrapAbove(screen.pages.pin(.{ .active = .{ .y = top } }).?, top_joined);
     const bottom = self.scrolling_region.bottom;
     if (bottom + 1 < self.rows) screen.breakWrapAbove(
         screen.pages.pin(.{ .active = .{ .y = bottom + 1 } }).?,
+        false,
     );
 }
 
@@ -3080,6 +3083,10 @@ pub fn insertLines(self: *Terminal, count: usize) void {
     // We have a slower path if we have left or right scroll margins.
     const left_right = self.scrolling_region.left > 0 or
         self.scrolling_region.right < self.cols - 1;
+
+    // Whether the row above the cursor wrapped into the cursor row, read
+    // before the rows move (see breakWrapAtLineEdges).
+    const top_joined = self.screens.active.cursor.page_row.wrap_continuation;
 
     // Remaining rows from our cursor to the bottom of the scroll region.
     const rem = self.scrolling_region.bottom - self.screens.active.cursor.y + 1;
@@ -3210,7 +3217,7 @@ pub fn insertLines(self: *Terminal, count: usize) void {
         if (cur_p.up(1)) |p| cur_p.* = p;
     }
 
-    if (!left_right) self.breakWrapAtLineEdges(start_y);
+    if (!left_right) self.breakWrapAtLineEdges(start_y, top_joined);
 }
 
 /// Removes amount lines from the current cursor row down. The remaining lines
@@ -3255,6 +3262,10 @@ pub fn deleteLines(self: *Terminal, count: usize) void {
     // We have a slower path if we have left or right scroll margins.
     const left_right = self.scrolling_region.left > 0 or
         self.scrolling_region.right < self.cols - 1;
+
+    // Whether the row above the cursor wrapped into the cursor row, read
+    // before the rows move (see breakWrapAtLineEdges).
+    const top_joined = self.screens.active.cursor.page_row.wrap_continuation;
 
     // Remaining rows from our cursor to the bottom of the scroll region.
     const rem = self.scrolling_region.bottom - self.screens.active.cursor.y + 1;
@@ -3380,7 +3391,7 @@ pub fn deleteLines(self: *Terminal, count: usize) void {
         if (cur_p.down(1)) |p| cur_p.* = p;
     }
 
-    if (!left_right) self.breakWrapAtLineEdges(start_y);
+    if (!left_right) self.breakWrapAtLineEdges(start_y, top_joined);
 }
 
 /// Inserts spaces at current cursor position moving existing cell contents

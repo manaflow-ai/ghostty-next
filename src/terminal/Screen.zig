@@ -1187,7 +1187,7 @@ pub fn cursorScrollAbove(self: *Screen) !void {
 
     // The rows below the cursor did not move but the cursor row is a new
     // blank row: the row below no longer continues it.
-    self.breakWrapAbove(self.cursor.page_pin.down(1).?);
+    self.breakWrapAbove(self.cursor.page_pin.down(1).?, false);
 
     if (self.cursor.style_id != style.default_id) {
         // The newly created line needs to be styled according to
@@ -1418,10 +1418,10 @@ pub fn cursorScrollRegionUp(self: *Screen, limit: usize) !void {
 /// so no soft wrap may join a row outside the region to one inside it.
 fn breakWrapAtScrolledRegionEdges(self: *Screen, limit: usize) void {
     if (self.cursor.y > limit) {
-        self.breakWrapAbove(self.cursor.page_pin.up(limit).?);
+        self.breakWrapAbove(self.cursor.page_pin.up(limit).?, false);
     }
     if (self.cursor.y + 1 < self.pages.rows) {
-        self.breakWrapAbove(self.cursor.page_pin.down(1).?);
+        self.breakWrapAbove(self.cursor.page_pin.down(1).?, false);
     }
 }
 
@@ -1679,16 +1679,24 @@ pub fn cursorResetWrap(self: *Screen) void {
 /// if either row's flag says they are joined. A scroll of a scroll region
 /// moves the rows on one side of its edge and not the other, so the two
 /// rows no longer hold one line; a stale wrap or wrap_continuation would
-/// make reflow and the unwrapping formatter join them. The row above may
-/// be a scrollback row.
-pub fn breakWrapAbove(self: *Screen, pin: Pin) void {
+/// make reflow and the unwrapping formatter join them.
+///
+/// `pin` is in the active area (always resident). The row above may be a
+/// history row in a compressed page: it is read only when the pair was
+/// joined, which `joined` (the pin row's wrap_continuation before the
+/// caller's scroll replaced it) or the pin row's own flag says. Otherwise a
+/// compressed page is left alone: printWrap sets both flags of a pair and
+/// every clear clears both, so its row cannot wrap into this one.
+pub fn breakWrapAbove(self: *Screen, pin: Pin, joined: bool) void {
     const row = pin.rowAndCell().row;
     const prev = pin.up(1) orelse {
         row.wrap_continuation = false;
         return;
     };
+    const linked = joined or row.wrap_continuation;
+    if (!linked and prev.node.storage() == .compressed) return;
     const prev_row = prev.rowAndCell().row;
-    if (!row.wrap_continuation and !prev_row.wrap) return;
+    if (!linked and !prev_row.wrap) return;
     row.wrap_continuation = false;
     prev_row.wrap = false;
 
