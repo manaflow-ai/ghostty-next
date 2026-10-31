@@ -16908,6 +16908,120 @@ test "Terminal: scroll region linefeed recycled row has default metadata" {
     }
 }
 
+// A scroll of a scroll region moves the rows inside it and keeps the rows
+// outside it. A soft wrap between a row outside and a row inside then joins
+// two rows that no longer hold one line: the outside row's wrap flag (above
+// the region) or wrap_continuation flag (below it) is stale. Reflow and the
+// unwrapping formatter read those flags, so each edge must be broken.
+fn testRowFlags(t: *Terminal, y: u32) struct { wrap: bool, cont: bool } {
+    const row = t.screens.active.pages.getCell(.{ .active = .{ .y = y } }).?.row;
+    return .{ .wrap = row.wrap, .cont = row.wrap_continuation };
+}
+
+test "Terminal: index at the scroll region bottom breaks the wrap into the row below" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 5, .rows = 6 });
+    defer t.deinit(alloc);
+
+    // Row 2 soft-wraps into row 3.
+    t.setCursorPos(3, 1);
+    try t.printString("abcdefg");
+    try testing.expect(testRowFlags(&t, 3).cont);
+
+    // DECSTBM rows 2-3 (rows 1-2 here), then a linefeed at its bottom:
+    // row 2 becomes a blank row and row 3, outside the region, stays.
+    t.setTopAndBottomMargin(2, 3);
+    t.setCursorPos(3, 1);
+    try t.linefeed();
+
+    try testing.expect(!testRowFlags(&t, 2).wrap);
+    try testing.expect(!testRowFlags(&t, 3).cont);
+}
+
+test "Terminal: index in a scroll region breaks the wrap across the region top" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 5, .rows = 6 });
+    defer t.deinit(alloc);
+
+    // Row 0 soft-wraps into row 1.
+    t.setCursorPos(1, 1);
+    try t.printString("abcdefg");
+    try testing.expect(testRowFlags(&t, 0).wrap);
+
+    // DECSTBM rows 2-4 (rows 1-3 here): row 1 is discarded and row 0,
+    // outside the region, stays.
+    t.setTopAndBottomMargin(2, 4);
+    t.setCursorPos(4, 1);
+    try t.linefeed();
+
+    try testing.expect(!testRowFlags(&t, 0).wrap);
+    try testing.expect(!testRowFlags(&t, 1).cont);
+}
+
+test "Terminal: index at a bottom margin with scrollback breaks the wrap into the row below" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 5, .rows = 6 });
+    defer t.deinit(alloc);
+
+    // Row 1 soft-wraps into row 2.
+    t.setCursorPos(2, 1);
+    try t.printString("abcdefg");
+    try testing.expect(testRowFlags(&t, 2).cont);
+
+    // DECSTBM rows 1-2 (rows 0-1 here) scrolls into the scrollback; row 1
+    // becomes a blank row and row 2, outside the region, stays.
+    t.setTopAndBottomMargin(1, 2);
+    t.setCursorPos(2, 1);
+    try t.linefeed();
+
+    try testing.expect(!testRowFlags(&t, 1).wrap);
+    try testing.expect(!testRowFlags(&t, 2).cont);
+}
+
+test "Terminal: deleteLines breaks the wrap across both region edges" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 5, .rows = 6 });
+    defer t.deinit(alloc);
+
+    // Row 0 soft-wraps into row 1 and row 3 soft-wraps into row 4.
+    t.setCursorPos(1, 1);
+    try t.printString("abcdefg");
+    t.setCursorPos(4, 1);
+    try t.printString("hijklmn");
+
+    // DECSTBM rows 2-4 (rows 1-3 here), delete the region's top line.
+    t.setTopAndBottomMargin(2, 4);
+    t.setCursorPos(2, 1);
+    t.deleteLines(1);
+
+    try testing.expect(!testRowFlags(&t, 0).wrap);
+    try testing.expect(!testRowFlags(&t, 1).cont);
+    try testing.expect(!testRowFlags(&t, 3).wrap);
+    try testing.expect(!testRowFlags(&t, 4).cont);
+}
+
+test "Terminal: insertLines breaks the wrap across both region edges" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 5, .rows = 6 });
+    defer t.deinit(alloc);
+
+    // Row 0 soft-wraps into row 1 and row 3 soft-wraps into row 4.
+    t.setCursorPos(1, 1);
+    try t.printString("abcdefg");
+    t.setCursorPos(4, 1);
+    try t.printString("hijklmn");
+
+    // DECSTBM rows 2-4 (rows 1-3 here), insert a line at the region's top.
+    t.setTopAndBottomMargin(2, 4);
+    t.setCursorPos(2, 1);
+    t.insertLines(1);
+
+    try testing.expect(!testRowFlags(&t, 0).wrap);
+    try testing.expect(!testRowFlags(&t, 1).cont);
+    try testing.expect(!testRowFlags(&t, 3).wrap);
+    try testing.expect(!testRowFlags(&t, 4).cont);
+}
+
 test "Terminal: alt screen scroll up recycled row has default metadata" {
     const alloc = testing.allocator;
     const io_impl = testing.io;
