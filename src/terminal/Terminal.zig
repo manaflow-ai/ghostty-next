@@ -1810,7 +1810,7 @@ fn printWrap(self: *Terminal) !void {
     const old_semantic_clear = cursor.semantic_content_clear_eol;
 
     // Move to the next line
-    try self.index();
+    try self.indexOpts(true);
     self.screens.active.cursorHorizontalAbsolute(self.scrolling_region.left);
 
     // Our pointer should never move
@@ -2384,6 +2384,12 @@ pub fn tabReset(self: *Terminal) void {
 ///
 /// This unsets the pending wrap state without wrapping.
 pub fn index(self: *Terminal) !void {
+    return self.indexOpts(false);
+}
+
+/// index(), and for `soft_wrap` (printWrap) the cursor row keeps the wrap
+/// printWrap set on it: the row it wraps into is the one the scroll makes.
+fn indexOpts(self: *Terminal, comptime soft_wrap: bool) !void {
     const screen: *Screen = self.screens.active;
 
     // Unset pending wrap state
@@ -2442,6 +2448,12 @@ pub fn index(self: *Terminal) !void {
             // Scrolling dirties the images because it updates their placements pins.
             screen.kitty_images.dirty = true;
         }
+
+        // A linefeed at a bottom margin moves the cursor row up and away
+        // from the row below the region: a soft wrap from it into that row
+        // no longer joins one line. printWrap's own wrap goes into the new
+        // row the scroll makes, so it stays.
+        if (!soft_wrap) self.breakWrapAtBottomMargin();
 
         // If our scrolling region is at the top, we create scrollback,
         // but only if our screen retains scrollback. If our screen
@@ -2506,6 +2518,16 @@ pub fn index(self: *Terminal) !void {
     if (screen.cursor.y < self.scrolling_region.bottom) {
         screen.cursorDown(1);
     }
+}
+
+/// Before a scroll that moves the cursor row (the bottom of a full-width
+/// region with rows below it) up: break the cursor row's soft wrap into the
+/// row below the region, which does not move.
+fn breakWrapAtBottomMargin(self: *Terminal) void {
+    if (self.scrolling_region.bottom + 1 >= self.rows or
+        self.scrolling_region.left != 0 or
+        self.scrolling_region.right != self.cols - 1) return;
+    self.screens.active.cursorResetWrap();
 }
 
 /// The operation when we have Kitty image placements during index.
@@ -2795,6 +2817,7 @@ pub fn scrollUp(self: *Terminal, count: usize) !void {
         // Move our cursor to the bottom of the scroll region so we can
         // use the cursorScrollAbove function to create scrollback
         self.screens.active.cursorAbsolute(0, self.scrolling_region.bottom);
+        self.breakWrapAtBottomMargin();
         for (0..adjusted_count) |_| try self.screens.active.cursorScrollAbove();
         return;
     }
@@ -3000,9 +3023,7 @@ fn invalidateFullWidthRowRange(
 /// them did not, so no soft wrap may join a row outside to one inside.
 fn breakWrapAtLineEdges(self: *Terminal, top: size.CellCountInt) void {
     const screen: *Screen = self.screens.active;
-    if (top > 0) screen.breakWrapAbove(
-        screen.pages.pin(.{ .active = .{ .y = top } }).?,
-    );
+    screen.breakWrapAbove(screen.pages.pin(.{ .active = .{ .y = top } }).?);
     const bottom = self.scrolling_region.bottom;
     if (bottom + 1 < self.rows) screen.breakWrapAbove(
         screen.pages.pin(.{ .active = .{ .y = bottom + 1 } }).?,
