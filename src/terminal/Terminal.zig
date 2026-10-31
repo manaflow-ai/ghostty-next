@@ -16952,7 +16952,38 @@ test "Terminal: index at the scroll region bottom breaks the wrap into the row b
     t.setCursorPos(3, 1);
     try t.linefeed();
 
+    // Row 2's content moved to row 1; row 3 did not move.
+    try testing.expect(!testRowFlags(&t, 1).wrap);
     try testing.expect(!testRowFlags(&t, 2).wrap);
+    try testing.expect(!testRowFlags(&t, 2).cont);
+    try testing.expect(!testRowFlags(&t, 3).cont);
+}
+
+test "Terminal: print wrap at the scroll region bottom keeps its own wrap and breaks the one below" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 5, .rows = 6 });
+    defer t.deinit(alloc);
+
+    // Row 2 soft-wraps into row 3.
+    t.setCursorPos(3, 1);
+    try t.printString("abcdefg");
+    try testing.expect(testRowFlags(&t, 3).cont);
+
+    // DECSTBM rows 2-3 (rows 1-2 here). A wide character at row 2's last
+    // column does not fit, so row 2 gets a spacer head and soft-wraps; the
+    // wrap scrolls the region and row 2 moves to row 1.
+    t.setTopAndBottomMargin(2, 3);
+    t.setCursorPos(3, 5);
+    try t.print(0x6F22); // 漢
+
+    // Row 1 (the moved row) wraps into the new row 2, with its spacer head.
+    try testing.expect(testRowFlags(&t, 1).wrap);
+    try testing.expect(testRowFlags(&t, 2).cont);
+    {
+        const cell = t.screens.active.pages.getCell(.{ .active = .{ .x = 4, .y = 1 } }).?.cell;
+        try testing.expectEqual(Cell.Wide.spacer_head, cell.wide);
+    }
+    // Row 3 does not move and no longer continues anything.
     try testing.expect(!testRowFlags(&t, 3).cont);
 }
 
@@ -16992,8 +17023,28 @@ test "Terminal: index at a bottom margin with scrollback breaks the wrap into th
     t.setCursorPos(2, 1);
     try t.linefeed();
 
+    // Row 1's content moved to row 0; row 2 did not move.
+    try testing.expect(!testRowFlags(&t, 0).wrap);
     try testing.expect(!testRowFlags(&t, 1).wrap);
     try testing.expect(!testRowFlags(&t, 2).cont);
+}
+
+test "Terminal: scrollUp at a bottom margin breaks the wrap into the row below" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 5, .rows = 6 });
+    defer t.deinit(alloc);
+
+    // Row 2 soft-wraps into row 3.
+    t.setCursorPos(3, 1);
+    try t.printString("abcdefg");
+
+    // DECSTBM rows 1-3 (rows 0-2 here), SU 1: row 2's content moves to
+    // row 1 and row 3 does not move.
+    t.setTopAndBottomMargin(1, 3);
+    try t.scrollUp(1);
+
+    try testing.expect(!testRowFlags(&t, 1).wrap);
+    try testing.expect(!testRowFlags(&t, 3).cont);
 }
 
 test "Terminal: deleteLines breaks the wrap across both region edges" {
