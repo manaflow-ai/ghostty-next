@@ -2995,6 +2995,20 @@ fn invalidateFullWidthRowRange(
     }
 }
 
+/// After insertLines or deleteLines with a full-width scroll region: the
+/// rows from `top` to the region bottom moved, the rows above and below
+/// them did not, so no soft wrap may join a row outside to one inside.
+fn breakWrapAtLineEdges(self: *Terminal, top: size.CellCountInt) void {
+    const screen: *Screen = self.screens.active;
+    if (top > 0) screen.breakWrapAbove(
+        screen.pages.pin(.{ .active = .{ .y = top } }).?,
+    );
+    const bottom = self.scrolling_region.bottom;
+    if (bottom + 1 < self.rows) screen.breakWrapAbove(
+        screen.pages.pin(.{ .active = .{ .y = bottom + 1 } }).?,
+    );
+}
+
 // TODO(qwerasd): `insertLines` and `deleteLines` are 99% identical,
 // the majority of their logic can (and should) be abstracted in to
 // a single shared helper function, probably on `Screen` not here.
@@ -3174,6 +3188,8 @@ pub fn insertLines(self: *Terminal, count: usize) void {
         // Move our pin up to the next row.
         if (cur_p.up(1)) |p| cur_p.* = p;
     }
+
+    if (!left_right) self.breakWrapAtLineEdges(start_y);
 }
 
 /// Removes amount lines from the current cursor row down. The remaining lines
@@ -3342,6 +3358,8 @@ pub fn deleteLines(self: *Terminal, count: usize) void {
         // Move our pin down to the next row.
         if (cur_p.down(1)) |p| cur_p.* = p;
     }
+
+    if (!left_right) self.breakWrapAtLineEdges(start_y);
 }
 
 /// Inserts spaces at current cursor position moving existing cell contents

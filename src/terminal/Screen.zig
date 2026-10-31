@@ -1185,6 +1185,10 @@ pub fn cursorScrollAbove(self: *Screen) !void {
         }
     }
 
+    // The rows below the cursor did not move but the cursor row is a new
+    // blank row: the row below no longer continues it.
+    self.breakWrapAbove(self.cursor.page_pin.down(1).?);
+
     if (self.cursor.style_id != style.default_id) {
         // The newly created line needs to be styled according to
         // the bg color if it is set.
@@ -1297,7 +1301,9 @@ fn cursorScrollAboveRotate(
 /// other scroll operations such as deleteLines).
 ///
 /// The cursor stays at the same screen position (the new blank row).
-/// Content outside of the region is unmodified.
+/// Content outside of the region is unmodified, but a soft wrap that
+/// joined a row outside the region to one inside it is broken (see
+/// breakWrapAbove): those rows no longer hold one line.
 ///
 /// This is a very hot path for scroll region usage (e.g. a program
 /// on the alt screen using DECSTBM and scrolling via LF/IND) so this
@@ -1313,7 +1319,11 @@ pub fn cursorScrollRegionUp(self: *Screen, limit: usize) !void {
     // If the region crosses a page boundary we take a slower path. This
     // is rare: it requires the active area to span multiple pages with
     // the split point inside the scroll region.
-    if (pin.y < limit) return try self.cursorScrollRegionUpSlow(limit);
+    if (pin.y < limit) {
+        try self.cursorScrollRegionUpSlow(limit);
+        self.breakWrapAtScrolledRegionEdges(limit);
+        return;
+    }
 
     // Fast path: the entire region is in a single page. We can clear
     // the top row and rotate it down to the cursor row, updating any
@@ -1399,6 +1409,20 @@ pub fn cursorScrollRegionUp(self: *Screen, limit: usize) !void {
     const cursor_row: *Row = &rows[limit];
     self.cursor.page_row = cursor_row;
     self.cursor.page_cell = &page.getCells(cursor_row)[self.cursor.x];
+
+    self.breakWrapAtScrolledRegionEdges(limit);
+}
+
+/// After cursorScrollRegionUp: the region from `limit` rows above the
+/// cursor to the cursor row moved, the rows above and below it did not,
+/// so no soft wrap may join a row outside the region to one inside it.
+fn breakWrapAtScrolledRegionEdges(self: *Screen, limit: usize) void {
+    if (self.cursor.y > limit) {
+        self.breakWrapAbove(self.cursor.page_pin.up(limit).?);
+    }
+    if (self.cursor.y + 1 < self.pages.rows) {
+        self.breakWrapAbove(self.cursor.page_pin.down(1).?);
+    }
 }
 
 /// Slow path for cursorScrollRegionUp: the scroll region spans
@@ -1648,6 +1672,32 @@ pub fn cursorResetWrap(self: *Screen) void {
             page_row,
             cells[self.cursor.page_pin.node.cols() - 1 ..][0..1],
         );
+    }
+}
+
+/// Break the soft wrap between the row at `pin` and the row above it,
+/// if either row's flag says they are joined. A scroll of a scroll region
+/// moves the rows on one side of its edge and not the other, so the two
+/// rows no longer hold one line; a stale wrap or wrap_continuation would
+/// make reflow and the unwrapping formatter join them. `pin` must not be
+/// the top row of the active area (the row above it is scrollback).
+pub fn breakWrapAbove(self: *Screen, pin: Pin) void {
+    const row = pin.rowAndCell().row;
+    const prev = pin.up(1) orelse {
+        row.wrap_continuation = false;
+        return;
+    };
+    const prev_row = prev.rowAndCell().row;
+    if (!row.wrap_continuation and !prev_row.wrap) return;
+    row.wrap_continuation = false;
+    prev_row.wrap = false;
+
+    // A spacer head only exists to carry a wide character over the wrap.
+    const cells = prev.cells(.all);
+    const last = prev.node.cols() - 1;
+    if (cells[last].wide == .spacer_head) {
+        self.clearCells(prev.node.page(), prev_row, cells[last..][0..1]);
+        prev.markDirty();
     }
 }
 
