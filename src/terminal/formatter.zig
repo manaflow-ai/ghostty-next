@@ -1368,6 +1368,8 @@ pub const PageFormatter = struct {
                 continue;
             }
 
+            // Whether a line break goes out before this row (a prior row did not wrap, or blank rows came before it).
+            const broke_before = blank_rows > 0;
             if (blank_rows > 0) {
                 // Reset style before emitting newlines to prevent background
                 // colors from bleeding into the next line's leading cells.
@@ -1432,8 +1434,13 @@ pub const PageFormatter = struct {
             if (!row.wrap or !self.opts.unwrap) blank_rows += 1;
 
             // If the row doesn't continue a wrap then we need to reset
-            // our blank cell count.
-            if (!row.wrap_continuation or !self.opts.unwrap) blank_cells = 0;
+            // our blank cell count. Also when a line break went out before
+            // it: blank cells carry only across a wrap we joined. A row can
+            // be marked as continuing a wrap while the row before it no
+            // longer wraps (its wrap flag cleared, the continuation flag
+            // kept); carrying the prior row's trailing blanks then printed
+            // them after the break, shifting the row right.
+            if (!row.wrap_continuation or !self.opts.unwrap or broke_before) blank_cells = 0;
 
             // Go through each cell and print it
             var cell_i: usize = 0;
