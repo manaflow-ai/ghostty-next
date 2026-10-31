@@ -17154,6 +17154,63 @@ test "Terminal: insertLines and deleteLines at the top row leave a compressed hi
     try testing.expectEqual(.compressed, history.storage());
 }
 
+test "Terminal: ED 1 breaks the wrap from the cleared rows into the cursor row" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 5, .rows = 4 });
+    defer t.deinit(alloc);
+
+    // Row 1 soft-wraps into row 2.
+    t.setCursorPos(2, 1);
+    try t.printString("abcdefg");
+    try testing.expect(testRowFlags(&t, 2).cont);
+
+    // ED 1 with the cursor on row 2: rows 0-1 are cleared.
+    t.setCursorPos(3, 4);
+    t.eraseDisplay(.above, false);
+
+    try testing.expect(!testRowFlags(&t, 1).wrap);
+    try testing.expect(!testRowFlags(&t, 2).cont);
+}
+
+test "Terminal: ED 2 breaks the wrap from a history row into the cleared screen" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 5, .rows = 3 });
+    defer t.deinit(alloc);
+
+    // A line soft-wraps from the bottom row; two more linefeeds move the
+    // wrapping row into the scrollback while its continuation is active
+    // row 0.
+    t.setCursorPos(3, 1);
+    try t.printString("abcdefg");
+    try t.linefeed();
+    try t.linefeed();
+    try testing.expect(testRowFlags(&t, 0).cont);
+    const history = t.screens.active.pages.pin(.{ .active = .{} }).?.up(1).?;
+    try testing.expect(history.rowAndCell().row.wrap);
+
+    t.eraseDisplay(.complete, false);
+
+    try testing.expect(!history.rowAndCell().row.wrap);
+    try testing.expect(!testRowFlags(&t, 0).cont);
+}
+
+test "Terminal: DECALN breaks the wrap from a history row into the filled screen" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 5, .rows = 3 });
+    defer t.deinit(alloc);
+
+    t.setCursorPos(3, 1);
+    try t.printString("abcdefg");
+    try t.linefeed();
+    try t.linefeed();
+    const history = t.screens.active.pages.pin(.{ .active = .{} }).?.up(1).?;
+    try testing.expect(history.rowAndCell().row.wrap);
+
+    try t.decaln();
+
+    try testing.expect(!history.rowAndCell().row.wrap);
+}
+
 test "Terminal: alt screen scroll up recycled row has default metadata" {
     const alloc = testing.allocator;
     const io_impl = testing.io;
