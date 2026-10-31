@@ -138,6 +138,8 @@ jobs:
             -Dtest-filter="Page vt preserved trailing blank rows" \
             -Dtest-filter="Page VT preserves a fully styled blank row" \
             -Dtest-filter="Page VT unstyled blank cells" \
+            -Dtest-filter="Page plain wrap continuation" \
+            -Dtest-filter="breaks the wrap" \
             -Dtest-filter="render: OSC dynamic color resets" \
             -Dtest-filter="get cursor visual" \
             -Dtest-filter="cursor activity" \
