@@ -143,6 +143,7 @@ jobs:
             -Dtest-filter="Page VT unstyled blank cells" \
             -Dtest-filter="Page plain wrap continuation" \
             -Dtest-filter="breaks the wrap" \
+            -Dtest-filter="print wrap at the scroll region bottom" \
             -Dtest-filter="render: OSC dynamic color resets" \
             -Dtest-filter="get cursor visual" \
             -Dtest-filter="cursor activity" \
