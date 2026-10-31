@@ -1,19 +1,22 @@
 name: GhosttyNextKit (ghostty-next)
 
 # Builds GhosttyNextKit.xcframework for the cmux iOS app on a remote macOS
-# runner, never on a developer Mac. A push to main publishes the release
-# `xcframework-<sha>-<flavor>` with a deterministic zip, SHA256SUMS,
-# manifest.json and a build provenance attestation. Pull requests build
-# and upload a workflow artifact only.
+# runner, never on a developer Mac. A push to main or to a release/*
+# branch publishes the release `xcframework-<sha>-<flavor>` with a
+# deterministic zip, SHA256SUMS, manifest.json and a build provenance
+# attestation. Pull requests build and upload a workflow artifact only.
 
 on:
   push:
-    branches: [main]
+    # release/*: a fix release on an older base (an embedder's pinned
+    # commit plus only the fix), so a pin never has to take unrelated
+    # main changes to get a fix. It is never marked the latest release.
+    branches: [main, 'release/**']
   pull_request:
   workflow_dispatch:
     inputs:
       publish:
-        description: "Publish the release for this commit (main only)"
+        description: "Publish the release for this commit (main or release/* only)"
         type: boolean
         default: false
       verify_reproducible:
@@ -224,7 +227,7 @@ jobs:
 
   publish:
     if: >-
-      github.ref == 'refs/heads/main' &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) &&
       (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish))
     needs: [plan, build]
     runs-on: ubuntu-latest # runner-policy-exception: actions/attest-build-provenance release attestation; kept GitHub-hosted for a GitHub-hosted provenance record
@@ -260,9 +263,14 @@ jobs:
             echo "::error::release $TAG already exists; a label is never reused, refusing to publish"
             exit 1
           fi
+          latest=()
+          if [[ "$GITHUB_REF" == refs/heads/release/* ]]; then
+            latest=(--latest=false)
+          fi
           gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
+            "${latest[@]}" \
             --title "GhosttyNextKit $LABEL" \
             --notes "GhosttyNextKit.xcframework, label $LABEL, for ghostty-next $GITHUB_SHA. sha256 (also the SwiftPM checksum): $SUM. Pin by URL and sha256. Toolchain and slice hashes: manifest.json." \
             out/GhosttyNextKit.xcframework.zip out/SHA256SUMS out/manifest.json
