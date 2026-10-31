@@ -1397,6 +1397,8 @@ pub const PageFormatter = struct {
                 continue;
             }
 
+            // Whether a line break goes out before this row (a prior row did not wrap, or blank rows came before it).
+            const broke_before = blank_rows > 0;
             if (blank_rows > 0) {
                 // Reset style before emitting newlines to prevent background
                 // colors from bleeding into the next line's leading cells.
@@ -1461,8 +1463,13 @@ pub const PageFormatter = struct {
             if (!row.wrap or !self.opts.unwrap) blank_rows += 1;
 
             // If the row doesn't continue a wrap then we need to reset
-            // our blank cell count.
-            if (!row.wrap_continuation or !self.opts.unwrap) blank_cells = 0;
+            // our blank cell count. Also when a line break went out before
+            // it: blank cells carry only across a wrap we joined. A row can
+            // be marked as continuing a wrap while the row before it no
+            // longer wraps (its wrap flag cleared, the continuation flag
+            // kept); carrying the prior row's trailing blanks then printed
+            // them after the break, shifting the row right.
+            if (!row.wrap_continuation or !self.opts.unwrap or broke_before) blank_cells = 0;
 
             // Go through each cell and print it
             var cell_i: usize = 0;
@@ -3289,6 +3296,40 @@ test "Page plain with prior trailing state cells with wrap continuation" {
         Coordinate{ .x = @intCast(i), .y = 0 },
         point_map.items[3 + i],
     );
+}
+
+test "Page plain wrap continuation after a row that does not wrap keeps its column" {
+    // A row marked as continuing a wrap while the row before it does not
+    // wrap (cmux VT fuzz finding E2): the line break goes out, and the prior
+    // row's trailing blank cells must not be printed after it.
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 80,
+        .rows = 24,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+
+    s.nextSlice("abc\r\nu");
+
+    const pages = &t.screens.active.pages;
+    const page = pages.pages.last.?.page();
+
+    // Row 0 does not wrap; row 1 keeps a stale continuation flag.
+    try testing.expect(!page.getRow(0).wrap);
+    page.getRow(1).wrap_continuation = true;
+
+    var formatter: PageFormatter = .init(page, .{ .emit = .plain, .unwrap = true });
+    try formatter.format(&builder.writer);
+    try testing.expectEqualStrings("abc\nu", builder.writer.buffered());
 }
 
 test "Page plain soft-wrapped without unwrap" {
