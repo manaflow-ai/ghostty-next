@@ -1679,8 +1679,8 @@ pub fn cursorResetWrap(self: *Screen) void {
 /// if either row's flag says they are joined. A scroll of a scroll region
 /// moves the rows on one side of its edge and not the other, so the two
 /// rows no longer hold one line; a stale wrap or wrap_continuation would
-/// make reflow and the unwrapping formatter join them. `pin` must not be
-/// the top row of the active area (the row above it is scrollback).
+/// make reflow and the unwrapping formatter join them. The row above may
+/// be a scrollback row.
 pub fn breakWrapAbove(self: *Screen, pin: Pin) void {
     const row = pin.rowAndCell().row;
     const prev = pin.up(1) orelse {
