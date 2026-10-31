@@ -3021,12 +3021,15 @@ fn invalidateFullWidthRowRange(
 /// After insertLines or deleteLines with a full-width scroll region: the
 /// rows from `top` to the region bottom moved, the rows above and below
 /// them did not, so no soft wrap may join a row outside to one inside.
-fn breakWrapAtLineEdges(self: *Terminal, top: size.CellCountInt) void {
+/// `top_joined` is the top row's wrap_continuation before the scroll (the
+/// row above `top` may be a compressed history row; see breakWrapAbove).
+fn breakWrapAtLineEdges(self: *Terminal, top: size.CellCountInt, top_joined: bool) void {
     const screen: *Screen = self.screens.active;
-    screen.breakWrapAbove(screen.pages.pin(.{ .active = .{ .y = top } }).?);
+    screen.breakWrapAbove(screen.pages.pin(.{ .active = .{ .y = top } }).?, top_joined);
     const bottom = self.scrolling_region.bottom;
     if (bottom + 1 < self.rows) screen.breakWrapAbove(
         screen.pages.pin(.{ .active = .{ .y = bottom + 1 } }).?,
+        false,
     );
 }
 
@@ -3080,6 +3083,10 @@ pub fn insertLines(self: *Terminal, count: usize) void {
     // We have a slower path if we have left or right scroll margins.
     const left_right = self.scrolling_region.left > 0 or
         self.scrolling_region.right < self.cols - 1;
+
+    // Whether the row above the cursor wrapped into the cursor row, read
+    // before the rows move (see breakWrapAtLineEdges).
+    const top_joined = self.screens.active.cursor.page_row.wrap_continuation;
 
     // Remaining rows from our cursor to the bottom of the scroll region.
     const rem = self.scrolling_region.bottom - self.screens.active.cursor.y + 1;
@@ -3210,7 +3217,7 @@ pub fn insertLines(self: *Terminal, count: usize) void {
         if (cur_p.up(1)) |p| cur_p.* = p;
     }
 
-    if (!left_right) self.breakWrapAtLineEdges(start_y);
+    if (!left_right) self.breakWrapAtLineEdges(start_y, top_joined);
 }
 
 /// Removes amount lines from the current cursor row down. The remaining lines
@@ -3255,6 +3262,10 @@ pub fn deleteLines(self: *Terminal, count: usize) void {
     // We have a slower path if we have left or right scroll margins.
     const left_right = self.scrolling_region.left > 0 or
         self.scrolling_region.right < self.cols - 1;
+
+    // Whether the row above the cursor wrapped into the cursor row, read
+    // before the rows move (see breakWrapAtLineEdges).
+    const top_joined = self.screens.active.cursor.page_row.wrap_continuation;
 
     // Remaining rows from our cursor to the bottom of the scroll region.
     const rem = self.scrolling_region.bottom - self.screens.active.cursor.y + 1;
@@ -3380,7 +3391,7 @@ pub fn deleteLines(self: *Terminal, count: usize) void {
         if (cur_p.down(1)) |p| cur_p.* = p;
     }
 
-    if (!left_right) self.breakWrapAtLineEdges(start_y);
+    if (!left_right) self.breakWrapAtLineEdges(start_y, top_joined);
 }
 
 /// Inserts spaces at current cursor position moving existing cell contents
@@ -17110,6 +17121,94 @@ test "Terminal: insertLines breaks the wrap across both region edges" {
     try testing.expect(!testRowFlags(&t, 1).cont);
     try testing.expect(!testRowFlags(&t, 3).wrap);
     try testing.expect(!testRowFlags(&t, 4).cont);
+}
+
+test "Terminal: insertLines and deleteLines at the top row leave a compressed history page compressed" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+
+    // Plain lines (no soft wrap) until the active area starts at the first
+    // row of a page, so the row above it is the last row of a history page.
+    var i: usize = 0;
+    while (true) : (i += 1) {
+        try testing.expect(i < 1_000_000);
+        const top = t.screens.active.pages.getTopLeft(.active);
+        if (top.y == 0 and top.node.prev != null) break;
+        try t.printString("x");
+        try t.linefeed();
+        t.carriageReturn();
+    }
+    const history = t.screens.active.pages.getTopLeft(.active).node.prev.?;
+    if (t.compress(.full) == .unsupported) return error.SkipZigTest;
+    try testing.expectEqual(.compressed, history.storage());
+
+    // A region scroll at the top row reads the history row's wrap flag only
+    // when the top row continued it; here it did not, so the page stays
+    // compressed (this runs per line under load).
+    t.setCursorPos(1, 1);
+    t.insertLines(1);
+    try testing.expectEqual(.compressed, history.storage());
+    t.setCursorPos(1, 1);
+    t.deleteLines(1);
+    try testing.expectEqual(.compressed, history.storage());
+}
+
+test "Terminal: ED 1 breaks the wrap from the cleared rows into the cursor row" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 5, .rows = 4 });
+    defer t.deinit(alloc);
+
+    // Row 1 soft-wraps into row 2.
+    t.setCursorPos(2, 1);
+    try t.printString("abcdefg");
+    try testing.expect(testRowFlags(&t, 2).cont);
+
+    // ED 1 with the cursor on row 2: rows 0-1 are cleared.
+    t.setCursorPos(3, 4);
+    t.eraseDisplay(.above, false);
+
+    try testing.expect(!testRowFlags(&t, 1).wrap);
+    try testing.expect(!testRowFlags(&t, 2).cont);
+}
+
+test "Terminal: ED 2 breaks the wrap from a history row into the cleared screen" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 5, .rows = 3 });
+    defer t.deinit(alloc);
+
+    // A line soft-wraps from the bottom row; two more linefeeds move the
+    // wrapping row into the scrollback while its continuation is active
+    // row 0.
+    t.setCursorPos(3, 1);
+    try t.printString("abcdefg");
+    try t.linefeed();
+    try t.linefeed();
+    try testing.expect(testRowFlags(&t, 0).cont);
+    const history = t.screens.active.pages.pin(.{ .active = .{} }).?.up(1).?;
+    try testing.expect(history.rowAndCell().row.wrap);
+
+    t.eraseDisplay(.complete, false);
+
+    try testing.expect(!history.rowAndCell().row.wrap);
+    try testing.expect(!testRowFlags(&t, 0).cont);
+}
+
+test "Terminal: DECALN breaks the wrap from a history row into the filled screen" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 5, .rows = 3 });
+    defer t.deinit(alloc);
+
+    t.setCursorPos(3, 1);
+    try t.printString("abcdefg");
+    try t.linefeed();
+    try t.linefeed();
+    const history = t.screens.active.pages.pin(.{ .active = .{} }).?.up(1).?;
+    try testing.expect(history.rowAndCell().row.wrap);
+
+    try t.decaln();
+
+    try testing.expect(!history.rowAndCell().row.wrap);
 }
 
 test "Terminal: alt screen scroll up recycled row has default metadata" {

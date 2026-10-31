@@ -141,6 +141,10 @@ jobs:
             -Dtest-filter="Page plain wrap continuation" \
             -Dtest-filter="breaks the wrap" \
             -Dtest-filter="print wrap at the scroll region bottom" \
+            -Dtest-filter="leave a compressed history page compressed" \
+            -Dtest-filter="the cleared rows' edges" \
+            -Dtest-filter="from a history row into the" \
+            -Dtest-filter="from the cleared rows into the cursor row" \
             -Dtest-filter="render: OSC dynamic color resets" \
             -Dtest-filter="get cursor visual" \
             -Dtest-filter="cursor activity" \
