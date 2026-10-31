@@ -17112,6 +17112,37 @@ test "Terminal: insertLines breaks the wrap across both region edges" {
     try testing.expect(!testRowFlags(&t, 4).cont);
 }
 
+test "Terminal: insertLines and deleteLines at the top row leave a compressed history page compressed" {
+    const alloc = testing.allocator;
+    var t = try init(testing.io, alloc, .{ .cols = 10, .rows = 5 });
+    defer t.deinit(alloc);
+
+    // Plain lines (no soft wrap) until the active area starts at the first
+    // row of a page, so the row above it is the last row of a history page.
+    var i: usize = 0;
+    while (true) : (i += 1) {
+        try testing.expect(i < 1_000_000);
+        const top = t.screens.active.pages.getTopLeft(.active);
+        if (top.y == 0 and top.node.prev != null) break;
+        try t.printString("x");
+        try t.linefeed();
+        t.carriageReturn();
+    }
+    const history = t.screens.active.pages.getTopLeft(.active).node.prev.?;
+    if (t.compress(.full) == .unsupported) return error.SkipZigTest;
+    try testing.expectEqual(.compressed, history.storage());
+
+    // A region scroll at the top row reads the history row's wrap flag only
+    // when the top row continued it; here it did not, so the page stays
+    // compressed (this runs per line under load).
+    t.setCursorPos(1, 1);
+    t.insertLines(1);
+    try testing.expectEqual(.compressed, history.storage());
+    t.setCursorPos(1, 1);
+    t.deleteLines(1);
+    try testing.expectEqual(.compressed, history.storage());
+}
+
 test "Terminal: alt screen scroll up recycled row has default metadata" {
     const alloc = testing.allocator;
     const io_impl = testing.io;
