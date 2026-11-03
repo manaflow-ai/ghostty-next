@@ -3,6 +3,7 @@ const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const oni = @import("oniguruma");
 const inputpkg = @import("../input.zig");
+const link_regex = @import("../input/link_regex.zig");
 const terminal = @import("../terminal/main.zig");
 const point = terminal.point;
 const Screen = terminal.Screen;
@@ -19,7 +20,7 @@ pub const Link = struct {
     highlight: inputpkg.Link.Highlight,
 
     pub fn deinit(self: *Link) void {
-        self.regex.deinit();
+        link_regex.release(self.regex);
     }
 
     /// Returns true if this link's highlight condition matches the given mouse state.
@@ -68,9 +69,10 @@ pub const Set = struct {
         var links: std.ArrayList(Link) = .empty;
         defer links.deinit(alloc);
 
+        // Shared with the surface and every other renderer (link_regex).
         for (config) |link| {
-            var regex = try link.oniRegex();
-            errdefer regex.deinit();
+            const regex = try link_regex.acquire(link.regex);
+            errdefer link_regex.release(regex);
             try links.append(alloc, .{
                 .regex = regex,
                 .highlight = link.highlight,
@@ -162,6 +164,10 @@ pub const Set = struct {
         }
     }
 };
+
+test {
+    _ = link_regex;
+}
 
 test "renderCellMap" {
     const testing = std.testing;

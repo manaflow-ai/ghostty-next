@@ -32,6 +32,7 @@ const font = @import("font/main.zig");
 const Command = @import("Command.zig");
 const terminal = @import("terminal/main.zig");
 const configpkg = @import("config.zig");
+const link_regex = @import("input/link_regex.zig");
 const Duration = configpkg.Config.Duration;
 const input = @import("input.zig");
 const App = @import("App.zig");
@@ -477,9 +478,11 @@ const DerivedConfig = struct {
         const links = links: {
             var links: std.ArrayList(DerivedConfig.Link) = .empty;
             defer links.deinit(alloc);
+            // Shared with every other surface and renderer (link_regex):
+            // a new surface compiles nothing for a pattern already in use.
             for (config.link.links.items) |link| {
-                var regex = try link.oniRegex();
-                errdefer regex.deinit();
+                const regex = try link_regex.acquire(link.regex);
+                errdefer link_regex.release(regex);
                 try links.append(alloc, .{
                     .regex = regex,
                     .action = link.action,
@@ -490,7 +493,7 @@ const DerivedConfig = struct {
             break :links try links.toOwnedSlice(alloc);
         };
         errdefer {
-            for (links) |*link| link.regex.deinit();
+            for (links) |link| link_regex.release(link.regex);
             alloc.free(links);
         }
 
@@ -550,7 +553,7 @@ const DerivedConfig = struct {
     }
 
     pub fn deinit(self: *DerivedConfig) void {
-        for (self.links) |*link| link.regex.deinit();
+        for (self.links) |link| link_regex.release(link.regex);
         self.arena.deinit();
     }
 
