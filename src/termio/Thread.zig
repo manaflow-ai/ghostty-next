@@ -40,6 +40,12 @@ const sync_reset_ms = 1000;
 /// The number of milliseconds between each movement during selection scrolling.
 const selection_scroll_ms = 15;
 
+/// A surface's termio thread wakes by source (`counters`).
+pub const Counters = struct {
+    wakeups: std.atomic.Value(u64) = .init(0),
+    timer_fires: std.atomic.Value(u64) = .init(0),
+};
+
 /// Allocator used for some state
 alloc: std.mem.Allocator,
 
@@ -72,11 +78,6 @@ coalesce_data: Coalesce = .{},
 /// coalesce, synchronized-output reset and selection-scroll timers.
 /// Read from any thread (`ghostty_surface_render_counters`).
 counters: Counters = .{},
-
-pub const Counters = struct {
-    wakeups: std.atomic.Value(u64) = .init(0),
-    timer_fires: std.atomic.Value(u64) = .init(0),
-};
 
 /// This timer is used to reset synchronized output modes so that
 /// the terminal doesn't freeze with a bad actor.
