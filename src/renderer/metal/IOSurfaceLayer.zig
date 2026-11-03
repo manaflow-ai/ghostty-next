@@ -458,3 +458,38 @@ test "host present: a frame of a new host size on main is shown when the layer's
     try layer.setSurface(drawn, 1);
     try testing.expectEqual(@as(?usize, 120), testShownWidth(&layer));
 }
+
+test "host present: an off-main frame never joins a present the embedder has not committed yet" {
+    const testing = std.testing;
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    var layer = try IOSurfaceLayer.init();
+    defer layer.release();
+    const shown = try testSurface(80, 60);
+    defer shown.release();
+    const presented = try testSurface(120, 60);
+    defer presented.release();
+    const next = try testSurface(120, 60);
+    defer next.release();
+    const after = try testSurface(120, 60);
+    defer after.release();
+    layer.setSurfaceSync(shown);
+    layer.setHostSize((120 << 32) | 60);
+    layer.setEmbedderPresents(true);
+
+    // The embedder showed the new size; its transaction (with the view's new
+    // bounds) is not committed yet.
+    try testing.expect(layer.setSurfacePresented(presented, 5));
+    // A newer frame at that size completes: an off-main transaction would
+    // commit it, alone, before the embedder's bounds. It goes through main.
+    try testing.expect(!layer.setSurfaceOffMain(next, 6));
+    const contents = layer.layer.getProperty(?*anyopaque, "contents");
+    try testing.expectEqual(@as(?*anyopaque, @ptrCast(presented)), contents);
+    // On main (after the embedder's commit) it shows, and frames go off main again.
+    try layer.setSurface(next, 6);
+    try testing.expect(layer.setSurfaceOffMain(after, 7));
+    const later = layer.layer.getProperty(?*anyopaque, "contents");
+    try testing.expectEqual(@as(?*anyopaque, @ptrCast(after)), later);
+}

@@ -1138,3 +1138,60 @@ test "host present: back to the renderer, a frame drawn for the host size goes t
     metal.setEmbedderPresents(false);
     try testing.expectEqual(@as(?usize, 120), testShownWidth(&metal));
 }
+
+test "host present: a refused present keeps the next frame of the host size publishing" {
+    const testing = std.testing;
+    const HostFrame = apprt.HostFrame;
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    const device = testDevice();
+    var metal = try testMetal(&device);
+    defer testDeinit(&metal);
+    const shown = try testSurface(80, 60);
+    defer shown.release();
+    const newer = try testSurface(80, 60);
+    defer newer.release();
+    const drawn = try testSurface(120, 60);
+    defer drawn.release();
+    metal.layer.setSurfaceSync(shown);
+    metal.setEmbedderPresents(true);
+    metal.setHostDrawableSize(true, 120, 60);
+    try metal.present(testTarget(&metal, drawn), false);
+    // The layer shows a newer frame (of the old size) than the one drawn for the
+    // host size, so the present refuses it.
+    try testing.expect(metal.layer.setSurfacePresented(newer, 50));
+
+    try testing.expectEqual(HostFrame.pending, metal.hostFrame(true));
+    // The next frame at the host size must publish for the next present.
+    try testing.expect(metal.fresh.armed.load(.acquire));
+}
+
+test "host present: the old present calls follow the embedder's ordered present" {
+    const testing = std.testing;
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    const device = testDevice();
+    var metal = try testMetal(&device);
+    defer testDeinit(&metal);
+    const shown = try testSurface(80, 60);
+    defer shown.release();
+    const stale = try testSurface(120, 60);
+    defer stale.release();
+    const fresh = try testSurface(120, 60);
+    defer fresh.release();
+    metal.layer.setSurfaceSync(shown);
+    metal.setEmbedderPresents(true);
+    metal.setHostDrawableSize(true, 120, 60);
+    var stale_target = testTarget(&metal, stale);
+    stale_target.cells_fresh = false;
+    try metal.present(stale_target, false);
+    try metal.present(testTarget(&metal, fresh), false);
+
+    // ghostty_surface_present_host_frame(_ready) while the embedder presents sizes.
+    try testing.expect(metal.presentHostSizedWait(true));
+    try metal.layer.setSurface(stale, 1);
+    const contents = metal.layer.layer.getProperty(?*anyopaque, "contents");
+    try testing.expectEqual(@as(?*anyopaque, @ptrCast(fresh)), contents);
+}
