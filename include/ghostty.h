@@ -1507,8 +1507,11 @@ typedef enum {
   // embedder set them without a present). A frame at the shown size still
   // reaches the screen off the main thread, and a first frame (nothing
   // shown yet) presents itself. ghostty_surface_draw (a synchronous draw the
-  // embedder asks for) still shows its frame at once. Going back to the
-  // renderer shows a frame drawn for the host size at once.
+  // embedder asks for) still shows its frame at once. In this mode
+  // ghostty_surface_present_host_frame(_ready) are ghostty_surface_host_frame
+  // with present true (no wait). A frame completed while the layer shows an
+  // embedder present not committed yet goes through the main thread. Going
+  // back to the renderer shows a frame drawn for the host size at once.
   GHOSTTY_HOST_PRESENT_EMBEDDER = 1,
 } ghostty_host_present_e;
 // Default GHOSTTY_HOST_PRESENT_RENDERER. No effect on iOS or on a surface

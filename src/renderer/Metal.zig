@@ -532,7 +532,12 @@ fn hasFresh(self: *Metal, width: usize, height: usize) bool {
 fn presentFresh(self: *Metal, width: usize, height: usize) bool {
     const taken = self.takeFresh(width, height) orelse return false;
     defer taken.surface.release();
-    if (!self.layer.setSurfacePresented(taken.surface, taken.seq)) return false;
+    if (!self.layer.setSurfacePresented(taken.surface, taken.seq)) {
+        // Not shown (the layer shows a newer frame): the next frame of this
+        // size publishes for the next present.
+        self.fresh.armed.store(true, .release);
+        return false;
+    }
     _ = self.counters.fresh_presents.fetchAdd(1, .monotonic);
     return true;
 }
@@ -552,6 +557,11 @@ pub fn presentHostSized(self: *Metal) bool {
 /// `presentHostSized`; with `wait` false it never blocks: it presents the fresh frame only if the
 /// renderer already published it, and otherwise keeps the last frame (counted late).
 pub fn presentHostSizedWait(self: *Metal, wait: bool) bool {
+    // An embedder that presents host sizes: the same ordered present as
+    // `ghostty_surface_host_frame`, which never waits.
+    if (comptime builtin.os.tag == .macos) {
+        if (self.embedder_presents.load(.acquire)) return self.hostFrame(true) != .none;
+    }
     const host = self.host_size.load(.acquire);
     if (host == 0) return false;
     // Hidden: nothing to draw now (the renderer draws when shown again),

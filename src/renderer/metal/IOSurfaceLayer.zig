@@ -38,6 +38,7 @@ pub fn init() !IOSurfaceLayer {
     layer.setInstanceVariable("host_size", .{ .value = null });
     layer.setInstanceVariable("present_seq", .{ .value = null });
     layer.setInstanceVariable("embedder_presents", .{ .value = null });
+    layer.setInstanceVariable("embedder_seq", .{ .value = null });
 
     return .{ .layer = layer };
 }
@@ -131,8 +132,24 @@ pub fn setSurfacePresented(self: *IOSurfaceLayer, surface: *IOSurface, seq: u64)
     defer CATransaction.msgSend(void, objc.sel("unlock"), .{});
     if (seq <= presentSeq(self.layer)) return false;
     setPresentSeq(self.layer, seq);
+    setEmbedderSeq(self.layer, seq);
     self.layer.setProperty("contents", surface);
     return true;
+}
+
+/// The present sequence of the embedder's last present (`setSurfacePresented`).
+/// While the layer still shows that frame, its transaction (with the view's
+/// new bounds) may not be committed yet, so no frame goes to the screen off
+/// the main thread: the next one goes through main, after that commit.
+/// Read and written under the Core Animation lock.
+fn embedderSeq(layer: objc.Object) u64 {
+    return @as(u64, @intFromPtr(layer.getInstanceVariable("embedder_seq").value)) >> 3;
+}
+
+fn setEmbedderSeq(layer: objc.Object, seq: u64) void {
+    // Shifted like `setHostSize`: the object-typed ivar holds an 8-aligned value, never retained.
+    const stored: usize = @intCast(seq << 3);
+    layer.setInstanceVariable("embedder_seq", .{ .value = @ptrFromInt(stored) });
 }
 
 /// Sets the layer's `contents` to the provided IOSurface.
@@ -206,6 +223,11 @@ pub fn setSurfaceOffMain(self: *IOSurfaceLayer, surface: *IOSurface, seq: u64) b
     const shown_surface: *IOSurface = @ptrCast(shown);
     if (shown_surface.getWidth() != width or shown_surface.getHeight() != height) return false;
     if (seq <= presentSeq(self.layer)) return true;
+    // The shown frame is the embedder's present, maybe not committed yet: a
+    // transaction committed here could carry new pixels before the view's new
+    // bounds. The frame goes through main (`setSurface`), after that commit.
+    const embedder_seq = embedderSeq(self.layer);
+    if (embedderPresents(self.layer) and embedder_seq != 0 and presentSeq(self.layer) == embedder_seq) return false;
     setPresentSeq(self.layer, seq);
     self.layer.setProperty("contents", surface);
     return true;
@@ -333,6 +355,7 @@ fn getSubclass() error{ObjCFailed}!objc.Class {
     if (!subclass.addIvar("host_size")) return error.ObjCFailed;
     if (!subclass.addIvar("present_seq")) return error.ObjCFailed;
     if (!subclass.addIvar("embedder_presents")) return error.ObjCFailed;
+    if (!subclass.addIvar("embedder_seq")) return error.ObjCFailed;
 
     subclass.replaceMethod("display", struct {
         fn display(target: objc.c.id, sel: objc.c.SEL) callconv(.c) void {
