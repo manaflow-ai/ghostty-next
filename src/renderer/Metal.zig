@@ -1013,6 +1013,8 @@ test "host present: a frame at the shown size goes to the screen off main while 
     metal.layer.setSurfaceSync(shown);
     metal.setEmbedderPresents(true);
     metal.setHostDrawableSize(true, 120, 60);
+    // The embedder committed its last change: frames at the shown size may go off main.
+    metal.hostFrameCommitted();
 
     // A content-only frame (a terminal echo) needs no geometry change.
     try metal.present(testTarget(&metal, drawn), false);

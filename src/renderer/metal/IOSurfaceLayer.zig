@@ -591,6 +591,7 @@ test "host present: a frame shown because the bounds already fit keeps frames on
     layer.setSurfaceSync(shown);
     layer.setHostSize((120 << 32) | 60);
     layer.setEmbedderPresents(true);
+    layer.setEmbedderCommitted();
     // The embedder gave the view its new bounds without a present.
     layer.layer.setProperty("contentsScale", @as(f64, 1));
     layer.layer.setProperty("bounds", macos.graphics.Rect{
@@ -601,4 +602,103 @@ test "host present: a frame shown because the bounds already fit keeps frames on
     try testing.expectEqual(@as(?usize, 120), testShownWidth(&layer));
     // Those bounds are not committed yet either.
     try testing.expect(!layer.setSurfaceOffMain(next, 2));
+}
+
+test "host present: a frame at the shown size shown on main keeps frames going off main" {
+    const testing = std.testing;
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    var layer = try IOSurfaceLayer.init();
+    defer layer.release();
+    const shown = try testSurface(120, 60);
+    defer shown.release();
+    const queued = try testSurface(120, 60);
+    defer queued.release();
+    const next = try testSurface(120, 60);
+    defer next.release();
+    layer.setSurfaceSync(shown);
+    layer.setHostSize((120 << 32) | 60);
+    layer.setEmbedderPresents(true);
+    layer.setEmbedderCommitted();
+
+    // A frame of the shown size on main changes no geometry: terminal echo
+    // after it still goes off main.
+    try layer.setSurface(queued, 1);
+    try testing.expect(layer.setSurfaceOffMain(next, 2));
+    const contents = layer.layer.getProperty(?*anyopaque, "contents");
+    try testing.expectEqual(@as(?*anyopaque, @ptrCast(next)), contents);
+}
+
+test "host present: the mode starts with frames on main until the embedder committed" {
+    const testing = std.testing;
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    var layer = try IOSurfaceLayer.init();
+    defer layer.release();
+    const shown = try testSurface(120, 60);
+    defer shown.release();
+    const first = try testSurface(120, 60);
+    defer first.release();
+    const later = try testSurface(120, 60);
+    defer later.release();
+    layer.setSurfaceSync(shown);
+    layer.setHostSize((120 << 32) | 60);
+
+    // A change the main thread made before the mode may still be in its open
+    // transaction.
+    layer.setEmbedderPresents(true);
+    try testing.expect(!layer.setSurfaceOffMain(first, 1));
+    layer.setEmbedderCommitted();
+    try testing.expect(layer.setSurfaceOffMain(later, 2));
+}
+
+test "host present: a sync present of a new size keeps frames on main until the embedder committed" {
+    const testing = std.testing;
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    var layer = try IOSurfaceLayer.init();
+    defer layer.release();
+    const shown = try testSurface(80, 60);
+    defer shown.release();
+    const drawn = try testSurface(120, 60);
+    defer drawn.release();
+    const next = try testSurface(120, 60);
+    defer next.release();
+    layer.setSurfaceSync(shown);
+    layer.setHostSize((120 << 32) | 60);
+    layer.setEmbedderPresents(true);
+    layer.setEmbedderCommitted();
+
+    // ghostty_surface_draw on main at the new size.
+    layer.setSurfaceSync(drawn);
+    try testing.expect(!layer.setSurfaceOffMain(next, 1));
+}
+
+test "host present: a sync present at the shown size keeps frames going off main" {
+    const testing = std.testing;
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    var layer = try IOSurfaceLayer.init();
+    defer layer.release();
+    const shown = try testSurface(120, 60);
+    defer shown.release();
+    const drawn = try testSurface(120, 60);
+    defer drawn.release();
+    const next = try testSurface(120, 60);
+    defer next.release();
+    layer.setSurfaceSync(shown);
+    layer.setHostSize((120 << 32) | 60);
+    layer.setEmbedderPresents(true);
+    layer.setEmbedderCommitted();
+
+    layer.setSurfaceSync(drawn);
+    try testing.expect(layer.setSurfaceOffMain(next, 1));
 }
