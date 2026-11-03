@@ -250,10 +250,10 @@ pub fn setSurfaceOffMain(self: *IOSurfaceLayer, surface: *IOSurface, seq: u64) b
     const host = hostSize(self.layer);
     if (host == 0 or (host >> 32) != width or (host & 0xffff_ffff) != height) return false;
     const CATransaction = objc.getClass("CATransaction").?;
-    // Invariant: no thread but main commits a Core Animation transaction while it holds [CATransaction lock]. A
-    // commit waits for locks main's commit holds while main's commit work takes [CATransaction lock] (cmux S4
-    // films, 2026-11-03: main in commit_transaction, this thread in an embedder-mode present that committed under
-    // the lock). Defers run last-first: the unlock below runs before the commit above.
+    // Invariant: no thread commits a Core Animation transaction (or flushes) while it holds [CATransaction lock]. A
+    // commit waits for locks another thread's commit holds while that commit's work takes [CATransaction lock]
+    // (cmux S4 films, 2026-11-03: main in commit_transaction, this thread in an embedder-mode present that
+    // committed under the lock). Defers run last-first: the unlock below runs before the commit above.
     CATransaction.msgSend(void, objc.sel("begin"), .{});
     defer CATransaction.msgSend(void, objc.sel("commit"), .{});
     // The Core Animation lock orders this against `setSurfaceCallback` on main.

@@ -1566,11 +1566,13 @@ typedef enum {
 // shows the new frame when it is drawn; until then, or while the bounds stay
 // old, call again until it returns SHOWN, NONE or HIDDEN. READY does not
 // reserve the frame: a hide can drop it before the present (HIDDEN then).
-// Call it with present true, and give the view its bounds, while holding
-// [CATransaction lock] (or inside a Core Animation layout or display pass of
-// the commit, which holds it): no off-main present runs its checks or sets its
-// frame in between, for this surface or another one in the window. Off-main
-// presents never hold that lock while they commit. Main thread.
+// Call it with present true, and give the view its bounds, in one
+// [CATransaction lock] span (or one Core Animation layout or display pass of
+// the commit); an open transaction alone is not enough. No off-main present
+// runs its checks or sets its frame in between, and none holds the lock while
+// it commits. Unlock before any commit or flush, and never call
+// ghostty_surface_draw under the lock: either can deadlock against a commit
+// that waits for the lock. Main thread.
 GHOSTTY_API ghostty_host_frame_e ghostty_surface_host_frame(ghostty_surface_t,
                                                             bool present);
 // The embedder's transaction that carried its last present or bounds change
