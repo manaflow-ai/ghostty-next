@@ -2271,6 +2271,13 @@ pub const CAPI = struct {
         host_fresh_presents: u64,
         host_late_presents: u64,
         host_off_main_presents: u64,
+        renderer_wakeups: u64,
+        renderer_draw_now: u64,
+        renderer_cursor_timer_fires: u64,
+        renderer_animation_timer_fires: u64,
+        renderer_compression_timer_fires: u64,
+        io_wakeups: u64,
+        io_timer_fires: u64,
     };
 
     /// The renderer's frame counters. See ghostty.h.
@@ -2293,6 +2300,13 @@ pub const CAPI = struct {
             .host_fresh_presents = hostCounter(surface, "fresh_presents"),
             .host_late_presents = hostCounter(surface, "late"),
             .host_off_main_presents = hostCounter(surface, "off_main_presents"),
+            .renderer_wakeups = c.thread_wakeups.load(.monotonic),
+            .renderer_draw_now = c.thread_draw_now.load(.monotonic),
+            .renderer_cursor_timer_fires = c.cursor_timer_fires.load(.monotonic),
+            .renderer_animation_timer_fires = c.animation_timer_fires.load(.monotonic),
+            .renderer_compression_timer_fires = c.compression_timer_fires.load(.monotonic),
+            .io_wakeups = surface.core_surface.io_thread.counters.wakeups.load(.monotonic),
+            .io_timer_fires = surface.core_surface.io_thread.counters.timer_fires.load(.monotonic),
         };
     }
 

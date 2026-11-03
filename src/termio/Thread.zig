@@ -67,6 +67,17 @@ coalesce_c: xev.Completion = .{},
 coalesce_cancel_c: xev.Completion = .{},
 coalesce_data: Coalesce = .{},
 
+/// Wakes of this thread by source (cmux SWITCH FRAMES: a live hidden
+/// terminal's cost): the wakeup async (mailbox messages), and the resize
+/// coalesce, synchronized-output reset and selection-scroll timers.
+/// Read from any thread (`ghostty_surface_render_counters`).
+counters: Counters = .{},
+
+pub const Counters = struct {
+    wakeups: std.atomic.Value(u64) = .init(0),
+    timer_fires: std.atomic.Value(u64) = .init(0),
+};
+
 /// This timer is used to reset synchronized output modes so that
 /// the terminal doesn't freeze with a bad actor.
 sync_reset: xev.Timer,
@@ -422,6 +433,7 @@ fn syncResetCallback(
     };
 
     const cb = cb_ orelse return .disarm;
+    _ = cb.self.counters.timer_fires.fetchAdd(1, .monotonic);
     cb.io.resetSynchronizedOutput();
     return .disarm;
 }
@@ -441,6 +453,7 @@ fn coalesceCallback(
     };
 
     const cb = cb_ orelse return .disarm;
+    _ = cb.self.counters.timer_fires.fetchAdd(1, .monotonic);
 
     if (cb.self.coalesce_data.resize) |v| {
         cb.self.coalesce_data.resize = null;
@@ -466,6 +479,7 @@ fn wakeupCallback(
     // When we wake up, we check the mailbox. Mailbox producers should
     // wake up our thread after publishing.
     const cb = cb_ orelse return .rearm;
+    _ = cb.self.counters.wakeups.fetchAdd(1, .monotonic);
     cb.self.drainMailbox(cb) catch |err|
         log.err("error draining mailbox err={}", .{err});
 
@@ -526,6 +540,7 @@ fn selectionScrollCallback(
 
     const cb = cb_ orelse return .disarm;
     const self = cb.self;
+    _ = self.counters.timer_fires.fetchAdd(1, .monotonic);
 
     // Send the tick to the main surface
     _ = cb.io.surface_mailbox.push(
