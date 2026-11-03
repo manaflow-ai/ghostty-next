@@ -736,3 +736,108 @@ test "host present: a sync present at the shown size keeps frames going off main
     layer.setSurfaceSync(drawn);
     try testing.expect(layer.setSurfaceOffMain(next, 1));
 }
+
+/// Counts, per thread, the transaction commits made while the thread holds [CATransaction lock] (the
+/// commit-order test): +[CATransaction lock], +unlock and +commit are swapped for counting versions that call the
+/// originals.
+const CommitOrder = struct {
+    const Imp = *const fn (objc.c.id, objc.c.SEL) callconv(.c) void;
+    threadlocal var depth: i32 = 0;
+    threadlocal var commits: u32 = 0;
+    threadlocal var commits_under_lock: u32 = 0;
+    var original_lock: ?Imp = null;
+    var original_unlock: ?Imp = null;
+    var original_commit: ?Imp = null;
+    /// The presenting thread's counts, copied out before it ends.
+    var seen_commits: u32 = 0;
+    var seen_commits_under_lock: u32 = 0;
+
+    fn lock(target: objc.c.id, sel: objc.c.SEL) callconv(.c) void {
+        original_lock.?(target, sel);
+        depth += 1;
+    }
+
+    fn unlock(target: objc.c.id, sel: objc.c.SEL) callconv(.c) void {
+        depth -= 1;
+        original_unlock.?(target, sel);
+    }
+
+    fn commit(target: objc.c.id, sel: objc.c.SEL) callconv(.c) void {
+        commits += 1;
+        if (depth > 0) commits_under_lock += 1;
+        original_commit.?(target, sel);
+    }
+
+    fn swap(meta: objc.Class, name: [:0]const u8, imp: Imp) ?Imp {
+        const old = objc.c.class_replaceMethod(meta.value, objc.sel(name).value, @ptrCast(imp), null);
+        return @ptrCast(old);
+    }
+
+    fn install() void {
+        const meta = objc.getMetaClass("CATransaction").?;
+        original_lock = swap(meta, "lock", &lock);
+        original_unlock = swap(meta, "unlock", &unlock);
+        original_commit = swap(meta, "commit", &commit);
+    }
+
+    fn remove() void {
+        const meta = objc.getMetaClass("CATransaction").?;
+        _ = swap(meta, "lock", original_lock.?);
+        _ = swap(meta, "unlock", original_unlock.?);
+        _ = swap(meta, "commit", original_commit.?);
+    }
+
+    /// The GPU completion thread's role: one off-main present of a frame at the shown size.
+    fn present(layer: *IOSurfaceLayer, surface: *IOSurface, presented: *bool) void {
+        const pool = objc.AutoreleasePool.init();
+        defer pool.deinit();
+        presented.* = layer.setSurfaceOffMain(surface, 1);
+        seen_commits = commits;
+        seen_commits_under_lock = commits_under_lock;
+    }
+};
+
+fn testOffMainCommitOrder(embedder: bool) !void {
+    const testing = std.testing;
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    var layer = try IOSurfaceLayer.init();
+    defer layer.release();
+    const shown = try testSurface(80, 60);
+    defer shown.release();
+    const drawn = try testSurface(80, 60);
+    defer drawn.release();
+    layer.setSurfaceSync(shown);
+    layer.setHostSize((80 << 32) | 60);
+    if (embedder) {
+        layer.setEmbedderPresents(true);
+        // Its last change is committed: the next frame at the shown size may go off main.
+        layer.setEmbedderCommitted();
+    }
+
+    CommitOrder.install();
+    defer CommitOrder.remove();
+    var presented = false;
+    const thread = try std.Thread.spawn(.{}, CommitOrder.present, .{ &layer, drawn, &presented });
+    thread.join();
+
+    // The present ran off the main thread and committed its frame, once.
+    try testing.expect(presented);
+    const contents = layer.layer.getProperty(?*anyopaque, "contents");
+    try testing.expectEqual(@as(?*anyopaque, @ptrCast(drawn)), contents);
+    try testing.expectEqual(@as(u32, 1), CommitOrder.seen_commits);
+    // The invariant: no thread but main commits a transaction while it holds [CATransaction lock].
+    try testing.expectEqual(@as(u32, 0), CommitOrder.seen_commits_under_lock);
+}
+
+test "host present: an off-main present never commits while it holds the Core Animation lock (embedder)" {
+    // cmux FRAME OWNER REFACTOR S4 films, 2026-11-03: with the embedder presenting host sizes, the main thread hung
+    // in CA::Transaction::commit and the Metal completion thread in setSurfaceOffMain, whose embedder branch
+    // committed while it held [CATransaction lock] (defers run last-first: commit, then unlock).
+    try testOffMainCommitOrder(true);
+}
+
+test "host present: an off-main present never commits while it holds the Core Animation lock (renderer)" {
+    try testOffMainCommitOrder(false);
+}
