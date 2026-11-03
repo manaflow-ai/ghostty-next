@@ -102,9 +102,22 @@ pub fn setEmbedderPresents(self: *IOSurfaceLayer, enabled: bool) void {
     // Stored like `setHostSize`: an 8-aligned value in an object-typed ivar,
     // never retained or released.
     const stored: usize = @as(usize, @intFromBool(enabled)) << 3;
+    const CATransaction = objc.getClass("CATransaction").?;
+    CATransaction.msgSend(void, objc.sel("lock"), .{});
+    defer CATransaction.msgSend(void, objc.sel("unlock"), .{});
     self.layer.setInstanceVariable("embedder_presents", .{ .value = @ptrFromInt(stored) });
-    // A mode change starts with nothing of the embedder's pending.
-    self.setEmbedderCommitted();
+    // The mode starts closed: a change the main thread made before it may
+    // still be in its open transaction. Leaving it, nothing is pending.
+    setMainPending(self.layer, enabled);
+}
+
+/// Whether showing `surface` changes the size of the frame the layer shows
+/// (or shows a first frame): only such a change can leave the view's bounds
+/// behind. Call under the Core Animation lock.
+fn changesShownSize(layer: objc.Object, surface: *IOSurface) bool {
+    const shown = layer.getProperty(?*anyopaque, "contents") orelse return true;
+    const shown_surface: *IOSurface = @ptrCast(shown);
+    return shown_surface.getWidth() != surface.getWidth() or shown_surface.getHeight() != surface.getHeight();
 }
 
 /// The value `setEmbedderPresents` stored.
@@ -206,12 +219,13 @@ pub inline fn setSurface(self: *IOSurfaceLayer, surface: *IOSurface, seq: u64) !
 /// Does not ensure this happens on the main thread.
 pub inline fn setSurfaceSync(self: *IOSurfaceLayer, surface: *IOSurface) void {
     // Main thread (a display pass, ghostty_surface_draw): with the embedder
-    // presenting host sizes, frames go through main until its commit.
+    // presenting host sizes, a new size goes with main's commit, so frames go
+    // through main until the embedder reports it.
     if (embedderPresents(self.layer)) {
         const CATransaction = objc.getClass("CATransaction").?;
         CATransaction.msgSend(void, objc.sel("lock"), .{});
         defer CATransaction.msgSend(void, objc.sel("unlock"), .{});
-        setMainPending(self.layer, true);
+        if (changesShownSize(self.layer, surface)) setMainPending(self.layer, true);
     }
     self.layer.setProperty("contents", surface);
 }
@@ -236,6 +250,28 @@ pub fn setSurfaceOffMain(self: *IOSurfaceLayer, surface: *IOSurface, seq: u64) b
     const host = hostSize(self.layer);
     if (host == 0 or (host >> 32) != width or (host & 0xffff_ffff) != height) return false;
     const CATransaction = objc.getClass("CATransaction").?;
+    if (embedderPresents(self.layer)) {
+        // The embedder presents host sizes: the Core Animation lock is held
+        // across this transaction's commit, so it can never run inside the
+        // embedder's present pass (which holds the lock: a layout or display
+        // pass of main's commit) or ship a contents change main made after the
+        // checks below. Nothing commits when a check refuses.
+        CATransaction.msgSend(void, objc.sel("lock"), .{});
+        defer CATransaction.msgSend(void, objc.sel("unlock"), .{});
+        const shown = self.layer.getProperty(?*anyopaque, "contents") orelse return false;
+        const shown_surface: *IOSurface = @ptrCast(shown);
+        if (shown_surface.getWidth() != width or shown_surface.getHeight() != height) return false;
+        if (seq <= presentSeq(self.layer)) return true;
+        // The main thread changed the shown size in a transaction the
+        // embedder has not reported committed: a transaction committed here
+        // could reach the screen ahead of the view's new bounds.
+        if (mainPending(self.layer)) return false;
+        CATransaction.msgSend(void, objc.sel("begin"), .{});
+        defer CATransaction.msgSend(void, objc.sel("commit"), .{});
+        setPresentSeq(self.layer, seq);
+        self.layer.setProperty("contents", surface);
+        return true;
+    }
     CATransaction.msgSend(void, objc.sel("begin"), .{});
     defer CATransaction.msgSend(void, objc.sel("commit"), .{});
     // The Core Animation lock orders this against `setSurfaceCallback` on main.
@@ -245,9 +281,7 @@ pub fn setSurfaceOffMain(self: *IOSurfaceLayer, surface: *IOSurface, seq: u64) b
     const shown_surface: *IOSurface = @ptrCast(shown);
     if (shown_surface.getWidth() != width or shown_surface.getHeight() != height) return false;
     if (seq <= presentSeq(self.layer)) return true;
-    // The main thread changed the contents in a transaction the embedder has
-    // not reported committed: a transaction committed here could reach the
-    // screen ahead of the view's new bounds. The frame goes through main.
+    // The mode turned on after the check above: the embedder path's gate.
     if (embedderPresents(self.layer) and mainPending(self.layer)) return false;
     setPresentSeq(self.layer, seq);
     self.layer.setProperty("contents", surface);
@@ -341,7 +375,7 @@ fn setSurfaceCallback(
     }
 
     if (block.seq != 0) setPresentSeq(layer, block.seq);
-    if (embedderPresents(layer)) setMainPending(layer, true);
+    if (embedderPresents(layer) and changesShownSize(layer, surface)) setMainPending(layer, true);
     layer.setProperty("contents", surface);
 }
 
