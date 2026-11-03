@@ -811,8 +811,8 @@ fn testOffMainCommitOrder(embedder: bool) !void {
     const contents = layer.layer.getProperty(?*anyopaque, "contents");
     try testing.expectEqual(@as(?*anyopaque, @ptrCast(drawn)), contents);
     try testing.expectEqual(@as(u32, 1), CommitOrder.seen_commits);
-    // The invariant, on the presenting thread: no thread commits a transaction (or flushes) while it holds
-    // [CATransaction lock].
+    // The invariant, on the presenting thread: no commit while it holds [CATransaction lock] (the off-main present
+    // calls no flush, so the test counts commits only).
     try testing.expectEqual(@as(u32, 0), CommitOrder.seen_commits_under_lock);
 }
 
