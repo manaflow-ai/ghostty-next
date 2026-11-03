@@ -1516,9 +1516,9 @@ typedef enum {
   // first frame, a new-size frame shown on main), every frame goes through
   // the main thread until ghostty_surface_host_frame_committed: Ghostty cannot
   // see the main thread's commit, and a frame committed off the main thread
-  // could reach the screen ahead of the view's new bounds. An off-main commit
-  // holds [CATransaction lock] across its commit. Going back to the renderer
-  // shows a frame drawn for the host size at once.
+  // could reach the screen ahead of the view's new bounds. An off-main present
+  // never commits while it holds [CATransaction lock]. Going back to the
+  // renderer shows a frame drawn for the host size at once.
   GHOSTTY_HOST_PRESENT_EMBEDDER = 1,
 } ghostty_host_present_e;
 // Default GHOSTTY_HOST_PRESENT_RENDERER. No effect on iOS or on a surface
@@ -1567,9 +1567,10 @@ typedef enum {
 // old, call again until it returns SHOWN, NONE or HIDDEN. READY does not
 // reserve the frame: a hide can drop it before the present (HIDDEN then).
 // Call it with present true, and give the view its bounds, while holding
-// [CATransaction lock], or inside a Core Animation layout or display pass of
-// the commit (which holds it): then no frame commits off the main thread in
-// between, for this surface or another one in the window. Main thread.
+// [CATransaction lock] (or inside a Core Animation layout or display pass of
+// the commit, which holds it): no off-main present runs its checks or sets its
+// frame in between, for this surface or another one in the window. Off-main
+// presents never hold that lock while they commit. Main thread.
 GHOSTTY_API ghostty_host_frame_e ghostty_surface_host_frame(ghostty_surface_t,
                                                             bool present);
 // The embedder's transaction that carried its last present or bounds change
