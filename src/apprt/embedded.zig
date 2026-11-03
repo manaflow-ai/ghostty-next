@@ -2236,6 +2236,15 @@ pub const CAPI = struct {
         return api.hostFrame(present);
     }
 
+    /// The embedder committed the transaction of its last host frame present or
+    /// bounds change. See ghostty.h.
+    export fn ghostty_surface_host_frame_committed(surface: *Surface) void {
+        if (comptime builtin.os.tag != .macos) return;
+        const api = &surface.core_surface.renderer.api;
+        if (comptime !@hasDecl(@TypeOf(api.*), "hostFrameCommitted")) return;
+        api.hostFrameCommitted();
+    }
+
     /// Draw a reflow preview while the locked grid does not fit the view.
     /// See ghostty.h.
     export fn ghostty_surface_set_reflow_preview(surface: *Surface, enabled: bool) void {

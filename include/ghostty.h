@@ -1507,11 +1507,16 @@ typedef enum {
   // embedder set them without a present). A frame at the shown size still
   // reaches the screen off the main thread, and a first frame (nothing
   // shown yet) presents itself. ghostty_surface_draw (a synchronous draw the
-  // embedder asks for) still shows its frame at once. In this mode
+  // embedder asks for) still shows its frame at once; it and the first
+  // frame's display pass wait on the main thread for a free frame and the
+  // GPU, as they do by default. In this mode
   // ghostty_surface_present_host_frame(_ready) are ghostty_surface_host_frame
-  // with present true (no wait). A frame completed while the layer shows an
-  // embedder present not committed yet goes through the main thread. Going
-  // back to the renderer shows a frame drawn for the host size at once.
+  // with present true (no wait). Once the main thread changed the layer's
+  // contents (a present, a frame shown on main), every frame goes through the
+  // main thread until ghostty_surface_host_frame_committed: Ghostty cannot
+  // see the main thread's commit, and a frame committed off the main thread
+  // could reach the screen ahead of the view's new bounds. Going back to the
+  // renderer shows a frame drawn for the host size at once.
   GHOSTTY_HOST_PRESENT_EMBEDDER = 1,
 } ghostty_host_present_e;
 // Default GHOSTTY_HOST_PRESENT_RENDERER. No effect on iOS or on a surface
@@ -1557,9 +1562,18 @@ typedef enum {
 // host_fresh_presents (PRESENTED) and host_late_presents (PENDING or HELD
 // with present true). A view whose bounds were given without a present
 // shows the new frame when it is drawn; until then, or while the bounds stay
-// old, call again until it returns SHOWN, NONE or HIDDEN. Main thread.
+// old, call again until it returns SHOWN, NONE or HIDDEN. READY does not
+// reserve the frame: a hide can drop it before the present (HIDDEN then).
+// Main thread.
 GHOSTTY_API ghostty_host_frame_e ghostty_surface_host_frame(ghostty_surface_t,
                                                             bool present);
+// The embedder's transaction that carried its last present or bounds change
+// was committed (for example: called from the next commit's pass). Frames at
+// the shown size go to the screen off the main thread again, which keeps a
+// terminal echo off the main thread. Without the call they go through main
+// (correct, slower). No effect outside GHOSTTY_HOST_PRESENT_EMBEDDER. Main
+// thread.
+GHOSTTY_API void ghostty_surface_host_frame_committed(ghostty_surface_t);
 GHOSTTY_API ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
 // Fills the grid metrics. Returns false while a resize of an unlocked grid
 // is in flight; with a host-locked grid (ghostty_surface_set_grid) the

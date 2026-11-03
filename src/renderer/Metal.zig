@@ -641,6 +641,13 @@ pub fn hostFrame(self: *Metal, show: bool) apprt.HostFrame {
     return if (self.frames_held.load(.acquire)) .held else .pending;
 }
 
+/// The embedder committed the transaction of its last present or bounds change
+/// (`ghostty_surface_host_frame_committed`). Main thread.
+pub fn hostFrameCommitted(self: *Metal) void {
+    if (comptime builtin.os.tag != .macos) return;
+    self.layer.setEmbedderCommitted();
+}
+
 /// A display pass while the embedder presents host sizes (Core Animation runs
 /// one on its own, for example for a new contents scale): it never waits and
 /// never shows a frame of another size than the one shown; the embedder does,

@@ -38,7 +38,7 @@ pub fn init() !IOSurfaceLayer {
     layer.setInstanceVariable("host_size", .{ .value = null });
     layer.setInstanceVariable("present_seq", .{ .value = null });
     layer.setInstanceVariable("embedder_presents", .{ .value = null });
-    layer.setInstanceVariable("embedder_seq", .{ .value = null });
+    layer.setInstanceVariable("main_pending", .{ .value = null });
 
     return .{ .layer = layer };
 }
@@ -103,6 +103,8 @@ pub fn setEmbedderPresents(self: *IOSurfaceLayer, enabled: bool) void {
     // never retained or released.
     const stored: usize = @as(usize, @intFromBool(enabled)) << 3;
     self.layer.setInstanceVariable("embedder_presents", .{ .value = @ptrFromInt(stored) });
+    // A mode change starts with nothing of the embedder's pending.
+    self.setEmbedderCommitted();
 }
 
 /// The value `setEmbedderPresents` stored.
@@ -132,30 +134,36 @@ pub fn setSurfacePresented(self: *IOSurfaceLayer, surface: *IOSurface, seq: u64)
     defer CATransaction.msgSend(void, objc.sel("unlock"), .{});
     if (seq <= presentSeq(self.layer)) return false;
     setPresentSeq(self.layer, seq);
-    setEmbedderSeq(self.layer, seq);
+    setMainPending(self.layer, true);
     self.layer.setProperty("contents", surface);
     return true;
 }
 
 /// The embedder committed the transaction of its last present or bounds change
-/// (`ghostty_surface_host_frame_committed`). Main thread.
+/// (`ghostty_surface_host_frame_committed`): frames at the shown size go to the
+/// screen off the main thread again. Main thread.
 pub fn setEmbedderCommitted(self: *IOSurfaceLayer) void {
-    _ = self;
+    const CATransaction = objc.getClass("CATransaction").?;
+    CATransaction.msgSend(void, objc.sel("lock"), .{});
+    defer CATransaction.msgSend(void, objc.sel("unlock"), .{});
+    setMainPending(self.layer, false);
 }
 
-/// The present sequence of the embedder's last present (`setSurfacePresented`).
-/// While the layer still shows that frame, its transaction (with the view's
-/// new bounds) may not be committed yet, so no frame goes to the screen off
-/// the main thread: the next one goes through main, after that commit.
-/// Read and written under the Core Animation lock.
-fn embedderSeq(layer: objc.Object) u64 {
-    return @as(u64, @intFromPtr(layer.getInstanceVariable("embedder_seq").value)) >> 3;
+/// Whether, while the embedder presents host sizes, the main thread changed
+/// the layer's contents in a transaction the embedder has not reported
+/// committed (`setEmbedderCommitted`). Ghostty cannot see the main thread's
+/// commit: until the embedder reports it, a frame committed off the main
+/// thread in its own transaction could reach the screen ahead of the view's
+/// new bounds, so frames go through main. Read and written under the Core
+/// Animation lock.
+fn mainPending(layer: objc.Object) bool {
+    return @intFromPtr(layer.getInstanceVariable("main_pending").value) != 0;
 }
 
-fn setEmbedderSeq(layer: objc.Object, seq: u64) void {
-    // Shifted like `setHostSize`: the object-typed ivar holds an 8-aligned value, never retained.
-    const stored: usize = @intCast(seq << 3);
-    layer.setInstanceVariable("embedder_seq", .{ .value = @ptrFromInt(stored) });
+fn setMainPending(layer: objc.Object, pending: bool) void {
+    // Stored like `setHostSize`: an 8-aligned value in an object-typed ivar, never retained.
+    const stored: usize = @as(usize, @intFromBool(pending)) << 3;
+    layer.setInstanceVariable("main_pending", .{ .value = @ptrFromInt(stored) });
 }
 
 /// Sets the layer's `contents` to the provided IOSurface.
@@ -197,6 +205,14 @@ pub inline fn setSurface(self: *IOSurfaceLayer, surface: *IOSurface, seq: u64) !
 ///
 /// Does not ensure this happens on the main thread.
 pub inline fn setSurfaceSync(self: *IOSurfaceLayer, surface: *IOSurface) void {
+    // Main thread (a display pass, ghostty_surface_draw): with the embedder
+    // presenting host sizes, frames go through main until its commit.
+    if (embedderPresents(self.layer)) {
+        const CATransaction = objc.getClass("CATransaction").?;
+        CATransaction.msgSend(void, objc.sel("lock"), .{});
+        defer CATransaction.msgSend(void, objc.sel("unlock"), .{});
+        setMainPending(self.layer, true);
+    }
     self.layer.setProperty("contents", surface);
 }
 
@@ -229,11 +245,10 @@ pub fn setSurfaceOffMain(self: *IOSurfaceLayer, surface: *IOSurface, seq: u64) b
     const shown_surface: *IOSurface = @ptrCast(shown);
     if (shown_surface.getWidth() != width or shown_surface.getHeight() != height) return false;
     if (seq <= presentSeq(self.layer)) return true;
-    // The shown frame is the embedder's present, maybe not committed yet: a
-    // transaction committed here could carry new pixels before the view's new
-    // bounds. The frame goes through main (`setSurface`), after that commit.
-    const embedder_seq = embedderSeq(self.layer);
-    if (embedderPresents(self.layer) and embedder_seq != 0 and presentSeq(self.layer) == embedder_seq) return false;
+    // The main thread changed the contents in a transaction the embedder has
+    // not reported committed: a transaction committed here could reach the
+    // screen ahead of the view's new bounds. The frame goes through main.
+    if (embedderPresents(self.layer) and mainPending(self.layer)) return false;
     setPresentSeq(self.layer, seq);
     self.layer.setProperty("contents", surface);
     return true;
@@ -326,6 +341,7 @@ fn setSurfaceCallback(
     }
 
     if (block.seq != 0) setPresentSeq(layer, block.seq);
+    if (embedderPresents(layer)) setMainPending(layer, true);
     layer.setProperty("contents", surface);
 }
 
@@ -361,7 +377,7 @@ fn getSubclass() error{ObjCFailed}!objc.Class {
     if (!subclass.addIvar("host_size")) return error.ObjCFailed;
     if (!subclass.addIvar("present_seq")) return error.ObjCFailed;
     if (!subclass.addIvar("embedder_presents")) return error.ObjCFailed;
-    if (!subclass.addIvar("embedder_seq")) return error.ObjCFailed;
+    if (!subclass.addIvar("main_pending")) return error.ObjCFailed;
 
     subclass.replaceMethod("display", struct {
         fn display(target: objc.c.id, sel: objc.c.SEL) callconv(.c) void {
