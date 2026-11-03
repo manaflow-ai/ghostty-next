@@ -92,6 +92,9 @@ jobs:
             -Dapp-runtime=none \
             -Demit-macos-app=false \
             -Dsentry=false \
+            -Dtest-filter="link regex" \
+            -Dtest-filter="link_regex: " \
+            -Dtest-filter="renderCellMap" \
             -Dtest-filter="manual: " \
             -Dtest-filter="terminal responses: " \
             -Dtest-filter="ghostty.h SurfaceIoMode" \
