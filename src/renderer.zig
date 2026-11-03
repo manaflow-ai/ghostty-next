@@ -69,4 +69,10 @@ test {
     _ = Thread;
     _ = State;
     _ = @import("renderer/mailbox.zig");
+
+    // The host-sized macOS present paths (Core Animation and IOSurface, no GPU).
+    if (comptime @import("builtin").os.tag == .macos) {
+        _ = @import("renderer/Metal.zig");
+        _ = @import("renderer/metal/IOSurfaceLayer.zig");
+    }
 }

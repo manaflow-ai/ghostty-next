@@ -322,6 +322,32 @@ pub const SurfaceLocalHistoryResult = enum(c_int) {
     mismatch = 1,
 };
 
+/// What an embedder that presents host sizes can show for a host-sized macOS
+/// surface (ghostty_surface_set_host_present, ghostty_surface_host_frame).
+///
+/// If this is changed, you must also update ghostty.h
+/// (ghostty_host_frame_e).
+pub const HostFrame = enum(c_int) {
+    /// Nothing to keep: not host-sized, not macOS, or no frame shown yet
+    /// (the first frame presents itself).
+    none = 0,
+    /// The surface does not draw (occluded): no frame comes until it is
+    /// shown again.
+    hidden = 1,
+    /// The layer shows a frame at the host size.
+    shown = 2,
+    /// A query: the renderer drew the host size's frame, not shown yet.
+    ready = 3,
+    /// That frame is the layer's contents now, in the caller's Core
+    /// Animation transaction.
+    presented = 4,
+    /// Not drawn yet: the layer keeps the frame it shows.
+    pending = 5,
+    /// Frame updates are held (synchronized output, a restore): no frame
+    /// can come now, and the layer keeps the frame it shows.
+    held = 6,
+};
+
 test "ghostty.h SurfaceLocalHistoryResult" {
     try @import("../lib/enum.zig").checkGhosttyHEnum(
         SurfaceLocalHistoryResult,

@@ -37,6 +37,7 @@ pub fn init() !IOSurfaceLayer {
     layer.setInstanceVariable("display_ctx", .{ .value = null });
     layer.setInstanceVariable("host_size", .{ .value = null });
     layer.setInstanceVariable("present_seq", .{ .value = null });
+    layer.setInstanceVariable("embedder_presents", .{ .value = null });
 
     return .{ .layer = layer };
 }
@@ -91,6 +92,16 @@ pub fn setHostSize(self: *IOSurfaceLayer, value: u64) void {
 /// The value `setHostSize` stored.
 fn hostSize(layer: objc.Object) u64 {
     return @as(u64, @intFromPtr(layer.getInstanceVariable("host_size").value)) >> 3;
+}
+
+/// Records whether the embedder presents the frames of a new host size
+/// (`Metal.setEmbedderPresents`, ghostty_surface_set_host_present). Main
+/// thread.
+pub fn setEmbedderPresents(self: *IOSurfaceLayer, enabled: bool) void {
+    // Stored like `setHostSize`: an 8-aligned value in an object-typed ivar,
+    // never retained or released.
+    const stored: usize = @as(usize, @intFromBool(enabled)) << 3;
+    self.layer.setInstanceVariable("embedder_presents", .{ .value = @ptrFromInt(stored) });
 }
 
 /// Sets the layer's `contents` to the provided IOSurface.
@@ -273,6 +284,7 @@ fn getSubclass() error{ObjCFailed}!objc.Class {
     if (!subclass.addIvar("display_ctx")) return error.ObjCFailed;
     if (!subclass.addIvar("host_size")) return error.ObjCFailed;
     if (!subclass.addIvar("present_seq")) return error.ObjCFailed;
+    if (!subclass.addIvar("embedder_presents")) return error.ObjCFailed;
 
     subclass.replaceMethod("display", struct {
         fn display(target: objc.c.id, sel: objc.c.SEL) callconv(.c) void {
@@ -306,4 +318,95 @@ fn getSubclass() error{ObjCFailed}!objc.Class {
     Subclass = subclass;
 
     return subclass;
+}
+
+fn testSurface(width: c_int, height: c_int) !*IOSurface {
+    return try IOSurface.init(.{
+        .width = width,
+        .height = height,
+        .pixel_format = .@"32BGRA",
+        .bytes_per_element = 4,
+        .colorspace = null,
+    });
+}
+
+/// The width of the frame the layer shows; null while it shows none.
+fn testShownWidth(self: *const IOSurfaceLayer) ?usize {
+    const shown = self.layer.getProperty(?*anyopaque, "contents") orelse return null;
+    const surface: *IOSurface = @ptrCast(shown);
+    return surface.getWidth();
+}
+
+fn testIsMainThread() bool {
+    return objc.getClass("NSThread").?.msgSend(bool, "isMainThread", .{});
+}
+
+test "host present: a frame of a new host size on main keeps the shown frame while the embedder presents sizes" {
+    const testing = std.testing;
+    // setSurface runs the main-thread present at once only on the main thread.
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    var layer = try IOSurfaceLayer.init();
+    defer layer.release();
+    const shown = try testSurface(80, 60);
+    defer shown.release();
+    const drawn = try testSurface(120, 60);
+    defer drawn.release();
+    layer.setSurfaceSync(shown);
+    layer.setHostSize((120 << 32) | 60);
+    layer.setEmbedderPresents(true);
+
+    // A frame of the new size that reached the main thread (queued before the
+    // embedder took over size changes): the embedder shows a new size with its
+    // bounds in its own transaction, so this frame does not replace the shown one.
+    try layer.setSurface(drawn, 1);
+    try testing.expectEqual(@as(?usize, 80), testShownWidth(&layer));
+}
+
+test "host present: a frame of a new host size on main is shown by default" {
+    const testing = std.testing;
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    var layer = try IOSurfaceLayer.init();
+    defer layer.release();
+    const shown = try testSurface(80, 60);
+    defer shown.release();
+    const drawn = try testSurface(120, 60);
+    defer drawn.release();
+    layer.setSurfaceSync(shown);
+    layer.setHostSize((120 << 32) | 60);
+
+    try layer.setSurface(drawn, 1);
+    try testing.expectEqual(@as(?usize, 120), testShownWidth(&layer));
+}
+
+test "host present: a frame of a new host size on main is shown when the layer's bounds already have that size" {
+    const testing = std.testing;
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    var layer = try IOSurfaceLayer.init();
+    defer layer.release();
+    const shown = try testSurface(80, 60);
+    defer shown.release();
+    const drawn = try testSurface(120, 60);
+    defer drawn.release();
+    layer.setSurfaceSync(shown);
+    layer.setHostSize((120 << 32) | 60);
+    layer.setEmbedderPresents(true);
+    // The embedder gave the view its new bounds without a present (a hidden
+    // surface, a frame that came too late): the new frame fits them.
+    layer.layer.setProperty("contentsScale", @as(f64, 1));
+    layer.layer.setProperty("bounds", macos.graphics.Rect{
+        .origin = .{ .x = 0, .y = 0 },
+        .size = .{ .width = 120, .height = 60 },
+    });
+
+    try layer.setSurface(drawn, 1);
+    try testing.expectEqual(@as(?usize, 120), testShownWidth(&layer));
 }

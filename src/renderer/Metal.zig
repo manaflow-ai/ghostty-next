@@ -81,6 +81,13 @@ frames_held: std.atomic.Value(bool) = .init(false),
 /// When the host size last changed (`setHostDrawableSize`). Main thread.
 host_size_set_at: ?std.Io.Timestamp = null,
 
+/// macOS host-sized surfaces, opt-in (`ghostty_surface_set_host_present`):
+/// the embedder, not the renderer, shows a frame whose size differs from the
+/// frame the layer shows, so it can change the view's bounds in the same
+/// Core Animation transaction. Main thread writes; the GPU completion thread
+/// and the display pass read.
+embedder_presents: std.atomic.Value(bool) = .init(false),
+
 /// Numbers presented frames in completion order, so a frame the main thread
 /// presents late never replaces a newer one presented off main. GPU
 /// completion thread.
@@ -279,6 +286,16 @@ pub fn setHostDrawableSize(self: *Metal, enabled: bool, width_px: u32, height_px
     self.layer.layer.setProperty("needsDisplayOnBoundsChange", value == 0);
     // One synchronous frame at the new target size (or at the bounds again).
     self.layer.layer.msgSend(void, objc.sel("setNeedsDisplay"), .{});
+}
+
+/// macOS host-sized surfaces (`ghostty_surface_set_host_present`): with
+/// `enabled`, the embedder shows each frame of a new host size itself
+/// (`hostFrame`), in the Core Animation transaction that changes the view's
+/// bounds. Main thread.
+pub fn setEmbedderPresents(self: *Metal, enabled: bool) void {
+    if (comptime builtin.os.tag != .macos) return;
+    self.embedder_presents.store(enabled, .release);
+    self.layer.setEmbedderPresents(enabled);
 }
 
 /// iOS only: detach the IOSurfaceLayer from the embedder's view before
@@ -528,6 +545,14 @@ pub fn presentHostSizedWait(self: *Metal, wait: bool) bool {
     return true;
 }
 
+/// What the embedder can show for the host size (`ghostty_surface_host_frame`).
+/// Main thread.
+pub fn hostFrame(self: *Metal, show: bool) apprt.HostFrame {
+    _ = self;
+    _ = show;
+    return .none;
+}
+
 /// The host size generation a frame drawn now belongs to (Target.size_generation).
 pub fn sizeGeneration(self: *const Metal) u64 {
     return self.fresh.generation.load(.acquire);
@@ -711,4 +736,315 @@ pub inline fn beginFrame(
     target: *Target,
 ) !Frame {
     return try Frame.begin(.{ .queue = self.queue }, renderer, target);
+}
+
+fn testDevice() Device {
+    var device: Device = undefined;
+    device.max_texture_size = 16384;
+    return device;
+}
+
+/// A host-sized Metal API with a real layer and no GPU: the paths under test
+/// touch only the layer, the host size and the fresh frame.
+fn testMetal(device: *const Device) !Metal {
+    return .{
+        .layer = try IOSurfaceLayer.init(),
+        .device = device,
+        .queue = undefined,
+        .blending = .native,
+    };
+}
+
+fn testDeinit(self: *Metal) void {
+    self.dropFresh();
+    self.layer.release();
+}
+
+fn testSurface(width: c_int, height: c_int) !*IOSurface {
+    return try IOSurface.init(.{
+        .width = width,
+        .height = height,
+        .pixel_format = .@"32BGRA",
+        .bytes_per_element = 4,
+        .colorspace = null,
+    });
+}
+
+/// The width of the frame the layer shows; null while it shows none.
+fn testShownWidth(self: *const Metal) ?usize {
+    const shown = self.layer.layer.getProperty(?*anyopaque, "contents") orelse return null;
+    const surface: *IOSurface = @ptrCast(shown);
+    return surface.getWidth();
+}
+
+/// A frame the renderer drew at `surface`'s size, with cells built for it.
+fn testTarget(self: *const Metal, surface: *IOSurface) Target {
+    return .{
+        .surface = surface,
+        .texture = undefined,
+        .width = surface.getWidth(),
+        .height = surface.getHeight(),
+        .cells_fresh = true,
+        .size_generation = self.sizeGeneration(),
+    };
+}
+
+fn testIsMainThread() bool {
+    return objc.getClass("NSThread").?.msgSend(bool, "isMainThread", .{});
+}
+
+test "host present: a new host size asks no display pass while the embedder presents sizes" {
+    const testing = std.testing;
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    const device = testDevice();
+    var metal = try testMetal(&device);
+    defer testDeinit(&metal);
+    const shown = try testSurface(80, 60);
+    defer shown.release();
+    metal.layer.setSurfaceSync(shown);
+    metal.setEmbedderPresents(true);
+    metal.layer.layer.msgSend(void, objc.sel("displayIfNeeded"), .{});
+    try testing.expect(!metal.layer.layer.getProperty(bool, "needsDisplay"));
+
+    metal.setHostDrawableSize(true, 120, 60);
+    // No display pass: Core Animation never presents (or waits for) the new
+    // size's frame on its own; the embedder shows it with its bounds.
+    try testing.expect(!metal.layer.layer.getProperty(bool, "needsDisplay"));
+}
+
+test "host present: a new host size asks a display pass by default" {
+    const testing = std.testing;
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    const device = testDevice();
+    var metal = try testMetal(&device);
+    defer testDeinit(&metal);
+    const shown = try testSurface(80, 60);
+    defer shown.release();
+    metal.layer.setSurfaceSync(shown);
+    metal.layer.layer.msgSend(void, objc.sel("displayIfNeeded"), .{});
+    try testing.expect(!metal.layer.layer.getProperty(bool, "needsDisplay"));
+
+    metal.setHostDrawableSize(true, 120, 60);
+    try testing.expect(metal.layer.layer.getProperty(bool, "needsDisplay"));
+}
+
+test "host present: the renderer never shows a frame of a new host size while the embedder presents sizes" {
+    const testing = std.testing;
+    // The main-thread present runs at once only on the main thread.
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    const device = testDevice();
+    var metal = try testMetal(&device);
+    defer testDeinit(&metal);
+    const shown = try testSurface(80, 60);
+    defer shown.release();
+    const drawn = try testSurface(120, 60);
+    defer drawn.release();
+    metal.layer.setSurfaceSync(shown);
+    metal.setEmbedderPresents(true);
+    metal.setHostDrawableSize(true, 120, 60);
+
+    // The renderer completed the frame of the new size.
+    try metal.present(testTarget(&metal, drawn), false);
+    // The layer keeps the shown frame and its size; the new frame waits, as
+    // the fresh frame, for the embedder's present.
+    try testing.expectEqual(@as(?usize, 80), testShownWidth(&metal));
+    try testing.expectEqual(@as(?*IOSurface, drawn), metal.fresh.surface);
+}
+
+test "host present: the renderer shows a frame of a new host size by default" {
+    const testing = std.testing;
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    const device = testDevice();
+    var metal = try testMetal(&device);
+    defer testDeinit(&metal);
+    const shown = try testSurface(80, 60);
+    defer shown.release();
+    const drawn = try testSurface(120, 60);
+    defer drawn.release();
+    metal.layer.setSurfaceSync(shown);
+    metal.setHostDrawableSize(true, 120, 60);
+
+    try metal.present(testTarget(&metal, drawn), false);
+    try testing.expectEqual(@as(?usize, 120), testShownWidth(&metal));
+}
+
+test "host present: a first frame presents itself while the embedder presents sizes" {
+    const testing = std.testing;
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    const device = testDevice();
+    var metal = try testMetal(&device);
+    defer testDeinit(&metal);
+    const drawn = try testSurface(120, 60);
+    defer drawn.release();
+    metal.setEmbedderPresents(true);
+    metal.setHostDrawableSize(true, 120, 60);
+
+    // Nothing is shown yet: there is no size to keep.
+    try metal.present(testTarget(&metal, drawn), false);
+    try testing.expectEqual(@as(?usize, 120), testShownWidth(&metal));
+}
+
+test "host present: a frame at the shown size goes to the screen off main while the embedder presents sizes" {
+    const testing = std.testing;
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    const device = testDevice();
+    var metal = try testMetal(&device);
+    defer testDeinit(&metal);
+    const shown = try testSurface(120, 60);
+    defer shown.release();
+    const drawn = try testSurface(120, 60);
+    defer drawn.release();
+    metal.layer.setSurfaceSync(shown);
+    metal.setEmbedderPresents(true);
+    metal.setHostDrawableSize(true, 120, 60);
+
+    // A content-only frame (a terminal echo) needs no geometry change.
+    try metal.present(testTarget(&metal, drawn), false);
+    const contents = metal.layer.layer.getProperty(?*anyopaque, "contents");
+    try testing.expectEqual(@as(?*anyopaque, @ptrCast(drawn)), contents);
+    try testing.expectEqual(@as(u64, 1), metal.counters.off_main_presents.load(.monotonic));
+}
+
+test "host present: hostFrame reports the frame drawn for a new host size and shows it in the caller's transaction" {
+    const testing = std.testing;
+    const HostFrame = apprt.HostFrame;
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    const device = testDevice();
+    var metal = try testMetal(&device);
+    defer testDeinit(&metal);
+    const shown = try testSurface(80, 60);
+    defer shown.release();
+    const drawn = try testSurface(120, 60);
+    defer drawn.release();
+    metal.layer.setSurfaceSync(shown);
+    metal.setEmbedderPresents(true);
+    metal.setHostDrawableSize(true, 120, 60);
+    try metal.present(testTarget(&metal, drawn), false);
+
+    // A query shows nothing.
+    try testing.expectEqual(HostFrame.ready, metal.hostFrame(false));
+    try testing.expectEqual(@as(?usize, 80), testShownWidth(&metal));
+    // A present shows the frame now; the embedder gives the view its new
+    // bounds in the same transaction.
+    try testing.expectEqual(HostFrame.presented, metal.hostFrame(true));
+    try testing.expectEqual(@as(?usize, 120), testShownWidth(&metal));
+    try testing.expectEqual(@as(u64, 1), metal.counters.fresh_presents.load(.monotonic));
+    // Nothing is left to show for this size.
+    try testing.expectEqual(HostFrame.shown, metal.hostFrame(true));
+}
+
+test "host present: hostFrame keeps the shown frame until the renderer drew the new host size" {
+    const testing = std.testing;
+    const HostFrame = apprt.HostFrame;
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    const device = testDevice();
+    var metal = try testMetal(&device);
+    defer testDeinit(&metal);
+    const shown = try testSurface(80, 60);
+    defer shown.release();
+    metal.layer.setSurfaceSync(shown);
+    metal.setEmbedderPresents(true);
+    metal.setHostDrawableSize(true, 120, 60);
+
+    try testing.expectEqual(HostFrame.pending, metal.hostFrame(false));
+    try testing.expectEqual(HostFrame.pending, metal.hostFrame(true));
+    try testing.expectEqual(@as(?usize, 80), testShownWidth(&metal));
+    // Only a present that kept the shown frame counts as late.
+    try testing.expectEqual(@as(u64, 1), metal.counters.late.load(.monotonic));
+}
+
+test "host present: hostFrame reports nothing to keep, held frames and a hidden surface" {
+    const testing = std.testing;
+    const HostFrame = apprt.HostFrame;
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    const device = testDevice();
+    var metal = try testMetal(&device);
+    defer testDeinit(&metal);
+
+    // Not host-sized: the target follows the bounds.
+    try testing.expectEqual(HostFrame.none, metal.hostFrame(true));
+    metal.setEmbedderPresents(true);
+    metal.setHostDrawableSize(true, 120, 60);
+    // Nothing shown yet: the first frame presents itself.
+    try testing.expectEqual(HostFrame.none, metal.hostFrame(true));
+    const shown = try testSurface(80, 60);
+    defer shown.release();
+    metal.layer.setSurfaceSync(shown);
+    // Synchronized output or a restore holds frame updates: no frame can come now.
+    metal.setFramesHeld(true);
+    try testing.expectEqual(HostFrame.held, metal.hostFrame(false));
+    try testing.expectEqual(HostFrame.held, metal.hostFrame(true));
+    metal.setFramesHeld(false);
+    // A hidden surface draws nothing until it is shown again.
+    metal.setVisibleHint(false);
+    try testing.expectEqual(HostFrame.hidden, metal.hostFrame(true));
+    try testing.expectEqual(@as(?usize, 80), testShownWidth(&metal));
+}
+
+test "host present: a frame that reaches the main thread late never replaces the one the embedder showed" {
+    const testing = std.testing;
+    const HostFrame = apprt.HostFrame;
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    const device = testDevice();
+    var metal = try testMetal(&device);
+    defer testDeinit(&metal);
+    const shown = try testSurface(80, 60);
+    defer shown.release();
+    const stale = try testSurface(120, 60);
+    defer stale.release();
+    const fresh = try testSurface(120, 60);
+    defer fresh.release();
+    metal.layer.setSurfaceSync(shown);
+    metal.setEmbedderPresents(true);
+    metal.setHostDrawableSize(true, 120, 60);
+
+    // The renderer drew the new size twice: first with the cells of the old
+    // size (present sequence 1), then with cells built for it (sequence 2).
+    var stale_target = testTarget(&metal, stale);
+    stale_target.cells_fresh = false;
+    try metal.present(stale_target, false);
+    try metal.present(testTarget(&metal, fresh), false);
+    try testing.expectEqual(HostFrame.presented, metal.hostFrame(true));
+
+    // The older frame's main-thread present runs after that (a block queued
+    // before it): it must not replace the newer frame.
+    try metal.layer.setSurface(stale, 1);
+    const contents = metal.layer.layer.getProperty(?*anyopaque, "contents");
+    try testing.expectEqual(@as(?*anyopaque, @ptrCast(fresh)), contents);
+}
+
+test "host present: back to the renderer, a frame drawn for the host size goes to the screen" {
+    const testing = std.testing;
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    const device = testDevice();
+    var metal = try testMetal(&device);
+    defer testDeinit(&metal);
+    const shown = try testSurface(80, 60);
+    defer shown.release();
+    const drawn = try testSurface(120, 60);
+    defer drawn.release();
+    metal.layer.setSurfaceSync(shown);
+    metal.setEmbedderPresents(true);
+    metal.setHostDrawableSize(true, 120, 60);
+    try metal.present(testTarget(&metal, drawn), false);
+
+    metal.setEmbedderPresents(false);
+    try testing.expectEqual(@as(?usize, 120), testShownWidth(&metal));
 }
