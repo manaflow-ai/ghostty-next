@@ -736,3 +736,182 @@ test "host present: a sync present at the shown size keeps frames going off main
     layer.setSurfaceSync(drawn);
     try testing.expect(layer.setSurfaceOffMain(next, 1));
 }
+
+/// The commit-lock test's shared state (an Objective-C method cannot capture).
+const CommitLockTest = struct {
+    /// The probe acts only once the test's threads run (the setup's own commit may display it too).
+    var armed: std.atomic.Value(u32) = .init(0);
+    var probe_inside: std.atomic.Value(u32) = .init(0);
+    var present_started: std.atomic.Value(u32) = .init(0);
+    var done: std.atomic.Value(u32) = .init(0);
+    var probe_class: ?objc.Class = null;
+
+    /// A CALayer whose display, which Core Animation runs inside the commit of the thread that commits it, takes the
+    /// transaction lock: what the main thread's commit work does (cmux's frame recorder reads layers under it).
+    fn probeClass() !objc.Class {
+        if (probe_class) |class| return class;
+        const CALayer = objc.getClass("CALayer") orelse return error.ObjCFailed;
+        var subclass = objc.allocateClassPair(CALayer, "GhosttyTestCommitLockProbe") orelse return error.ObjCFailed;
+        subclass.replaceMethod("display", struct {
+            fn display(target: objc.c.id, sel: objc.c.SEL) callconv(.c) void {
+                _ = target;
+                _ = sel;
+                probeDisplay();
+            }
+        }.display);
+        objc.registerClassPair(subclass);
+        probe_class = subclass;
+        return subclass;
+    }
+
+    /// Inside the committing thread's commit: wait (at most 2 s) until the off-main present started, give it time
+    /// to reach its own commit, then take the transaction lock. The wait is the one timing assumption of this test:
+    /// nothing outside Core Animation can see a thread blocked in a commit. The fixed order never depends on it.
+    fn probeDisplay() void {
+        if (armed.load(.acquire) == 0) return;
+        const io = std.testing.io;
+        probe_inside.store(1, .release);
+        io.futexWake(std.atomic.Value(u32), &probe_inside, 1);
+        if (present_started.load(.acquire) == 0) {
+            io.futexWaitTimeout(std.atomic.Value(u32), &present_started, .init(0), .{
+                .duration = .{ .raw = .fromMilliseconds(2000), .clock = .awake },
+            }) catch {};
+        }
+        std.Io.sleep(io, .fromMilliseconds(100), .awake) catch {};
+        const CATransaction = objc.getClass("CATransaction").?;
+        CATransaction.msgSend(void, objc.sel("lock"), .{});
+        CATransaction.msgSend(void, objc.sel("unlock"), .{});
+    }
+
+    fn finished() void {
+        _ = done.fetchAdd(1, .release);
+        std.testing.io.futexWake(std.atomic.Value(u32), &done, 1);
+    }
+
+    /// The main thread's role: a commit of the tree (its display runs the probe).
+    fn commitThread(probe: objc.Object) void {
+        const pool = objc.AutoreleasePool.init();
+        defer pool.deinit();
+        const CATransaction = objc.getClass("CATransaction").?;
+        CATransaction.msgSend(void, objc.sel("begin"), .{});
+        probe.msgSend(void, objc.sel("setNeedsDisplay"), .{});
+        CATransaction.msgSend(void, objc.sel("commit"), .{});
+        finished();
+    }
+
+    /// The GPU completion thread's role: an off-main present of a frame at the shown size.
+    fn presentThread(layer: *IOSurfaceLayer, surface: *IOSurface) void {
+        const pool = objc.AutoreleasePool.init();
+        defer pool.deinit();
+        const io = std.testing.io;
+        if (probe_inside.load(.acquire) == 0) {
+            io.futexWaitTimeout(std.atomic.Value(u32), &probe_inside, .init(0), .{
+                .duration = .{ .raw = .fromMilliseconds(2000), .clock = .awake },
+            }) catch {};
+        }
+        present_started.store(1, .release);
+        io.futexWake(std.atomic.Value(u32), &present_started, 1);
+        _ = layer.setSurfaceOffMain(surface, 1);
+        finished();
+    }
+};
+
+test "host present: an off-main present never commits while it holds the Core Animation lock" {
+    // cmux FRAME OWNER REFACTOR S4 films, 2026-11-03: the main thread in
+    // CA::Transaction::commit > commit_transaction, waiting for a lock; the Metal completion thread in
+    // setSurfaceOffMain, which committed while it held [CATransaction lock]. Here, in one Core Animation context
+    // (a CARenderer's): one thread commits the tree and, inside that commit, takes the transaction lock (as the
+    // main thread's commit work does); another presents a frame off the main thread meanwhile.
+    const testing = std.testing;
+    const mtl = @import("api.zig");
+    const io = testing.io;
+    const pool = objc.AutoreleasePool.init();
+
+    const device = objc.Object.fromId(mtl.MTLCreateSystemDefaultDevice() orelse return error.SkipZigTest);
+    const descriptor = objc.getClass("MTLTextureDescriptor").?.msgSend(
+        objc.Object,
+        objc.sel("texture2DDescriptorWithPixelFormat:width:height:mipmapped:"),
+        .{ @as(c_ulong, 80), @as(c_ulong, 64), @as(c_ulong, 64), false },
+    );
+    // MTLTextureUsageShaderRead | ShaderWrite | RenderTarget.
+    descriptor.setProperty("usage", @as(c_ulong, 1 | 2 | 4));
+    const texture = device.msgSend(objc.Object, objc.sel("newTextureWithDescriptor:"), .{descriptor});
+    const renderer = objc.getClass("CARenderer").?.msgSend(
+        objc.Object,
+        objc.sel("rendererWithMTLTexture:options:"),
+        .{ texture, @as(?*anyopaque, null) },
+    ).retain();
+
+    var layer = try IOSurfaceLayer.init();
+    const shown = try testSurface(80, 60);
+    const drawn = try testSurface(80, 60);
+    const probe = (try CommitLockTest.probeClass()).msgSend(objc.Object, objc.sel("layer"), .{}).retain();
+    const root = objc.getClass("CALayer").?.msgSend(objc.Object, objc.sel("layer"), .{}).retain();
+
+    const CATransaction = objc.getClass("CATransaction").?;
+    CATransaction.msgSend(void, objc.sel("begin"), .{});
+    const rect: macos.graphics.Rect = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 64, .height = 64 } };
+    root.setProperty("frame", rect);
+    probe.setProperty("frame", macos.graphics.Rect{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 1, .height = 1 } });
+    layer.layer.setProperty("frame", rect);
+    root.msgSend(void, objc.sel("addSublayer:"), .{layer.layer.value});
+    root.msgSend(void, objc.sel("addSublayer:"), .{probe.value});
+    renderer.setProperty("layer", root);
+    renderer.setProperty("bounds", rect);
+    // A frame at the host size is shown, the embedder presents sizes, and its last change is committed: the next
+    // frame at that size goes to the screen off the main thread.
+    layer.setSurfaceSync(shown);
+    layer.setHostSize((80 << 32) | 60);
+    layer.setEmbedderPresents(true);
+    layer.setEmbedderCommitted();
+    CATransaction.msgSend(void, objc.sel("commit"), .{});
+    CATransaction.msgSend(void, objc.sel("flush"), .{});
+
+    CommitLockTest.probe_inside.store(0, .release);
+    CommitLockTest.present_started.store(0, .release);
+    CommitLockTest.done.store(0, .release);
+    CommitLockTest.armed.store(1, .release);
+    const committer = try std.Thread.spawn(.{}, CommitLockTest.commitThread, .{probe});
+    const presenter = try std.Thread.spawn(.{}, CommitLockTest.presentThread, .{ &layer, drawn });
+    const started = std.Io.Timestamp.now(io, .awake);
+    while (CommitLockTest.done.load(.acquire) < 2) {
+        const waited: i96 = started.durationTo(std.Io.Timestamp.now(io, .awake)).nanoseconds;
+        if (waited >= 5 * std.time.ns_per_s) {
+            // Deadlocked: the off-main present holds the transaction lock in its commit, which waits for the other
+            // commit, which waits for the lock. Both threads stay stuck holding Core Animation's locks, so every
+            // later test that takes the lock would hang: fail now, loudly, and end the process.
+            std.debug.print(
+                "host present: DEADLOCK: setSurfaceOffMain committed while it held [CATransaction lock], " ++
+                    "against a commit that takes the lock (cmux S4 films 2026-11-03)\n",
+                .{},
+            );
+            std.process.exit(1);
+        }
+        const seen = CommitLockTest.done.load(.acquire);
+        if (seen >= 2) break;
+        io.futexWaitTimeout(std.atomic.Value(u32), &CommitLockTest.done, .init(seen), .{
+            .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake },
+        }) catch {};
+    }
+    committer.join();
+    presenter.join();
+    CommitLockTest.armed.store(0, .release);
+
+    // The case ran: Core Animation displayed the probe inside the other thread's commit.
+    try testing.expectEqual(@as(u32, 1), CommitLockTest.probe_inside.load(.acquire));
+    // The present ran, off the main thread, and showed its frame.
+    try testing.expectEqual(@as(?usize, 80), testShownWidth(&layer));
+    const contents = layer.layer.getProperty(?*anyopaque, "contents");
+    try testing.expectEqual(@as(?*anyopaque, @ptrCast(drawn)), contents);
+
+    renderer.setProperty("layer", @as(?*anyopaque, null));
+    root.release();
+    probe.release();
+    renderer.release();
+    texture.release();
+    device.release();
+    layer.release();
+    shown.release();
+    drawn.release();
+    pool.deinit();
+}
