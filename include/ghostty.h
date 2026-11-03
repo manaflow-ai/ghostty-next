@@ -1558,21 +1558,24 @@ typedef enum {
 // a READY frame becomes the layer's contents in the caller's Core Animation
 // transaction (PRESENTED); call it after every surface of the transaction
 // got its size (their renderers draw in parallel) and before the commit, for
-// example from a layer that Core Animation displays in that commit. A frame
-// that reaches the main thread later never replaces a newer one. Never waits
-// and never draws. Counted in host_present_calls (present true),
-// host_fresh_presents (PRESENTED) and host_late_presents (PENDING or HELD
-// with present true). A view whose bounds were given without a present
-// shows the new frame when it is drawn; until then, or while the bounds stay
-// old, call again until it returns SHOWN, NONE or HIDDEN. READY does not
-// reserve the frame: a hide can drop it before the present (HIDDEN then).
-// Call it with present true, and give the view its bounds, in one
-// [CATransaction lock] span (or one Core Animation layout or display pass of
-// the commit); an open transaction alone is not enough. No off-main present
-// runs its checks or sets its frame in between, and none holds the lock while
-// it commits. Unlock before any commit or flush, and never call
-// ghostty_surface_draw under the lock: either can deadlock against a commit
-// that waits for the lock. Main thread.
+// example from a main run-loop observer that runs just before Core
+// Animation's commit. A frame that reaches the main thread later never
+// replaces a newer one. Never waits and never draws. Counted in
+// host_present_calls (present true), host_fresh_presents (PRESENTED) and
+// host_late_presents (PENDING or HELD with present true). A view whose
+// bounds were given without a present shows the new frame when it is drawn;
+// until then, or while the bounds stay old, call again until it returns
+// SHOWN, NONE or HIDDEN. READY does not reserve the frame: a hide can drop it
+// before the present (HIDDEN then).
+// Call it with present true, and give the view its bounds, in one explicit
+// [CATransaction lock] span. An open transaction, a layout pass or a display
+// pass alone is not such a span. No off-main present runs its checks or sets
+// its frame in between, and none holds the lock while it commits. In the
+// span, never commit or flush, and never draw: not ghostty_surface_draw, and
+// not a display pass of a surface with nothing shown (a first frame draws on
+// main). A draw waits for a free frame, and the GPU completion thread that
+// frees it needs the lock. Each of these can deadlock against a commit that
+// waits for the lock. Main thread.
 GHOSTTY_API ghostty_host_frame_e ghostty_surface_host_frame(ghostty_surface_t,
                                                             bool present);
 // The embedder's transaction that carried its last present or bounds change
