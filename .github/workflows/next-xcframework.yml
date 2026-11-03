@@ -124,6 +124,9 @@ jobs:
             -Dtest-filter="kitty renderer keeps an image" \
             -Dtest-filter="no frame shows the READY terminal" \
             -Dtest-filter="OSC 7501" \
+            -Dtest-filter="host present: " \
+            -Dtest-filter="ghostty.h HostPresent" \
+            -Dtest-filter="ghostty.h HostFrame" \
             --summary all
           # libghostty-vt patches (VT replay formatter, terminal and Kitty
           # graphics C API). These live in the lib-vt test modules.
