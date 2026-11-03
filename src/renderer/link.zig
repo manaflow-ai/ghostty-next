@@ -473,3 +473,22 @@ test "renderCellMap mods no match" {
     try testing.expect(!result.contains(.{ .x = 1, .y = 1 }));
     try testing.expect(!result.contains(.{ .x = 1, .y = 2 }));
 }
+
+test "link regex: two sets from the same config share one compiled regex" {
+    // Each new surface builds a Set (and the surface's own link list) from
+    // the same config. Compiling the regex again for each one cost the main
+    // thread about 0.5 ms per surface (onig_compile of the URL regex).
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const config: []const inputpkg.Link = &.{.{
+        .regex = "shared-regex-test-[0-9]+",
+        .action = .{ .open = {} },
+        .highlight = .{ .always = {} },
+    }};
+
+    var a = try Set.fromConfig(alloc, config);
+    defer a.deinit(alloc);
+    var b = try Set.fromConfig(alloc, config);
+    defer b.deinit(alloc);
+    try testing.expectEqual(a.links[0].regex.value, b.links[0].regex.value);
+}

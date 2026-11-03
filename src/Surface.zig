@@ -7328,3 +7328,27 @@ test "bounded clipboard: an empty selection gives empty plain text" {
     );
     try testing.expectEqualStrings("", contents[0].data);
 }
+
+test "link regex: two surfaces and their renderers compile each link regex once" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const rendererlink = @import("renderer/link.zig");
+
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    // The default config has the URL link.
+    try testing.expect(config.link.links.items.len > 0);
+
+    var a = try DerivedConfig.init(alloc, &config);
+    defer a.deinit();
+    var b = try DerivedConfig.init(alloc, &config);
+    defer b.deinit();
+    var r = try rendererlink.Set.fromConfig(alloc, config.link.links.items);
+    defer r.deinit(alloc);
+
+    try testing.expectEqual(a.links.len, r.links.len);
+    for (a.links, b.links, r.links) |la, lb, lr| {
+        try testing.expectEqual(la.regex.value, lb.regex.value);
+        try testing.expectEqual(la.regex.value, lr.regex.value);
+    }
+}
