@@ -762,6 +762,19 @@ typedef struct {
   // unchanged) that went to the screen from the renderer's GPU completion
   // thread, in their own Core Animation transaction, without the main thread.
   uint64_t host_off_main_presents;
+  // Wakes of the surface's threads by source, for what a surface costs
+  // while it is hidden. Renderer thread: its wakeup async (output, mailbox
+  // messages, a cursor tick that draws), its draw-now async (the display
+  // link), and its cursor blink, animation and scrollback-compression
+  // timers. Termio thread: its wakeup async (mailbox messages) and its
+  // timers (resize coalesce, synchronized-output reset, selection scroll).
+  uint64_t renderer_wakeups;
+  uint64_t renderer_draw_now;
+  uint64_t renderer_cursor_timer_fires;
+  uint64_t renderer_animation_timer_fires;
+  uint64_t renderer_compression_timer_fires;
+  uint64_t io_wakeups;
+  uint64_t io_timer_fires;
 } ghostty_surface_render_counters_s;
 
 // Config types
