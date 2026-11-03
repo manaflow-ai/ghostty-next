@@ -95,13 +95,44 @@ fn hostSize(layer: objc.Object) u64 {
 }
 
 /// Records whether the embedder presents the frames of a new host size
-/// (`Metal.setEmbedderPresents`, ghostty_surface_set_host_present). Main
-/// thread.
+/// (`Metal.setEmbedderPresents`, ghostty_surface_set_host_present), which
+/// `setSurfaceCallback` checks frames against. Main thread.
 pub fn setEmbedderPresents(self: *IOSurfaceLayer, enabled: bool) void {
     // Stored like `setHostSize`: an 8-aligned value in an object-typed ivar,
     // never retained or released.
     const stored: usize = @as(usize, @intFromBool(enabled)) << 3;
     self.layer.setInstanceVariable("embedder_presents", .{ .value = @ptrFromInt(stored) });
+}
+
+/// The value `setEmbedderPresents` stored.
+fn embedderPresents(layer: objc.Object) bool {
+    return @intFromPtr(layer.getInstanceVariable("embedder_presents").value) != 0;
+}
+
+/// The pixel size of the frame the layer shows, or null while it shows
+/// none. Read under the Core Animation lock: a frame presented off the main
+/// thread (`setSurfaceOffMain`) can replace the shown one.
+pub fn shownSize(self: *IOSurfaceLayer) ?struct { width: usize, height: usize } {
+    const CATransaction = objc.getClass("CATransaction").?;
+    CATransaction.msgSend(void, objc.sel("lock"), .{});
+    defer CATransaction.msgSend(void, objc.sel("unlock"), .{});
+    const shown = self.layer.getProperty(?*anyopaque, "contents") orelse return null;
+    const surface: *IOSurface = @ptrCast(shown);
+    return .{ .width = surface.getWidth(), .height = surface.getHeight() };
+}
+
+/// Shows `surface`, the frame of present sequence `seq`, in the caller's
+/// Core Animation transaction (the embedder's, which gives the view its new
+/// bounds), unless the layer shows a newer frame (`setSurface`,
+/// `setSurfaceOffMain`). Returns whether it did. Main thread.
+pub fn setSurfacePresented(self: *IOSurfaceLayer, surface: *IOSurface, seq: u64) bool {
+    const CATransaction = objc.getClass("CATransaction").?;
+    CATransaction.msgSend(void, objc.sel("lock"), .{});
+    defer CATransaction.msgSend(void, objc.sel("unlock"), .{});
+    if (seq <= presentSeq(self.layer)) return false;
+    setPresentSeq(self.layer, seq);
+    self.layer.setProperty("contents", surface);
+    return true;
 }
 
 /// Sets the layer's `contents` to the provided IOSurface.
@@ -249,6 +280,23 @@ fn setSurfaceCallback(
     CATransaction.msgSend(void, objc.sel("lock"), .{});
     defer CATransaction.msgSend(void, objc.sel("unlock"), .{});
     if (block.seq != 0 and block.seq <= presentSeq(layer)) return;
+
+    // An embedder that presents host sizes shows a frame of another size
+    // than the shown one itself, in the transaction that gives the view its
+    // bounds (`Metal.hostFrame`): such a frame shows here only if the bounds
+    // already have its size (the embedder set them without a present), so a
+    // commit never carries new pixels in the old bounds. A first frame
+    // (nothing shown) presents itself.
+    if (embedderPresents(layer)) embedder: {
+        const shown = layer.getProperty(?*anyopaque, "contents") orelse break :embedder;
+        const shown_surface: *IOSurface = @ptrCast(shown);
+        if (shown_surface.getWidth() == surface.getWidth() and
+            shown_surface.getHeight() == surface.getHeight()) break :embedder;
+        const bounds_width: usize = @intFromFloat(bounds.size.width * scale);
+        const bounds_height: usize = @intFromFloat(bounds.size.height * scale);
+        if (bounds_width != surface.getWidth() or bounds_height != surface.getHeight()) return;
+    }
+
     if (block.seq != 0) setPresentSeq(layer, block.seq);
     layer.setProperty("contents", surface);
 }

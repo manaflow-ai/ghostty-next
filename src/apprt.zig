@@ -39,6 +39,7 @@ pub const SurfaceIoMode = structs.SurfaceIoMode;
 pub const SurfaceGrid = structs.SurfaceGrid;
 pub const SurfaceSnapshotPhase = structs.SurfaceSnapshotPhase;
 pub const SurfaceLocalHistoryResult = structs.SurfaceLocalHistoryResult;
+pub const HostPresent = structs.HostPresent;
 pub const HostFrame = structs.HostFrame;
 
 /// The implementation to use for the app runtime. This is comptime chosen
