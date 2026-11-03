@@ -137,6 +137,12 @@ pub fn setSurfacePresented(self: *IOSurfaceLayer, surface: *IOSurface, seq: u64)
     return true;
 }
 
+/// The embedder committed the transaction of its last present or bounds change
+/// (`ghostty_surface_host_frame_committed`). Main thread.
+pub fn setEmbedderCommitted(self: *IOSurfaceLayer) void {
+    _ = self;
+}
+
 /// The present sequence of the embedder's last present (`setSurfacePresented`).
 /// While the layer still shows that frame, its transaction (with the view's
 /// new bounds) may not be committed yet, so no frame goes to the screen off
@@ -510,9 +516,73 @@ test "host present: an off-main frame never joins a present the embedder has not
     try testing.expect(!layer.setSurfaceOffMain(next, 6));
     const contents = layer.layer.getProperty(?*anyopaque, "contents");
     try testing.expectEqual(@as(?*anyopaque, @ptrCast(presented)), contents);
-    // On main (after the embedder's commit) it shows, and frames go off main again.
+    // On main it shows; once the embedder committed, frames go off main again.
     try layer.setSurface(next, 6);
+    layer.setEmbedderCommitted();
     try testing.expect(layer.setSurfaceOffMain(after, 7));
     const later = layer.layer.getProperty(?*anyopaque, "contents");
     try testing.expectEqual(@as(?*anyopaque, @ptrCast(after)), later);
+}
+
+test "host present: a main-thread frame after the embedder's present keeps frames on main until the embedder committed" {
+    const testing = std.testing;
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    var layer = try IOSurfaceLayer.init();
+    defer layer.release();
+    const shown = try testSurface(80, 60);
+    defer shown.release();
+    const presented = try testSurface(120, 60);
+    defer presented.release();
+    const queued = try testSurface(120, 60);
+    defer queued.release();
+    const next = try testSurface(120, 60);
+    defer next.release();
+    const later = try testSurface(120, 60);
+    defer later.release();
+    layer.setSurfaceSync(shown);
+    layer.setHostSize((120 << 32) | 60);
+    layer.setEmbedderPresents(true);
+
+    try testing.expect(layer.setSurfacePresented(presented, 5));
+    // A main-queue block runs before the embedder's commit (CFRunLoop runs
+    // main-queue blocks before the before-waiting observers): it shows a
+    // newer frame at that size in main's open transaction.
+    try layer.setSurface(queued, 6);
+    // An off-main commit now would still go out ahead of the embedder's bounds.
+    try testing.expect(!layer.setSurfaceOffMain(next, 7));
+    // The embedder committed: frames go off main again.
+    layer.setEmbedderCommitted();
+    try testing.expect(layer.setSurfaceOffMain(later, 8));
+}
+
+test "host present: a frame shown because the bounds already fit keeps frames on main until the embedder committed" {
+    const testing = std.testing;
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    var layer = try IOSurfaceLayer.init();
+    defer layer.release();
+    const shown = try testSurface(80, 60);
+    defer shown.release();
+    const drawn = try testSurface(120, 60);
+    defer drawn.release();
+    const next = try testSurface(120, 60);
+    defer next.release();
+    layer.setSurfaceSync(shown);
+    layer.setHostSize((120 << 32) | 60);
+    layer.setEmbedderPresents(true);
+    // The embedder gave the view its new bounds without a present.
+    layer.layer.setProperty("contentsScale", @as(f64, 1));
+    layer.layer.setProperty("bounds", macos.graphics.Rect{
+        .origin = .{ .x = 0, .y = 0 },
+        .size = .{ .width = 120, .height = 60 },
+    });
+    try layer.setSurface(drawn, 1);
+    try testing.expectEqual(@as(?usize, 120), testShownWidth(&layer));
+    // Those bounds are not committed yet either.
+    try testing.expect(!layer.setSurfaceOffMain(next, 2));
 }
