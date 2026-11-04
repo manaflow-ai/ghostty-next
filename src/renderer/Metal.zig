@@ -495,8 +495,13 @@ pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
 /// `publishFresh`). Decided under the Core Animation lock, then `fresh.mutex`:
 /// the main thread presents the fresh frame in that order too (`hostFrame` in
 /// the embedder's lock span), so it cannot take or drop the frame between the
-/// checks; a host change that drops it afterwards means its frame is no longer
-/// wanted (the renderer draws the new size). GPU completion thread.
+/// checks. A host change that drops it afterwards follows the rule of every
+/// kept frame (`setHostDrawableSize`): a frame kept from before a host change
+/// is not the new size's frame, even at an equal size (A->B->A). The renderer
+/// draws each new host size at once while visible (`Thread` resize: `resized`
+/// draws now), and that frame is published and presented; while frames are
+/// held or the surface is hidden, the layer keeps its last frame. GPU
+/// completion thread.
 fn embedderShowsKeptFrame(self: *Metal, surface: *IOSurface, seq: u64, generation: u64) bool {
     const CATransaction = objc.getClass("CATransaction").?;
     CATransaction.msgSend(void, objc.sel("lock"), .{});
@@ -1066,6 +1071,52 @@ test "host present: a kept frame that a host change dropped since its publish st
     metal.setHostDrawableSize(true, 160, 60);
     metal.setHostDrawableSize(true, 120, 60);
     try testing.expect(!metal.embedderShowsKeptFrame(drawn, 1, target.size_generation));
+}
+
+test "host present: after a host change drops a skipped frame, the new size's frame replaces it" {
+    // Review of this change (Codex FIX at 17ccbcfea): the completion skipped the main-thread present of a kept frame
+    // of host size A; then the host went to B and back to A (each change drops the kept frame) and the embedder gave
+    // the view A bounds without a present. No stale frame shows for the second A (the kept-frame rule): the layer keeps
+    // its last frame (PENDING), and the renderer's frame of the second A presents itself through main.
+    const testing = std.testing;
+    const HostFrame = apprt.HostFrame;
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    const device = testDevice();
+    var metal = try testMetal(&device);
+    defer testDeinit(&metal);
+    const shown = try testSurface(80, 60);
+    defer shown.release();
+    const first = try testSurface(120, 60);
+    defer first.release();
+    const second = try testSurface(120, 60);
+    defer second.release();
+    metal.layer.setSurfaceSync(shown);
+    metal.layer.layer.setProperty("contentsScale", @as(f64, 1));
+    metal.layer.layer.setProperty("bounds", macos.graphics.Rect{
+        .origin = .{ .x = 0, .y = 0 },
+        .size = .{ .width = 80, .height = 60 },
+    });
+    metal.setEmbedderPresents(true);
+    metal.setHostDrawableSize(true, 120, 60);
+    try metal.present(testTarget(&metal, first), false);
+    try testing.expectEqual(@as(u64, 0), metal.counters.main_presents.load(.monotonic));
+
+    metal.setHostDrawableSize(true, 160, 60);
+    metal.setHostDrawableSize(true, 120, 60);
+    metal.layer.layer.setProperty("bounds", macos.graphics.Rect{
+        .origin = .{ .x = 0, .y = 0 },
+        .size = .{ .width = 120, .height = 60 },
+    });
+    try testing.expectEqual(HostFrame.pending, metal.hostFrame(false));
+    try testing.expectEqual(@as(?usize, 80), testShownWidth(&metal));
+
+    // The renderer drew the second A at once (a resize draws now): its frame fits the bounds and presents itself.
+    try metal.present(testTarget(&metal, second), false);
+    try testing.expectEqual(@as(u64, 1), metal.counters.main_presents.load(.monotonic));
+    const contents = metal.layer.layer.getProperty(?*anyopaque, "contents");
+    try testing.expectEqual(@as(?*anyopaque, @ptrCast(second)), contents);
 }
 
 test "host present: a frame for bounds the embedder already set presents itself through main" {
