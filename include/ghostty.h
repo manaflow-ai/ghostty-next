@@ -1582,7 +1582,10 @@ typedef enum {
 // giving bounds without a present, call with present true when it returns
 // READY. Until the frame shows, or while the bounds stay old, call again until
 // it returns SHOWN, NONE or HIDDEN. READY does not reserve the frame: a hide can
-// drop it before the present (HIDDEN then).
+// drop it before the present (HIDDEN then), and a new host size drops it too,
+// even an equal one after another size (A->B->A): only a frame drawn after the
+// last ghostty_surface_set_size shows for it (the renderer draws a new size at
+// once; while it holds its frames, the layer keeps its last frame).
 // Call it with present true, and give the view its bounds, in one explicit
 // [CATransaction lock] span. An open transaction, a layout pass or a display
 // pass alone is not such a span. No off-main present runs its checks or sets
