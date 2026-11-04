@@ -466,7 +466,7 @@ typedef struct {
 } ghostty_string_s;
 
 typedef struct {
-  const char* path;
+  const char* GHOSTTY_NULL_UNSPECIFIED path;
   uintptr_t line;
 } ghostty_config_source_s;
 
@@ -630,7 +630,9 @@ typedef enum {
 // Calls for one surface never overlap. The callback may run while
 // Ghostty holds the surface's terminal lock, so it must not call back
 // into the surface. It can be called until ghostty_surface_free returns.
-typedef void (*ghostty_io_write_cb)(void*, const char*, uintptr_t);
+typedef void (*ghostty_io_write_cb)(void* GHOSTTY_NULLABLE,
+                                    const char*,
+                                    uintptr_t);
 
 // Font binding actions reported after Ghostty applied them (increase,
 // decrease, reset, set). The callback runs synchronously on the surface's
@@ -648,11 +650,11 @@ typedef enum {
 // terminal lock held, so it answers from what it already knows and never
 // calls into Ghostty; to change an answer, the embedder sends the pointer
 // position again (ghostty_surface_mouse_pos) or refreshes.
-typedef bool (*ghostty_surface_link_filter_cb)(void* userdata,
+typedef bool (*ghostty_surface_link_filter_cb)(void* GHOSTTY_NULLABLE userdata,
                                                const char* text,
                                                uintptr_t len);
 typedef void (*ghostty_font_size_action_cb)(
-    void* userdata,
+    void* GHOSTTY_NULLABLE userdata,
     ghostty_font_size_action_e action,
     float previous_points,
     float current_points,
@@ -676,8 +678,8 @@ typedef struct {
   // embedder to create (new tab or split actions) do not inherit these
   // fields; they start in EXEC mode.
   ghostty_surface_io_mode_e io_mode;
-  ghostty_io_write_cb io_write_cb;
-  void* io_write_userdata;
+  ghostty_io_write_cb GHOSTTY_NULLABLE io_write_cb;
+  void* GHOSTTY_NULLABLE io_write_userdata;
 } ghostty_surface_config_s;
 
 typedef struct {
@@ -1435,13 +1437,14 @@ GHOSTTY_API ghostty_string_s ghostty_config_open_path(void);
 // the key is at its default, came from the command line, or is unknown. The
 // path and the loaded-file strings are owned by the config.
 GHOSTTY_API uintptr_t ghostty_config_key_count(void);
-GHOSTTY_API const char* ghostty_config_key_name(uintptr_t);
+GHOSTTY_API const char* GHOSTTY_NULLABLE ghostty_config_key_name(uintptr_t);
 GHOSTTY_API bool ghostty_config_key_source(ghostty_config_t,
                                            const char*,
                                            uintptr_t,
                                            ghostty_config_source_s*);
 GHOSTTY_API uintptr_t ghostty_config_loaded_file_count(ghostty_config_t);
-GHOSTTY_API const char* ghostty_config_loaded_file(ghostty_config_t, uintptr_t);
+GHOSTTY_API const char* GHOSTTY_NULLABLE ghostty_config_loaded_file(ghostty_config_t,
+                                                                  uintptr_t);
 
 GHOSTTY_API ghostty_app_t GHOSTTY_NULLABLE ghostty_app_new(const ghostty_runtime_config_s*,
                                              ghostty_config_t);
@@ -1479,14 +1482,15 @@ GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
 // returns.
 GHOSTTY_API bool ghostty_surface_set_font_size_action_callback(
     ghostty_surface_t,
-    ghostty_font_size_action_cb,
-    void* userdata);
+    ghostty_font_size_action_cb GHOSTTY_NULLABLE,
+    void* GHOSTTY_NULLABLE userdata);
 // Installs the link filter for this surface; a NULL callback removes it.
 // userdata must stay valid until the filter is removed or
 // ghostty_surface_free returns.
-GHOSTTY_API void ghostty_surface_set_link_filter(ghostty_surface_t,
-                                                 ghostty_surface_link_filter_cb,
-                                                 void* userdata);
+GHOSTTY_API void ghostty_surface_set_link_filter(
+    ghostty_surface_t,
+    ghostty_surface_link_filter_cb GHOSTTY_NULLABLE,
+    void* GHOSTTY_NULLABLE userdata);
 GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t);
 // macOS: with enabled true the renderer draws at the pixel size of the last
 // ghostty_surface_set_size, not at the view's bounds. While the view's
@@ -1700,7 +1704,7 @@ GHOSTTY_API void ghostty_surface_set_color_scheme(ghostty_surface_t,
 // of 0 is instant (the default). Main thread.
 GHOSTTY_API void ghostty_surface_set_color_transition(
     ghostty_surface_t,
-    const ghostty_color_transition_s*);
+    const ghostty_color_transition_s* GHOSTTY_NULLABLE);
 // The renderer's frame counters since the surface started. Any thread
 // (diagnostics).
 GHOSTTY_API ghostty_surface_render_counters_s ghostty_surface_render_counters(
@@ -1763,7 +1767,7 @@ typedef enum {
 
 // Receives an encoded snapshot: (userdata, bytes, length). The bytes are
 // valid only during the call; copy them.
-typedef void (*ghostty_surface_snapshot_write_cb)(void*,
+typedef void (*ghostty_surface_snapshot_write_cb)(void* GHOSTTY_NULLABLE,
                                                   const uint8_t*,
                                                   size_t);
 
@@ -1819,7 +1823,7 @@ typedef void (*ghostty_surface_snapshot_write_cb)(void*,
 // keeps the pages applied so far and ends the restore.
 GHOSTTY_API bool ghostty_surface_restore_snapshot(
     ghostty_surface_t,
-    const uint8_t*,
+    const uint8_t* GHOSTTY_NULLABLE,
     size_t,
     ghostty_surface_snapshot_phase_e);
 
@@ -1934,10 +1938,10 @@ typedef enum {
 // io_write_cb.
 GHOSTTY_API int ghostty_surface_restore_snapshot_local_history(
     ghostty_surface_t,
-    const uint8_t* bytes,
+    const uint8_t* GHOSTTY_NULLABLE bytes,
     size_t len,
     uint64_t expected_history_rows,
-    const uint8_t* expected_digest,
+    const uint8_t* GHOSTTY_NULLABLE expected_digest,
     size_t digest_len);
 
 // Apply a Kitty image replay stream that the owning libghostty-vt
@@ -1958,9 +1962,10 @@ GHOSTTY_API int ghostty_surface_restore_snapshot_local_history(
 // skipped parts (bytes
 // outside Kitty APC commands, other commands, malformed or truncated
 // commands); the valid commands before and after those still ran.
-GHOSTTY_API bool ghostty_surface_apply_kitty_replay(ghostty_surface_t,
-                                                    const uint8_t*,
-                                                    size_t);
+GHOSTTY_API bool ghostty_surface_apply_kitty_replay(
+    ghostty_surface_t,
+    const uint8_t* GHOSTTY_NULLABLE,
+    size_t);
 
 // The history digest of a MANUAL or MANUAL_MIRROR surface's primary
 // screen: the same value as ghostty_terminal_history_digest computes for
@@ -1968,10 +1973,11 @@ GHOSTTY_API bool ghostty_surface_apply_kitty_replay(ghostty_surface_t,
 // output queue; it takes the terminal lock. out_len must be
 // GHOSTTY_SURFACE_HISTORY_DIGEST_LEN. Returns false, and writes nothing,
 // for an EXEC surface, a NULL pointer or a wrong length.
-GHOSTTY_API bool ghostty_surface_history_digest(ghostty_surface_t,
-                                                uint64_t* history_rows,
-                                                uint8_t* out,
-                                                size_t out_len);
+GHOSTTY_API bool ghostty_surface_history_digest(
+    ghostty_surface_t,
+    uint64_t* GHOSTTY_NULLABLE history_rows,
+    uint8_t* GHOSTTY_NULLABLE out,
+    size_t out_len);
 
 // Encode the terminal of a MANUAL or MANUAL_MIRROR surface as a snapshot
 // (READY prefix, HISTORY records, or COMPLETE) and pass the bytes to
@@ -1983,8 +1989,8 @@ GHOSTTY_API bool ghostty_surface_history_digest(ghostty_surface_t,
 // longer than 1 MiB.
 GHOSTTY_API bool ghostty_surface_encode_snapshot(
     ghostty_surface_t,
-    ghostty_surface_snapshot_write_cb,
-    void*,
+    ghostty_surface_snapshot_write_cb GHOSTTY_NULLABLE,
+    void* GHOSTTY_NULLABLE,
     ghostty_surface_snapshot_phase_e);
 
 // The GHOSTSNP format version that ghostty_surface_restore_snapshot

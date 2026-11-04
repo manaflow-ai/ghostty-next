@@ -2579,6 +2579,9 @@ test "tmux active_window notification is handled" {
     handler.renderer_state = &renderer_state;
     handler.termio_messaged = false;
     handler.tmux_viewer = null;
+    // Fork fields the handler reads when it sends a message.
+    handler.suppress_terminal_responses = false;
+    handler.pwd_raw_url = false;
     defer if (handler.tmux_viewer) |viewer| {
         viewer.deinit();
         testing.allocator.destroy(viewer);

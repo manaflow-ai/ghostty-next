@@ -147,8 +147,32 @@ Conflicts:
 - `.github/workflows/test.yml`: stays deleted (the fork replaced it with
   `next-xcframework.yml`).
 - `include/ghostty.h`: kept the fork's `ghostty_surface_process_output`
-  declaration and docs; took upstream's `GHOSTTY_NULLABLE` on
-  `ghostty_surface_preedit`'s text.
+  declaration and docs, and took upstream's whole nullability change
+  (0e067ded7): the header is in `#pragma clang assume_nonnull`, so every
+  pointer is non-null unless it is marked `GHOSTTY_NULLABLE` (or
+  `GHOSTTY_NULL_UNSPECIFIED` for a field the caller zero-initializes). The
+  fork's declarations are annotated to match the Zig side:
+  - Nullable returns: `ghostty_config_key_name` and
+    `ghostty_config_loaded_file` (null out of range).
+  - Nullable userdata: every fork callback typedef (`ghostty_io_write_cb`,
+    `ghostty_surface_link_filter_cb`, `ghostty_font_size_action_cb`,
+    `ghostty_surface_snapshot_write_cb`), `io_write_userdata`, and the
+    userdata parameters of `ghostty_surface_set_font_size_action_callback`,
+    `ghostty_surface_set_link_filter` and `ghostty_surface_encode_snapshot`.
+  - Nullable callbacks: `ghostty_surface_config_s.io_write_cb` (input is
+    dropped) and the callback parameters of the three setters above (NULL
+    removes the link filter; the others return false).
+  - Nullable inputs: `ghostty_surface_set_color_transition` (NULL is
+    instant), the bytes of `ghostty_surface_restore_snapshot`,
+    `ghostty_surface_restore_snapshot_local_history` (and its digest) and
+    `ghostty_surface_apply_kitty_replay` (NULL is allowed with length 0),
+    and both out pointers of `ghostty_surface_history_digest`.
+  - `ghostty_config_source_s.path` is `GHOSTTY_NULL_UNSPECIFIED`, like
+    upstream's `ghostty_text_s.text`.
+  The byte pointers that callbacks receive, the `const char*` + length
+  inputs (`ghostty_config_load_string`, `ghostty_surface_text_input`,
+  `ghostty_surface_process_output`), config keys and the out structs of
+  the grid and selection queries stay non-null.
 - `src/terminal/Screen.zig` `clearRows`: kept both. The fork's wrap break
   across the cleared range's edges (`breakWrapAbove`, fork PR #68 line) runs in
   a `defer`; upstream's blank-row fast path (`blank_zero`) resets the same
