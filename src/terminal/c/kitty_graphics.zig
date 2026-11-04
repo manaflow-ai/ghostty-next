@@ -321,7 +321,7 @@ pub fn image_set_number(
 
     const storage = graphics_;
     // C storage handles always come from a Screen's kitty_images.
-    const screen: *Screen = @fieldParentPtr("kitty_images", storage);
+    const screen: *Screen = @alignCast(@fieldParentPtr("kitty_images", storage));
     return if (storage.setImageNumber(screen.io, image_id, image_number))
         .success
     else

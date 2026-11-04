@@ -4172,7 +4172,7 @@ fn bgPaint(
             break :rgb ColorBlend.Paint.rgbOnly(.{ .r = rgb.r, .g = rgb.g, .b = rgb.b });
         },
 
-        else => switch (style.bg_color) {
+        else => switch (style.bg_color.value()) {
             .none => null,
             .palette => |idx| ColorBlend.Paint.entry(table, idx),
             .rgb => |rgb| ColorBlend.Paint.rgbOnly(rgb),
@@ -4185,7 +4185,7 @@ fn fgPaint(
     table: *const ColorBlend.Table,
     bold: ?terminal.Style.BoldColor,
 ) ColorBlend.Paint {
-    return switch (style.fg_color) {
+    return switch (style.fg_color.value()) {
         .none => default: {
             if (style.flags.bold) {
                 if (bold) |b| switch (b) {
@@ -4227,7 +4227,7 @@ fn underlinePaint(
     style: terminal.Style,
     table: *const ColorBlend.Table,
 ) ?ColorBlend.Paint {
-    return switch (style.underline_color) {
+    return switch (style.underline_color.value()) {
         .none => null,
         .palette => |idx| ColorBlend.Paint.entry(table, idx),
         .rgb => |rgb| ColorBlend.Paint.rgbOnly(rgb),

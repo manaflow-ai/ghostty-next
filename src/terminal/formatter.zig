@@ -8425,7 +8425,7 @@ test "Page VT preserves a fully styled blank row" {
         const cell = target.screens.active.pages.getCell(pt).?;
         const bg: ?u8 = switch (cell.cell.content_tag) {
             .bg_color_palette => cell.cell.content.color_palette.data,
-            .codepoint, .codepoint_grapheme => switch (cell.style().bg_color) {
+            .codepoint, .codepoint_grapheme => switch (cell.style().bg_color.value()) {
                 .palette => |idx| idx,
                 else => null,
             },
