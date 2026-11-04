@@ -1576,10 +1576,11 @@ typedef enum {
 // replaces a newer one. Never waits and never draws. Counted in
 // host_present_calls (present true), host_fresh_presents (PRESENTED) and
 // host_late_presents (PENDING or HELD with present true). A view whose
-// bounds were given without a present shows the new frame when it is drawn;
-// until then, or while the bounds stay old, call again until it returns
-// SHOWN, NONE or HIDDEN. READY does not reserve the frame: a hide can drop it
-// before the present (HIDDEN then).
+// bounds were given without a present shows a frame drawn after that by
+// itself; a frame drawn before them waits for a present (READY), with no
+// main-thread present of its own. Until the frame shows, or while the bounds
+// stay old, call again until it returns SHOWN, NONE or HIDDEN. READY does not
+// reserve the frame: a hide can drop it before the present (HIDDEN then).
 // Call it with present true, and give the view its bounds, in one explicit
 // [CATransaction lock] span. An open transaction, a layout pass or a display
 // pass alone is not such a span. No off-main present runs its checks or sets

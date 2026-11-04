@@ -456,22 +456,44 @@ pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
         self.layer.setSurfaceSync(target.surface);
     } else {
         const seq = self.present_seq.fetchAdd(1, .monotonic) + 1;
+        var published = false;
         if (comptime builtin.os.tag == .macos) {
             if (target.cells_fresh and self.fresh.armed.load(.acquire) and
                 target.size_generation == self.fresh.generation.load(.acquire) and
-                self.host_size.load(.acquire) != 0) self.publishFresh(target.surface, seq);
+                self.host_size.load(.acquire) != 0)
+            {
+                self.publishFresh(target.surface, seq);
+                published = true;
+            }
         }
         // A content-only frame of a host-sized surface goes to the screen from
         // this (completion) thread: a terminal echo does not wait for main.
         if (comptime builtin.os.tag == .macos) {
-            if (self.host_size.load(.acquire) != 0 and self.layer.setSurfaceOffMain(target.surface, seq)) {
+            const host = self.host_size.load(.acquire);
+            if (host != 0 and self.layer.setSurfaceOffMain(target.surface, seq)) {
                 _ = self.counters.off_main_presents.fetchAdd(1, .monotonic);
                 return;
             }
+            if (host != 0 and self.embedder_presents.load(.acquire) and
+                self.embedderTakesFrame(target.surface, host, published)) return;
         }
         _ = self.counters.main_presents.fetchAdd(1, .monotonic);
         try self.layer.setSurface(target.surface, seq);
     }
+}
+
+/// While the embedder presents host sizes: whether a frame that cannot go to
+/// the screen off main needs no main-thread present either, because
+/// `setSurfaceCallback` would drop it there. A frame of a size the host no
+/// longer has: the layer never shows it, and the renderer draws the new size.
+/// A frame of the host size, `published` for the embedder's present (`hostFrame`),
+/// while the layer shows a frame of another size in bounds that do not have
+/// this one's: the embedder shows it with its bounds. A first frame (nothing
+/// shown) and a frame for bounds the embedder already set still present
+/// themselves through main. GPU completion thread.
+fn embedderTakesFrame(self: *Metal, surface: *IOSurface, host: u64, published: bool) bool {
+    if ((host >> 32) != surface.getWidth() or (host & 0xffff_ffff) != surface.getHeight()) return true;
+    return published and self.layer.embedderShowsFrame(surface);
 }
 
 /// Keeps `surface`, the frame of present sequence `seq`, as the newest fresh
