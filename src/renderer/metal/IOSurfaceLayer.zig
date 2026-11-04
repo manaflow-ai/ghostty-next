@@ -282,7 +282,14 @@ pub fn setSurfaceOffMain(self: *IOSurfaceLayer, surface: *IOSurface, seq: u64) b
 /// presents itself through main). Call under the Core Animation lock, which
 /// orders it against main's changes (`Metal.embedderShowsKeptFrame`).
 pub fn embedderShowsFrameLocked(self: *IOSurfaceLayer, surface: *IOSurface) bool {
-    return embedderDrops(self.layer, surface);
+    // MUTANT (scratch, never merge): no shown-size check on the skip path.
+    if (!embedderPresents(self.layer)) return false;
+    if (self.layer.getProperty(?*anyopaque, "contents") == null) return false;
+    const bounds = self.layer.getProperty(macos.graphics.Rect, "bounds");
+    const scale = self.layer.getProperty(f64, "contentsScale");
+    const width: usize = @intFromFloat(bounds.size.width * scale);
+    const height: usize = @intFromFloat(bounds.size.height * scale);
+    return width != surface.getWidth() or height != surface.getHeight();
 }
 
 /// The one rule of `setSurfaceCallback` and `embedderShowsFrameLocked`: with
