@@ -272,6 +272,31 @@ pub fn setSurfaceOffMain(self: *IOSurfaceLayer, surface: *IOSurface, seq: u64) b
     return true;
 }
 
+/// While the embedder presents host sizes (`setEmbedderPresents`): whether
+/// the embedder shows `surface`, a frame of the host size, itself, so a
+/// present through main would do nothing. True when the layer shows a frame
+/// of another size and its bounds do not have this frame's size:
+/// `setSurfaceCallback` drops such a frame, and the embedder presents it with
+/// its bounds (`Metal.hostFrame`). False for a first frame (nothing shown), a
+/// frame at the shown size (it waits for the embedder's commit, through main)
+/// and bounds the embedder already set (it presents itself through main).
+/// Under the Core Animation lock, which orders it against main's changes.
+pub fn embedderShowsFrame(self: *IOSurfaceLayer, surface: *IOSurface) bool {
+    const CATransaction = objc.getClass("CATransaction").?;
+    CATransaction.msgSend(void, objc.sel("lock"), .{});
+    defer CATransaction.msgSend(void, objc.sel("unlock"), .{});
+    if (!embedderPresents(self.layer)) return false;
+    const shown = self.layer.getProperty(?*anyopaque, "contents") orelse return false;
+    const shown_surface: *IOSurface = @ptrCast(shown);
+    if (shown_surface.getWidth() == surface.getWidth() and
+        shown_surface.getHeight() == surface.getHeight()) return false;
+    const bounds = self.layer.getProperty(macos.graphics.Rect, "bounds");
+    const scale = self.layer.getProperty(f64, "contentsScale");
+    const width: usize = @intFromFloat(bounds.size.width * scale);
+    const height: usize = @intFromFloat(bounds.size.height * scale);
+    return width != surface.getWidth() or height != surface.getHeight();
+}
+
 /// The sequence number of the newest frame presented (`setSurface`,
 /// `setSurfaceOffMain`). Read and written under the Core Animation lock.
 fn presentSeq(layer: objc.Object) u64 {
