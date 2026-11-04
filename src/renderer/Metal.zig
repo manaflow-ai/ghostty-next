@@ -1256,6 +1256,32 @@ test "host present: a frame at the shown size goes to the screen off main while 
     try testing.expectEqual(@as(u64, 1), metal.counters.off_main_presents.load(.monotonic));
 }
 
+test "host present: a frame at the shown size goes through main until the embedder reports its commit" {
+    // Independent review of #75 (finding 1): a frame kept for the embedder at the size the layer already shows is not
+    // one the embedder presents with new bounds (hostFrame answers SHOWN for it): it must go through main while the
+    // embedder's last change is not reported committed (setSurfaceOffMain refuses it then), never be skipped.
+    const testing = std.testing;
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    const device = testDevice();
+    var metal = try testMetal(&device);
+    defer testDeinit(&metal);
+    const shown = try testSurface(120, 60);
+    defer shown.release();
+    const drawn = try testSurface(120, 60);
+    defer drawn.release();
+    metal.layer.setSurfaceSync(shown);
+    metal.setEmbedderPresents(true);
+    metal.setHostDrawableSize(true, 120, 60);
+
+    try metal.present(testTarget(&metal, drawn), false);
+    try testing.expectEqual(@as(u64, 0), metal.counters.off_main_presents.load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), metal.counters.main_presents.load(.monotonic));
+    const contents = metal.layer.layer.getProperty(?*anyopaque, "contents");
+    try testing.expectEqual(@as(?*anyopaque, @ptrCast(drawn)), contents);
+}
+
 test "host present: hostFrame reports the frame drawn for a new host size and shows it in the caller's transaction" {
     const testing = std.testing;
     const HostFrame = apprt.HostFrame;
