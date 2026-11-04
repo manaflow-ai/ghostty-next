@@ -129,6 +129,33 @@ Next in the stack (tracked in the design): presentation callbacks for
 frame-exact acknowledgment, Kitty image replay after a snapshot, and a
 local scrollback window limit for restored snapshots.
 
+## Upstream sync to c7f68a7f4 (2026-11-04)
+
+`sync/upstream-20261104` first merges the cmux release line
+`release/cmux-9ce9b7d0-e2` (7d43bb68b, fork PRs #66, #69, #70, #71) into
+`main`, so the commit cmux-next pins stays an ancestor of `main`. That merge
+was clean. It then merges upstream `main` at c7f68a7f4 (2026-11-03, 241
+commits after v1.4.0). Zig stays 0.17.0. `next/UPSTREAM_BASE` is c7f68a7f4.
+
+Why now: cmux-next NIGHTLY froze with the main thread in `pthread_join` on a
+renderer stuck in `CVDisplayLinkStop` (manaflow-ai/cmux#35300). Upstream's
+fix ffaaf5d7a came in with v1.4.0 on `main`, but cmux-next still pinned the
+pre-1.4.0 release line.
+
+Conflicts:
+- `.github/workflows/test.yml`: stays deleted (the fork replaced it with
+  `next-xcframework.yml`).
+- `include/ghostty.h`: kept the fork's `ghostty_surface_process_output`
+  declaration and docs; took upstream's `GHOSTTY_NULLABLE` on
+  `ghostty_surface_preedit`'s text.
+- `src/terminal/Screen.zig` `clearRows`: kept both. The fork's wrap break
+  across the cleared range's edges (`breakWrapAbove`, fork PR #68 line) runs in
+  a `defer`; upstream's blank-row fast path (`blank_zero`) resets the same
+  row metadata, so the edge breaks still apply.
+- `src/termio/stream_handler.zig`: kept the fork's reply tests and
+  `osc7Path`; added upstream's tmux `active_window` test. Upstream's
+  `osc7Host` (no RFC 1123 host check) merged without conflict.
+
 ## Upstream sync to v1.4.0 (2026-10-28)
 
 `main` merged upstream tag `v1.4.0` (83fb95624) with a merge commit, not a
