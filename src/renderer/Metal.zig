@@ -474,26 +474,17 @@ pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
                 _ = self.counters.off_main_presents.fetchAdd(1, .monotonic);
                 return;
             }
-            if (host != 0 and self.embedder_presents.load(.acquire) and
-                self.embedderTakesFrame(target.surface, host, published)) return;
+            // While the embedder presents host sizes, a frame kept for its present that the layer cannot show in
+            // its bounds now (`setSurfaceCallback` drops it) goes to no main-queue block: the embedder shows it with
+            // its bounds (`hostFrame`). A frame of a size the host no longer has still goes through main, which
+            // rechecks the host size then: it is not kept anywhere (review of this change: an A->B->A host could
+            // want it again).
+            if (host != 0 and published and self.embedder_presents.load(.acquire) and
+                self.layer.embedderShowsFrame(target.surface)) return;
         }
         _ = self.counters.main_presents.fetchAdd(1, .monotonic);
         try self.layer.setSurface(target.surface, seq);
     }
-}
-
-/// While the embedder presents host sizes: whether a frame that cannot go to
-/// the screen off main needs no main-thread present either, because
-/// `setSurfaceCallback` would drop it there. A frame of a size the host no
-/// longer has: the layer never shows it, and the renderer draws the new size.
-/// A frame of the host size, `published` for the embedder's present (`hostFrame`),
-/// while the layer shows a frame of another size in bounds that do not have
-/// this one's: the embedder shows it with its bounds. A first frame (nothing
-/// shown) and a frame for bounds the embedder already set still present
-/// themselves through main. GPU completion thread.
-fn embedderTakesFrame(self: *Metal, surface: *IOSurface, host: u64, published: bool) bool {
-    if ((host >> 32) != surface.getWidth() or (host & 0xffff_ffff) != surface.getHeight()) return true;
-    return published and self.layer.embedderShowsFrame(surface);
 }
 
 /// Keeps `surface`, the frame of present sequence `seq`, as the newest fresh
@@ -1050,9 +1041,9 @@ test "host present: a frame for bounds the embedder already set presents itself 
     try testing.expectEqual(@as(?usize, 120), testShownWidth(&metal));
 }
 
-test "host present: a frame of a size the host no longer has wakes no main-thread present while the embedder presents sizes" {
-    // In a key resize the host size changes in every refresh: a frame that completes after the next size was set has a
-    // size the layer never shows (setSurfaceCallback drops it), and the renderer draws the new size next.
+test "host present: a frame of a size the host no longer has still goes through main while the embedder presents sizes" {
+    // Not kept for the embedder (the host size changed while it was drawn), so nothing else can show it: the main
+    // thread's present rechecks the host size when it runs (the host can have its size again by then, A->B->A).
     const testing = std.testing;
     try testing.expect(testIsMainThread());
     const pool = objc.AutoreleasePool.init();
@@ -1071,7 +1062,7 @@ test "host present: a frame of a size the host no longer has wakes no main-threa
     metal.setHostDrawableSize(true, 160, 60);
 
     try metal.present(target, false);
-    try testing.expectEqual(@as(u64, 0), metal.counters.main_presents.load(.monotonic));
+    try testing.expectEqual(@as(u64, 1), metal.counters.main_presents.load(.monotonic));
     try testing.expectEqual(@as(?usize, 80), testShownWidth(&metal));
     try testing.expectEqual(@as(?*IOSurface, null), metal.fresh.surface);
 }
