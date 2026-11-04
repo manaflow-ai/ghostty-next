@@ -476,15 +476,37 @@ pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
             }
             // While the embedder presents host sizes, a frame kept for its present that the layer cannot show in
             // its bounds now (`setSurfaceCallback` drops it) goes to no main-queue block: the embedder shows it with
-            // its bounds (`hostFrame`). A frame of a size the host no longer has still goes through main, which
-            // rechecks the host size then: it is not kept anywhere (review of this change: an A->B->A host could
-            // want it again).
+            // its bounds (`hostFrame`). Any other frame still goes through main, which rechecks it then: one the host
+            // no longer has the size of, or one no longer kept (a host change dropped it since it was published).
             if (host != 0 and published and self.embedder_presents.load(.acquire) and
-                self.layer.embedderShowsFrame(target.surface)) return;
+                self.embedderShowsKeptFrame(target.surface, seq, target.size_generation)) return;
         }
         _ = self.counters.main_presents.fetchAdd(1, .monotonic);
         try self.layer.setSurface(target.surface, seq);
     }
+}
+
+/// While the embedder presents host sizes: whether the embedder shows
+/// `surface` (present sequence `seq`, drawn under host size generation
+/// `generation`) itself, so no main-thread present is needed. True only while
+/// the layer shows a frame of another size in bounds of another size
+/// (`setSurfaceCallback` would drop it) and the kept fresh frame is still this
+/// one at this generation (no host change or present took it since
+/// `publishFresh`). Decided under the Core Animation lock, then `fresh.mutex`:
+/// the main thread presents the fresh frame in that order too (`hostFrame` in
+/// the embedder's lock span), so it cannot take or drop the frame between the
+/// checks; a host change that drops it afterwards means its frame is no longer
+/// wanted (the renderer draws the new size). GPU completion thread.
+fn embedderShowsKeptFrame(self: *Metal, surface: *IOSurface, seq: u64, generation: u64) bool {
+    const CATransaction = objc.getClass("CATransaction").?;
+    CATransaction.msgSend(void, objc.sel("lock"), .{});
+    defer CATransaction.msgSend(void, objc.sel("unlock"), .{});
+    if (!self.layer.embedderShowsFrameLocked(surface)) return false;
+    const io = global.io();
+    self.fresh.mutex.lockUncancelable(io);
+    defer self.fresh.mutex.unlock(io);
+    return self.fresh.surface == surface and self.fresh.surface_seq == seq and
+        self.fresh.generation.load(.acquire) == generation;
 }
 
 /// Keeps `surface`, the frame of present sequence `seq`, as the newest fresh
@@ -1011,6 +1033,38 @@ test "host present: a frame of a new host size that the embedder presents wakes 
     // The frame waits for the embedder, which shows it in its transaction.
     try testing.expectEqual(HostFrame.presented, metal.hostFrame(true));
     try testing.expectEqual(@as(?usize, 120), testShownWidth(&metal));
+}
+
+test "host present: a kept frame that a host change dropped since its publish still goes through main" {
+    // Review of this change (Codex FIX at 3d209283a): the frame of host size A was kept for the embedder, then the host
+    // changed to B and back to A (each change drops the kept frame); the completion must not skip the main-thread
+    // present for a frame that nothing keeps any more.
+    const testing = std.testing;
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    const device = testDevice();
+    var metal = try testMetal(&device);
+    defer testDeinit(&metal);
+    const shown = try testSurface(80, 60);
+    defer shown.release();
+    const drawn = try testSurface(120, 60);
+    defer drawn.release();
+    metal.layer.setSurfaceSync(shown);
+    metal.layer.layer.setProperty("contentsScale", @as(f64, 1));
+    metal.layer.layer.setProperty("bounds", macos.graphics.Rect{
+        .origin = .{ .x = 0, .y = 0 },
+        .size = .{ .width = 80, .height = 60 },
+    });
+    metal.setEmbedderPresents(true);
+    metal.setHostDrawableSize(true, 120, 60);
+    const target = testTarget(&metal, drawn);
+    metal.publishFresh(drawn, 1);
+    try testing.expect(metal.embedderShowsKeptFrame(drawn, 1, target.size_generation));
+
+    metal.setHostDrawableSize(true, 160, 60);
+    metal.setHostDrawableSize(true, 120, 60);
+    try testing.expect(!metal.embedderShowsKeptFrame(drawn, 1, target.size_generation));
 }
 
 test "host present: a frame for bounds the embedder already set presents itself through main" {
