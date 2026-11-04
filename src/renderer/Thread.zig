@@ -515,6 +515,7 @@ fn wakeupCallback(
     };
 
     const t = self_.?;
+    _ = t.renderer.counters.thread_wakeups.fetchAdd(1, .monotonic);
 
     // When we wake up, we check the mailbox. Mailbox producers should
     // wake up our thread after publishing.
@@ -562,6 +563,7 @@ fn drawNowCallback(
 
     // Draw immediately
     const t = self_.?;
+    _ = t.renderer.counters.thread_draw_now.fetchAdd(1, .monotonic);
     const before = t.renderer.counters.frames.load(.monotonic);
     t.drawFrame(true);
     t.flags.last_tick_drew = t.renderer.counters.frames.load(.monotonic) != before;
@@ -679,6 +681,7 @@ fn animationTimerCallback(
         log.warn("animation callback fired without data set", .{});
         return .disarm;
     };
+    _ = t.renderer.counters.animation_timer_fires.fetchAdd(1, .monotonic);
 
     // Animations pause entirely while we're invisible; the .visible
     // mailbox message re-arms us when we can be seen again.
@@ -726,6 +729,7 @@ fn cursorTimerCallback(
         log.warn("render callback fired without data set", .{});
         return .disarm;
     };
+    _ = t.renderer.counters.cursor_timer_fires.fetchAdd(1, .monotonic);
 
     t.flags.cursor_blink_visible = !t.flags.cursor_blink_visible;
     // A tick changes pixels only when the cursor blinks and shows: a hidden
@@ -931,6 +935,7 @@ const Compression = struct {
         };
 
         const self = &thread.compression;
+        _ = thread.renderer.counters.compression_timer_fires.fetchAdd(1, .monotonic);
 
         if (self.step(thread)) |delay| {
             self.schedule(thread, delay);
