@@ -282,13 +282,24 @@ pub fn setSurfaceOffMain(self: *IOSurfaceLayer, surface: *IOSurface, seq: u64) b
 /// presents itself through main). Call under the Core Animation lock, which
 /// orders it against main's changes (`Metal.embedderShowsKeptFrame`).
 pub fn embedderShowsFrameLocked(self: *IOSurfaceLayer, surface: *IOSurface) bool {
-    if (!embedderPresents(self.layer)) return false;
-    const shown = self.layer.getProperty(?*anyopaque, "contents") orelse return false;
+    return embedderDrops(self.layer, surface);
+}
+
+/// The one rule of `setSurfaceCallback` and `embedderShowsFrameLocked`: with
+/// the embedder presenting host sizes, whether the main-thread present must
+/// not show `surface` now, because the layer shows a frame of another size
+/// and its bounds do not have `surface`'s size (the embedder shows it with its
+/// bounds). A first frame (nothing shown), a frame at the shown size and a
+/// frame for bounds the embedder already set are shown. Call under the Core
+/// Animation lock.
+fn embedderDrops(layer: objc.Object, surface: *IOSurface) bool {
+    if (!embedderPresents(layer)) return false;
+    const shown = layer.getProperty(?*anyopaque, "contents") orelse return false;
     const shown_surface: *IOSurface = @ptrCast(shown);
     if (shown_surface.getWidth() == surface.getWidth() and
         shown_surface.getHeight() == surface.getHeight()) return false;
-    const bounds = self.layer.getProperty(macos.graphics.Rect, "bounds");
-    const scale = self.layer.getProperty(f64, "contentsScale");
+    const bounds = layer.getProperty(macos.graphics.Rect, "bounds");
+    const scale = layer.getProperty(f64, "contentsScale");
     const width: usize = @intFromFloat(bounds.size.width * scale);
     const height: usize = @intFromFloat(bounds.size.height * scale);
     return width != surface.getWidth() or height != surface.getHeight();
@@ -370,15 +381,7 @@ fn setSurfaceCallback(
     // already have its size (the embedder set them without a present), so a
     // commit never carries new pixels in the old bounds. A first frame
     // (nothing shown) presents itself.
-    if (embedderPresents(layer)) embedder: {
-        const shown = layer.getProperty(?*anyopaque, "contents") orelse break :embedder;
-        const shown_surface: *IOSurface = @ptrCast(shown);
-        if (shown_surface.getWidth() == surface.getWidth() and
-            shown_surface.getHeight() == surface.getHeight()) break :embedder;
-        const bounds_width: usize = @intFromFloat(bounds.size.width * scale);
-        const bounds_height: usize = @intFromFloat(bounds.size.height * scale);
-        if (bounds_width != surface.getWidth() or bounds_height != surface.getHeight()) return;
-    }
+    if (embedderDrops(layer, surface)) return;
 
     if (block.seq != 0) setPresentSeq(layer, block.seq);
     if (embedderPresents(layer) and changesShownSize(layer, surface)) setMainPending(layer, true);
