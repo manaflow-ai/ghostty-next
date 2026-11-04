@@ -134,7 +134,8 @@ local scrollback window limit for restored snapshots.
 `sync/upstream-20261104` first merges the cmux release line
 `release/cmux-9ce9b7d0-e2` (7d43bb68b, fork PRs #66, #69, #70, #71) into
 `main`, so the commit cmux-next pins stays an ancestor of `main`. That merge
-was clean. It then merges upstream `main` at c7f68a7f4 (2026-11-03, 241
+was clean. A second merge takes the line's newer head bd7ff2687 (PRs #72,
+#73), also clean. It then merges upstream `main` at c7f68a7f4 (2026-11-03, 241
 commits after v1.4.0). Zig stays 0.17.0. `next/UPSTREAM_BASE` is c7f68a7f4.
 
 Why now: cmux-next NIGHTLY froze with the main thread in `pthread_join` on a
