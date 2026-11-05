@@ -58,6 +58,28 @@ pub fn deinit(self: *Device) void {
     self.* = undefined;
 }
 
+/// Tests only: the system's default Metal device (release it with `deinit`).
+/// The test binary does not link the Metal framework; Core Animation loads
+/// it, so its entry point is looked up at run time.
+pub fn initForTest() !Device {
+    if (comptime !builtin.is_test) @compileError("initForTest is for tests");
+    const TestLoader = struct {
+        extern "c" fn dlopen(path: [*:0]const u8, mode: c_int) ?*anyopaque;
+        extern "c" fn dlsym(handle: ?*anyopaque, symbol: [*:0]const u8) ?*anyopaque;
+    };
+    const rtld_lazy = 1;
+    const metal = TestLoader.dlopen("/System/Library/Frameworks/Metal.framework/Metal", rtld_lazy) orelse
+        return error.NoMetalDevice;
+    const symbol = TestLoader.dlsym(metal, "MTLCreateSystemDefaultDevice") orelse return error.NoMetalDevice;
+    const create: *const fn () callconv(.c) ?*anyopaque = @ptrCast(@alignCast(symbol));
+    const device = objc.Object.fromId(create() orelse return error.NoMetalDevice);
+    return .{
+        .device = device,
+        .default_storage_mode = if (device.getProperty(bool, "hasUnifiedMemory")) .shared else .managed,
+        .max_texture_size = queryMaxTextureSize(device),
+    };
+}
+
 /// Warm up the Metal device machinery. The first Metal device query in
 /// a process takes multiple milliseconds; once warm, subsequent queries
 /// are effectively free. Calling this early (e.g. on a background
