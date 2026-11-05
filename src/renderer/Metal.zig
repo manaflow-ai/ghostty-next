@@ -71,10 +71,16 @@ host_size: std.atomic.Value(u64) = .init(0),
 host_capacity: std.atomic.Value(u64) = .init(0),
 
 /// A capacity was cleared and the swap chain may still hold targets of its
-/// size: the renderer thread gives them back at its next draw
-/// (`Renderer.SwapChain.trim`, `trimArmed`). Main thread writes it
-/// (`setHostCapacity`); the renderer thread clears it once done (`trimDone`).
+/// size: the renderer thread gives back the idle ones at its next draw
+/// (`Renderer.SwapChain.trim`), and a frame in flight gives back its own when
+/// it completes (`frameDone`). Main thread writes it (`setHostCapacity`); the
+/// renderer thread clears it once no frame is in flight (`trimDone`).
 trim_armed: std.atomic.Value(bool) = .init(false),
+
+/// A capacity was cleared and no frame was drawn since: the renderer thread's
+/// next draw draws the landing frame at the host size even when nothing else
+/// changed (`takeLandingDue`), so the layer stops showing a capacity surface.
+landing_due: std.atomic.Value(bool) = .init(false),
 
 /// macOS host-sized surfaces: the newest frame the renderer thread drew with
 /// cells built at that frame's size (`Target.cells_fresh`), for the display
@@ -357,11 +363,19 @@ pub fn setHostCapacity(self: *Metal, width_px: u32, height_px: u32) bool {
     // capacity arms the trim; a clear with none set changes nothing.
     if (value != 0) {
         self.trim_armed.store(false, .release);
+        self.landing_due.store(false, .release);
         return false;
     }
     if (old == 0) return false;
     self.trim_armed.store(true, .release);
+    self.landing_due.store(true, .release);
     return true;
+}
+
+/// Whether the next draw must draw the landing frame of a cleared capacity;
+/// true once per clear. Renderer thread.
+pub fn takeLandingDue(self: *Metal) bool {
+    return self.landing_due.swap(false, .acq_rel);
 }
 
 /// Whether a cleared capacity still waits for its targets to be given back
@@ -371,8 +385,8 @@ pub fn trimArmed(self: *const Metal) bool {
     return self.trim_armed.load(.acquire) and self.host_capacity.load(.acquire) == 0;
 }
 
-/// The swap chain gave back the targets of the cleared capacity. Renderer
-/// thread.
+/// No target of the cleared capacity is left: none larger than the host size,
+/// and no frame in flight (`Renderer.SwapChain.trim`). Renderer thread.
 pub fn trimDone(self: *Metal) void {
     self.trim_armed.store(false, .release);
 }
@@ -570,16 +584,23 @@ fn targetSize(
 /// main for a sync draw.
 pub fn frameCommitted(self: *Metal, target: *Target) void {
     _ = self;
-    _ = target;
+    target.in_flight.store(true, .release);
 }
 
 /// The frame of `target` completed and was presented (`Frame.bufferCompleted`),
-/// before its swap-chain slot is released. GPU completion thread. Not
-/// implemented yet: a cleared capacity's target stays until the renderer
-/// thread's trim.
+/// before its swap-chain slot is released. After a cleared capacity, a target
+/// larger than the size the next frame draws at goes back now
+/// (`Target.release`), so no draw is needed for it: the renderer thread's
+/// trim (`Renderer.SwapChain.trim`) gave back only the idle ones. Outside the
+/// Core Animation lock (`present` released it). The layer keeps showing the
+/// frame until a newer one replaces it (it holds its own reference). GPU
+/// completion thread.
 pub fn frameDone(self: *Metal, target: *Target) void {
-    _ = self;
-    _ = target;
+    // Last: from here the target is the renderer thread's again.
+    defer target.in_flight.store(false, .release);
+    if (!self.trimArmed()) return;
+    const size = self.surfaceSize() catch return;
+    if (target.largerThan(size.width, size.height)) target.release();
 }
 
 /// Present the provided target.

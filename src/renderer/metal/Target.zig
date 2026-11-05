@@ -55,6 +55,13 @@ live_bytes: ?*std.atomic.Value(u64) = null,
 /// The IOSurface's allocation size, as counted in `live_bytes`.
 bytes: u64 = 0,
 
+/// A frame drawn into this target is in flight: committed (`Metal.frameCommitted`)
+/// and not completed (`Metal.frameDone`). Meanwhile only its completion may
+/// change the target; the renderer thread leaves it alone (`SwapChain.trim`).
+/// Set by the renderer thread, cleared by the GPU completion thread (release),
+/// read by the renderer thread (acquire).
+in_flight: std.atomic.Value(bool) = .init(false),
+
 /// The frame drawn into this target last had cells built at this target's
 /// size (macOS host-sized surfaces present only such frames in a display
 /// pass of a new size, `Metal.presentHostSized`). Set before each draw.

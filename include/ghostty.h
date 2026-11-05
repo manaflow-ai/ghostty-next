@@ -1633,11 +1633,13 @@ GHOSTTY_API void ghostty_surface_host_frame_committed(ghostty_surface_t);
 // than the capacity grows the target it is drawn into once, to that size.
 // 0, 0 clears the capacity (at the landing; clear it before the landing
 // size's ghostty_surface_set_size): the renderer thread wakes (one
-// renderer_draw_now), gives back every target larger than the host size once
-// no frame is in flight (it waits for them at most 8 ms, else it tries again
-// at its next draw), and then draws a frame at the host size in a target of
-// that size, so the layer stops showing a capacity surface even when nothing
-// else draws. A given-back target makes a new one at its next frame. Counted
+// renderer_draw_now), gives back at once every target larger than the host
+// size that no frame is drawing (it never waits), and draws the landing frame
+// at the host size in a target of that size, so the layer stops showing a
+// capacity surface even when nothing else draws. A target whose frame was in
+// flight goes back when that frame completes, on the GPU completion thread,
+// with no further draw. A given-back target makes a new one at its next
+// frame. Counted
 // in host_target_allocs, host_target_bytes (peak) and host_target_live_bytes.
 // Default: no capacity (each target has its frame's size). No effect on iOS.
 // Main thread.

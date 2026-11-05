@@ -466,47 +466,36 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.frame_sema.post(global.io());
             }
 
-            /// How long `trim` waits for the frames in flight before it leaves
-            /// the targets to the next draw.
-            const trim_wait_ns = 8 * std.time.ns_per_ms;
-
             /// After the host clears its capacity (Metal `setHostCapacity`):
-            /// gives back every render target larger than `width` x `height`,
-            /// so the surface keeps no capacity-sized target after the gesture,
-            /// even when it draws nothing more (no output, a hidden cursor).
-            /// Every frame must be idle: a frame in flight presents from its
-            /// target when it completes. It waits for them at most
-            /// `trim_wait_ns`; past that the targets stay and the next draw
-            /// tries again. A given-back target is empty until the next frame
-            /// drawn into it makes one of its size (`FrameState.fit`); the one
-            /// the layer shows stays on screen (the layer holds its own
-            /// reference until a newer frame replaces it). Returns whether it
-            /// gave one back: the caller then draws a frame at this size now,
-            /// so the layer stops showing a capacity surface. Caller holds the
-            /// draw mutex and no frame (`nextFrame`).
+            /// gives back at once every render target larger than `width` x
+            /// `height` that no frame is drawing (`Target.in_flight`), so the
+            /// surface keeps no capacity-sized target after the gesture, even
+            /// when it draws nothing more (no output, a hidden cursor). It
+            /// never waits: a target in flight goes back when its frame
+            /// completes (Metal `frameDone`). A given-back target is empty
+            /// until the next frame drawn into it makes one of its size
+            /// (`FrameState.fit`); the one the layer shows stays on screen (the
+            /// layer holds its own reference until a newer frame replaces it).
+            /// Returns whether it gave one back. Caller holds the draw mutex
+            /// and no frame (`nextFrame`).
             pub fn trim(self: *SwapChain, api: *GraphicsAPI, width: usize, height: usize) bool {
                 if (comptime !@hasDecl(GraphicsAPI, "trimArmed")) return false;
                 if (!api.trimArmed()) return false;
-                // Only the draw mutex's holder changes a target: reading their
-                // sizes while frames are in flight is safe.
+                var released = false;
+                var in_flight = false;
                 for (&self.frames) |*frame| {
-                    if (frame.target.largerThan(width, height)) break;
-                } else {
-                    // Nothing larger than this size: nothing to give back.
-                    api.trimDone();
-                    return false;
+                    // Its completion owns it until it clears the flag.
+                    if (frame.target.in_flight.load(.acquire)) {
+                        in_flight = true;
+                        continue;
+                    }
+                    if (frame.target.largerThan(width, height)) {
+                        frame.target.release();
+                        released = true;
+                    }
                 }
-                if (!self.waitIdle(trim_wait_ns)) return false;
-                defer {
-                    for (0..buf_count) |_| self.frame_sema.post(global.io());
-                }
-                // A new capacity (the next gesture) reuses the targets.
-                if (!api.trimArmed()) return false;
-                for (&self.frames) |*frame| {
-                    if (frame.target.largerThan(width, height)) frame.target.release();
-                }
-                api.trimDone();
-                return true;
+                if (!in_flight) api.trimDone();
+                return released;
             }
         };
 
@@ -2148,12 +2137,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     break :rebuild .{ &self.swap_chain.?, true };
                 };
 
-            // A cleared host capacity (Metal `setHostCapacity`) gives the
-            // capacity-sized targets back (`SwapChain.trim`), and a frame is
-            // then drawn now at this size, so the layer stops showing a
-            // capacity surface. Never in the main thread's sync draws: the
-            // trim can wait for frames in flight.
-            const trimmed = !sync and swap_chain.trim(&self.api, surface_size.width, surface_size.height);
+            // A cleared host capacity (Metal `setHostCapacity`): the targets
+            // larger than this size that no frame is drawing go back now
+            // (`SwapChain.trim`, which never waits; one in flight goes back
+            // when its frame completes), and the landing frame is drawn now
+            // at this size, so the layer stops showing a capacity surface.
+            const landing = if (comptime @hasDecl(GraphicsAPI, "takeLandingDue")) landing: {
+                _ = swap_chain.trim(&self.api, surface_size.width, surface_size.height);
+                break :landing self.api.takeLandingDue();
+            } else false;
 
             const size_changed =
                 self.size.screen.width != surface_size.width or
@@ -2167,7 +2159,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const needs_redraw =
                 size_changed or
                 swap_chain_rebuilt or
-                trimmed or
+                landing or
                 self.cells_rebuilt or
                 self.animationWake() != null or
                 sync;
