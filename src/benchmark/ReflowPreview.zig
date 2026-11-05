@@ -9,7 +9,7 @@
 //! Each step runs `frames` frames: the width steps down one column per
 //! frame and back, and the height changes every 8 frames. At the end of
 //! the run it prints the per-frame p50, p95, p99 and max, and the time
-//! of `source` alone.
+//! of `source` alone. Run: `ghostty-bench +reflow-preview` (zig build -Demit-bench).
 const ReflowPreviewBench = @This();
 
 const std = @import("std");
@@ -29,6 +29,8 @@ state: renderer.State = undefined,
 preview: ReflowPreview = .{},
 total: std.ArrayList(u64) = .empty,
 locked: std.ArrayList(u64) = .empty,
+copy_ns: std.ArrayList(u64) = .empty,
+reflow_ns: std.ArrayList(u64) = .empty,
 
 pub const Options = struct {
     @"terminal-cols": u16 = 200,
@@ -43,6 +45,11 @@ pub const Options = struct {
 
     /// Steps (gestures) per run.
     loops: u32 = 5,
+
+    /// Also time the two parts of a rebuild apart: the copy of the live
+    /// terminal (under the terminal lock) and the reflow of the copy (off
+    /// the lock).
+    split: bool = true,
 };
 
 pub fn create(alloc: Allocator, opts: Options) !*ReflowPreviewBench {
@@ -64,8 +71,12 @@ pub fn create(alloc: Allocator, opts: Options) !*ReflowPreviewBench {
 pub fn destroy(self: *ReflowPreviewBench, alloc: Allocator) void {
     report("frame", self.total.items);
     report("source (under the lock; the copy in update also holds it)", self.locked.items);
+    report("split: copy (under the terminal lock)", self.copy_ns.items);
+    report("split: reflow (off the lock)", self.reflow_ns.items);
     self.total.deinit(alloc);
     self.locked.deinit(alloc);
+    self.copy_ns.deinit(alloc);
+    self.reflow_ns.deinit(alloc);
     self.preview.deinit(alloc);
     self.terminal.deinit(alloc);
     alloc.destroy(self);
@@ -130,7 +141,25 @@ fn step(ptr: *anyopaque) Benchmark.Error!void {
             lock_ns = t1.durationTo(t2).nanoseconds;
             self.total.append(self.alloc, @intCast(t0.durationTo(t2).nanoseconds)) catch return error.BenchmarkFailed;
             self.locked.append(self.alloc, @intCast(lock_ns)) catch return error.BenchmarkFailed;
+            if (self.opts.split) try self.splitFrame(fit);
         }
     }
     if (self.terminal.cols != cols or self.terminal.rows != rows) return error.BenchmarkFailed;
+}
+
+/// One rebuild at `fit`, its copy and its reflow timed apart.
+fn splitFrame(self: *ReflowPreviewBench, fit: renderer.GridSize) Benchmark.Error!void {
+    const io = global.io();
+    const t0: std.Io.Timestamp = .now(io, .awake);
+    var copy = copy: {
+        self.state.lockDemand(io);
+        defer self.state.unlockDemand(io);
+        break :copy ReflowPreview.snapshot(self.alloc, self.state.terminal, fit) catch return error.BenchmarkFailed;
+    };
+    defer copy.deinit(self.alloc);
+    const t1: std.Io.Timestamp = .now(io, .awake);
+    ReflowPreview.reflow(self.alloc, &copy, fit) catch return error.BenchmarkFailed;
+    const t2: std.Io.Timestamp = .now(io, .awake);
+    self.copy_ns.append(self.alloc, @intCast(t0.durationTo(t1).nanoseconds)) catch return error.BenchmarkFailed;
+    self.reflow_ns.append(self.alloc, @intCast(t1.durationTo(t2).nanoseconds)) catch return error.BenchmarkFailed;
 }
