@@ -473,6 +473,42 @@ test "reflow preview: a frame whose only change is the grid copies nothing under
     try testing.expectEqual(@as(u64, 2), preview.locked_copies);
 }
 
+test "reflow preview: a real resize of the live terminal during a preview takes a fresh copy at the next frame" {
+    const alloc = testing.allocator;
+    var live = try Terminal.init(global.io(), alloc, .{ .cols = 10, .rows = 4 });
+    defer live.deinit(alloc);
+    try live.printString("0123456789ABCDEFGHIJ");
+
+    var mutex: std.Io.Mutex = .init;
+    var state: renderer.State = .{ .mutex = &mutex, .terminal = &live };
+    var preview: ReflowPreview = .{};
+    defer preview.deinit(alloc);
+
+    // Frames of a drag: one copy, then re-wraps of the kept copy.
+    _ = testFrame(&preview, alloc, &state, .{ .columns = 6, .rows = 4 });
+    _ = testFrame(&preview, alloc, &state, .{ .columns = 7, .rows = 4 });
+    try testing.expectEqual(@as(u64, 1), preview.locked_copies);
+
+    // Mouse-up: the PTY owner applies a grid (set_grid resizes the live
+    // terminal) that is not the next frame's grid, and the shell then
+    // prints at that grid.
+    try live.resize(alloc, .{ .cols = 8, .rows = 4, .reflow = true });
+    try live.printString("KL");
+    try testing.expectEqual(@as(u16, 8), live.cols);
+
+    // The next frame (a grid that still differs from the live one) copies
+    // the resized live terminal again and draws its text at the frame's
+    // grid: never the copy taken before the resize.
+    const drawn = testFrame(&preview, alloc, &state, .{ .columns = 6, .rows = 4 });
+    try testing.expect(drawn != &live);
+    try testing.expectEqual(@as(u16, 6), drawn.cols);
+    try testing.expectEqual(@as(u64, 2), preview.locked_copies);
+    const rows = try testRows(alloc, drawn);
+    defer alloc.free(rows);
+    try testing.expectEqualStrings("012345\n6789AB\nCDEFGH\nIJKL", rows);
+    try testing.expectEqual(@as(u16, 8), live.cols);
+}
+
 test "reflow preview: output during the gesture shows in the re-wrapped frame" {
     const alloc = testing.allocator;
     var live = try Terminal.init(global.io(), alloc, .{ .cols = 10, .rows = 4 });
