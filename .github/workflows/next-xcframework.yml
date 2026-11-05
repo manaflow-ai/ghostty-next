@@ -100,6 +100,6 @@ jobs:
             -Dapp-runtime=none \
             -Demit-macos-app=false \
             -Dsentry=false
-          for i in 1 2 3; do ./zig-out/bin/ghostty-bench reflow-preview; done
-          ./zig-out/bin/ghostty-bench reflow-preview --terminal-cols=300 --terminal-rows=80 --fill-lines=20000
+          for i in 1 2 3; do ./zig-out/bin/ghostty-bench +reflow-preview; done
+          ./zig-out/bin/ghostty-bench +reflow-preview --terminal-cols=300 --terminal-rows=80 --fill-lines=20000
 
