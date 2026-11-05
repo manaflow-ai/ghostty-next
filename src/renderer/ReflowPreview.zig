@@ -73,6 +73,10 @@ failed_fit: renderer.GridSize = .{},
 /// reads it (`ghostty_surface_drawn_grid`).
 drawn_grid: std.atomic.Value(u32) = .init(0),
 
+/// Copies of the live terminal taken under the terminal lock (tests,
+/// `ghostty-bench +reflow-preview`). Renderer thread only.
+locked_copies: u64 = 0,
+
 pub fn deinit(self: *ReflowPreview, alloc: Allocator) void {
     if (self.terminal) |*t| t.deinit(alloc);
     self.watch.deinit(alloc);
@@ -143,6 +147,7 @@ pub fn update(
         self.watch.endUpdate();
         if (!grid_changed and !live_changed) return;
 
+        self.locked_copies += 1;
         break :copy snapshot(alloc, state.terminal, fit) catch |err| {
             log.warn("reflow preview copy failed err={}", .{err});
             self.end(alloc);
@@ -206,6 +211,7 @@ pub fn source(
 
 /// Build the preview under the terminal lock. False on a failure.
 fn buildLocked(self: *ReflowPreview, alloc: Allocator, live: *const Terminal, fit: renderer.GridSize) bool {
+    self.locked_copies += 1;
     var copy = snapshot(alloc, live, fit) catch |err| {
         log.warn("reflow preview copy failed err={}", .{err});
         return false;
@@ -379,6 +385,40 @@ test "reflow preview: a preview size per frame re-wraps the drawn rows and leave
         defer alloc.free(live_now);
         try testing.expectEqualStrings(live_before, live_now);
     }
+}
+
+test "reflow preview: a frame whose only change is the grid copies nothing under the terminal lock" {
+    const alloc = testing.allocator;
+    var live = try Terminal.init(global.io(), alloc, .{ .cols = 10, .rows = 4 });
+    defer live.deinit(alloc);
+    try live.printString("0123456789ABCDEFGHIJ");
+
+    var mutex: std.Io.Mutex = .init;
+    var state: renderer.State = .{ .mutex = &mutex, .terminal = &live };
+    var preview: ReflowPreview = .{};
+    defer preview.deinit(alloc);
+
+    // The first frame of the gesture copies the live terminal once.
+    _ = testFrame(&preview, alloc, &state, .{ .columns = 9, .rows = 4 });
+    try testing.expectEqual(@as(u64, 1), preview.locked_copies);
+
+    // Each later frame has a new grid and the same live terminal: the
+    // re-wrap comes from the copy the preview holds, off the lock.
+    for ([_]u16{ 8, 7, 6, 5, 6, 7 }) |c| {
+        const drawn = testFrame(&preview, alloc, &state, .{ .columns = c, .rows = 4 });
+        try testing.expectEqual(c, drawn.cols);
+    }
+    try testing.expectEqual(@as(u64, 1), preview.locked_copies);
+
+    // Output changes the live terminal: the next frame copies it again.
+    try live.printString("KL");
+    {
+        const drawn = testFrame(&preview, alloc, &state, .{ .columns = 8, .rows = 4 });
+        const rows = try testRows(alloc, drawn);
+        defer alloc.free(rows);
+        try testing.expectEqualStrings("01234567\n89ABCDEF\nGHIJKL", rows);
+    }
+    try testing.expectEqual(@as(u64, 2), preview.locked_copies);
 }
 
 test "reflow preview: output during the gesture shows in the re-wrapped frame" {
