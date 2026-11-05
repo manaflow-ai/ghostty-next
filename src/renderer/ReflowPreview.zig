@@ -505,7 +505,16 @@ test "reflow preview: a real resize of the live terminal during a preview takes 
     try testing.expectEqual(@as(u64, 2), preview.locked_copies);
     const rows = try testRows(alloc, drawn);
     defer alloc.free(rows);
-    try testing.expectEqualStrings("012345\n6789AB\nCDEFGH\nIJKL", rows);
+
+    // The reference: the resized live terminal (with "KL") reflowed to
+    // the frame's grid on its own copy.
+    var reference = try snapshot(alloc, &live, historyNeed(live.cols, .{ .columns = 6, .rows = 4 }));
+    defer reference.deinit(alloc);
+    try reflow(alloc, &reference, .{ .columns = 6, .rows = 4 });
+    const expected = try testRows(alloc, &reference);
+    defer alloc.free(expected);
+    try testing.expectEqualStrings(expected, rows);
+    try testing.expect(std.mem.indexOf(u8, rows, "KL") != null);
     try testing.expectEqual(@as(u16, 8), live.cols);
 }
 
