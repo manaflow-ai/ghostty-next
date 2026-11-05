@@ -8,6 +8,8 @@ const objc = @import("objc");
 const macos = @import("macos");
 
 const IOSurface = macos.iosurface.IOSurface;
+const mtl = @import("api.zig");
+const Device = @import("Device.zig");
 
 const log = std.log.scoped(.IOSurfaceLayer);
 
@@ -958,4 +960,223 @@ test "host present: an off-main present never commits while it holds the Core An
 
 test "host present: an off-main present never commits while it holds the Core Animation lock (renderer)" {
     try testOffMainCommitOrder(false);
+}
+
+/// Fills `surface` with a picture in which every pixel has its own color: blue from its column, green from its row,
+/// and red high inside the top-left `drawn_width` x `drawn_height` pixels (the frame of a capacity target), low outside.
+fn testPicture(surface: *IOSurface, drawn_width: usize, drawn_height: usize) void {
+    surface.lock();
+    defer surface.unlock();
+    const base = surface.getBaseAddress().?;
+    const bytes_per_row = surface.getBytesPerRow();
+    for (0..surface.getHeight()) |y| {
+        for (0..surface.getWidth()) |x| {
+            const pixel = base + y * bytes_per_row + x * 4;
+            pixel[0] = @intCast(x * 30 + 10);
+            pixel[1] = @intCast(y * 30 + 10);
+            pixel[2] = if (x < drawn_width and y < drawn_height) 200 else 20;
+            pixel[3] = 255;
+        }
+    }
+}
+
+/// What Core Animation shows of `layer`: its layer tree rendered (CARenderer, on `device`) into a `width` x `height`
+/// BGRA texture, read back row by row. The layer has `width` x `height` points at scale 1, nearest filtering, so one
+/// point is one surface pixel.
+fn testRendered(device: objc.Object, layer: objc.Object, width: usize, height: usize, out: []u32) !void {
+    const rect: macos.graphics.Rect = .{
+        .origin = .{ .x = 0, .y = 0 },
+        .size = .{ .width = @floatFromInt(width), .height = @floatFromInt(height) },
+    };
+    layer.setProperty("contentsScale", @as(f64, 1));
+    layer.setProperty("anchorPoint", macos.graphics.Point{ .x = 0, .y = 0 });
+    layer.setProperty("position", macos.graphics.Point{ .x = 0, .y = 0 });
+    layer.setProperty("bounds", rect);
+    const NSString = objc.getClass("NSString").?;
+    const nearest = NSString.msgSend(objc.Object, objc.sel("stringWithUTF8String:"), .{"nearest"});
+    layer.setProperty("magnificationFilter", nearest.value);
+    layer.setProperty("minificationFilter", nearest.value);
+
+    const unified = device.getProperty(bool, "hasUnifiedMemory");
+    const descriptor = objc.getClass("MTLTextureDescriptor").?.msgSend(
+        objc.Object,
+        objc.sel("texture2DDescriptorWithPixelFormat:width:height:mipmapped:"),
+        .{ @as(c_ulong, 80), @as(c_ulong, width), @as(c_ulong, height), false },
+    );
+    descriptor.setProperty("usage", @as(c_ulong, 5)); // shader read | render target
+    descriptor.setProperty("storageMode", @as(c_ulong, if (unified) 0 else 1)); // shared | managed
+    const texture = objc.Object.fromId(
+        device.msgSend(?*anyopaque, objc.sel("newTextureWithDescriptor:"), .{descriptor}) orelse return error.MetalFailed,
+    );
+    defer texture.release();
+    const queue = device.msgSend(objc.Object, objc.sel("newCommandQueue"), .{});
+    defer queue.release();
+
+    const TestCA = struct {
+        extern "c" const kCARendererMetalCommandQueue: objc.c.id;
+        extern "c" fn CACurrentMediaTime() f64;
+    };
+    const options = objc.getClass("NSDictionary").?.msgSend(
+        objc.Object,
+        objc.sel("dictionaryWithObject:forKey:"),
+        .{ queue.value, TestCA.kCARendererMetalCommandQueue },
+    );
+    const renderer = objc.getClass("CARenderer").?.msgSend(
+        objc.Object,
+        objc.sel("rendererWithMTLTexture:options:"),
+        .{ texture.value, options.value },
+    );
+    renderer.setProperty("layer", layer.value);
+    renderer.setProperty("bounds", rect);
+    // The layer's changes reach the render tree with a commit.
+    objc.getClass("CATransaction").?.msgSend(void, objc.sel("flush"), .{});
+    renderer.msgSend(void, objc.sel("beginFrameAtTime:timeStamp:"), .{ TestCA.CACurrentMediaTime(), @as(?*anyopaque, null) });
+    renderer.msgSend(void, objc.sel("addUpdateRect:"), .{rect});
+    renderer.msgSend(void, objc.sel("render"), .{});
+    renderer.msgSend(void, objc.sel("endFrame"), .{});
+    // The renderer encodes on `queue`: a command buffer after its work completes after it.
+    const done = queue.msgSend(objc.Object, objc.sel("commandBuffer"), .{});
+    if (!unified) {
+        const blit = done.msgSend(objc.Object, objc.sel("blitCommandEncoder"), .{});
+        blit.msgSend(void, objc.sel("synchronizeResource:"), .{texture.value});
+        blit.msgSend(void, objc.sel("endEncoding"), .{});
+    }
+    done.msgSend(void, objc.sel("commit"), .{});
+    done.msgSend(void, objc.sel("waitUntilCompleted"), .{});
+    texture.msgSend(void, objc.sel("getBytes:bytesPerRow:fromRegion:mipmapLevel:"), .{
+        @as(*anyopaque, @ptrCast(out.ptr)),
+        @as(c_ulong, width * 4),
+        mtl.MTLRegion{
+            .origin = .{ .x = 0, .y = 0, .z = 0 },
+            .size = .{ .width = width, .height = height, .depth = 1 },
+        },
+        @as(c_ulong, 0),
+    });
+}
+
+test "host present: a capacity frame shows only its drawn pixels, top-left" {
+    // cmux FRAME OWNER S4, plan B: while the host sets a capacity, a frame is drawn in the top-left corner of a larger
+    // target, and the layer shows only that part (contentsRect). Rendered by Core Animation, the layer must show
+    // exactly the drawn pixels: none of the rest of the surface, unscaled, and the right way up (the surface's first
+    // row, the one Metal draws first, at the top, as when a frame fills its surface). This also settles which way
+    // the unit rect's y runs for an IOSurface (`contents_rect_y_up`).
+    const testing = std.testing;
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    var device = try Device.initForTest();
+    defer device.deinit();
+
+    // A capacity target of 8 x 8 pixels with a frame drawn at 6 x 4.
+    const surface = try testSurface(8, 8);
+    defer surface.release();
+    testPicture(surface, 6, 4);
+
+    // The whole surface, as a frame that fills its target shows: surface row y is layer row y from the top. Which
+    // way the rendered texture runs is the renderer's; the red marks of the drawn rows tell it.
+    var whole = try IOSurfaceLayer.init();
+    defer whole.release();
+    whole.setSurfaceSync(.whole(surface));
+    var reference: [8 * 8]u32 = undefined;
+    try testRendered(device.device, whole.layer, 8, 8, &reference);
+    const red = struct {
+        fn of(pixel: u32) u32 {
+            return (pixel >> 16) & 0xff;
+        }
+    }.of;
+    const first_drawn = red(reference[0]) > 100;
+    const last_drawn = red(reference[7 * 8]) > 100;
+    // Exactly one end of the texture holds the drawn rows: the picture is not stretched or empty.
+    try testing.expect(first_drawn != last_drawn);
+    const texture_row_0_is_top = first_drawn;
+
+    // The capacity frame, in a layer of its own size.
+    var layer = try IOSurfaceLayer.init();
+    defer layer.release();
+    layer.setSurfaceSync(.{ .surface = surface, .width = 6, .height = 4 });
+    try testing.expectEqual(@as(?Size, .{ .width = 6, .height = 4 }), layer.shownSize());
+    var shown: [6 * 4]u32 = undefined;
+    try testRendered(device.device, layer.layer, 6, 4, &shown);
+    // Layer row r from the top shows surface row r, column c shows column c: the pixel the whole surface showed there.
+    for (0..4) |row| {
+        for (0..6) |column| {
+            const shown_row = if (texture_row_0_is_top) row else 3 - row;
+            const whole_row = if (texture_row_0_is_top) row else 7 - row;
+            testing.expectEqual(reference[whole_row * 8 + column], shown[shown_row * 6 + column]) catch |err| {
+                std.debug.print("layer pixel ({d}, {d}) from the top-left is not surface pixel ({d}, {d})\n", .{ column, row, column, row });
+                return err;
+            };
+        }
+    }
+
+    // In bounds larger than the frame (a drag ahead of it), the frame stays in the top-left corner, unscaled.
+    var ahead = try IOSurfaceLayer.init();
+    defer ahead.release();
+    ahead.setSurfaceSync(.{ .surface = surface, .width = 6, .height = 4 });
+    var wide: [8 * 8]u32 = undefined;
+    try testRendered(device.device, ahead.layer, 8, 8, &wide);
+    for (0..4) |row| {
+        for (0..6) |column| {
+            const texture_row = if (texture_row_0_is_top) row else 7 - row;
+            try testing.expectEqual(reference[texture_row * 8 + column], wide[texture_row * 8 + column]);
+        }
+    }
+}
+
+test "host present: a frame that fills its surface keeps the whole surface as its contents rect" {
+    // No capacity (the default): every present sets the unit contentsRect, as the layer had before.
+    const testing = std.testing;
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    var layer = try IOSurfaceLayer.init();
+    defer layer.release();
+    const capacity = try testSurface(160, 60);
+    defer capacity.release();
+    const whole = try testSurface(80, 60);
+    defer whole.release();
+
+    layer.setSurfaceSync(.{ .surface = capacity, .width = 120, .height = 60 });
+    try testing.expectEqual(@as(?Size, .{ .width = 120, .height = 60 }), layer.shownSize());
+    layer.setSurfaceSync(.whole(whole));
+    const rect = layer.layer.getProperty(macos.graphics.Rect, "contentsRect");
+    try testing.expectEqual(@as(f64, 0), rect.origin.x);
+    try testing.expectEqual(@as(f64, 0), rect.origin.y);
+    try testing.expectEqual(@as(f64, 1), rect.size.width);
+    try testing.expectEqual(@as(f64, 1), rect.size.height);
+    try testing.expectEqual(@as(?Size, .{ .width = 80, .height = 60 }), layer.shownSize());
+}
+
+test "host present: an off-main frame of a capacity target compares its drawn size, not its surface's" {
+    // Every size rule of the S4 present mode compares drawn sizes: a capacity target's IOSurface is larger than the
+    // frame drawn in it. A content-only frame at the host size goes off main into a layer that shows a frame of that
+    // drawn size, and a frame of another drawn size in the same surface does not.
+    const testing = std.testing;
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    var layer = try IOSurfaceLayer.init();
+    defer layer.release();
+    const shown = try testSurface(160, 60);
+    defer shown.release();
+    const next = try testSurface(160, 60);
+    defer next.release();
+    layer.setSurfaceSync(.{ .surface = shown, .width = 120, .height = 60 });
+    layer.setHostSize((120 << 32) | 60);
+    layer.setEmbedderPresents(true);
+    layer.setEmbedderCommitted();
+
+    try testing.expect(layer.setSurfaceOffMain(.{ .surface = next, .width = 120, .height = 60 }, 1));
+    try testing.expectEqual(@as(?*anyopaque, @ptrCast(next)), layer.layer.getProperty(?*anyopaque, "contents"));
+    // The host moved on: a frame drawn at 130 in the same surface is a new size; it goes through main.
+    layer.setHostSize((130 << 32) | 60);
+    try testing.expect(!layer.setSurfaceOffMain(.{ .surface = shown, .width = 130, .height = 60 }, 2));
+    // The embedder shows it with its bounds: the layer's bounds (80 points) have neither size.
+    layer.layer.setProperty("contentsScale", @as(f64, 1));
+    layer.layer.setProperty("bounds", macos.graphics.Rect{
+        .origin = .{ .x = 0, .y = 0 },
+        .size = .{ .width = 80, .height = 60 },
+    });
+    try testing.expect(layer.embedderShowsFrameLocked(130, 60));
+    try testing.expect(!layer.embedderShowsFrameLocked(120, 60));
 }

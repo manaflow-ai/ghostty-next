@@ -1472,3 +1472,152 @@ test "host present: the old present calls follow the embedder's ordered present"
     const contents = metal.layer.layer.getProperty(?*anyopaque, "contents");
     try testing.expectEqual(@as(?*anyopaque, @ptrCast(fresh)), contents);
 }
+
+/// The size of the frame the layer shows (drawn size) and its contents rect.
+fn testExpectShows(metal: *Metal, target: *const Target) !void {
+    const testing = std.testing;
+    const shown = metal.layer.shownSize() orelse return error.NothingShown;
+    try testing.expectEqual(target.drawn_width, shown.width);
+    try testing.expectEqual(target.drawn_height, shown.height);
+    const contents = metal.layer.layer.getProperty(?*anyopaque, "contents");
+    try testing.expectEqual(@as(?*anyopaque, @ptrCast(target.surface)), contents);
+    // Exactly the drawn pixels: the top-left drawn_width x drawn_height of the surface.
+    const rect = metal.layer.layer.getProperty(graphics.Rect, "contentsRect");
+    const expected = IOSurfaceLayer.drawnRect(.{
+        .surface = target.surface,
+        .width = target.drawn_width,
+        .height = target.drawn_height,
+    });
+    try testing.expectEqual(expected.origin.x, rect.origin.x);
+    try testing.expectEqual(expected.origin.y, rect.origin.y);
+    try testing.expectEqual(expected.size.width, rect.size.width);
+    try testing.expectEqual(expected.size.height, rect.size.height);
+    try testing.expectEqual(
+        @as(f64, @floatFromInt(target.drawn_width)) / @as(f64, @floatFromInt(target.width)),
+        rect.size.width,
+    );
+}
+
+/// One frame of a resize: the host size changes, the renderer gives the next swap-chain frame its target
+/// (`fitTarget`, as `drawFrame` does), and the frame completes and presents.
+fn testResizeFrame(metal: *Metal, target: *Target, width: u32, height: u32) !void {
+    metal.setHostDrawableSize(true, width, height);
+    try metal.fitTarget(target, width, height, false);
+    target.cells_fresh = true;
+    target.size_generation = metal.sizeGeneration();
+    try metal.present(target.*, false);
+}
+
+test "host present: a held-key resize makes at most one render target per swap-chain frame with a host capacity" {
+    // cmux FRAME OWNER S4 (contract m14): in a held-key resize every moving terminal presents a frame at its pane's
+    // size each frame. Each new size made a new IOSurface and MTLTexture per frame (FrameState.resize -> initTarget):
+    // IOSurfaceCreate 7 -> 57 ms, newTextureWithDescriptor:iosurface 15 -> 36 ms, __mmap 30 -> 104 ms per round in
+    // cmux's held keys-stress. With the gesture's largest size as the host capacity, each swap-chain frame keeps one
+    // target for the whole gesture: at most one allocation per target (one each to reach the capacity), not one per
+    // frame. Each frame is still drawn at its host size, and the layer shows exactly those pixels.
+    const testing = std.testing;
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    var device = try Device.initForTest();
+    defer device.deinit();
+    var metal = try testMetal(&device);
+    defer testDeinit(&metal);
+
+    // At rest: the swap chain's targets have the pane's size, and one of them is shown.
+    var targets: [swap_chain_count]Target = undefined;
+    for (&targets) |*target| target.* = try metal.initTarget(80, 60);
+    defer for (&targets) |*target| target.deinit();
+    try testResizeFrame(&metal, &targets[0], 80, 60);
+    try testExpectShows(&metal, &targets[0]);
+    const at_rest = metal.counters.target_allocs.load(.monotonic);
+    try testing.expectEqual(@as(u64, swap_chain_count), at_rest);
+
+    // The gesture: 24 frames, each at a new size, all inside the capacity.
+    metal.setHostCapacity(160, 60);
+    const frames = 24;
+    var replaced = [_]u32{0} ** swap_chain_count;
+    for (0..frames) |i| {
+        const index = (i + 1) % swap_chain_count;
+        const target = &targets[index];
+        const surface = target.surface;
+        const width: u32 = @intCast(81 + 3 * i);
+        try testResizeFrame(&metal, target, width, 60);
+        if (target.surface != surface) replaced[index] += 1;
+        try testing.expectEqual(@as(usize, width), target.drawn_width);
+        try testing.expectEqual(@as(usize, 60), target.drawn_height);
+        try testing.expect(target.width >= 160 and target.height >= 60);
+        try testExpectShows(&metal, target);
+    }
+    // Each target was replaced at most once (to reach the capacity), and the counter agrees.
+    for (replaced) |count| try testing.expect(count <= 1);
+    const gesture = metal.counters.target_allocs.load(.monotonic) - at_rest;
+    try testing.expect(gesture <= swap_chain_count);
+    var replacements: u64 = 0;
+    for (replaced) |count| replacements += count;
+    try testing.expectEqual(replacements, gesture);
+
+    // A size past the capacity grows that target once, to that size; another frame at it allocates nothing.
+    const past = &targets[(frames + 1) % swap_chain_count];
+    const before_past = metal.counters.target_allocs.load(.monotonic);
+    try testResizeFrame(&metal, past, 200, 60);
+    try testing.expectEqual(before_past + 1, metal.counters.target_allocs.load(.monotonic));
+    try testing.expectEqual(@as(usize, 200), past.width);
+    try testExpectShows(&metal, past);
+    try testResizeFrame(&metal, past, 190, 60);
+    try testing.expectEqual(before_past + 1, metal.counters.target_allocs.load(.monotonic));
+    try testExpectShows(&metal, past);
+
+    // The landing clears the capacity: the next frame gets a target of its own size, shown whole.
+    metal.setHostCapacity(0, 0);
+    const landing = &targets[(frames + 2) % swap_chain_count];
+    try testResizeFrame(&metal, landing, 120, 60);
+    try testing.expectEqual(@as(usize, 120), landing.width);
+    try testing.expectEqual(@as(usize, 60), landing.height);
+    try testExpectShows(&metal, landing);
+    const rect = metal.layer.layer.getProperty(graphics.Rect, "contentsRect");
+    try testing.expectEqual(@as(f64, 1), rect.size.width);
+    try testing.expectEqual(@as(f64, 1), rect.size.height);
+
+    // The peak bytes count the swap chain at the capacity; the live bytes are the targets alive now.
+    const capacity_bytes = 160 * 60 * 4;
+    try testing.expect(metal.counters.target_bytes_peak.load(.monotonic) >= swap_chain_count * capacity_bytes);
+    var live: u64 = 0;
+    for (&targets) |*target| live += target.surface.getAllocSize();
+    try testing.expectEqual(live, metal.counters.target_bytes_live.load(.monotonic));
+}
+
+test "host present: without a host capacity each new size makes a target of exactly that size" {
+    // The default (no capacity, and cmux with its switch off) is unchanged: one new target per frame at a new size,
+    // of exactly that size, shown whole.
+    const testing = std.testing;
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    var device = try Device.initForTest();
+    defer device.deinit();
+    var metal = try testMetal(&device);
+    defer testDeinit(&metal);
+
+    var targets: [swap_chain_count]Target = undefined;
+    for (&targets) |*target| target.* = try metal.initTarget(80, 60);
+    defer for (&targets) |*target| target.deinit();
+    try testResizeFrame(&metal, &targets[0], 80, 60);
+    const at_rest = metal.counters.target_allocs.load(.monotonic);
+
+    for (0..6) |i| {
+        const target = &targets[(i + 1) % swap_chain_count];
+        const width: u32 = @intCast(81 + i);
+        try testResizeFrame(&metal, target, width, 60);
+        try testing.expectEqual(at_rest + i + 1, metal.counters.target_allocs.load(.monotonic));
+        try testing.expectEqual(@as(usize, width), target.width);
+        try testing.expectEqual(@as(usize, 60), target.height);
+        try testExpectShows(&metal, target);
+        const rect = metal.layer.layer.getProperty(graphics.Rect, "contentsRect");
+        try testing.expectEqual(@as(f64, 1), rect.size.width);
+        try testing.expectEqual(@as(f64, 1), rect.size.height);
+    }
+    // The same size again keeps the target.
+    try testResizeFrame(&metal, &targets[(5 + 1) % swap_chain_count], 86, 60);
+    try testing.expectEqual(at_rest + 6, metal.counters.target_allocs.load(.monotonic));
+}
