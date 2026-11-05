@@ -223,7 +223,8 @@ fn buildLocked(self: *ReflowPreview, alloc: Allocator, live: *const Terminal, fi
 
 /// Reflow `copy` to `fit` as the owner's resize does, keeping the prompt:
 /// the owner's prompt redraw comes as output after its own resize.
-fn reflow(alloc: Allocator, copy: *Terminal, fit: renderer.GridSize) !void {
+/// Public for the benchmark (`ghostty-bench +reflow-preview`).
+pub fn reflow(alloc: Allocator, copy: *Terminal, fit: renderer.GridSize) !void {
     copy.flags.shell_redraws_prompt = .false;
     try copy.resize(alloc, .{
         .cols = fit.columns,
@@ -245,8 +246,9 @@ fn end(self: *ReflowPreview, alloc: Allocator) void {
 
 /// A copy of `live` that a reflow to `fit` can fill: the READY state
 /// (both screens, modes, colors, cursor) and the newest history rows the
-/// reflow needs. Caller holds the terminal lock.
-fn snapshot(alloc: Allocator, live: *const Terminal, fit: renderer.GridSize) !Terminal {
+/// reflow needs. Caller holds the terminal lock. Public for the
+/// benchmark (`ghostty-bench +reflow-preview`).
+pub fn snapshot(alloc: Allocator, live: *const Terminal, fit: renderer.GridSize) !Terminal {
     const snap = terminalpkg.snapshot;
 
     var bytes: std.Io.Writer.Allocating = .init(alloc);
