@@ -970,7 +970,7 @@ extern "c" fn dlsym(handle: ?*anyopaque, symbol: [*:0]const u8) ?*anyopaque;
 fn MTLCreateSystemDefaultDevice() ?*anyopaque {
     const handle = dlopen("/System/Library/Frameworks/Metal.framework/Metal", 1) orelse return null;
     const sym = dlsym(handle, "MTLCreateSystemDefaultDevice") orelse return null;
-    const f: *const fn () callconv(.c) ?*anyopaque = @ptrCast(sym);
+    const f: *const fn () callconv(.c) ?*anyopaque = @ptrCast(@alignCast(sym));
     return f();
 }
 
