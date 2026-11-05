@@ -83,6 +83,9 @@ pub const QosClass = enum(c_uint) {
     unspecified = 0x00,
 };
 
+/// The QoS class of the calling thread.
+pub extern "c" fn qos_class_self() QosClass;
+
 extern "c" fn pthread_set_qos_class_self_np(
     qos_class: QosClass,
     relative_priority: c_int,

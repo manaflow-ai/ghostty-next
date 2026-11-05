@@ -277,30 +277,64 @@ fn setQosClass(self: *const Thread) void {
     // Thread QoS classes are only relevant on macOS.
     if (comptime !builtin.target.os.tag.isDarwin()) return;
 
-    const class: internal_os.macos.QosClass = class: {
-        // If we aren't visible (our view is fully occluded) then we
-        // always drop our rendering priority down because it's just
-        // mostly wasted work.
-        //
-        // The renderer itself should be doing this as well (for example
-        // Metal will stop our DisplayLink) but this also helps with
-        // general forced updates and CPU usage i.e. a rebuild cells call.
-        if (!self.flags.visible) break :class .utility;
-
-        // If we're not focused, but we're visible, then we set a higher
-        // than default priority because framerates still matter but it isn't
-        // as important as when we're focused.
-        if (!self.flags.focused) break :class .user_initiated;
-
-        // We are focused and visible, we are the definition of user interactive.
-        break :class .user_interactive;
-    };
-
+    const class = qosClassFor(self.flags.visible, self.flags.focused);
     if (internal_os.macos.setQosClass(class)) {
         log.debug("thread QoS class set class={}", .{class});
     } else |err| {
         log.warn("error setting QoS class err={}", .{err});
     }
+}
+
+/// The QoS class of a renderer thread whose surface is `visible` and
+/// `focused`.
+fn qosClassFor(visible: bool, focused: bool) internal_os.macos.QosClass {
+    // If we aren't visible (our view is fully occluded) then we
+    // always drop our rendering priority down because it's just
+    // mostly wasted work.
+    //
+    // The renderer itself should be doing this as well (for example
+    // Metal will stop our DisplayLink) but this also helps with
+    // general forced updates and CPU usage i.e. a rebuild cells call.
+    if (!visible) return .utility;
+
+    // If we're not focused, but we're visible, then we set a higher
+    // than default priority because framerates still matter but it isn't
+    // as important as when we're focused.
+    if (!focused) return .user_initiated;
+
+    // We are focused and visible, we are the definition of user interactive.
+    return .user_interactive;
+}
+
+test "renderer thread QoS: a visible terminal renders at user_interactive, focused or not" {
+    if (comptime !builtin.target.os.tag.isDarwin()) return error.SkipZigTest;
+    const testing = std.testing;
+    // A resize re-wraps every visible pane in the same frames as the
+    // focused one; an unfocused pane's frame is as late-sensitive.
+    try testing.expectEqual(internal_os.macos.QosClass.user_interactive, qosClassFor(true, false));
+    try testing.expectEqual(internal_os.macos.QosClass.user_interactive, qosClassFor(true, true));
+}
+
+test "renderer thread QoS: a hidden terminal stays at utility" {
+    if (comptime !builtin.target.os.tag.isDarwin()) return error.SkipZigTest;
+    const testing = std.testing;
+    try testing.expectEqual(internal_os.macos.QosClass.utility, qosClassFor(false, false));
+    try testing.expectEqual(internal_os.macos.QosClass.utility, qosClassFor(false, true));
+}
+
+test "renderer thread QoS: the class applied to a visible unfocused surface's thread is user_interactive" {
+    if (comptime !builtin.target.os.tag.isDarwin()) return error.SkipZigTest;
+    const testing = std.testing;
+    const Probe = struct {
+        fn run(out: *internal_os.macos.QosClass) void {
+            internal_os.macos.setQosClass(qosClassFor(true, false)) catch {};
+            out.* = internal_os.macos.qos_class_self();
+        }
+    };
+    var applied: internal_os.macos.QosClass = .unspecified;
+    const thread = try std.Thread.spawn(.{}, Probe.run, .{&applied});
+    thread.join();
+    try testing.expectEqual(internal_os.macos.QosClass.user_interactive, applied);
 }
 
 /// Drain the mailbox.
