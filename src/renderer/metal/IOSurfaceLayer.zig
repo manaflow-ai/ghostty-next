@@ -964,7 +964,15 @@ test "host present: an off-main present never commits while it holds the Core An
 
 extern "c" const kCARendererMetalCommandQueue: objc.c.id;
 extern "c" fn CACurrentMediaTime() f64;
-extern "c" fn MTLCreateSystemDefaultDevice() ?*anyopaque;
+extern "c" fn dlopen(path: [*:0]const u8, mode: c_int) ?*anyopaque;
+extern "c" fn dlsym(handle: ?*anyopaque, symbol: [*:0]const u8) ?*anyopaque;
+
+fn MTLCreateSystemDefaultDevice() ?*anyopaque {
+    const handle = dlopen("/System/Library/Frameworks/Metal.framework/Metal", 1) orelse return null;
+    const sym = dlsym(handle, "MTLCreateSystemDefaultDevice") orelse return null;
+    const f: *const fn () callconv(.c) ?*anyopaque = @ptrCast(sym);
+    return f();
+}
 
 const ProbeRender = struct {
     pixels: [64]u32 = [_]u32{0} ** 64,
