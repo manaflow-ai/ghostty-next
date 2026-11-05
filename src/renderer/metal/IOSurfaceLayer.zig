@@ -21,7 +21,9 @@ var Subclass: ?objc.Class = null;
 layer: objc.Object,
 
 /// A frame for the layer: its IOSurface and the pixel size it was drawn at,
-/// from the surface's top-left corner (`Target.drawn_width`).
+/// from the surface's top-left corner. The surface is larger than that only
+/// while the host sets a capacity (`Metal.setHostCapacity`): the layer then
+/// shows only the drawn pixels (`contentsRect`, `showLocked`).
 pub const Drawn = struct {
     surface: *IOSurface,
     width: usize,
@@ -129,13 +131,63 @@ pub fn setEmbedderPresents(self: *IOSurfaceLayer, enabled: bool) void {
     setMainPending(self.layer, enabled);
 }
 
-/// Whether showing `surface` changes the size of the frame the layer shows
-/// (or shows a first frame): only such a change can leave the view's bounds
-/// behind. Call under the Core Animation lock.
-fn changesShownSize(layer: objc.Object, surface: *IOSurface) bool {
-    const shown = layer.getProperty(?*anyopaque, "contents") orelse return true;
-    const shown_surface: *IOSurface = @ptrCast(shown);
-    return shown_surface.getWidth() != surface.getWidth() or shown_surface.getHeight() != surface.getHeight();
+/// Whether showing a frame drawn at `width` x `height` changes the size of
+/// the frame the layer shows (or shows a first frame): only such a change can
+/// leave the view's bounds behind. Call under the Core Animation lock.
+fn changesShownSize(layer: objc.Object, width: usize, height: usize) bool {
+    const shown = shownSizeLocked(layer) orelse return true;
+    return shown.width != width or shown.height != height;
+}
+
+/// The pixel size of the frame the layer shows, or null while it shows none:
+/// the part of its contents (an IOSurface) that `contentsRect` selects, which
+/// is the whole surface unless the frame was drawn in a larger target (a host
+/// capacity, `showLocked`). Read from the layer itself, so a change of its
+/// contents by the embedder counts too. Call under the Core Animation lock:
+/// `contents` and `contentsRect` change together under it.
+fn shownSizeLocked(layer: objc.Object) ?Size {
+    const shown = layer.getProperty(?*anyopaque, "contents") orelse return null;
+    const surface: *IOSurface = @ptrCast(shown);
+    const rect = layer.getProperty(macos.graphics.Rect, "contentsRect");
+    return .{
+        .width = @intFromFloat(@round(rect.size.width * @as(f64, @floatFromInt(surface.getWidth())))),
+        .height = @intFromFloat(@round(rect.size.height * @as(f64, @floatFromInt(surface.getHeight())))),
+    };
+}
+
+/// The `contentsRect` (unit coordinates of the contents) that shows exactly
+/// the drawn pixels of `frame`: its top-left `width` x `height` pixels. The
+/// unit rect (the whole surface) for a frame drawn over its whole surface.
+pub fn drawnRect(frame: Drawn) macos.graphics.Rect {
+    const surface_width: f64 = @floatFromInt(frame.surface.getWidth());
+    const surface_height: f64 = @floatFromInt(frame.surface.getHeight());
+    const width = @as(f64, @floatFromInt(frame.width)) / surface_width;
+    const height = @as(f64, @floatFromInt(frame.height)) / surface_height;
+    return .{
+        .origin = .{ .x = 0, .y = if (contents_rect_y_up) 1 - height else 0 },
+        .size = .{ .width = width, .height = height },
+    };
+}
+
+/// Whether a `contentsRect` y of 0 is the bottom row of an IOSurface contents
+/// (true) or its top row, the row Metal draws first (false). Proved by the
+/// test "host present: a capacity frame shows only its drawn pixels,
+/// top-left", which renders the layer.
+const contents_rect_y_up = true;
+
+/// Shows `frame`: the layer's contents becomes its surface, and
+/// `contentsRect` selects its drawn pixels, in the same Core Animation lock
+/// span, so no reader sees one without the other. Every present sets both
+/// here. Call under the Core Animation lock.
+fn showLocked(layer: objc.Object, frame: Drawn) void {
+    layer.setProperty("contents", frame.surface);
+    const rect = drawnRect(frame);
+    const current = layer.getProperty(macos.graphics.Rect, "contentsRect");
+    if (current.origin.x != rect.origin.x or current.origin.y != rect.origin.y or
+        current.size.width != rect.size.width or current.size.height != rect.size.height)
+    {
+        layer.setProperty("contentsRect", rect);
+    }
 }
 
 /// The value `setEmbedderPresents` stored.
@@ -143,16 +195,15 @@ fn embedderPresents(layer: objc.Object) bool {
     return @intFromPtr(layer.getInstanceVariable("embedder_presents").value) != 0;
 }
 
-/// The pixel size of the frame the layer shows, or null while it shows
-/// none. Read under the Core Animation lock: a frame presented off the main
-/// thread (`setSurfaceOffMain`) can replace the shown one.
+/// The pixel size of the frame the layer shows (its drawn size, not its
+/// surface's: a capacity target is larger, `shownSizeLocked`), or null while
+/// it shows none. Read under the Core Animation lock: a frame presented off
+/// the main thread (`setSurfaceOffMain`) can replace the shown one.
 pub fn shownSize(self: *IOSurfaceLayer) ?Size {
     const CATransaction = objc.getClass("CATransaction").?;
     CATransaction.msgSend(void, objc.sel("lock"), .{});
     defer CATransaction.msgSend(void, objc.sel("unlock"), .{});
-    const shown = self.layer.getProperty(?*anyopaque, "contents") orelse return null;
-    const surface: *IOSurface = @ptrCast(shown);
-    return .{ .width = surface.getWidth(), .height = surface.getHeight() };
+    return shownSizeLocked(self.layer);
 }
 
 /// Shows `frame`, the frame of present sequence `seq`, in the caller's
@@ -166,7 +217,7 @@ pub fn setSurfacePresented(self: *IOSurfaceLayer, frame: Drawn, seq: u64) bool {
     if (seq <= presentSeq(self.layer)) return false;
     setPresentSeq(self.layer, seq);
     setMainPending(self.layer, true);
-    self.layer.setProperty("contents", frame.surface);
+    showLocked(self.layer, frame);
     return true;
 }
 
@@ -197,23 +248,24 @@ fn setMainPending(layer: objc.Object, pending: bool) void {
     layer.setInstanceVariable("main_pending", .{ .value = @ptrFromInt(stored) });
 }
 
-/// Sets the layer's `contents` to the frame's IOSurface.
+/// Shows `frame` (its surface as the layer's `contents`, `showLocked`).
 ///
 /// Makes sure to do so on the main thread to avoid visual artifacts.
 pub inline fn setSurface(self: *IOSurfaceLayer, frame: Drawn, seq: u64) !void {
-    const surface = frame.surface;
     // We retain the surface to make sure it's not GC'd
     // before we can set it as the contents of the layer.
     //
     // We release in the callback after setting the contents.
-    surface.retain();
+    frame.surface.retain();
     // NOTE: Since `self.layer` is passed as an `objc.c.id`, it's
     //       automatically retained when the block is copied, so we
     //       don't need to retain it ourselves like with the surface.
 
     var block = SetSurfaceBlock.init(.{
         .layer = self.layer.value,
-        .surface = surface,
+        .surface = frame.surface,
+        .width = frame.width,
+        .height = frame.height,
         .seq = seq,
     }, &setSurfaceCallback);
 
@@ -233,41 +285,44 @@ pub inline fn setSurface(self: *IOSurfaceLayer, frame: Drawn, seq: u64) !void {
     }
 }
 
-/// Sets the layer's `contents` to the frame's IOSurface.
+/// Shows `frame` (its surface as the layer's `contents`, `showLocked`).
 ///
 /// Does not ensure this happens on the main thread.
 pub inline fn setSurfaceSync(self: *IOSurfaceLayer, frame: Drawn) void {
-    const surface = frame.surface;
+    // The contents and the contents rect change in one lock span (an
+    // off-main present reads both under the lock).
+    const CATransaction = objc.getClass("CATransaction").?;
+    CATransaction.msgSend(void, objc.sel("lock"), .{});
+    defer CATransaction.msgSend(void, objc.sel("unlock"), .{});
     // Main thread (a display pass, ghostty_surface_draw): with the embedder
     // presenting host sizes, a new size goes with main's commit, so frames go
     // through main until the embedder reports it.
-    if (embedderPresents(self.layer)) {
-        const CATransaction = objc.getClass("CATransaction").?;
-        CATransaction.msgSend(void, objc.sel("lock"), .{});
-        defer CATransaction.msgSend(void, objc.sel("unlock"), .{});
-        if (changesShownSize(self.layer, surface)) setMainPending(self.layer, true);
+    if (embedderPresents(self.layer) and changesShownSize(self.layer, frame.width, frame.height)) {
+        setMainPending(self.layer, true);
     }
-    self.layer.setProperty("contents", surface);
+    showLocked(self.layer, frame);
 }
 
 const SetSurfaceBlock = objc.Block(struct {
     layer: objc.c.id,
     surface: *IOSurface,
+    /// The drawn size of the frame (`Drawn`).
+    width: usize,
+    height: usize,
     seq: u64,
 }, .{}, void);
 
-/// Presents `surface`, a frame that changes only content, from the calling
+/// Presents `frame`, a frame that changes only content, from the calling
 /// (GPU completion) thread in its own Core Animation transaction, without the
 /// main thread: a terminal echo reaches the screen while main is busy. Only
-/// when the frame has the host size (`setHostSize`, nonzero) and the layer
-/// already shows a frame of that size, so no geometry change of the main
-/// thread is pending for it, and only if no newer frame was presented
+/// when the frame was drawn at the host size (`setHostSize`, nonzero) and the
+/// layer already shows a frame of that size, so no geometry change of the
+/// main thread is pending for it, and only if no newer frame was presented
 /// (`seq`). Returns false, and changes nothing, otherwise: the caller then
 /// presents it through the main thread (`setSurface`).
 pub fn setSurfaceOffMain(self: *IOSurfaceLayer, frame: Drawn, seq: u64) bool {
-    const surface = frame.surface;
-    const width = surface.getWidth();
-    const height = surface.getHeight();
+    const width = frame.width;
+    const height = frame.height;
     const host = hostSize(self.layer);
     if (host == 0 or (host >> 32) != width or (host & 0xffff_ffff) != height) return false;
     const CATransaction = objc.getClass("CATransaction").?;
@@ -295,7 +350,7 @@ pub fn setSurfaceOffMain(self: *IOSurfaceLayer, frame: Drawn, seq: u64) bool {
     // nothing), the frame becomes its contents, and it commits after the unlock.
     CATransaction.msgSend(void, objc.sel("begin"), .{});
     setPresentSeq(self.layer, seq);
-    self.layer.setProperty("contents", surface);
+    showLocked(self.layer, frame);
     CATransaction.msgSend(void, objc.sel("unlock"), .{});
     CATransaction.msgSend(void, objc.sel("commit"), .{});
     return true;
@@ -304,13 +359,12 @@ pub fn setSurfaceOffMain(self: *IOSurfaceLayer, frame: Drawn, seq: u64) bool {
 /// What `setSurfaceOffMain` does with a frame of `width` x `height`, present sequence `seq`, at the host size.
 const OffMainDecision = enum { show, through_main, superseded };
 
-/// The off-main checks, read-only: the layer shows a frame of this size (else the size change goes through main),
-/// no newer frame was presented, and no main-thread change waits for the embedder's commit. Call under the Core
-/// Animation lock.
+/// The off-main checks, read-only: the layer shows a frame drawn at this size (else the size change goes through
+/// main), no newer frame was presented, and no main-thread change waits for the embedder's commit. Call under the
+/// Core Animation lock.
 fn offMainDecisionLocked(layer: objc.Object, width: usize, height: usize, seq: u64) OffMainDecision {
-    const shown = layer.getProperty(?*anyopaque, "contents") orelse return .through_main;
-    const shown_surface: *IOSurface = @ptrCast(shown);
-    if (shown_surface.getWidth() != width or shown_surface.getHeight() != height) return .through_main;
+    const shown = shownSizeLocked(layer) orelse return .through_main;
+    if (shown.width != width or shown.height != height) return .through_main;
     if (seq <= presentSeq(layer)) return .superseded;
     // The embedder presents host sizes and the main thread changed the shown size in a transaction the embedder
     // has not reported committed: a transaction committed here could reach the screen ahead of the view's new
@@ -320,36 +374,35 @@ fn offMainDecisionLocked(layer: objc.Object, width: usize, height: usize, seq: u
 }
 
 /// While the embedder presents host sizes (`setEmbedderPresents`): whether
-/// the layer cannot show `surface`, a frame of the host size, in its bounds
-/// now, so `setSurfaceCallback` would drop it and the embedder presents it
-/// with its bounds (`Metal.hostFrame`). True when the layer shows a frame of
-/// another size and its bounds do not have this frame's size. False for a
-/// first frame (nothing shown), a frame at the shown size (it waits for the
-/// embedder's commit, through main) and bounds the embedder already set (it
-/// presents itself through main). Call under the Core Animation lock, which
-/// orders it against main's changes (`Metal.embedderShowsKeptFrame`).
+/// the layer cannot show `frame`, drawn at the host size, in its bounds now, so `setSurfaceCallback` would drop it and the embedder
+/// presents it with its bounds (`Metal.hostFrame`). True when the layer shows
+/// a frame of another size and its bounds do not have this frame's size.
+/// False for a first frame (nothing shown), a frame at the shown size (it
+/// waits for the embedder's commit, through main) and bounds the embedder
+/// already set (it presents itself through main). Call under the Core
+/// Animation lock, which orders it against main's changes
+/// (`Metal.embedderShowsKeptFrame`).
 pub fn embedderShowsFrameLocked(self: *IOSurfaceLayer, frame: Drawn) bool {
-    return embedderDrops(self.layer, frame.surface);
+    return embedderDrops(self.layer, frame.width, frame.height);
 }
 
 /// The one rule of `setSurfaceCallback` and `embedderShowsFrameLocked`: with
 /// the embedder presenting host sizes, whether the main-thread present must
-/// not show `surface` now, because the layer shows a frame of another size
-/// and its bounds do not have `surface`'s size (the embedder shows it with its
-/// bounds). A first frame (nothing shown), a frame at the shown size and a
-/// frame for bounds the embedder already set are shown. Call under the Core
+/// not show a frame drawn at `width` x `height` now, because the layer shows a
+/// frame of another size and its bounds do not have that size (the embedder
+/// shows it with its bounds). A first frame (nothing shown), a frame at the
+/// shown size and a frame for bounds the embedder already set are shown. Sizes
+/// are drawn sizes (`Drawn`), never a capacity surface's. Call under the Core
 /// Animation lock.
-fn embedderDrops(layer: objc.Object, surface: *IOSurface) bool {
+fn embedderDrops(layer: objc.Object, width: usize, height: usize) bool {
     if (!embedderPresents(layer)) return false;
-    const shown = layer.getProperty(?*anyopaque, "contents") orelse return false;
-    const shown_surface: *IOSurface = @ptrCast(shown);
-    if (shown_surface.getWidth() == surface.getWidth() and
-        shown_surface.getHeight() == surface.getHeight()) return false;
+    const shown = shownSizeLocked(layer) orelse return false;
+    if (shown.width == width and shown.height == height) return false;
     const bounds = layer.getProperty(macos.graphics.Rect, "bounds");
     const scale = layer.getProperty(f64, "contentsScale");
-    const width: usize = @intFromFloat(bounds.size.width * scale);
-    const height: usize = @intFromFloat(bounds.size.height * scale);
-    return width != surface.getWidth() or height != surface.getHeight();
+    const bounds_width: usize = @intFromFloat(bounds.size.width * scale);
+    const bounds_height: usize = @intFromFloat(bounds.size.height * scale);
+    return bounds_width != width or bounds_height != height;
 }
 
 /// The sequence number of the newest frame presented (`setSurface`,
@@ -391,6 +444,7 @@ fn setSurfaceCallback(
 ) callconv(.c) void {
     const layer = objc.Object.fromId(block.layer);
     const surface: *IOSurface = block.surface;
+    const frame: Drawn = .{ .surface = surface, .width = block.width, .height = block.height };
 
     // See explanation of why we retain and release in `setSurface`.
     defer surface.release();
@@ -401,16 +455,17 @@ fn setSurfaceCallback(
     // a synchronously drawn frame during a resize, and if we don't
     // discard the improperly sized surface it creates jank.
     // A host-sized layer expects the host's size, not its bounds (which
-    // move ahead of it during a drag).
+    // move ahead of it during a drag). The frame's drawn size, not its
+    // surface's (a capacity target is larger).
     const host = hostSize(layer);
     const bounds = layer.getProperty(macos.graphics.Rect, "bounds");
     const scale = layer.getProperty(f64, "contentsScale");
     const width: usize = if (host != 0) @intCast(host >> 32) else @intFromFloat(bounds.size.width * scale);
     const height: usize = if (host != 0) @intCast(host & 0xffff_ffff) else @intFromFloat(bounds.size.height * scale);
-    if (width != surface.getWidth() or height != surface.getHeight()) {
+    if (width != frame.width or height != frame.height) {
         log.debug(
-            "setSurfaceCallback(): surface is wrong size for layer, discarding. surface = {d}x{d}, layer = {d}x{d}",
-            .{ surface.getWidth(), surface.getHeight(), width, height },
+            "setSurfaceCallback(): frame is wrong size for layer, discarding. frame = {d}x{d}, layer = {d}x{d}",
+            .{ frame.width, frame.height, width, height },
         );
         return;
     }
@@ -428,11 +483,11 @@ fn setSurfaceCallback(
     // already have its size (the embedder set them without a present), so a
     // commit never carries new pixels in the old bounds. A first frame
     // (nothing shown) presents itself.
-    if (embedderDrops(layer, surface)) return;
+    if (embedderDrops(layer, frame.width, frame.height)) return;
 
     if (block.seq != 0) setPresentSeq(layer, block.seq);
-    if (embedderPresents(layer) and changesShownSize(layer, surface)) setMainPending(layer, true);
-    layer.setProperty("contents", surface);
+    if (embedderPresents(layer) and changesShownSize(layer, frame.width, frame.height)) setMainPending(layer, true);
+    showLocked(layer, frame);
 }
 
 pub const DisplayCallback = ?*align(8) const fn (?*anyopaque) void;

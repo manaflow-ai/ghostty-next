@@ -61,6 +61,21 @@ autorelease_pool: ?*objc.AutoreleasePool = null,
 /// Written on the main thread, read by `surfaceSize` on any thread.
 host_size: std.atomic.Value(u64) = .init(0),
 
+/// macOS, opt-in (`ghostty_surface_set_host_capacity`): the least pixel size
+/// of every render target, packed width << 32 | height, for a gesture whose
+/// sizes all fit in it (a held-key resize, a divider drag): each swap-chain
+/// target keeps one IOSurface that large and each frame is drawn in its
+/// top-left corner at the host size, so a new size allocates nothing
+/// (`fitTarget`). 0 (the default): a target has exactly its frame's size.
+/// Main thread writes, the renderer thread reads.
+host_capacity: std.atomic.Value(u64) = .init(0),
+
+/// A capacity was cleared and the swap chain may still hold targets of its
+/// size: the renderer thread gives them back at its next draw
+/// (`Renderer.SwapChain.trim`, `trimArmed`). Main thread writes it
+/// (`setHostCapacity`); the renderer thread clears it once done (`trimDone`).
+trim_armed: std.atomic.Value(bool) = .init(false),
+
 /// macOS host-sized surfaces: the newest frame the renderer thread drew with
 /// cells built at that frame's size (`Target.cells_fresh`), for the display
 /// pass of a new host size to present in the same Core Animation transaction
@@ -131,6 +146,10 @@ const FreshFrame = struct {
     mutex: std.Io.Mutex = .init,
     /// Retained; null after a take or before the first fresh frame.
     surface: ?*IOSurface = null,
+    /// The pixel size `surface` was drawn at (`IOSurfaceLayer.Drawn`): the
+    /// surface is larger while the host sets a capacity.
+    width: usize = 0,
+    height: usize = 0,
     /// The present sequence number (`Metal.present_seq`) of `surface`.
     surface_seq: u64 = 0,
     /// Bumped on each publish; the display pass waits on it (futex).
@@ -138,9 +157,9 @@ const FreshFrame = struct {
 };
 
 /// A fresh frame taken for a present (`takeFresh`): retained, the caller
-/// releases `surface`.
+/// releases `frame.surface`.
 const TakenFrame = struct {
-    surface: *IOSurface,
+    frame: IOSurfaceLayer.Drawn,
     /// Its present sequence number (`Metal.present_seq`).
     seq: u64,
 };
@@ -315,16 +334,47 @@ pub fn setHostDrawableSize(self: *Metal, enabled: bool, width_px: u32, height_px
     self.layer.layer.msgSend(void, objc.sel("setNeedsDisplay"), .{});
 }
 
-/// macOS (`ghostty_surface_set_host_capacity`): keep every render target at
-/// least `width_px` x `height_px` for a gesture; 0, 0 clears it. Returns
-/// whether it cleared a capacity: the caller then wakes the renderer thread,
-/// which gives the capacity-sized targets back (`Renderer.SwapChain.trim`).
-/// Not implemented yet: every target keeps its frame's size. Main thread.
+/// macOS (`ghostty_surface_set_host_capacity`): every render target is at
+/// least `width_px` x `height_px` until the capacity is cleared (0, 0), so the
+/// frames of a gesture whose sizes all fit draw into the same targets: one
+/// IOSurface per swap-chain frame for the whole gesture instead of one per
+/// frame and size. A frame is drawn at the host size from the target's
+/// top-left corner (the render pass's viewport and scissor), and the layer
+/// shows only those pixels (`IOSurfaceLayer.showLocked`). A larger size grows
+/// the target it is drawn into to that size. Clamped to the largest texture.
+/// Returns whether it cleared a capacity: the caller then wakes the renderer
+/// thread, which gives the targets larger than the host size back and draws
+/// a frame at the host size (`Renderer.SwapChain.trim`). Main thread.
 pub fn setHostCapacity(self: *Metal, width_px: u32, height_px: u32) bool {
-    _ = self;
-    _ = width_px;
-    _ = height_px;
-    return false;
+    if (comptime builtin.os.tag != .macos) return false;
+    const max = self.device.max_texture_size;
+    const value: u64 = if (width_px > 0 and height_px > 0)
+        (@as(u64, @min(width_px, max)) << 32) | @min(height_px, max)
+    else
+        0;
+    const old = self.host_capacity.swap(value, .acq_rel);
+    // A new gesture reuses the targets: nothing to give back. A clear after a
+    // capacity arms the trim; a clear with none set changes nothing.
+    if (value != 0) {
+        self.trim_armed.store(false, .release);
+        return false;
+    }
+    if (old == 0) return false;
+    self.trim_armed.store(true, .release);
+    return true;
+}
+
+/// Whether a cleared capacity still waits for its targets to be given back
+/// (`Renderer.SwapChain.trim`); false again once a new capacity is set.
+/// Renderer thread.
+pub fn trimArmed(self: *const Metal) bool {
+    return self.trim_armed.load(.acquire) and self.host_capacity.load(.acquire) == 0;
+}
+
+/// The swap chain gave back the targets of the cleared capacity. Renderer
+/// thread.
+pub fn trimDone(self: *Metal) void {
+    self.trim_armed.store(false, .release);
 }
 
 /// macOS host-sized surfaces (`ghostty_surface_set_host_present`): with
@@ -477,11 +527,11 @@ pub fn initTarget(self: *Metal, width: usize, height: usize) !Target {
 
 /// Gives `target` (a swap-chain frame's) the size to draw a frame of `width` x
 /// `height` pixels, and records that drawn size (`Target.drawn_width`): a new
-/// target of exactly that size when it has another size, or with `rebuild`
-/// (its config changed, such as the blending mode). Renderer thread.
+/// target only when it does not fit (`targetSize`), or with `rebuild` (its
+/// config changed, such as the blending mode). Renderer thread.
 pub fn fitTarget(self: *Metal, target: *Target, width: usize, height: usize, rebuild: bool) !void {
-    if (rebuild or target.width != width or target.height != height) {
-        const fitted = try self.initTarget(width, height);
+    if (self.targetSize(target.width, target.height, width, height, rebuild)) |size| {
+        const fitted = try self.initTarget(size.width, size.height);
         target.deinit();
         target.* = fitted;
     }
@@ -489,9 +539,35 @@ pub fn fitTarget(self: *Metal, target: *Target, width: usize, height: usize, reb
     target.drawn_height = height;
 }
 
+/// The size of the new render target a frame of `width` x `height` pixels
+/// needs, given a target of `have_width` x `have_height` (0 x 0: one given
+/// back, `Target.release`); null keeps that target. Without a host capacity a
+/// target has the frame's size, as it always had. With one (`setHostCapacity`)
+/// a target is at least the capacity and never shrinks while it is set: it
+/// fits any frame up to its size, and a larger frame grows it to that size.
+fn targetSize(
+    self: *const Metal,
+    have_width: usize,
+    have_height: usize,
+    width: usize,
+    height: usize,
+    rebuild: bool,
+) ?IOSurfaceLayer.Size {
+    const capacity = self.host_capacity.load(.acquire);
+    if (capacity == 0) {
+        if (!rebuild and have_width == width and have_height == height) return null;
+        return .{ .width = width, .height = height };
+    }
+    const want_width = @max(width, @as(usize, @intCast(capacity >> 32)));
+    const want_height = @max(height, @as(usize, @intCast(capacity & 0xffff_ffff)));
+    if (rebuild) return .{ .width = want_width, .height = want_height };
+    if (have_width >= want_width and have_height >= want_height) return null;
+    return .{ .width = @max(have_width, want_width), .height = @max(have_height, want_height) };
+}
+
 /// Present the provided target.
 pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
-    // The frame and the size it was drawn at.
+    // The frame and the size it was drawn at: the target is larger while the host sets a capacity.
     const frame: IOSurfaceLayer.Drawn = .{
         .surface = target.surface,
         .width = target.drawn_width,
@@ -571,6 +647,8 @@ fn publishFresh(self: *Metal, frame: IOSurfaceLayer.Drawn, seq: u64) void {
         frame.surface.retain();
         const old = self.fresh.surface;
         self.fresh.surface = frame.surface;
+        self.fresh.width = frame.width;
+        self.fresh.height = frame.height;
         self.fresh.surface_seq = seq;
         break :old old;
     };
@@ -592,27 +670,31 @@ fn dropFresh(self: *Metal) void {
     if (old) |o| o.release();
 }
 
-/// The fresh frame if it has `width` x `height` pixels (retained; the caller
-/// releases it). A fresh frame of another size stays for its own pass.
+/// The fresh frame if it was drawn at `width` x `height` pixels (retained;
+/// the caller releases it). A fresh frame of another size stays for its own
+/// pass.
 fn takeFresh(self: *Metal, width: usize, height: usize) ?TakenFrame {
     const io = global.io();
     self.fresh.mutex.lockUncancelable(io);
     defer self.fresh.mutex.unlock(io);
     const surface = self.fresh.surface orelse return null;
-    if (surface.getWidth() != width or surface.getHeight() != height) return null;
+    if (self.fresh.width != width or self.fresh.height != height) return null;
     self.fresh.surface = null;
     self.fresh.armed.store(false, .release);
-    return .{ .surface = surface, .seq = self.fresh.surface_seq };
+    return .{
+        .frame = .{ .surface = surface, .width = width, .height = height },
+        .seq = self.fresh.surface_seq,
+    };
 }
 
-/// Whether a fresh frame of `width` x `height` pixels waits (`takeFresh`
-/// would take it). Main thread.
+/// Whether a fresh frame drawn at `width` x `height` pixels waits
+/// (`takeFresh` would take it). Main thread.
 fn hasFresh(self: *Metal, width: usize, height: usize) bool {
     const io = global.io();
     self.fresh.mutex.lockUncancelable(io);
     defer self.fresh.mutex.unlock(io);
-    const surface = self.fresh.surface orelse return false;
-    return surface.getWidth() == width and surface.getHeight() == height;
+    if (self.fresh.surface == null) return false;
+    return self.fresh.width == width and self.fresh.height == height;
 }
 
 /// Shows the fresh frame of `width` x `height` pixels in the caller's Core
@@ -620,8 +702,8 @@ fn hasFresh(self: *Metal, width: usize, height: usize) bool {
 /// whether it did. Main thread.
 fn presentFresh(self: *Metal, width: usize, height: usize) bool {
     const taken = self.takeFresh(width, height) orelse return false;
-    defer taken.surface.release();
-    if (!self.layer.setSurfacePresented(.whole(taken.surface), taken.seq)) {
+    defer taken.frame.surface.release();
+    if (!self.layer.setSurfacePresented(taken.frame, taken.seq)) {
         // Not shown (the layer shows a newer frame): the next frame of this
         // size publishes for the next present.
         self.fresh.armed.store(true, .release);
@@ -658,11 +740,11 @@ pub fn presentHostSizedWait(self: *Metal, wait: bool) bool {
     if (!self.visible_hint.load(.acquire)) return true;
     const width: usize = @intCast(host >> 32);
     const height: usize = @intCast(host & 0xffff_ffff);
-    const shown = self.layer.layer.getProperty(?*anyopaque, "contents") orelse return false;
-    const shown_surface: *IOSurface = @ptrCast(shown);
-    if (shown_surface.getWidth() == width and shown_surface.getHeight() == height) {
+    // The drawn size of the shown frame, not its surface's (a capacity target is larger).
+    const shown = self.layer.shownSize() orelse return false;
+    if (shown.width == width and shown.height == height) {
         // The renderer thread's frame at this size already landed.
-        if (self.takeFresh(width, height)) |taken| taken.surface.release();
+        if (self.takeFresh(width, height)) |taken| taken.frame.surface.release();
         return true;
     }
 
@@ -671,8 +753,8 @@ pub fn presentHostSizedWait(self: *Metal, wait: bool) bool {
     while (true) {
         const seq = self.fresh.seq.load(.acquire);
         if (self.takeFresh(width, height)) |taken| {
-            defer taken.surface.release();
-            self.layer.setSurfaceSync(.whole(taken.surface));
+            defer taken.frame.surface.release();
+            self.layer.setSurfaceSync(taken.frame);
             _ = self.counters.fresh_presents.fetchAdd(1, .monotonic);
             return true;
         }
@@ -716,7 +798,7 @@ pub fn hostFrame(self: *Metal, show: bool) apprt.HostFrame {
         // bounds the embedder had set, or an earlier present): a kept fresh
         // frame is not newer, and no frame needs to publish until the next
         // size (frames at this size go off main).
-        if (self.takeFresh(width, height)) |taken| taken.surface.release();
+        if (self.takeFresh(width, height)) |taken| taken.frame.surface.release();
         self.fresh.armed.store(false, .release);
         return .shown;
     }

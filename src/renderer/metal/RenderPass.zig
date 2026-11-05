@@ -117,6 +117,31 @@ pub fn begin(
         .{desc.value},
     );
 
+    // A target larger than its frame (a host capacity, `Metal.setHostCapacity`)
+    // is drawn only from its top-left corner, at the frame's size: the
+    // viewport maps the frame there (unstretched), and the scissor keeps every
+    // draw inside it. A target of the frame's size keeps the defaults (the
+    // whole texture), as before.
+    for (opts.attachments) |at| switch (at.target) {
+        .texture => {},
+        .target => |t| if (t.drawn_width != t.width or t.drawn_height != t.height) {
+            encoder.msgSend(void, objc.sel("setViewport:"), .{mtl.MTLViewport{
+                .x = 0,
+                .y = 0,
+                .width = @floatFromInt(t.drawn_width),
+                .height = @floatFromInt(t.drawn_height),
+                .znear = 0,
+                .zfar = 1,
+            }});
+            encoder.msgSend(void, objc.sel("setScissorRect:"), .{mtl.MTLScissorRect{
+                .x = 0,
+                .y = 0,
+                .width = @intCast(t.drawn_width),
+                .height = @intCast(t.drawn_height),
+            }});
+        },
+    };
+
     return .{ .encoder = encoder };
 }
 

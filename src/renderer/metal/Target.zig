@@ -30,15 +30,15 @@ pub const Options = struct {
     storage_mode: mtl.MTLResourceOptions.StorageMode,
 };
 
-/// The underlying IOSurface.
+/// The underlying IOSurface. Undefined while the target is empty (`release`).
 surface: *IOSurface,
 
-/// The underlying MTLTexture.
+/// The underlying MTLTexture. Undefined while the target is empty (`release`).
 texture: objc.Object,
 
-/// Current width of this target.
+/// Current width of this target; 0 while it is empty (`release`).
 width: usize,
-/// Current height of this target.
+/// Current height of this target; 0 while it is empty (`release`).
 height: usize,
 
 /// The pixel size of the frame drawn into this target, from its top-left
@@ -128,7 +128,35 @@ pub fn init(opts: Options) !Self {
 }
 
 pub fn deinit(self: *Self) void {
+    // An empty target (`release`) holds nothing.
+    if (self.width == 0) return;
     if (self.live_bytes) |live| _ = live.fetchSub(self.bytes, .monotonic);
     self.surface.deinit();
     self.texture.release();
+}
+
+/// Whether this target is larger than a frame of `width` x `height` pixels
+/// needs, in either dimension. An empty target is not.
+pub fn largerThan(self: *const Self, width: usize, height: usize) bool {
+    return self.width > width or self.height > height;
+}
+
+/// Frees the surface and the texture now; the target is then empty (width
+/// and height 0) until the next frame drawn into it gets a new one
+/// (`Metal.fitTarget`). For a target given back after a host capacity
+/// (`Renderer.SwapChain.trim`). Only for a target that is not in flight: a
+/// frame in flight presents from it when it completes. A surface the layer
+/// shows stays on screen: the layer holds its own reference until a newer
+/// frame replaces it.
+pub fn release(self: *Self) void {
+    if (self.width == 0) return;
+    self.deinit();
+    self.surface = undefined;
+    self.texture = undefined;
+    self.width = 0;
+    self.height = 0;
+    self.drawn_width = 0;
+    self.drawn_height = 0;
+    self.live_bytes = null;
+    self.bytes = 0;
 }

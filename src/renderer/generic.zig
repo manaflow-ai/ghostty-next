@@ -466,18 +466,47 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.frame_sema.post(global.io());
             }
 
+            /// How long `trim` waits for the frames in flight before it leaves
+            /// the targets to the next draw.
+            const trim_wait_ns = 8 * std.time.ns_per_ms;
+
             /// After the host clears its capacity (Metal `setHostCapacity`):
             /// gives back every render target larger than `width` x `height`,
-            /// so the surface keeps no capacity-sized target after the gesture.
-            /// Returns whether it gave one back: the caller then draws a frame
-            /// at this size now. Not implemented yet: a target is replaced only
-            /// when a frame is drawn into it.
+            /// so the surface keeps no capacity-sized target after the gesture,
+            /// even when it draws nothing more (no output, a hidden cursor).
+            /// Every frame must be idle: a frame in flight presents from its
+            /// target when it completes. It waits for them at most
+            /// `trim_wait_ns`; past that the targets stay and the next draw
+            /// tries again. A given-back target is empty until the next frame
+            /// drawn into it makes one of its size (`FrameState.fit`); the one
+            /// the layer shows stays on screen (the layer holds its own
+            /// reference until a newer frame replaces it). Returns whether it
+            /// gave one back: the caller then draws a frame at this size now,
+            /// so the layer stops showing a capacity surface. Caller holds the
+            /// draw mutex and no frame (`nextFrame`).
             pub fn trim(self: *SwapChain, api: *GraphicsAPI, width: usize, height: usize) bool {
-                _ = self;
-                _ = api;
-                _ = width;
-                _ = height;
-                return false;
+                if (comptime !@hasDecl(GraphicsAPI, "trimArmed")) return false;
+                if (!api.trimArmed()) return false;
+                // Only the draw mutex's holder changes a target: reading their
+                // sizes while frames are in flight is safe.
+                for (&self.frames) |*frame| {
+                    if (frame.target.largerThan(width, height)) break;
+                } else {
+                    // Nothing larger than this size: nothing to give back.
+                    api.trimDone();
+                    return false;
+                }
+                if (!self.waitIdle(trim_wait_ns)) return false;
+                defer {
+                    for (0..buf_count) |_| self.frame_sema.post(global.io());
+                }
+                // A new capacity (the next gesture) reuses the targets.
+                if (!api.trimArmed()) return false;
+                for (&self.frames) |*frame| {
+                    if (frame.target.largerThan(width, height)) frame.target.release();
+                }
+                api.trimDone();
+                return true;
             }
         };
 
