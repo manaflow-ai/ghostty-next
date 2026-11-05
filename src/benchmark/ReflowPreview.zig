@@ -73,6 +73,7 @@ pub fn destroy(self: *ReflowPreviewBench, alloc: Allocator) void {
     report("source (under the lock; the copy in update also holds it)", self.locked.items);
     report("split: copy (under the terminal lock)", self.copy_ns.items);
     report("split: reflow (off the lock)", self.reflow_ns.items);
+    std.debug.print("reflow-preview copies under the terminal lock: {d} for {d} frames\n", .{ self.preview.locked_copies, self.total.items.len });
     self.total.deinit(alloc);
     self.locked.deinit(alloc);
     self.copy_ns.deinit(alloc);
@@ -154,7 +155,7 @@ fn splitFrame(self: *ReflowPreviewBench, fit: renderer.GridSize) Benchmark.Error
     var copy = copy: {
         self.state.lockDemand(io);
         defer self.state.unlockDemand(io);
-        break :copy ReflowPreview.snapshot(self.alloc, self.state.terminal, fit) catch return error.BenchmarkFailed;
+        break :copy ReflowPreview.snapshot(self.alloc, self.state.terminal, ReflowPreview.historyNeed(self.state.terminal.cols, fit)) catch return error.BenchmarkFailed;
     };
     defer copy.deinit(self.alloc);
     const t1: std.Io.Timestamp = .now(io, .awake);
