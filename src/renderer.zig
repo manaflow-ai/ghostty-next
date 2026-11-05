@@ -69,6 +69,7 @@ test {
     _ = Thread;
     _ = State;
     _ = @import("renderer/mailbox.zig");
+    _ = @import("renderer/ReflowPreview.zig");
 
     // The host-sized macOS present paths (Core Animation and IOSurface, no GPU).
     if (comptime @import("builtin").os.tag == .macos) {
