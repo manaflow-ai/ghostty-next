@@ -87,6 +87,8 @@ fn bufferCompleted(
         };
     }
 
+    // Before the frame's swap-chain slot is released: the target is the renderer thread's again after it.
+    block.renderer.api.frameDone(block.target);
     block.renderer.frameCompleted(health);
 }
 
@@ -119,6 +121,8 @@ pub inline fn complete(self: *Self, sync: bool) void {
         );
     }
 
+    // In flight from here until its completion (`Metal.frameDone`).
+    self.block.renderer.api.frameCommitted(self.block.target);
     self.buffer.msgSend(void, objc.sel("commit"), .{});
 
     // If we need to complete synchronously, we wait until

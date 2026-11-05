@@ -565,6 +565,23 @@ fn targetSize(
     return .{ .width = @max(have_width, want_width), .height = @max(have_height, want_height) };
 }
 
+/// The frame drawn into `target` was committed to the GPU (`Frame.complete`):
+/// it is in flight until its completion (`frameDone`). Renderer thread, or
+/// main for a sync draw.
+pub fn frameCommitted(self: *Metal, target: *Target) void {
+    _ = self;
+    _ = target;
+}
+
+/// The frame of `target` completed and was presented (`Frame.bufferCompleted`),
+/// before its swap-chain slot is released. GPU completion thread. Not
+/// implemented yet: a cleared capacity's target stays until the renderer
+/// thread's trim.
+pub fn frameDone(self: *Metal, target: *Target) void {
+    _ = self;
+    _ = target;
+}
+
 /// Present the provided target.
 pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
     // The frame and the size it was drawn at: the target is larger while the host sets a capacity.
@@ -1622,18 +1639,33 @@ fn testExpectShows(metal: *Metal, target: *const Target) !void {
 }
 
 /// One frame of `drawFrameLocked` on a real swap chain, without the GPU: the host size, the trim of a cleared
-/// capacity (`SwapChain.trim`), the next frame's target (`FrameState.fit`), its present, and its completion (the
-/// frame is free again). Returns that frame's target.
-fn testDraw(metal: *Metal, chain: *Renderer.SwapChain, width: u32, height: u32) !*Target {
+/// capacity (`SwapChain.trim`), the next frame's target (`FrameState.fit`) and its commit (`Frame.complete`). The frame
+/// is in flight until `testComplete`.
+fn testCommit(metal: *Metal, chain: *Renderer.SwapChain, width: u32, height: u32) !*Target {
     metal.setHostDrawableSize(true, width, height);
     _ = chain.trim(metal, width, height);
     const frame = chain.nextFrame();
-    defer chain.releaseFrame();
+    errdefer chain.releaseFrame();
     try frame.fit(metal, width, height, false);
     frame.target.cells_fresh = true;
     frame.target.size_generation = metal.sizeGeneration();
-    try metal.present(frame.target, false);
+    metal.frameCommitted(&frame.target);
     return &frame.target;
+}
+
+/// The completion of a committed frame (`Frame.bufferCompleted`): its present, `frameDone`, then its swap-chain slot
+/// is free again. Frames complete in commit order, as on a Metal command queue.
+fn testComplete(metal: *Metal, chain: *Renderer.SwapChain, target: *Target) !void {
+    try metal.present(target.*, false);
+    metal.frameDone(target);
+    chain.releaseFrame();
+}
+
+/// `testCommit`, then its completion at once. Returns that frame's target.
+fn testDraw(metal: *Metal, chain: *Renderer.SwapChain, width: u32, height: u32) !*Target {
+    const target = try testCommit(metal, chain, width, height);
+    try testComplete(metal, chain, target);
+    return target;
 }
 
 test "host present: a held-key resize makes one render target per swap-chain frame with a host capacity" {
@@ -1738,9 +1770,10 @@ test "host present: clearing the host capacity at the landing leaves one target,
     try testing.expectEqual(@as(u64, 2 * landing.surface.getAllocSize()), live.load(.monotonic));
 }
 
-test "host present: clearing the host capacity gives back no target while a frame is in flight" {
-    // A frame in flight presents from its target when it completes: the trim owns every frame first. While one is in
-    // flight the targets stay (the trim waits a little, then leaves them to the next draw).
+test "host present: the landing gives back the idle targets at once and never waits for a frame in flight" {
+    // Review of #82 (F2): the trim of a cleared capacity ran at the start of the landing draw and waited up to 8 ms
+    // under the draw mutex for frames in flight, on the most visible frame of the gesture. It never waits: targets no
+    // frame is drawing go back at once, and one in flight goes back when its frame completes (`frameDone`).
     const testing = std.testing;
     try testing.expect(testIsMainThread());
     const pool = objc.AutoreleasePool.init();
@@ -1755,24 +1788,80 @@ test "host present: clearing the host capacity gives back no target while a fram
     for (0..swap_chain_count) |_| _ = try testDraw(&metal, &chain, 80, 60);
     _ = metal.setHostCapacity(160, 60);
     for (0..swap_chain_count) |i| _ = try testDraw(&metal, &chain, @intCast(100 + i), 60);
-    // The last frame of the gesture is still in flight: its completion has not run.
-    metal.setHostDrawableSize(true, 150, 60);
-    const in_flight = chain.nextFrame();
+    // The last frame of the gesture is still in flight.
+    const in_flight = try testCommit(&metal, &chain, 150, 60);
     var completed = false;
     defer if (!completed) chain.releaseFrame();
-    try in_flight.fit(&metal, 150, 60, false);
-    var widths: [swap_chain_count]usize = undefined;
-    for (&chain.frames, 0..) |*frame, i| widths[i] = frame.target.width;
+    try testing.expectEqual(@as(usize, 160), in_flight.width);
 
     _ = metal.setHostCapacity(0, 0);
-    try testing.expect(!chain.trim(&metal, 120, 60));
-    for (&chain.frames, 0..) |*frame, i| try testing.expectEqual(widths[i], frame.target.width);
+    const io = global.io();
+    const start: std.Io.Timestamp = .now(io, .awake);
+    const released = chain.trim(&metal, 120, 60);
+    const waited_ns = start.durationTo(.now(io, .awake)).nanoseconds;
+    std.debug.print("host capacity: the landing trim took {d} ns with a frame in flight\n", .{waited_ns});
+    // No wait (the old trim waited 8 ms for the frame in flight, then gave nothing back).
+    try testing.expect(waited_ns < 4 * std.time.ns_per_ms);
+    try testing.expect(released);
+    // The two idle targets went back at once; the one in flight is untouched.
+    for (&chain.frames) |*frame| {
+        if (&frame.target == in_flight) {
+            try testing.expectEqual(@as(usize, 160), frame.target.width);
+        } else {
+            try testing.expectEqual(@as(usize, 0), frame.target.width);
+        }
+    }
 
-    // It completed: the next trim gives every target larger than the host size back.
-    chain.releaseFrame();
+    // Its frame completes: its target goes back too, with no draw. No target is left.
+    try testComplete(&metal, &chain, in_flight);
     completed = true;
-    try testing.expect(chain.trim(&metal, 120, 60));
-    for (&chain.frames) |*frame| try testing.expectEqual(@as(usize, 0), frame.target.width);
+    try testing.expectEqual(@as(usize, 0), in_flight.width);
+    try testing.expectEqual(@as(u64, 0), metal.counters.target_bytes_live.load(.monotonic));
+}
+
+test "host present: a frame in flight at the landing gives back its capacity target when it completes, with no other draw" {
+    // Review of #82 (F1): the clear wakes the renderer for one draw. When a frame of the gesture was still in flight
+    // then (likely: a completed frame presents before it frees its slot, and that present takes the Core Animation lock
+    // that main's landing commit holds), its capacity-sized target stayed until a later draw, and a terminal that draws
+    // nothing more kept it. Its completion gives it back.
+    const testing = std.testing;
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    var device = try Device.initForTest();
+    defer device.deinit();
+    var metal = try testMetal(&device);
+    defer testDeinit(&metal);
+    var chain = try Renderer.SwapChain.init(&metal, false);
+    defer chain.deinit();
+    const live = &metal.counters.target_bytes_live;
+
+    // A pane of 1000 x 700 pixels grows toward 2000 (the capacity) while the key is held.
+    for (0..swap_chain_count) |_| _ = try testDraw(&metal, &chain, 1000, 700);
+    _ = metal.setHostCapacity(2000, 700);
+    for (0..11) |i| _ = try testDraw(&metal, &chain, @intCast(1010 + 75 * i), 700);
+    // The gesture's last frame is in flight when the host clears the capacity.
+    const last = try testCommit(&metal, &chain, 1835, 700);
+    _ = metal.setHostCapacity(0, 0);
+
+    // The landing frame (the one draw the clear wakes) is committed; then the frames complete, in order. No other draw.
+    const landing = try testCommit(&metal, &chain, 1200, 700);
+    try testComplete(&metal, &chain, last);
+    try testComplete(&metal, &chain, landing);
+
+    const landed = live.load(.monotonic);
+    std.debug.print(
+        "host capacity: live target bytes {d} after the landing with a frame in flight (the pane's target: {d}), peak {d}\n",
+        .{ landed, landing.surface.getAllocSize(), metal.counters.target_bytes_peak.load(.monotonic) },
+    );
+    try testing.expectEqual(@as(u64, landing.surface.getAllocSize()), landed);
+    try testing.expectEqual(@as(usize, 1200), landing.width);
+    try testExpectShows(&metal, landing);
+    var empty: usize = 0;
+    for (&chain.frames) |*frame| {
+        if (frame.target.width == 0) empty += 1;
+    }
+    try testing.expectEqual(@as(usize, swap_chain_count - 1), empty);
 }
 
 test "host present: without a host capacity each new size makes a target of exactly that size" {
