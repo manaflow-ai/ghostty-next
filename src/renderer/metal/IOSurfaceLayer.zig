@@ -959,3 +959,127 @@ test "host present: an off-main present never commits while it holds the Core An
 test "host present: an off-main present never commits while it holds the Core Animation lock (renderer)" {
     try testOffMainCommitOrder(false);
 }
+
+// ---- probe (scratch, never merge): contentsRect orientation of an IOSurface on macOS ----
+
+extern "c" const kCARendererMetalCommandQueue: objc.c.id;
+extern "c" fn CACurrentMediaTime() f64;
+extern "c" fn MTLCreateSystemDefaultDevice() ?*anyopaque;
+
+const ProbeRender = struct {
+    pixels: [64]u32 = [_]u32{0} ** 64,
+};
+
+fn probeFill(surface: *IOSurface, drawn_w: usize, drawn_h: usize) void {
+    surface.lock();
+    defer surface.unlock();
+    const base = surface.getBaseAddress().?;
+    const bpr = surface.getBytesPerRow();
+    for (0..surface.getHeight()) |y| {
+        for (0..surface.getWidth()) |x| {
+            const p = base + y * bpr + x * 4;
+            p[0] = @intCast(x * 30 + 10); // B
+            p[1] = @intCast(y * 30 + 10); // G
+            p[2] = if (x < drawn_w and y < drawn_h) 200 else 20; // R
+            p[3] = 255;
+        }
+    }
+}
+
+fn probeRender(device: objc.Object, queue: objc.Object, layer: objc.Object, w: usize, h: usize) !ProbeRender {
+    const Desc = objc.getClass("MTLTextureDescriptor").?;
+    const desc = Desc.msgSend(objc.Object, objc.sel("texture2DDescriptorWithPixelFormat:width:height:mipmapped:"), .{
+        @as(c_ulong, 80), @as(c_ulong, w), @as(c_ulong, h), false,
+    });
+    desc.setProperty("usage", @as(c_ulong, 5));
+    desc.setProperty("storageMode", @as(c_ulong, 0));
+    const tex = objc.Object.fromId(device.msgSend(?*anyopaque, objc.sel("newTextureWithDescriptor:"), .{desc}) orelse return error.NoTexture);
+    defer tex.release();
+    const NSDictionary = objc.getClass("NSDictionary").?;
+    const options = NSDictionary.msgSend(objc.Object, objc.sel("dictionaryWithObject:forKey:"), .{ queue.value, kCARendererMetalCommandQueue });
+    const CARenderer = objc.getClass("CARenderer").?;
+    const renderer = CARenderer.msgSend(objc.Object, objc.sel("rendererWithMTLTexture:options:"), .{ tex.value, options.value });
+    const rect = macos.graphics.Rect{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = @floatFromInt(w), .height = @floatFromInt(h) } };
+    renderer.setProperty("layer", layer.value);
+    renderer.setProperty("bounds", rect);
+    objc.getClass("CATransaction").?.msgSend(void, objc.sel("flush"), .{});
+    renderer.msgSend(void, objc.sel("beginFrameAtTime:timeStamp:"), .{ CACurrentMediaTime(), @as(?*anyopaque, null) });
+    renderer.msgSend(void, objc.sel("addUpdateRect:"), .{rect});
+    renderer.msgSend(void, objc.sel("render"), .{});
+    renderer.msgSend(void, objc.sel("endFrame"), .{});
+    const cb = queue.msgSend(objc.Object, objc.sel("commandBuffer"), .{});
+    cb.msgSend(void, objc.sel("commit"), .{});
+    cb.msgSend(void, objc.sel("waitUntilCompleted"), .{});
+    var out: ProbeRender = .{};
+    tex.msgSend(void, objc.sel("getBytes:bytesPerRow:fromRegion:mipmapLevel:"), .{
+        @as(*anyopaque, @ptrCast(&out.pixels)),
+        @as(c_ulong, w * 4),
+        @import("api.zig").MTLRegion{ .origin = .{ .x = 0, .y = 0, .z = 0 }, .size = .{ .width = w, .height = h, .depth = 1 } },
+        @as(c_ulong, 0),
+    });
+    return out;
+}
+
+fn probeLayer(surface: *IOSurface, w: f64, h: f64, rect: ?macos.graphics.Rect) !IOSurfaceLayer {
+    var layer = try IOSurfaceLayer.init();
+    layer.layer.setProperty("contentsScale", @as(f64, 1));
+    layer.layer.setProperty("anchorPoint", macos.graphics.Point{ .x = 0, .y = 0 });
+    layer.layer.setProperty("position", macos.graphics.Point{ .x = 0, .y = 0 });
+    layer.layer.setProperty("bounds", macos.graphics.Rect{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = w, .height = h } });
+    const NSString = objc.getClass("NSString").?;
+    const nearest = NSString.msgSend(objc.Object, objc.sel("stringWithUTF8String:"), .{"nearest"});
+    layer.layer.setProperty("magnificationFilter", nearest.value);
+    layer.layer.setProperty("minificationFilter", nearest.value);
+    layer.layer.setProperty("contents", surface);
+    if (rect) |r| layer.layer.setProperty("contentsRect", r);
+    return layer;
+}
+
+fn probeDump(name: []const u8, r: ProbeRender, w: usize, h: usize) void {
+    std.debug.print("PROBE {s} ({d}x{d}):\n", .{ name, w, h });
+    for (0..h) |y| {
+        std.debug.print("PROBE   row {d}:", .{y});
+        for (0..w) |x| {
+            const v = r.pixels[y * w + x];
+            const b = v & 0xff;
+            const g = (v >> 8) & 0xff;
+            const red = (v >> 16) & 0xff;
+            std.debug.print(" (x{d},y{d},{s})", .{ (b -% 10) / 30, (g -% 10) / 30, if (red > 100) "D" else "p" });
+        }
+        std.debug.print("\n", .{});
+    }
+}
+
+test "host present: PROBE contentsRect orientation" {
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    const dev_id = MTLCreateSystemDefaultDevice();
+    std.debug.print("PROBE device: {any}\n", .{dev_id != null});
+    const device = objc.Object.fromId(dev_id orelse return error.ProbeNoDevice);
+    std.debug.print("PROBE device name: {s}\n", .{std.mem.span(device.getProperty(objc.Object, "name").msgSend([*:0]const u8, objc.sel("UTF8String"), .{}))});
+    const queue = device.msgSend(objc.Object, objc.sel("newCommandQueue"), .{});
+    const surface = try testSurface(8, 8);
+    defer surface.release();
+    probeFill(surface, 6, 4);
+
+    var ref = try probeLayer(surface, 8, 8, null);
+    defer ref.release();
+    probeDump("reference full 8x8", try probeRender(device, queue, ref.layer, 8, 8), 8, 8);
+
+    var a = try probeLayer(surface, 6, 4, .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 0.75, .height = 0.5 } });
+    defer a.release();
+    probeDump("rect y=0", try probeRender(device, queue, a.layer, 6, 4), 6, 4);
+
+    var b = try probeLayer(surface, 6, 4, .{ .origin = .{ .x = 0, .y = 0.5 }, .size = .{ .width = 0.75, .height = 0.5 } });
+    defer b.release();
+    probeDump("rect y=0.5", try probeRender(device, queue, b.layer, 6, 4), 6, 4);
+
+    // gravity top-left with bounds larger than the sub-rect
+    var c = try probeLayer(surface, 8, 8, .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 0.75, .height = 0.5 } });
+    defer c.release();
+    probeDump("rect y=0 in 8x8 bounds", try probeRender(device, queue, c.layer, 8, 8), 8, 8);
+    var d = try probeLayer(surface, 8, 8, .{ .origin = .{ .x = 0, .y = 0.5 }, .size = .{ .width = 0.75, .height = 0.5 } });
+    defer d.release();
+    probeDump("rect y=0.5 in 8x8 bounds", try probeRender(device, queue, d.layer, 8, 8), 8, 8);
+    return error.ProbeDone;
+}
