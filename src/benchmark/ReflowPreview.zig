@@ -9,7 +9,7 @@
 //! Each step runs `frames` frames: the width steps down one column per
 //! frame and back, and the height changes every 8 frames. At the end of
 //! the run it prints the per-frame p50, p95, p99 and max, and the time
-//! of `source` alone.
+//! of `source` alone. Run: `ghostty-bench +reflow-preview` (zig build -Demit-bench).
 const ReflowPreviewBench = @This();
 
 const std = @import("std");
