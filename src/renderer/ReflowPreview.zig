@@ -488,16 +488,16 @@ test "reflow preview: per-frame cost of a 200x60 screen" {
             .columns = cols - 1 - step,
             .rows = rows - @as(u16, @intCast((i / 8) % 4)),
         };
-        const start = std.Io.Timestamp.now(global.io(), .awake);
+        const t_start = std.Io.Timestamp.now(global.io(), .awake);
         preview.update(alloc, &state, true, fit);
-        const mid = std.Io.Timestamp.now(global.io(), .awake);
+        const t_mid = std.Io.Timestamp.now(global.io(), .awake);
         state.lockDemand(global.io());
         const drawn = preview.source(alloc, true, state.terminal, fit);
         state.unlockDemand(global.io());
-        const end = std.Io.Timestamp.now(global.io(), .awake);
+        const t_end = std.Io.Timestamp.now(global.io(), .awake);
         try testing.expectEqual(fit.columns, drawn.cols);
-        times[i] = @intCast(start.durationTo(end).toNanoseconds());
-        locked[i] = @intCast(mid.durationTo(end).toNanoseconds());
+        times[i] = @intCast(t_start.durationTo(t_end).toNanoseconds());
+        locked[i] = @intCast(t_mid.durationTo(t_end).toNanoseconds());
     }
     // Live terminal untouched by the whole drag.
     try testing.expectEqual(@as(u16, cols), live.cols);
