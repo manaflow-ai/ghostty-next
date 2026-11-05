@@ -147,6 +147,11 @@ pub fn update(
         // preview is drawn; `source` makes the live render state rebuild
         // when the live terminal is drawn again.
         self.live_flags_consumed = true;
+        // Fields the watch sets on every update without a dirty flag: a
+        // cursor move along the line, its style and visibility, and
+        // OSC 10/11/12 or DECSCNM colors. A change of any of them is a
+        // live change too.
+        const before = watchSnapshot(&self.watch);
         self.watch.beginUpdate(alloc, state.terminal) catch {
             self.end(alloc);
             return;
@@ -156,7 +161,8 @@ pub fn update(
         // the new colors.
         const colors_changed = state.color_config_epoch != self.color_config_epoch;
         self.color_config_epoch = state.color_config_epoch;
-        const live_changed = self.watch.dirty != .false or colors_changed;
+        const live_changed = self.watch.dirty != .false or colors_changed or
+            !std.meta.eql(before, watchSnapshot(&self.watch));
         self.watch.endUpdate();
         // The caller resets the dirty state it handled (RenderState.dirty):
         // without this, every frame after the first saw a change and
@@ -230,7 +236,13 @@ pub fn source(
         !(self.failed_fit.columns == fit.columns and self.failed_fit.rows == fit.rows))
     {
         current = self.buildLocked(alloc, live, fit);
-        if (!current) self.failed_fit = fit;
+        if (!current) {
+            self.failed_fit = fit;
+            // The live terminal is drawn this frame and consumes its dirty
+            // flags: a kept base could miss those changes, so the next
+            // preview copies the live terminal again.
+            self.end(alloc);
+        }
     }
     const use = want and current;
     const t: *Terminal = if (use) &self.terminal.? else live;
@@ -271,6 +283,31 @@ pub fn reflow(alloc: Allocator, copy: *Terminal, fit: renderer.GridSize) !void {
         .reflow = true,
     });
     copy.flags.dirty.clear = true;
+}
+
+/// The watch's fields that change with no dirty flag (`update`).
+const WatchSnapshot = struct {
+    active: @FieldType(terminalpkg.RenderState.Cursor, "active"),
+    visual_style: @FieldType(terminalpkg.RenderState.Cursor, "visual_style"),
+    password_input: bool,
+    visible: bool,
+    blinking: bool,
+    background: @FieldType(terminalpkg.RenderState.Colors, "background"),
+    foreground: @FieldType(terminalpkg.RenderState.Colors, "foreground"),
+    cursor_color: @FieldType(terminalpkg.RenderState.Colors, "cursor"),
+};
+
+fn watchSnapshot(w: *const terminalpkg.RenderState) WatchSnapshot {
+    return .{
+        .active = w.cursor.active,
+        .visual_style = w.cursor.visual_style,
+        .password_input = w.cursor.password_input,
+        .visible = w.cursor.visible,
+        .blinking = w.cursor.blinking,
+        .background = w.colors.background,
+        .foreground = w.colors.foreground,
+        .cursor_color = w.colors.cursor,
+    };
 }
 
 /// Drop the drawn preview after a failed build off the lock. Only the
