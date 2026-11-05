@@ -158,6 +158,10 @@ pub fn update(
         self.color_config_epoch = state.color_config_epoch;
         const live_changed = self.watch.dirty != .false or colors_changed;
         self.watch.endUpdate();
+        // The caller resets the dirty state it handled (RenderState.dirty):
+        // without this, every frame after the first saw a change and
+        // copied the live terminal under the lock again.
+        self.watch.dirty = .false;
         if (!grid_changed and !live_changed) return;
 
         // `base` still holds the live terminal: the new grid is re-wrapped
