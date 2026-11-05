@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Decide whether a push to main publishes a GhosttyNextKit release.
+"""Decide whether a main or release/* push publishes a GhosttyNextKit release.
 
 Rules (coordinator decision 2026-10-03):
 1. Skip when no build input changed since the newest release tag that is an

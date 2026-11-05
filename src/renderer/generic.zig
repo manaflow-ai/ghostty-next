@@ -45,6 +45,16 @@ pub const RenderCounters = struct {
     full_swap: std.atomic.Value(u64) = .init(0),
     /// The drawn terminal's grid changed size.
     full_resize: std.atomic.Value(u64) = .init(0),
+    /// Wakes of the renderer thread by source (renderer/Thread.zig): the
+    /// wakeup async (output, mailbox messages, a cursor tick that draws),
+    /// the draw-now async (display link), and the cursor blink, animation
+    /// and scrollback-compression timers. A hidden surface's idle cost is
+    /// what these count (cmux SWITCH FRAMES: a live hidden terminal).
+    thread_wakeups: std.atomic.Value(u64) = .init(0),
+    thread_draw_now: std.atomic.Value(u64) = .init(0),
+    cursor_timer_fires: std.atomic.Value(u64) = .init(0),
+    animation_timer_fires: std.atomic.Value(u64) = .init(0),
+    compression_timer_fires: std.atomic.Value(u64) = .init(0),
 };
 const imagepkg = @import("image.zig");
 const ImageState = imagepkg.State;
@@ -709,7 +719,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             font_thicken: bool,
             font_thicken_strength: u8,
-            font_features: std.ArrayListUnmanaged([:0]const u8),
+            font_features: std.ArrayList([:0]const u8),
             font_styles: font.CodepointResolver.StyleStatus,
             font_shaping_break: configpkg.FontShapingBreak,
             cursor_color: ?configpkg.Config.TerminalColor,
@@ -4162,7 +4172,7 @@ fn bgPaint(
             break :rgb ColorBlend.Paint.rgbOnly(.{ .r = rgb.r, .g = rgb.g, .b = rgb.b });
         },
 
-        else => switch (style.bg_color) {
+        else => switch (style.bg_color.value()) {
             .none => null,
             .palette => |idx| ColorBlend.Paint.entry(table, idx),
             .rgb => |rgb| ColorBlend.Paint.rgbOnly(rgb),
@@ -4175,7 +4185,7 @@ fn fgPaint(
     table: *const ColorBlend.Table,
     bold: ?terminal.Style.BoldColor,
 ) ColorBlend.Paint {
-    return switch (style.fg_color) {
+    return switch (style.fg_color.value()) {
         .none => default: {
             if (style.flags.bold) {
                 if (bold) |b| switch (b) {
@@ -4217,7 +4227,7 @@ fn underlinePaint(
     style: terminal.Style,
     table: *const ColorBlend.Table,
 ) ?ColorBlend.Paint {
-    return switch (style.underline_color) {
+    return switch (style.underline_color.value()) {
         .none => null,
         .palette => |idx| ColorBlend.Paint.entry(table, idx),
         .rgb => |rgb| ColorBlend.Paint.rgbOnly(rgb),

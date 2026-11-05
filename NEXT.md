@@ -122,10 +122,64 @@ thread. New tab and split surfaces do not inherit the IO fields.
 | embedded: the grid a size will fit, and the alternate screen in the grid metrics | `ghostty_surface_fit_grid(surface, w, h, &cols, &rows)` gives the grid `ghostty_surface_set_size` would give a w x h pixel view (`Surface.fitGrid`: configured padding, current cell size; balanced padding never changes the grid), and resizes nothing. cmux-next reports a pane's FINAL grid to the PTY owner when its split or close animation starts, so the program in the terminal redraws at the new size during the animation, not after it; a pane that shrinks does not have its final size yet. `ghostty_surface_grid_metrics_s.alternate_screen` (new last field) says a full-screen program is on the alternate screen, which pins the terminal to the top of a pane that grows. Test: `fitGrid gives the grid resize gives the same screen`. |
 | embedded: a host-size present that never waits | `ghostty_surface_present_host_frame_ready` is `ghostty_surface_present_host_frame` without the bounded wait (`Metal.presentHostSizedWait(false)`): it presents the renderer thread's frame at the host size in the caller's Core Animation transaction only if that frame is already published, otherwise it keeps the last frame (counted in `host_late_presents`) and the new frame lands through `setSurface` when it completes. cmux-next measured the waiting present at up to 4 ms of main per drag frame (main p95 20.5 -> 24.1 ms, more dropped frames), so it calls only this one, from one observer just before the commit. |
 | renderer: a content-only frame goes to the screen without the main thread | A frame of a host-sized surface whose drawable size is the host size and equals the frame the layer shows (no geometry change pending) is presented from the GPU completion thread in its own `CATransaction` (`IOSurfaceLayer.setSurfaceOffMain`), not by a `dispatch_async` to main: a terminal echo reaches the screen while the app's main thread is busy (cmux-next G9). A frame for a new size still goes through main with its geometry. Frames are numbered in completion order (`Metal.present_seq`) and both paths check the number under the Core Animation lock, so a late main-thread present never replaces a newer frame. Counted in `host_off_main_presents`. Covered by cmux-next `TerminalEchoOffMainTests`. |
+| input: one compiled link regex per pattern for the whole process | `input/link_regex.zig`: surfaces and their renderers share each compiled link regex, counted by its users; up to 16 unused patterns stay compiled. A new surface compiled the URL regex twice on the main thread (Surface `DerivedConfig` and the renderer `link.Set`, about 0.5 ms each: cmux workspace switch trace, 6.3 ms of `onig_compile` per switch). Oniguruma 6.9.9 search never writes to a `regex_t`, so one regex serves every thread. |
+| renderer + embedded: the embedder presents a new host size with its bounds | `ghostty_surface_set_host_present(surface, GHOSTTY_HOST_PRESENT_EMBEDDER)` (macOS, host-sized surfaces; default `GHOSTTY_HOST_PRESENT_RENDERER`): the renderer still draws each new host size at once with cells rebuilt for it and keeps that frame (`Metal.fresh`, with its present sequence), but never shows a frame of another size than the shown one itself: `setHostDrawableSize` asks for no display pass, a display pass never waits (`displayWhileEmbedderPresents`), and `setSurfaceCallback` refuses such a frame unless the layer's bounds already have its size. `ghostty_surface_host_frame(surface, present)` (`Metal.hostFrame`) answers NONE, HIDDEN, SHOWN, READY, PRESENTED, PENDING or HELD; with `present` a READY frame becomes the layer's contents in the caller's Core Animation transaction (`IOSurfaceLayer.setSurfacePresented`, ordered by the present sequence, so a late main-thread frame never replaces it). cmux-next (frame owner refactor S4) changes a terminal view's bounds only in the transaction that shows the frame at the new size, or keeps both: before, a new-size frame landed in the old bounds 2-4 refreshes after the geometry. Frames at the shown size still go off main (an off-main present never commits while it holds the Core Animation lock: that deadlocked against main's commit in cmux's S4 films), except from the mode's start and after a main-thread change of the shown size until the embedder reports its commit (`ghostty_surface_host_frame_committed`: Ghostty cannot see the main thread's commit); a first frame presents itself; `ghostty_surface_present_host_frame(_ready)` follow the same ordered present in this mode. A frame that the embedder shows itself (one of the host size, kept for its present, while the view keeps bounds of another size; checked under the Core Animation lock and then `fresh.mutex`, while the kept frame is still this one, `Metal.embedderShowsKeptFrame`) goes to no main-queue block: `setSurfaceCallback` dropped it there, one main-thread wake per moving terminal and frame in cmux-next's held key resize. A first frame, a frame for bounds the embedder already set and a frame of a size the host no longer has (not kept anywhere; main rechecks the host size) still go through main. Tests: `host present:` in `renderer/Metal.zig` and `renderer/metal/IOSurfaceLayer.zig` (real layer and IOSurfaces, no GPU). |
 
 Next in the stack (tracked in the design): presentation callbacks for
 frame-exact acknowledgment, Kitty image replay after a snapshot, and a
 local scrollback window limit for restored snapshots.
+
+## Upstream sync to c7f68a7f4 (2026-11-04)
+
+`sync/upstream-20261104` first merges the cmux release line
+`release/cmux-9ce9b7d0-e2` (7d43bb68b, fork PRs #66, #69, #70, #71) into
+`main`, so the commit cmux-next pins stays an ancestor of `main`. That merge
+was clean. A second merge takes the line's newer head bd7ff2687 (PRs #72,
+#73), also clean. It then merges upstream `main` at c7f68a7f4 (2026-11-03, 241
+commits after v1.4.0). Zig stays 0.17.0. `next/UPSTREAM_BASE` is c7f68a7f4.
+
+Why now: cmux-next NIGHTLY froze with the main thread in `pthread_join` on a
+renderer stuck in `CVDisplayLinkStop` (manaflow-ai/cmux#35300). Upstream's
+fix ffaaf5d7a came in with v1.4.0 on `main`, but cmux-next still pinned the
+pre-1.4.0 release line.
+
+Conflicts:
+- `.github/workflows/test.yml`: stays deleted (the fork replaced it with
+  `next-xcframework.yml`).
+- `include/ghostty.h`: kept the fork's `ghostty_surface_process_output`
+  declaration and docs, and took upstream's whole nullability change
+  (0e067ded7): the header is in `#pragma clang assume_nonnull`, so every
+  pointer is non-null unless it is marked `GHOSTTY_NULLABLE` (or
+  `GHOSTTY_NULL_UNSPECIFIED` for a field the caller zero-initializes). The
+  fork's declarations are annotated to match the Zig side:
+  - Nullable returns: `ghostty_config_key_name` and
+    `ghostty_config_loaded_file` (null out of range).
+  - Nullable userdata: every fork callback typedef (`ghostty_io_write_cb`,
+    `ghostty_surface_link_filter_cb`, `ghostty_font_size_action_cb`,
+    `ghostty_surface_snapshot_write_cb`), `io_write_userdata`, and the
+    userdata parameters of `ghostty_surface_set_font_size_action_callback`,
+    `ghostty_surface_set_link_filter` and `ghostty_surface_encode_snapshot`.
+  - Nullable callbacks: `ghostty_surface_config_s.io_write_cb` (input is
+    dropped) and the callback parameters of the three setters above (NULL
+    removes the link filter; the others return false).
+  - Nullable inputs: `ghostty_surface_set_color_transition` (NULL is
+    instant), the bytes of `ghostty_surface_restore_snapshot`,
+    `ghostty_surface_restore_snapshot_local_history` (and its digest) and
+    `ghostty_surface_apply_kitty_replay` (NULL is allowed with length 0),
+    and both out pointers of `ghostty_surface_history_digest`.
+  - `ghostty_config_source_s.path` is `GHOSTTY_NULL_UNSPECIFIED`, like
+    upstream's `ghostty_text_s.text`.
+  The byte pointers that callbacks receive, the `const char*` + length
+  inputs (`ghostty_config_load_string`, `ghostty_surface_text_input`,
+  `ghostty_surface_process_output`), config keys and the out structs of
+  the grid and selection queries stay non-null.
+- `src/terminal/Screen.zig` `clearRows`: kept both. The fork's wrap break
+  across the cleared range's edges (`breakWrapAbove`, fork PR #68 line) runs in
+  a `defer`; upstream's blank-row fast path (`blank_zero`) resets the same
+  row metadata, so the edge breaks still apply.
+- `src/termio/stream_handler.zig`: kept the fork's reply tests and
+  `osc7Path`; added upstream's tmux `active_window` test. Upstream's
+  `osc7Host` (no RFC 1123 host check) merged without conflict.
 
 ## Upstream sync to v1.4.0 (2026-10-28)
 

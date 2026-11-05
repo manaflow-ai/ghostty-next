@@ -598,6 +598,17 @@ pub const TerminalFormatter = struct {
             };
         }
 
+        // A wrap is pending at the right margin when the cursor is within
+        // the left and right margins, which the modes (DECLRMM) and the
+        // scrolling region above restore before the cursor is.
+        if (self.opts.emit == .vt and
+            self.extra.modes and
+            self.extra.scrolling_region and
+            self.terminal.screens.active.cursor.x <= self.terminal.scrolling_region.right)
+        {
+            screen_formatter.wrap_column = self.terminal.scrolling_region.right;
+        }
+
         try screen_formatter.format(writer);
     }
 
@@ -749,6 +760,13 @@ pub const ScreenFormatter = struct {
     /// (DECOM), where CUP counts from the top-left of the scrolling region.
     cursor_origin: CursorOrigin = .{},
 
+    /// The column where a pending wrap is restored by printing the cell
+    /// under the cursor again. This is the last column of the screen
+    /// unless the output is replayed with left and right margins (DECSLRM)
+    /// that the cursor is within, where a wrap is pending at the right
+    /// margin instead. Null means the last column.
+    wrap_column: ?size.CellCountInt = null,
+
     pub const Content = union(enum) {
         /// Emit no content, only terminal state such as modes, palette, etc.
         /// via extra.
@@ -879,7 +897,8 @@ pub const ScreenFormatter = struct {
             const origin = self.cursor_origin;
 
             // If we don't have pending wrap, then we can just use CUP.
-            if (!cursor.pending_wrap or cursor.x != self.screen.pages.cols - 1) {
+            const wrap_column = self.wrap_column orelse self.screen.pages.cols - 1;
+            if (!cursor.pending_wrap or cursor.x != wrap_column) {
                 try writer.print("\x1b[{d};{d}H", .{
                     (cursor.y -| origin.y) + 1,
                     (cursor.x -| origin.x) + 1,
@@ -1397,6 +1416,8 @@ pub const PageFormatter = struct {
                 continue;
             }
 
+            // Whether a line break goes out before this row (a prior row did not wrap, or blank rows came before it).
+            const broke_before = blank_rows > 0;
             if (blank_rows > 0) {
                 // Reset style before emitting newlines to prevent background
                 // colors from bleeding into the next line's leading cells.
@@ -1461,8 +1482,13 @@ pub const PageFormatter = struct {
             if (!row.wrap or !self.opts.unwrap) blank_rows += 1;
 
             // If the row doesn't continue a wrap then we need to reset
-            // our blank cell count.
-            if (!row.wrap_continuation or !self.opts.unwrap) blank_cells = 0;
+            // our blank cell count. Also when a line break went out before
+            // it: blank cells carry only across a wrap we joined. A row can
+            // be marked as continuing a wrap while the row before it no
+            // longer wraps (its wrap flag cleared, the continuation flag
+            // kept); carrying the prior row's trailing blanks then printed
+            // them after the break, shifting the row right.
+            if (!row.wrap_continuation or !self.opts.unwrap or broke_before) blank_cells = 0;
 
             // Go through each cell and print it
             var cell_i: usize = 0;
@@ -2355,19 +2381,15 @@ pub const PageFormatter = struct {
                 ).*,
 
             .bg_color_palette => .{
-                .bg_color = .{
-                    .palette = cell.content.color_palette.data,
-                },
+                .bg_color = .palette(cell.content.color_palette.data),
             },
 
             .bg_color_rgb => .{
-                .bg_color = .{
-                    .rgb = .{
-                        .r = cell.content.color_rgb.r,
-                        .g = cell.content.color_rgb.g,
-                        .b = cell.content.color_rgb.b,
-                    },
-                },
+                .bg_color = .rgb(.{
+                    .r = cell.content.color_rgb.r,
+                    .g = cell.content.color_rgb.g,
+                    .b = cell.content.color_rgb.b,
+                }),
             },
         };
     }
@@ -3289,6 +3311,40 @@ test "Page plain with prior trailing state cells with wrap continuation" {
         Coordinate{ .x = @intCast(i), .y = 0 },
         point_map.items[3 + i],
     );
+}
+
+test "Page plain wrap continuation after a row that does not wrap keeps its column" {
+    // A row marked as continuing a wrap while the row before it does not
+    // wrap (cmux VT fuzz finding E2): the line break goes out, and the prior
+    // row's trailing blank cells must not be printed after it.
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 80,
+        .rows = 24,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+
+    s.nextSlice("abc\r\nu");
+
+    const pages = &t.screens.active.pages;
+    const page = pages.pages.last.?.page();
+
+    // Row 0 does not wrap; row 1 keeps a stale continuation flag.
+    try testing.expect(!page.getRow(0).wrap);
+    page.getRow(1).wrap_continuation = true;
+
+    var formatter: PageFormatter = .init(page, .{ .emit = .plain, .unwrap = true });
+    try formatter.format(&builder.writer);
+    try testing.expectEqualStrings("abc\nu", builder.writer.buffered());
 }
 
 test "Page plain soft-wrapped without unwrap" {
@@ -7009,6 +7065,55 @@ test "Terminal vt with cursor in origin mode" {
     }
 }
 
+test "Terminal vt cursor preserves pending wrap at the right margin" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    // Each stream sets left and right margins (which need mode 69) and
+    // leaves a pending wrap: at the right margin, at the right margin with
+    // a wide character, and at the last column with the cursor right of
+    // the margins.
+    const streams = [_][]const u8{
+        "\x1b[?69h\x1b[;2s00",
+        "\x1b[?69h\x1b[3;6s\x1b[1;5H\u{1F600}",
+        "\x1b[?69h\x1b[3;6s\x1b[1;20Hx",
+    };
+    for (streams) |stream| {
+        var builder: std.Io.Writer.Allocating = .init(alloc);
+        defer builder.deinit();
+
+        var t = try Terminal.init(io, alloc, .{ .cols = 20, .rows = 4 });
+        defer t.deinit(alloc);
+        var s = t.vtStream();
+        defer s.deinit();
+        s.nextSlice(stream);
+        try testing.expect(t.screens.active.cursor.pending_wrap);
+
+        var formatter: TerminalFormatter = .init(&t, .vt);
+        formatter.extra = .all;
+        try formatter.format(&builder.writer);
+
+        var t2 = try Terminal.init(io, alloc, .{ .cols = 20, .rows = 4 });
+        defer t2.deinit(alloc);
+        var s2 = t2.vtStream();
+        defer s2.deinit();
+        s2.nextSlice(builder.writer.buffered());
+
+        try testing.expectEqual(t.screens.active.cursor.x, t2.screens.active.cursor.x);
+        try testing.expectEqual(t.screens.active.cursor.y, t2.screens.active.cursor.y);
+        try testing.expect(t2.screens.active.cursor.pending_wrap);
+
+        s.nextSlice("X");
+        s2.nextSlice("X");
+        const contents = try t.screens.active.dumpStringAlloc(alloc, .{ .screen = .{} });
+        defer alloc.free(contents);
+        const contents2 = try t2.screens.active.dumpStringAlloc(alloc, .{ .screen = .{} });
+        defer alloc.free(contents2);
+        try testing.expectEqualStrings(contents, contents2);
+    }
+}
+
 test "Terminal vt with cursor in origin mode without the region" {
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -8320,7 +8425,7 @@ test "Page VT preserves a fully styled blank row" {
         const cell = target.screens.active.pages.getCell(pt).?;
         const bg: ?u8 = switch (cell.cell.content_tag) {
             .bg_color_palette => cell.cell.content.color_palette.data,
-            .codepoint, .codepoint_grapheme => switch (cell.style().bg_color) {
+            .codepoint, .codepoint_grapheme => switch (cell.style().bg_color.value()) {
                 .palette => |idx| idx,
                 else => null,
             },

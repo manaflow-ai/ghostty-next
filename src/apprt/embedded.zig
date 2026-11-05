@@ -2254,6 +2254,36 @@ pub const CAPI = struct {
         return api.presentHostSized();
     }
 
+    /// Who shows the frame of a new host size: the renderer (default) or the
+    /// embedder (ghostty_surface_host_frame). See ghostty.h.
+    export fn ghostty_surface_set_host_present(surface: *Surface, mode_raw: c_int) void {
+        if (comptime builtin.os.tag != .macos) return;
+        const mode = std.enums.fromInt(apprt.HostPresent, mode_raw) orelse return;
+        const api = &surface.core_surface.renderer.api;
+        if (comptime !@hasDecl(@TypeOf(api.*), "setEmbedderPresents")) return;
+        api.setEmbedderPresents(mode == .embedder);
+    }
+
+    /// What the embedder can show for the host size; with present, shows the
+    /// frame the renderer drew for it in the caller's Core Animation
+    /// transaction. See ghostty.h.
+    export fn ghostty_surface_host_frame(surface: *Surface, present: bool) apprt.HostFrame {
+        if (comptime builtin.os.tag != .macos) return .none;
+        const api = &surface.core_surface.renderer.api;
+        if (comptime !@hasDecl(@TypeOf(api.*), "hostFrame")) return .none;
+        if (present) _ = api.counters.present_calls.fetchAdd(1, .monotonic);
+        return api.hostFrame(present);
+    }
+
+    /// The embedder committed the transaction of its last host frame present or
+    /// bounds change. See ghostty.h.
+    export fn ghostty_surface_host_frame_committed(surface: *Surface) void {
+        if (comptime builtin.os.tag != .macos) return;
+        const api = &surface.core_surface.renderer.api;
+        if (comptime !@hasDecl(@TypeOf(api.*), "hostFrameCommitted")) return;
+        api.hostFrameCommitted();
+    }
+
     /// Draw a reflow preview while the locked grid does not fit the view.
     /// See ghostty.h.
     export fn ghostty_surface_set_reflow_preview(surface: *Surface, enabled: bool) void {
@@ -2310,6 +2340,13 @@ pub const CAPI = struct {
         host_fresh_presents: u64,
         host_late_presents: u64,
         host_off_main_presents: u64,
+        renderer_wakeups: u64,
+        renderer_draw_now: u64,
+        renderer_cursor_timer_fires: u64,
+        renderer_animation_timer_fires: u64,
+        renderer_compression_timer_fires: u64,
+        io_wakeups: u64,
+        io_timer_fires: u64,
     };
 
     /// The renderer's frame counters. See ghostty.h.
@@ -2332,6 +2369,13 @@ pub const CAPI = struct {
             .host_fresh_presents = hostCounter(surface, "fresh_presents"),
             .host_late_presents = hostCounter(surface, "late"),
             .host_off_main_presents = hostCounter(surface, "off_main_presents"),
+            .renderer_wakeups = c.thread_wakeups.load(.monotonic),
+            .renderer_draw_now = c.thread_draw_now.load(.monotonic),
+            .renderer_cursor_timer_fires = c.cursor_timer_fires.load(.monotonic),
+            .renderer_animation_timer_fires = c.animation_timer_fires.load(.monotonic),
+            .renderer_compression_timer_fires = c.compression_timer_fires.load(.monotonic),
+            .io_wakeups = surface.core_surface.io_thread.counters.wakeups.load(.monotonic),
+            .io_timer_fires = surface.core_surface.io_thread.counters.timer_fires.load(.monotonic),
         };
     }
 
@@ -2539,13 +2583,15 @@ pub const CAPI = struct {
     }
 
     /// Set the preedit text for the surface. This is used for IME
-    /// composition. If the length is 0, then the preedit text is cleared.
+    /// composition. If the pointer is null or the length is 0, then the
+    /// preedit text is cleared.
     export fn ghostty_surface_preedit(
         surface: *Surface,
-        ptr: [*]const u8,
+        ptr: ?[*]const u8,
         len: usize,
     ) void {
-        surface.preeditCallback(if (len == 0) null else ptr[0..len]);
+        const text = ptr orelse return surface.preeditCallback(null);
+        surface.preeditCallback(if (len == 0) null else text[0..len]);
     }
 
     /// Send committed text (typed text, an IME commit) to the terminal.

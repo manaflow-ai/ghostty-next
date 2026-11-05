@@ -54,6 +54,22 @@ typedef SSIZE_T ssize_t;
 #endif
 #endif
 
+// Pointers in this header are non-null unless marked otherwise, so importers
+// such as Swift can enforce it. GHOSTTY_NULLABLE marks a pointer that may be
+// null. GHOSTTY_NULL_UNSPECIFIED marks a field of a struct that callers
+// zero-initialize before libghostty fills it in. GHOSTTY_NONNULL is only needed
+// for nested pointers, which the default doesn't cover.
+#if defined(__clang__)
+  #define GHOSTTY_NONNULL _Nonnull
+  #define GHOSTTY_NULLABLE _Nullable
+  #define GHOSTTY_NULL_UNSPECIFIED _Null_unspecified
+  #pragma clang assume_nonnull begin
+#else
+  #define GHOSTTY_NONNULL
+  #define GHOSTTY_NULLABLE
+  #define GHOSTTY_NULL_UNSPECIFIED
+#endif
+
 //-------------------------------------------------------------------
 // Types
 
@@ -89,9 +105,9 @@ typedef struct {
 // The payload for completing a clipboard read request. See
 // ghostty_surface_complete_clipboard_request.
 typedef struct {
-  const ghostty_clipboard_content_s *contents;
+  const ghostty_clipboard_content_s *GHOSTTY_NULLABLE contents;
   size_t contents_len;
-  const char *const *available;
+  const char *const GHOSTTY_NONNULL *GHOSTTY_NULLABLE available;
   size_t available_len;
   bool confirmed;
   bool remember;
@@ -101,11 +117,11 @@ typedef struct {
 // completion contents plus the information shown in the permission
 // prompt. See ghostty_runtime_confirm_read_clipboard_cb.
 typedef struct {
-  const ghostty_clipboard_content_s *contents;
+  const ghostty_clipboard_content_s *GHOSTTY_NULLABLE contents;
   size_t contents_len;
-  const char *const *available;
+  const char *const GHOSTTY_NONNULL *GHOSTTY_NULLABLE available;
   size_t available_len;
-  const char *name;
+  const char *GHOSTTY_NULLABLE name;
   bool can_remember;
 } ghostty_clipboard_confirm_s;
 
@@ -396,7 +412,7 @@ typedef struct {
   // iOS the USB HID keyboard usage that UIKit reports as UIKey.keyCode
   // (UIKeyboardHIDUsage, for example 0x04 for A).
   uint32_t keycode;
-  const char* text;
+  const char* GHOSTTY_NULLABLE text;
   uint32_t unshifted_codepoint;
   bool composing;
 } ghostty_input_key_s;
@@ -444,13 +460,13 @@ typedef struct {
 } ghostty_diagnostic_s;
 
 typedef struct {
-  const char* ptr;
+  const char* GHOSTTY_NULLABLE ptr;
   uintptr_t len;
   bool sentinel;
 } ghostty_string_s;
 
 typedef struct {
-  const char* path;
+  const char* GHOSTTY_NULL_UNSPECIFIED path;
   uintptr_t line;
 } ghostty_config_source_s;
 
@@ -459,7 +475,7 @@ typedef struct {
   double tl_px_y;
   uint32_t offset_start;
   uint32_t offset_len;
-  const char* text;
+  const char* GHOSTTY_NULL_UNSPECIFIED text;
   uintptr_t text_len;
 } ghostty_text_s;
 
@@ -495,11 +511,11 @@ typedef struct {
 } ghostty_env_var_s;
 
 typedef struct {
-  void* nsview;
+  void* GHOSTTY_NULLABLE nsview;
 } ghostty_platform_macos_s;
 
 typedef struct {
-  void* uiview;
+  void* GHOSTTY_NULLABLE uiview;
 } ghostty_platform_ios_s;
 
 typedef union {
@@ -614,7 +630,9 @@ typedef enum {
 // Calls for one surface never overlap. The callback may run while
 // Ghostty holds the surface's terminal lock, so it must not call back
 // into the surface. It can be called until ghostty_surface_free returns.
-typedef void (*ghostty_io_write_cb)(void*, const char*, uintptr_t);
+typedef void (*ghostty_io_write_cb)(void* GHOSTTY_NULLABLE,
+                                    const char*,
+                                    uintptr_t);
 
 // Font binding actions reported after Ghostty applied them (increase,
 // decrease, reset, set). The callback runs synchronously on the surface's
@@ -632,11 +650,11 @@ typedef enum {
 // terminal lock held, so it answers from what it already knows and never
 // calls into Ghostty; to change an answer, the embedder sends the pointer
 // position again (ghostty_surface_mouse_pos) or refreshes.
-typedef bool (*ghostty_surface_link_filter_cb)(void* userdata,
+typedef bool (*ghostty_surface_link_filter_cb)(void* GHOSTTY_NULLABLE userdata,
                                                const char* text,
                                                uintptr_t len);
 typedef void (*ghostty_font_size_action_cb)(
-    void* userdata,
+    void* GHOSTTY_NULLABLE userdata,
     ghostty_font_size_action_e action,
     float previous_points,
     float current_points,
@@ -646,22 +664,22 @@ typedef void (*ghostty_font_size_action_cb)(
 typedef struct {
   ghostty_platform_e platform_tag;
   ghostty_platform_u platform;
-  void* userdata;
+  void* GHOSTTY_NULLABLE userdata;
   double scale_factor;
   float font_size;
-  const char* working_directory;
-  const char* command;
-  ghostty_env_var_s* env_vars;
+  const char* GHOSTTY_NULLABLE working_directory;
+  const char* GHOSTTY_NULLABLE command;
+  ghostty_env_var_s* GHOSTTY_NULLABLE env_vars;
   size_t env_var_count;
-  const char* initial_input;
+  const char* GHOSTTY_NULLABLE initial_input;
   bool wait_after_command;
   ghostty_surface_context_e context;
   // See ghostty_surface_io_mode_e. Surfaces that Ghostty asks the
   // embedder to create (new tab or split actions) do not inherit these
   // fields; they start in EXEC mode.
   ghostty_surface_io_mode_e io_mode;
-  ghostty_io_write_cb io_write_cb;
-  void* io_write_userdata;
+  ghostty_io_write_cb GHOSTTY_NULLABLE io_write_cb;
+  void* GHOSTTY_NULLABLE io_write_userdata;
 } ghostty_surface_config_s;
 
 typedef struct {
@@ -762,13 +780,26 @@ typedef struct {
   // unchanged) that went to the screen from the renderer's GPU completion
   // thread, in their own Core Animation transaction, without the main thread.
   uint64_t host_off_main_presents;
+  // Wakes of the surface's threads by source, for what a surface costs
+  // while it is hidden. Renderer thread: its wakeup async (output, mailbox
+  // messages, a cursor tick that draws), its draw-now async (the display
+  // link), and its cursor blink, animation and scrollback-compression
+  // timers. Termio thread: its wakeup async (mailbox messages) and its
+  // timers (resize coalesce, synchronized-output reset, selection scroll).
+  uint64_t renderer_wakeups;
+  uint64_t renderer_draw_now;
+  uint64_t renderer_cursor_timer_fires;
+  uint64_t renderer_animation_timer_fires;
+  uint64_t renderer_compression_timer_fires;
+  uint64_t io_wakeups;
+  uint64_t io_timer_fires;
 } ghostty_surface_render_counters_s;
 
 // Config types
 
 // config.Path
 typedef struct {
-  const char* path;
+  const char* GHOSTTY_NULL_UNSPECIFIED path;
   bool optional;
 } ghostty_config_path_s;
 
@@ -787,13 +818,13 @@ typedef struct {
 
 // config.ColorList
 typedef struct {
-  const ghostty_config_color_s* colors;
+  const ghostty_config_color_s* GHOSTTY_NULL_UNSPECIFIED colors;
   size_t len;
 } ghostty_config_color_list_s;
 
 // config.RepeatableCommand
 typedef struct {
-  const ghostty_command_s* commands;
+  const ghostty_command_s* GHOSTTY_NULL_UNSPECIFIED commands;
   size_t len;
 } ghostty_config_command_list_s;
 
@@ -840,7 +871,7 @@ typedef enum {
 } ghostty_target_tag_e;
 
 typedef union {
-  ghostty_surface_t surface;
+  ghostty_surface_t GHOSTTY_NULLABLE surface;
 } ghostty_target_u;
 
 typedef struct {
@@ -1308,38 +1339,38 @@ typedef struct {
   ghostty_action_u action;
 } ghostty_action_s;
 
-typedef void (*ghostty_runtime_wakeup_cb)(void*);
+typedef void (*ghostty_runtime_wakeup_cb)(void* GHOSTTY_NULLABLE);
 typedef ghostty_clipboard_read_result_e (*ghostty_runtime_read_clipboard_cb)(
-    void*,
+    void* GHOSTTY_NULLABLE,
     ghostty_clipboard_e,
     void*,
-    const char* const*,
+    const char* const GHOSTTY_NONNULL* GHOSTTY_NONNULL,
     size_t,
     bool);
 typedef void (*ghostty_runtime_confirm_read_clipboard_cb)(
-    void*,
+    void* GHOSTTY_NULLABLE,
     const ghostty_clipboard_confirm_s*,
     void*,
     ghostty_clipboard_request_e);
-typedef void (*ghostty_runtime_write_clipboard_cb)(void*,
+typedef void (*ghostty_runtime_write_clipboard_cb)(void* GHOSTTY_NULLABLE,
                                                    ghostty_clipboard_e,
                                                    const ghostty_clipboard_content_s*,
                                                    size_t,
                                                    bool);
-typedef void (*ghostty_runtime_close_surface_cb)(void*, bool);
+typedef void (*ghostty_runtime_close_surface_cb)(void* GHOSTTY_NULLABLE, bool);
 typedef bool (*ghostty_runtime_action_cb)(ghostty_app_t,
                                           ghostty_target_s,
                                           ghostty_action_s);
 
 typedef struct {
-  void* userdata;
+  void* GHOSTTY_NULLABLE userdata;
   bool supports_selection_clipboard;
   ghostty_runtime_wakeup_cb wakeup_cb;
   ghostty_runtime_action_cb action_cb;
   ghostty_runtime_read_clipboard_cb read_clipboard_cb;
   ghostty_runtime_confirm_read_clipboard_cb confirm_read_clipboard_cb;
   ghostty_runtime_write_clipboard_cb write_clipboard_cb;
-  ghostty_runtime_close_surface_cb close_surface_cb;
+  ghostty_runtime_close_surface_cb GHOSTTY_NULLABLE close_surface_cb;
 } ghostty_runtime_config_s;
 
 // apprt.ipc.Target.Key
@@ -1349,7 +1380,7 @@ typedef enum {
 } ghostty_ipc_target_tag_e;
 
 typedef union {
-  char *klass;
+  char *GHOSTTY_NULLABLE klass;
 } ghostty_ipc_target_u;
 
 typedef struct {
@@ -1360,7 +1391,7 @@ typedef struct {
 // apprt.ipc.Action.NewWindow
 typedef struct {
   // This should be a null terminated list of strings.
-  const char **arguments;
+  const char *GHOSTTY_NULLABLE *GHOSTTY_NULLABLE arguments;
 } ghostty_ipc_action_new_window_s;
 
 typedef union {
@@ -1377,15 +1408,15 @@ typedef enum {
 //-------------------------------------------------------------------
 // Published API
 
-GHOSTTY_API int ghostty_init(uintptr_t, char**);
+GHOSTTY_API int ghostty_init(uintptr_t, char* GHOSTTY_NULLABLE* GHOSTTY_NONNULL);
 GHOSTTY_API void ghostty_cli_try_action(void);
 GHOSTTY_API ghostty_info_s ghostty_info(void);
 GHOSTTY_API const char* ghostty_translate(const char*);
 GHOSTTY_API void ghostty_string_free(ghostty_string_s);
 
-GHOSTTY_API ghostty_config_t ghostty_config_new();
-GHOSTTY_API void ghostty_config_free(ghostty_config_t);
-GHOSTTY_API ghostty_config_t ghostty_config_clone(ghostty_config_t);
+GHOSTTY_API ghostty_config_t GHOSTTY_NULLABLE ghostty_config_new();
+GHOSTTY_API void ghostty_config_free(ghostty_config_t GHOSTTY_NULLABLE);
+GHOSTTY_API ghostty_config_t GHOSTTY_NULLABLE ghostty_config_clone(ghostty_config_t);
 GHOSTTY_API void ghostty_config_load_cli_args(ghostty_config_t);
 GHOSTTY_API void ghostty_config_load_file(ghostty_config_t, const char*);
 GHOSTTY_API void ghostty_config_load_string(ghostty_config_t, const char*, uintptr_t, const char*);
@@ -1406,19 +1437,20 @@ GHOSTTY_API ghostty_string_s ghostty_config_open_path(void);
 // the key is at its default, came from the command line, or is unknown. The
 // path and the loaded-file strings are owned by the config.
 GHOSTTY_API uintptr_t ghostty_config_key_count(void);
-GHOSTTY_API const char* ghostty_config_key_name(uintptr_t);
+GHOSTTY_API const char* GHOSTTY_NULLABLE ghostty_config_key_name(uintptr_t);
 GHOSTTY_API bool ghostty_config_key_source(ghostty_config_t,
                                            const char*,
                                            uintptr_t,
                                            ghostty_config_source_s*);
 GHOSTTY_API uintptr_t ghostty_config_loaded_file_count(ghostty_config_t);
-GHOSTTY_API const char* ghostty_config_loaded_file(ghostty_config_t, uintptr_t);
+GHOSTTY_API const char* GHOSTTY_NULLABLE ghostty_config_loaded_file(ghostty_config_t,
+                                                                  uintptr_t);
 
-GHOSTTY_API ghostty_app_t ghostty_app_new(const ghostty_runtime_config_s*,
+GHOSTTY_API ghostty_app_t GHOSTTY_NULLABLE ghostty_app_new(const ghostty_runtime_config_s*,
                                              ghostty_config_t);
 GHOSTTY_API void ghostty_app_free(ghostty_app_t);
 GHOSTTY_API void ghostty_app_tick(ghostty_app_t);
-GHOSTTY_API void* ghostty_app_userdata(ghostty_app_t);
+GHOSTTY_API void* GHOSTTY_NULLABLE ghostty_app_userdata(ghostty_app_t);
 GHOSTTY_API void ghostty_app_set_focus(ghostty_app_t, bool);
 GHOSTTY_API bool ghostty_app_key(ghostty_app_t, ghostty_input_key_s);
 GHOSTTY_API void ghostty_app_keyboard_changed(ghostty_app_t);
@@ -1430,10 +1462,10 @@ GHOSTTY_API void ghostty_app_set_color_scheme(ghostty_app_t, ghostty_color_schem
 
 GHOSTTY_API ghostty_surface_config_s ghostty_surface_config_new();
 
-GHOSTTY_API ghostty_surface_t ghostty_surface_new(ghostty_app_t,
+GHOSTTY_API ghostty_surface_t GHOSTTY_NULLABLE ghostty_surface_new(ghostty_app_t,
                                                      const ghostty_surface_config_s*);
 GHOSTTY_API void ghostty_surface_free(ghostty_surface_t);
-GHOSTTY_API void* ghostty_surface_userdata(ghostty_surface_t);
+GHOSTTY_API void* GHOSTTY_NULLABLE ghostty_surface_userdata(ghostty_surface_t);
 GHOSTTY_API ghostty_app_t ghostty_surface_app(ghostty_surface_t);
 GHOSTTY_API ghostty_surface_config_s ghostty_surface_inherited_config(ghostty_surface_t, ghostty_surface_context_e);
 GHOSTTY_API void ghostty_surface_update_config(ghostty_surface_t, ghostty_config_t);
@@ -1450,14 +1482,15 @@ GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
 // returns.
 GHOSTTY_API bool ghostty_surface_set_font_size_action_callback(
     ghostty_surface_t,
-    ghostty_font_size_action_cb,
-    void* userdata);
+    ghostty_font_size_action_cb GHOSTTY_NULLABLE,
+    void* GHOSTTY_NULLABLE userdata);
 // Installs the link filter for this surface; a NULL callback removes it.
 // userdata must stay valid until the filter is removed or
 // ghostty_surface_free returns.
-GHOSTTY_API void ghostty_surface_set_link_filter(ghostty_surface_t,
-                                                 ghostty_surface_link_filter_cb,
-                                                 void* userdata);
+GHOSTTY_API void ghostty_surface_set_link_filter(
+    ghostty_surface_t,
+    ghostty_surface_link_filter_cb GHOSTTY_NULLABLE,
+    void* GHOSTTY_NULLABLE userdata);
 GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t);
 // macOS: with enabled true the renderer draws at the pixel size of the last
 // ghostty_surface_set_size, not at the view's bounds. While the view's
@@ -1492,6 +1525,107 @@ GHOSTTY_API bool ghostty_surface_present_host_frame(ghostty_surface_t);
 // the last frame (counted in host_late_presents) and the new frame lands when
 // it completes. Never blocks the main thread.
 GHOSTTY_API bool ghostty_surface_present_host_frame_ready(ghostty_surface_t);
+// macOS, host-sized surfaces: who shows the frame of a new host size.
+typedef enum {
+  // The renderer (default): see ghostty_surface_set_host_sized.
+  GHOSTTY_HOST_PRESENT_RENDERER = 0,
+  // The embedder, with ghostty_surface_host_frame, in the Core Animation
+  // transaction that gives the view its new bounds, so a commit never
+  // carries new pixels in the old bounds or old pixels in the new bounds.
+  // A new size asks for no display pass and a display pass never waits.
+  // The renderer still draws each new size at once on its renderer thread
+  // (cells rebuilt for it, the reflow preview included) and keeps that frame
+  // for the embedder, but never shows a frame of another size than the one
+  // the layer shows, unless the view's bounds already have that size (the
+  // embedder set them without a present). A frame at the shown size still
+  // reaches the screen off the main thread, and a first frame (nothing
+  // shown yet) presents itself. ghostty_surface_draw (a synchronous draw the
+  // embedder asks for) still shows its frame at once; it and the first
+  // frame's display pass wait on the main thread for a free frame and the
+  // GPU, as they do by default. In this mode
+  // ghostty_surface_present_host_frame(_ready) are ghostty_surface_host_frame
+  // with present true (no wait). From the start of the mode, and after the
+  // main thread changed the size of the frame the layer shows (a present, a
+  // first frame, a new-size frame shown on main), every frame goes through
+  // the main thread until ghostty_surface_host_frame_committed: Ghostty cannot
+  // see the main thread's commit, and a frame committed off the main thread
+  // could reach the screen ahead of the view's new bounds. An off-main present
+  // never commits while it holds [CATransaction lock]. Going back to the
+  // renderer shows a frame drawn for the host size at once.
+  GHOSTTY_HOST_PRESENT_EMBEDDER = 1,
+} ghostty_host_present_e;
+// Default GHOSTTY_HOST_PRESENT_RENDERER. No effect on iOS or on a surface
+// that is not host-sized. Main thread.
+GHOSTTY_API void ghostty_surface_set_host_present(ghostty_surface_t,
+                                                  ghostty_host_present_e);
+// What ghostty_surface_host_frame found for the host size (the size of the
+// last ghostty_surface_set_size).
+typedef enum {
+  // Nothing to keep: not host-sized, iOS, or no frame shown yet (the first
+  // frame presents itself). Give the view its new bounds now.
+  GHOSTTY_HOST_FRAME_NONE = 0,
+  // The surface does not draw (occluded). No frame comes until it is shown
+  // again (ghostty_surface_set_occlusion true), which arms the present for
+  // its host size.
+  GHOSTTY_HOST_FRAME_HIDDEN = 1,
+  // The layer shows a frame at the host size: nothing is left to present.
+  GHOSTTY_HOST_FRAME_SHOWN = 2,
+  // present false: the renderer drew the host size's frame; it is not shown
+  // yet. A call with present true shows it.
+  GHOSTTY_HOST_FRAME_READY = 3,
+  // present true: that frame is the layer's contents now, in the caller's
+  // Core Animation transaction. Give the view its new bounds in the same
+  // transaction.
+  GHOSTTY_HOST_FRAME_PRESENTED = 4,
+  // Not drawn yet: the layer keeps the frame it shows. Keep the view's old
+  // bounds and call again before a later commit.
+  GHOSTTY_HOST_FRAME_PENDING = 5,
+  // Frame updates are held (synchronized output, a snapshot restore): no
+  // frame can come now, and the layer keeps the frame it shows.
+  GHOSTTY_HOST_FRAME_HELD = 6,
+} ghostty_host_frame_e;
+// macOS, a surface whose new host sizes the embedder presents
+// (ghostty_surface_set_host_present): what it can show for its host size.
+// With present false the layer does not change (a query: for example to
+// present a group of surfaces together or not at all). With present true,
+// a READY frame becomes the layer's contents in the caller's Core Animation
+// transaction (PRESENTED); call it after every surface of the transaction
+// got its size (their renderers draw in parallel) and before the commit, for
+// example from a main run-loop observer that runs just before Core
+// Animation's commit. A frame that reaches the main thread later never
+// replaces a newer one. Never waits and never draws. Counted in
+// host_present_calls (present true), host_fresh_presents (PRESENTED) and
+// host_late_presents (PENDING or HELD with present true). A view whose
+// bounds were given without a present shows a frame that completes after that
+// by itself; a frame whose completion already left its present to the
+// embedder (it completed while the bounds were old) waits for a present: after
+// giving bounds without a present, call with present true when it returns
+// READY. Until the frame shows, or while the bounds stay old, call again until
+// it returns SHOWN, NONE or HIDDEN. READY does not reserve the frame: a hide can
+// drop it before the present (HIDDEN then), and a change of the host size
+// drops it too, even back to an equal size after another one (A->B->A): a
+// frame kept for a present before that change is not presented for the new
+// size (the renderer draws a new size at once; while it holds its frames, the
+// layer keeps its last frame).
+// Call it with present true, and give the view its bounds, in one explicit
+// [CATransaction lock] span. An open transaction, a layout pass or a display
+// pass alone is not such a span. No off-main present runs its checks or sets
+// its frame in between, and none holds the lock while it commits. In the
+// span, never commit or flush, and never draw: not ghostty_surface_draw, and
+// not a display pass of a surface with nothing shown (a first frame draws on
+// main). A draw waits for a free frame, and the GPU completion thread that
+// frees it needs the lock. Each of these can deadlock against a commit that
+// waits for the lock. Main thread.
+GHOSTTY_API ghostty_host_frame_e ghostty_surface_host_frame(ghostty_surface_t,
+                                                            bool present);
+// The embedder's transaction that carried its last present or bounds change
+// was committed (for example: called after each commit while the embedder
+// presents host sizes; a call with nothing pending does nothing). Frames at
+// the shown size go to the screen off the main thread again, which keeps a
+// terminal echo off the main thread. Without the call they go through main
+// (correct, slower). No effect outside GHOSTTY_HOST_PRESENT_EMBEDDER. Main
+// thread.
+GHOSTTY_API void ghostty_surface_host_frame_committed(ghostty_surface_t);
 GHOSTTY_API ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
 // Fills the grid metrics. Returns false while a resize of an unlocked grid
 // is in flight; with a host-locked grid (ghostty_surface_set_grid) the
@@ -1577,7 +1711,7 @@ GHOSTTY_API void ghostty_surface_set_color_scheme(ghostty_surface_t,
 // of 0 is instant (the default). Main thread.
 GHOSTTY_API void ghostty_surface_set_color_transition(
     ghostty_surface_t,
-    const ghostty_color_transition_s*);
+    const ghostty_color_transition_s* GHOSTTY_NULLABLE);
 // The renderer's frame counters since the surface started. Any thread
 // (diagnostics).
 GHOSTTY_API ghostty_surface_render_counters_s ghostty_surface_render_counters(
@@ -1587,7 +1721,7 @@ GHOSTTY_API ghostty_input_mods_e ghostty_surface_key_translation_mods(ghostty_su
 GHOSTTY_API bool ghostty_surface_key(ghostty_surface_t, ghostty_input_key_s);
 GHOSTTY_API bool ghostty_surface_key_is_binding(ghostty_surface_t,
                                                    ghostty_input_key_s,
-                                                   ghostty_binding_flags_e*);
+                                                   ghostty_binding_flags_e* GHOSTTY_NULLABLE);
 GHOSTTY_API void ghostty_surface_text(ghostty_surface_t, const char*, uintptr_t);
 // Send committed text, such as typed text or an IME commit, as if typed.
 // Unlike ghostty_surface_text (a paste), there is no bracketed paste and
@@ -1596,7 +1730,7 @@ GHOSTTY_API void ghostty_surface_text_input(ghostty_surface_t,
                                             const char*,
                                             uintptr_t);
 GHOSTTY_API void ghostty_surface_paste_text(ghostty_surface_t, const char*, uintptr_t);
-GHOSTTY_API void ghostty_surface_preedit(ghostty_surface_t, const char*, uintptr_t);
+GHOSTTY_API void ghostty_surface_preedit(ghostty_surface_t, const char* GHOSTTY_NULLABLE, uintptr_t);
 // Parse terminal output as if it was read from the pty and render it.
 // This is how a MANUAL or MANUAL_MIRROR surface receives output; for an
 // EXEC surface it does nothing. See ghostty_io_write_cb for the thread
@@ -1640,7 +1774,7 @@ typedef enum {
 
 // Receives an encoded snapshot: (userdata, bytes, length). The bytes are
 // valid only during the call; copy them.
-typedef void (*ghostty_surface_snapshot_write_cb)(void*,
+typedef void (*ghostty_surface_snapshot_write_cb)(void* GHOSTTY_NULLABLE,
                                                   const uint8_t*,
                                                   size_t);
 
@@ -1696,7 +1830,7 @@ typedef void (*ghostty_surface_snapshot_write_cb)(void*,
 // keeps the pages applied so far and ends the restore.
 GHOSTTY_API bool ghostty_surface_restore_snapshot(
     ghostty_surface_t,
-    const uint8_t*,
+    const uint8_t* GHOSTTY_NULLABLE,
     size_t,
     ghostty_surface_snapshot_phase_e);
 
@@ -1811,10 +1945,10 @@ typedef enum {
 // io_write_cb.
 GHOSTTY_API int ghostty_surface_restore_snapshot_local_history(
     ghostty_surface_t,
-    const uint8_t* bytes,
+    const uint8_t* GHOSTTY_NULLABLE bytes,
     size_t len,
     uint64_t expected_history_rows,
-    const uint8_t* expected_digest,
+    const uint8_t* GHOSTTY_NULLABLE expected_digest,
     size_t digest_len);
 
 // Apply a Kitty image replay stream that the owning libghostty-vt
@@ -1835,9 +1969,10 @@ GHOSTTY_API int ghostty_surface_restore_snapshot_local_history(
 // skipped parts (bytes
 // outside Kitty APC commands, other commands, malformed or truncated
 // commands); the valid commands before and after those still ran.
-GHOSTTY_API bool ghostty_surface_apply_kitty_replay(ghostty_surface_t,
-                                                    const uint8_t*,
-                                                    size_t);
+GHOSTTY_API bool ghostty_surface_apply_kitty_replay(
+    ghostty_surface_t,
+    const uint8_t* GHOSTTY_NULLABLE,
+    size_t);
 
 // The history digest of a MANUAL or MANUAL_MIRROR surface's primary
 // screen: the same value as ghostty_terminal_history_digest computes for
@@ -1845,10 +1980,11 @@ GHOSTTY_API bool ghostty_surface_apply_kitty_replay(ghostty_surface_t,
 // output queue; it takes the terminal lock. out_len must be
 // GHOSTTY_SURFACE_HISTORY_DIGEST_LEN. Returns false, and writes nothing,
 // for an EXEC surface, a NULL pointer or a wrong length.
-GHOSTTY_API bool ghostty_surface_history_digest(ghostty_surface_t,
-                                                uint64_t* history_rows,
-                                                uint8_t* out,
-                                                size_t out_len);
+GHOSTTY_API bool ghostty_surface_history_digest(
+    ghostty_surface_t,
+    uint64_t* GHOSTTY_NULLABLE history_rows,
+    uint8_t* GHOSTTY_NULLABLE out,
+    size_t out_len);
 
 // Encode the terminal of a MANUAL or MANUAL_MIRROR surface as a snapshot
 // (READY prefix, HISTORY records, or COMPLETE) and pass the bytes to
@@ -1860,8 +1996,8 @@ GHOSTTY_API bool ghostty_surface_history_digest(ghostty_surface_t,
 // longer than 1 MiB.
 GHOSTTY_API bool ghostty_surface_encode_snapshot(
     ghostty_surface_t,
-    ghostty_surface_snapshot_write_cb,
-    void*,
+    ghostty_surface_snapshot_write_cb GHOSTTY_NULLABLE,
+    void* GHOSTTY_NULLABLE,
     ghostty_surface_snapshot_phase_e);
 
 // The GHOSTSNP format version that ghostty_surface_restore_snapshot
@@ -1942,11 +2078,11 @@ GHOSTTY_API void ghostty_surface_free_text(ghostty_surface_t, ghostty_text_s*);
 
 #ifdef __APPLE__
 GHOSTTY_API void ghostty_surface_set_display_id(ghostty_surface_t, uint32_t);
-GHOSTTY_API void* ghostty_surface_quicklook_font(ghostty_surface_t);
+GHOSTTY_API void* GHOSTTY_NULLABLE ghostty_surface_quicklook_font(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_quicklook_word(ghostty_surface_t, ghostty_text_s*);
 #endif
 
-GHOSTTY_API ghostty_inspector_t ghostty_surface_inspector(ghostty_surface_t);
+GHOSTTY_API ghostty_inspector_t GHOSTTY_NULLABLE ghostty_surface_inspector(ghostty_surface_t);
 GHOSTTY_API void ghostty_inspector_free(ghostty_surface_t);
 GHOSTTY_API void ghostty_inspector_set_focus(ghostty_inspector_t, bool);
 GHOSTTY_API void ghostty_inspector_set_content_scale(ghostty_inspector_t, double, double);
@@ -1978,6 +2114,10 @@ GHOSTTY_API void ghostty_set_window_background_blur(ghostty_app_t, void*);
 
 // Benchmark API, if available.
 GHOSTTY_API bool ghostty_benchmark_cli(const char*, const char*);
+
+#if defined(__clang__)
+  #pragma clang assume_nonnull end
+#endif
 
 #ifdef __cplusplus
 }

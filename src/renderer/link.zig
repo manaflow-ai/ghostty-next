@@ -3,6 +3,7 @@ const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const oni = @import("oniguruma");
 const inputpkg = @import("../input.zig");
+const link_regex = @import("../input/link_regex.zig");
 const terminal = @import("../terminal/main.zig");
 const point = terminal.point;
 const Screen = terminal.Screen;
@@ -19,7 +20,7 @@ pub const Link = struct {
     highlight: inputpkg.Link.Highlight,
 
     pub fn deinit(self: *Link) void {
-        self.regex.deinit();
+        link_regex.release(self.regex);
     }
 
     /// Returns true if this link's highlight condition matches the given mouse state.
@@ -68,9 +69,10 @@ pub const Set = struct {
         var links: std.ArrayList(Link) = .empty;
         defer links.deinit(alloc);
 
+        // Shared with the surface and every other renderer (link_regex).
         for (config) |link| {
-            var regex = try link.oniRegex();
-            errdefer regex.deinit();
+            const regex = try link_regex.acquire(link.regex);
+            errdefer link_regex.release(regex);
             try links.append(alloc, .{
                 .regex = regex,
                 .highlight = link.highlight,
@@ -162,6 +164,10 @@ pub const Set = struct {
         }
     }
 };
+
+test {
+    _ = link_regex;
+}
 
 test "renderCellMap" {
     const testing = std.testing;
@@ -472,4 +478,23 @@ test "renderCellMap mods no match" {
     try testing.expect(!result.contains(.{ .x = 3, .y = 0 }));
     try testing.expect(!result.contains(.{ .x = 1, .y = 1 }));
     try testing.expect(!result.contains(.{ .x = 1, .y = 2 }));
+}
+
+test "link regex: two sets from the same config share one compiled regex" {
+    // Each new surface builds a Set (and the surface's own link list) from
+    // the same config. Compiling the regex again for each one cost the main
+    // thread about 0.5 ms per surface (onig_compile of the URL regex).
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const config: []const inputpkg.Link = &.{.{
+        .regex = "shared-regex-test-[0-9]+",
+        .action = .{ .open = {} },
+        .highlight = .{ .always = {} },
+    }};
+
+    var a = try Set.fromConfig(alloc, config);
+    defer a.deinit(alloc);
+    var b = try Set.fromConfig(alloc, config);
+    defer b.deinit(alloc);
+    try testing.expectEqual(a.links[0].regex.value, b.links[0].regex.value);
 }

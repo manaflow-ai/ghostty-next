@@ -32,6 +32,7 @@ const font = @import("font/main.zig");
 const Command = @import("Command.zig");
 const terminal = @import("terminal/main.zig");
 const configpkg = @import("config.zig");
+const link_regex = @import("input/link_regex.zig");
 const Duration = configpkg.Config.Duration;
 const input = @import("input.zig");
 const App = @import("App.zig");
@@ -391,13 +392,13 @@ pub const Keyboard = struct {
     ///
     /// This is naturally bounded due to the configuration maximum
     /// length of a sequence.
-    sequence_queued: std.ArrayListUnmanaged(termio.Message.WriteReq) = .empty,
+    sequence_queued: std.ArrayList(termio.Message.WriteReq) = .empty,
 
     /// The stack of tables that is currently active. The first value
     /// in this is the first activated table (NOT the default keybinding set).
     ///
     /// This is bounded by `max_active_key_tables`.
-    table_stack: std.ArrayListUnmanaged(struct {
+    table_stack: std.ArrayList(struct {
         set: *const input.Binding.Set,
         once: bool,
     }) = .empty,
@@ -479,9 +480,11 @@ const DerivedConfig = struct {
         const links = links: {
             var links: std.ArrayList(DerivedConfig.Link) = .empty;
             defer links.deinit(alloc);
+            // Shared with every other surface and renderer (link_regex):
+            // a new surface compiles nothing for a pattern already in use.
             for (config.link.links.items) |link| {
-                var regex = try link.oniRegex();
-                errdefer regex.deinit();
+                const regex = try link_regex.acquire(link.regex);
+                errdefer link_regex.release(regex);
                 try links.append(alloc, .{
                     .regex = regex,
                     .action = link.action,
@@ -492,7 +495,7 @@ const DerivedConfig = struct {
             break :links try links.toOwnedSlice(alloc);
         };
         errdefer {
-            for (links) |*link| link.regex.deinit();
+            for (links) |link| link_regex.release(link.regex);
             alloc.free(links);
         }
 
@@ -552,7 +555,7 @@ const DerivedConfig = struct {
     }
 
     pub fn deinit(self: *DerivedConfig) void {
-        for (self.links) |*link| link.regex.deinit();
+        for (self.links) |link| link_regex.release(link.regex);
         self.arena.deinit();
     }
 
@@ -7395,4 +7398,28 @@ test "bounded clipboard: an empty selection gives empty plain text" {
         4096,
     );
     try testing.expectEqualStrings("", contents[0].data);
+}
+
+test "link regex: two surfaces and their renderers compile each link regex once" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const rendererlink = @import("renderer/link.zig");
+
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    // The default config has the URL link.
+    try testing.expect(config.link.links.items.len > 0);
+
+    var a = try DerivedConfig.init(alloc, &config);
+    defer a.deinit();
+    var b = try DerivedConfig.init(alloc, &config);
+    defer b.deinit();
+    var r = try rendererlink.Set.fromConfig(alloc, config.link.links.items);
+    defer r.deinit(alloc);
+
+    try testing.expectEqual(a.links.len, r.links.len);
+    for (a.links, b.links, r.links) |la, lb, lr| {
+        try testing.expectEqual(la.regex.value, lb.regex.value);
+        try testing.expectEqual(la.regex.value, lr.regex.value);
+    }
 }
