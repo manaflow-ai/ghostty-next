@@ -12,9 +12,12 @@
 //!
 //! The preview is rebuilt at most once per frame, only when the view's
 //! grid or the live terminal changed. The live terminal's dirty state is
-//! read by a second render state (`watch`). Under the terminal lock the
-//! work grows with the screen and the copied rows, never with the
-//! history; the reflow runs without the lock.
+//! read by a second render state (`watch`). The live terminal is copied
+//! under the terminal lock only when it changed (`base`, not reflowed):
+//! a frame whose only change is the grid (each frame of a resize
+//! gesture) re-wraps a copy of `base`, with no lock held. Under the lock
+//! the work grows with the screen and the copied rows, never with the
+//! history.
 //!
 //! What the preview cannot predict: the owner clears a prompt that its
 //! shell redraws after the resize, while the preview keeps and reflows
@@ -48,6 +51,14 @@ terminal: ?Terminal = null,
 /// The grid `terminal` was reflowed to.
 grid: renderer.GridSize = .{},
 
+/// A copy of the live terminal as it was at its last change, not
+/// reflowed, owned by the renderer thread: each new grid re-wraps a copy
+/// of it off the lock. Null while no preview is drawn.
+base: ?Terminal = null,
+
+/// The history rows `base` holds enough of (`historyNeed`).
+base_need: usize = 0,
+
 /// The live terminal's dirty state since the preview was built.
 watch: terminalpkg.RenderState = .empty,
 
@@ -79,6 +90,7 @@ locked_copies: u64 = 0,
 
 pub fn deinit(self: *ReflowPreview, alloc: Allocator) void {
     if (self.terminal) |*t| t.deinit(alloc);
+    if (self.base) |*t| t.deinit(alloc);
     self.watch.deinit(alloc);
     self.* = undefined;
 }
@@ -96,9 +108,10 @@ pub fn wanted(live: *const Terminal, fit: renderer.GridSize) bool {
 }
 
 /// Bring the preview up to date for this frame. Takes the terminal lock
-/// (demand-aware, like the frame update) for the change check and the
-/// copy only. On any failure the preview ends and the live terminal is
-/// drawn.
+/// (demand-aware, like the frame update) for the change check, and for a
+/// copy of the live terminal only when it changed since `base` was
+/// taken. The re-wrap at a new grid runs off the lock. On any failure
+/// the preview ends and the live terminal is drawn.
 pub fn update(
     self: *ReflowPreview,
     alloc: Allocator,
@@ -113,7 +126,7 @@ pub fn update(
             self.fit_last.rows == fit.rows) return;
     }
 
-    var copy: Terminal = copy: {
+    {
         state.lockDemand(global.io());
         defer state.unlockDemand(global.io());
 
@@ -147,22 +160,38 @@ pub fn update(
         self.watch.endUpdate();
         if (!grid_changed and !live_changed) return;
 
-        self.locked_copies += 1;
-        break :copy snapshot(alloc, state.terminal, fit) catch |err| {
-            log.warn("reflow preview copy failed err={}", .{err});
-            self.end(alloc);
-            return;
-        };
+        // `base` still holds the live terminal: the new grid is re-wrapped
+        // from it after the lock is released.
+        const live = state.terminal;
+        const need = historyNeed(live.cols, fit);
+        const base_current = if (self.base) |*b|
+            !live_changed and b.cols == live.cols and b.rows == live.rows and self.base_need >= need
+        else
+            false;
+        if (!base_current) {
+            self.locked_copies += 1;
+            const fresh = snapshot(alloc, live, need) catch |err| {
+                log.warn("reflow preview copy failed err={}", .{err});
+                self.end(alloc);
+                return;
+            };
+            if (self.base) |*old| old.deinit(alloc);
+            self.base = fresh;
+            self.base_need = need;
+        }
+    }
+
+    // Off the lock: `base` belongs to this thread.
+    var copy = snapshot(alloc, &self.base.?, historyNeed(self.base.?.cols, fit)) catch |err| {
+        log.warn("reflow preview copy failed err={}", .{err});
+        self.dropDrawn(alloc);
+        return;
     };
 
     reflow(alloc, &copy, fit) catch |err| {
         log.warn("reflow preview resize failed err={}", .{err});
         copy.deinit(alloc);
-        // Only the renderer thread uses the preview terminal; the watch
-        // is reset at the next `end` under the lock.
-        if (self.terminal) |*old| old.deinit(alloc);
-        self.terminal = null;
-        self.grid = .{};
+        self.dropDrawn(alloc);
         return;
     };
 
@@ -212,7 +241,7 @@ pub fn source(
 /// Build the preview under the terminal lock. False on a failure.
 fn buildLocked(self: *ReflowPreview, alloc: Allocator, live: *const Terminal, fit: renderer.GridSize) bool {
     self.locked_copies += 1;
-    var copy = snapshot(alloc, live, fit) catch |err| {
+    var copy = snapshot(alloc, live, historyNeed(live.cols, fit)) catch |err| {
         log.warn("reflow preview copy failed err={}", .{err});
         return false;
     };
@@ -240,21 +269,47 @@ pub fn reflow(alloc: Allocator, copy: *Terminal, fit: renderer.GridSize) !void {
     copy.flags.dirty.clear = true;
 }
 
+/// Drop the drawn preview after a failed build off the lock. Only the
+/// renderer thread uses the preview terminals; the watch is reset at the
+/// next `end` under the lock.
+fn dropDrawn(self: *ReflowPreview, alloc: Allocator) void {
+    if (self.terminal) |*old| old.deinit(alloc);
+    self.terminal = null;
+    self.grid = .{};
+    if (self.base) |*old| old.deinit(alloc);
+    self.base = null;
+    self.base_need = 0;
+}
+
 /// Drop the preview. Caller holds the terminal lock.
 fn end(self: *ReflowPreview, alloc: Allocator) void {
     if (self.terminal) |*t| t.deinit(alloc);
     self.terminal = null;
     self.grid = .{};
+    if (self.base) |*t| t.deinit(alloc);
+    self.base = null;
+    self.base_need = 0;
     // The next preview starts from a full watch update.
     self.watch.deinit(alloc);
     self.watch = .empty;
 }
 
-/// A copy of `live` that a reflow to `fit` can fill: the READY state
-/// (both screens, modes, colors, cursor) and the newest history rows the
-/// reflow needs. Caller holds the terminal lock. Public for the
-/// benchmark (`ghostty-bench +reflow-preview`).
-pub fn snapshot(alloc: Allocator, live: *const Terminal, fit: renderer.GridSize) !Terminal {
+/// The history rows above the screen that fill any reflow of a terminal
+/// of `cols` columns to `fit`, including rows a taller grid pulls from
+/// history. A new row starts anywhere in an old row and spans at most
+/// ceil(new cols / old cols) + 1 old rows of one logical line. At least
+/// a widening to twice the columns is covered, so the copy a preview
+/// keeps (`base`) serves the grids of a whole gesture.
+pub fn historyNeed(cols: u16, fit: renderer.GridSize) usize {
+    const widen = @max(2, std.math.divCeil(usize, fit.columns, cols) catch 1);
+    return @as(usize, fit.rows) * (widen + 1) + margin_rows;
+}
+
+/// A copy of `live`: the READY state (both screens, modes, colors,
+/// cursor) and its newest `need` history rows (`historyNeed`). Caller
+/// holds the terminal lock when `live` is the live terminal. Public for
+/// the benchmark (`ghostty-bench +reflow-preview`).
+pub fn snapshot(alloc: Allocator, live: *const Terminal, need: usize) !Terminal {
     const snap = terminalpkg.snapshot;
 
     var bytes: std.Io.Writer.Allocating = .init(alloc);
@@ -280,13 +335,6 @@ pub fn snapshot(alloc: Allocator, live: *const Terminal, fit: renderer.GridSize)
     errdefer copy.deinit(alloc);
     // Not in GHOSTSNP v1; the reflow must pull history as the owner does.
     copy.flags.resize_pull_scrollback = live.flags.resize_pull_scrollback;
-
-    // A new row starts anywhere in an old row and spans at most
-    // ceil(new cols / old cols) + 1 old rows of one logical line, so this
-    // many old rows above the screen fill any reflow to `fit`, including
-    // rows a taller grid pulls from history.
-    const widen = std.math.divCeil(usize, fit.columns, live.cols) catch 1;
-    const need = @as(usize, fit.rows) * (widen + 1) + margin_rows;
 
     // prependHistoryFrom copies whole source pages, newest first, and
     // stops at the first page over the line limit: the limit is the
