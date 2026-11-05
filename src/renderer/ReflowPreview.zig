@@ -246,6 +246,10 @@ pub fn source(
     }
     const use = want and current;
     const t: *Terminal = if (use) &self.terminal.? else live;
+    // The live terminal is drawn this frame and its render state consumes
+    // the live dirty flags: a kept copy would miss those changes when the
+    // preview is wanted again, so it ends here.
+    if (!use and (self.terminal != null or self.base != null)) self.end(alloc);
     if (!use and self.live_flags_consumed) {
         live.flags.dirty.clear = true;
         self.live_flags_consumed = false;
