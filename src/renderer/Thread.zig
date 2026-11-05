@@ -285,9 +285,13 @@ fn setQosClass(self: *const Thread) void {
     }
 }
 
-/// The QoS class of a renderer thread whose surface is `visible` and
-/// `focused`.
+/// The QoS class of a renderer thread whose surface is `visible`. Focus
+/// does not decide it: every visible surface's frame is on screen in the
+/// same refresh (a resize re-wraps every visible pane at once), and an
+/// embedder that shows many panes marks only one of them focused.
 fn qosClassFor(visible: bool, focused: bool) internal_os.macos.QosClass {
+    _ = focused;
+
     // If we aren't visible (our view is fully occluded) then we
     // always drop our rendering priority down because it's just
     // mostly wasted work.
@@ -297,12 +301,6 @@ fn qosClassFor(visible: bool, focused: bool) internal_os.macos.QosClass {
     // general forced updates and CPU usage i.e. a rebuild cells call.
     if (!visible) return .utility;
 
-    // If we're not focused, but we're visible, then we set a higher
-    // than default priority because framerates still matter but it isn't
-    // as important as when we're focused.
-    if (!focused) return .user_initiated;
-
-    // We are focused and visible, we are the definition of user interactive.
     return .user_interactive;
 }
 
