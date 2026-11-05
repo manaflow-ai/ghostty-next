@@ -304,3 +304,215 @@ fn snapshot(alloc: Allocator, live: *const Terminal, fit: renderer.GridSize) !Te
     _ = try primary.pages.prependHistoryFrom(alloc, src, seam);
     return copy;
 }
+
+const testing = std.testing;
+const builtin = @import("builtin");
+
+/// One renderer frame of the preview, as `generic.updateFrame` runs it:
+/// `update` before the lock, then `source` under it. Returns the drawn
+/// terminal (valid until the next frame).
+fn testFrame(
+    preview: *ReflowPreview,
+    alloc: Allocator,
+    state: *renderer.State,
+    fit: renderer.GridSize,
+) *Terminal {
+    preview.update(alloc, state, true, fit);
+    state.lockDemand(global.io());
+    defer state.unlockDemand(global.io());
+    return preview.source(alloc, true, state.terminal, fit);
+}
+
+/// The rows the frame draws, as text (soft wraps kept as row breaks).
+fn testRows(alloc: Allocator, t: *Terminal) ![]const u8 {
+    return t.plainString(alloc);
+}
+
+test "reflow preview: a preview size per frame re-wraps the drawn rows and leaves the live grid unchanged" {
+    const alloc = testing.allocator;
+    var live = try Terminal.init(global.io(), alloc, .{ .cols = 10, .rows = 4 });
+    defer live.deinit(alloc);
+    // One logical line of 20 cells: two rows at 10 columns.
+    try live.printString("0123456789ABCDEFGHIJ");
+    const live_before = try live.plainString(alloc);
+    defer alloc.free(live_before);
+    try testing.expectEqualStrings("0123456789\nABCDEFGHIJ", live_before);
+    const live_total_rows = live.screens.active.pages.total_rows;
+
+    var mutex: std.Io.Mutex = .init;
+    var state: renderer.State = .{ .mutex = &mutex, .terminal = &live };
+    var preview: ReflowPreview = .{};
+    defer preview.deinit(alloc);
+
+    // The frames of one resize gesture: a new pane size in each frame.
+    const Frame = struct { cols: u16, rows: u16, drawn: []const u8 };
+    const frames = [_]Frame{
+        .{ .cols = 8, .rows = 4, .drawn = "01234567\n89ABCDEF\nGHIJ" },
+        .{ .cols = 5, .rows = 4, .drawn = "01234\n56789\nABCDE\nFGHIJ" },
+        .{ .cols = 7, .rows = 5, .drawn = "0123456\n789ABCD\nEFGHIJ" },
+        .{ .cols = 20, .rows = 3, .drawn = "0123456789ABCDEFGHIJ" },
+        .{ .cols = 12, .rows = 4, .drawn = "0123456789AB\nCDEFGHIJ" },
+    };
+    for (frames) |f| {
+        const fit: renderer.GridSize = .{ .columns = f.cols, .rows = f.rows };
+        const drawn = testFrame(&preview, alloc, &state, fit);
+
+        // The frame draws the text re-wrapped at the frame's grid.
+        try testing.expect(drawn != &live);
+        try testing.expectEqual(f.cols, drawn.cols);
+        try testing.expectEqual(f.rows, drawn.rows);
+        const rows = try testRows(alloc, drawn);
+        defer alloc.free(rows);
+        try testing.expectEqualStrings(f.drawn, rows);
+        // ghostty_surface_drawn_grid reports the frame's grid.
+        const packed_grid = preview.drawn_grid.load(.acquire);
+        try testing.expectEqual(@as(u32, f.cols) << 16 | f.rows, packed_grid);
+
+        // The live terminal (the grid the PTY owner set, its rows and its
+        // history) does not change: no resize reaches it.
+        try testing.expectEqual(@as(u16, 10), live.cols);
+        try testing.expectEqual(@as(u16, 4), live.rows);
+        try testing.expectEqual(live_total_rows, live.screens.active.pages.total_rows);
+        const live_now = try live.plainString(alloc);
+        defer alloc.free(live_now);
+        try testing.expectEqualStrings(live_before, live_now);
+    }
+}
+
+test "reflow preview: output during the gesture shows in the re-wrapped frame" {
+    const alloc = testing.allocator;
+    var live = try Terminal.init(global.io(), alloc, .{ .cols = 10, .rows = 4 });
+    defer live.deinit(alloc);
+    try live.printString("0123456789AB");
+
+    var mutex: std.Io.Mutex = .init;
+    var state: renderer.State = .{ .mutex = &mutex, .terminal = &live };
+    var preview: ReflowPreview = .{};
+    defer preview.deinit(alloc);
+
+    const fit: renderer.GridSize = .{ .columns = 6, .rows = 4 };
+    {
+        const drawn = testFrame(&preview, alloc, &state, fit);
+        const rows = try testRows(alloc, drawn);
+        defer alloc.free(rows);
+        try testing.expectEqualStrings("012345\n6789AB", rows);
+    }
+    // Output arrives at the live terminal between two frames of the same
+    // size: the next frame draws it, re-wrapped.
+    try live.printString("CD");
+    {
+        const drawn = testFrame(&preview, alloc, &state, fit);
+        const rows = try testRows(alloc, drawn);
+        defer alloc.free(rows);
+        try testing.expectEqualStrings("012345\n6789AB\nCD", rows);
+    }
+    try testing.expectEqual(@as(u16, 10), live.cols);
+}
+
+test "reflow preview: the committed grid changes the live grid once and the live terminal is drawn again" {
+    const alloc = testing.allocator;
+    var live = try Terminal.init(global.io(), alloc, .{ .cols = 10, .rows = 4 });
+    defer live.deinit(alloc);
+    try live.printString("0123456789ABCDEFGHIJ");
+
+    var mutex: std.Io.Mutex = .init;
+    var state: renderer.State = .{ .mutex = &mutex, .terminal = &live };
+    var preview: ReflowPreview = .{};
+    defer preview.deinit(alloc);
+
+    // Frames of a gesture: preview only.
+    var last_preview_rows: ?[]const u8 = null;
+    defer if (last_preview_rows) |r| alloc.free(r);
+    for ([_]u16{ 9, 8, 7, 6 }) |c| {
+        const drawn = testFrame(&preview, alloc, &state, .{ .columns = c, .rows = 4 });
+        try testing.expect(drawn != &live);
+        if (last_preview_rows) |r| alloc.free(r);
+        last_preview_rows = try testRows(alloc, drawn);
+        try testing.expectEqual(@as(u16, 10), live.cols);
+    }
+
+    // The coalesced commit: the PTY owner applies the last size once, and
+    // the live terminal takes that grid (ghostty_surface_set_grid runs this
+    // resize on a MANUAL_MIRROR surface).
+    try live.resize(alloc, .{ .cols = 6, .rows = 4, .reflow = true });
+    try testing.expectEqual(@as(u16, 6), live.cols);
+
+    // The grid fits: the frame draws the live terminal, with the rows the
+    // preview drew.
+    const drawn = testFrame(&preview, alloc, &state, .{ .columns = 6, .rows = 4 });
+    try testing.expect(drawn == &live);
+    try testing.expect(preview.terminal == null);
+    const rows = try testRows(alloc, drawn);
+    defer alloc.free(rows);
+    try testing.expectEqualStrings(last_preview_rows.?, rows);
+}
+
+test "reflow preview: per-frame cost of a 200x60 screen" {
+    const alloc = testing.allocator;
+    const cols = 200;
+    const rows = 60;
+    var live = try Terminal.init(global.io(), alloc, .{
+        .cols = cols,
+        .rows = rows,
+        .max_scrollback_bytes = null,
+    });
+    defer live.deinit(alloc);
+    // A busy screen: 2000 lines of history and a full screen of long
+    // lines (each wraps, so every frame re-wraps every row) with styles.
+    {
+        var line: [450]u8 = undefined;
+        for (0..2060) |i| {
+            for (&line, 0..) |*ch, j| ch.* = @intCast('a' + (i + j) % 26);
+            try live.setAttribute(.bold);
+            try live.setAttribute(.{ .@"8_fg" = @enumFromInt(@as(u8, @intCast(i % 8))) });
+            const n = 120 + (i * 37) % 330;
+            try live.printString(line[0..n]);
+            try live.setAttribute(.unset);
+            try live.printString("\n");
+        }
+    }
+
+    var mutex: std.Io.Mutex = .init;
+    var state: renderer.State = .{ .mutex = &mutex, .terminal = &live };
+    var preview: ReflowPreview = .{};
+    defer preview.deinit(alloc);
+
+    // A drag: one new width per frame, 200 down to 121 and back, and a
+    // height change every 8 frames. Each frame rebuilds the preview.
+    const frame_count = 160;
+    var times: [frame_count]u64 = undefined;
+    var locked: [frame_count]u64 = undefined;
+    for (0..frame_count) |i| {
+        const step: u16 = @intCast(if (i < 80) i else 159 - i);
+        const fit: renderer.GridSize = .{
+            .columns = cols - 1 - step,
+            .rows = rows - @as(u16, @intCast((i / 8) % 4)),
+        };
+        const start = std.Io.Timestamp.now(global.io(), .awake);
+        preview.update(alloc, &state, true, fit);
+        const mid = std.Io.Timestamp.now(global.io(), .awake);
+        state.lockDemand(global.io());
+        const drawn = preview.source(alloc, true, state.terminal, fit);
+        state.unlockDemand(global.io());
+        const end = std.Io.Timestamp.now(global.io(), .awake);
+        try testing.expectEqual(fit.columns, drawn.cols);
+        times[i] = @intCast(start.durationTo(end).toNanoseconds());
+        locked[i] = @intCast(mid.durationTo(end).toNanoseconds());
+    }
+    // Live terminal untouched by the whole drag.
+    try testing.expectEqual(@as(u16, cols), live.cols);
+    try testing.expectEqual(@as(u16, rows), live.rows);
+
+    std.mem.sort(u64, &times, {}, std.sort.asc(u64));
+    std.mem.sort(u64, &locked, {}, std.sort.asc(u64));
+    const p50 = times[frame_count / 2];
+    const p95 = times[frame_count * 95 / 100];
+    const max = times[frame_count - 1];
+    std.debug.print(
+        "reflow preview cost 200x60 ({s}): per frame p50 {d} us, p95 {d} us, max {d} us; source (under lock) p95 {d} us\n",
+        .{ @tagName(builtin.mode), p50 / 1000, p95 / 1000, max / 1000, locked[frame_count * 95 / 100] / 1000 },
+    );
+    // The budget (cmux-ad m18): well under 1 ms per frame on an M-series
+    // Mac. Only an optimized build measures it; Debug only prints.
+    if (builtin.mode != .Debug) try testing.expect(p95 < 1 * std.time.ns_per_ms);
+}
