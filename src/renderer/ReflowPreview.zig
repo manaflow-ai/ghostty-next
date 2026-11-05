@@ -518,6 +518,43 @@ test "reflow preview: a real resize of the live terminal during a preview takes 
     try testing.expectEqual(@as(u16, 8), live.cols);
 }
 
+test "reflow preview: a cursor move or a cursor visibility change with no cell change shows at the next frame" {
+    const alloc = testing.allocator;
+    var live = try Terminal.init(global.io(), alloc, .{ .cols = 10, .rows = 4 });
+    defer live.deinit(alloc);
+    try live.printString("$ abcdef");
+
+    var mutex: std.Io.Mutex = .init;
+    var state: renderer.State = .{ .mutex = &mutex, .terminal = &live };
+    var preview: ReflowPreview = .{};
+    defer preview.deinit(alloc);
+
+    const fit: renderer.GridSize = .{ .columns = 6, .rows = 4 };
+    {
+        const drawn = testFrame(&preview, alloc, &state, fit);
+        // "$ abcdef" re-wrapped at 6 columns: the cursor is after "f" on
+        // the second row.
+        try testing.expectEqual(@as(u16, 2), drawn.screens.active.cursor.x);
+        try testing.expectEqual(@as(u16, 1), drawn.screens.active.cursor.y);
+    }
+
+    // A Left arrow at a shell prompt: the cursor moves along the line and
+    // no cell changes (Screen.cursorLeft marks no row dirty).
+    live.cursorLeft(1);
+    {
+        const drawn = testFrame(&preview, alloc, &state, fit);
+        try testing.expectEqual(@as(u16, 1), drawn.screens.active.cursor.x);
+        try testing.expectEqual(@as(u16, 1), drawn.screens.active.cursor.y);
+    }
+
+    // DECTCEM hides the cursor: no cell changes either.
+    live.modes.set(.cursor_visible, false);
+    {
+        const drawn = testFrame(&preview, alloc, &state, fit);
+        try testing.expect(!drawn.modes.get(.cursor_visible));
+    }
+}
+
 test "reflow preview: output during the gesture shows in the re-wrapped frame" {
     const alloc = testing.allocator;
     var live = try Terminal.init(global.io(), alloc, .{ .cols = 10, .rows = 4 });
