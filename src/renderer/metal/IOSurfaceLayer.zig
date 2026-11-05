@@ -8,6 +8,8 @@ const objc = @import("objc");
 const macos = @import("macos");
 
 const IOSurface = macos.iosurface.IOSurface;
+const mtl = @import("api.zig");
+const Device = @import("Device.zig");
 
 const log = std.log.scoped(.IOSurfaceLayer);
 
@@ -17,6 +19,22 @@ var Subclass: ?objc.Class = null;
 
 /// The underlying CALayer
 layer: objc.Object,
+
+/// A frame for the layer: its IOSurface and the pixel size it was drawn at,
+/// from the surface's top-left corner (`Target.drawn_width`).
+pub const Drawn = struct {
+    surface: *IOSurface,
+    width: usize,
+    height: usize,
+
+    /// A frame drawn over the whole of `surface`.
+    pub fn whole(surface: *IOSurface) Drawn {
+        return .{ .surface = surface, .width = surface.getWidth(), .height = surface.getHeight() };
+    }
+};
+
+/// A pixel size.
+pub const Size = struct { width: usize, height: usize };
 
 pub fn init() !IOSurfaceLayer {
     // The layer returned by `[CALayer layer]` is autoreleased, which means
@@ -128,7 +146,7 @@ fn embedderPresents(layer: objc.Object) bool {
 /// The pixel size of the frame the layer shows, or null while it shows
 /// none. Read under the Core Animation lock: a frame presented off the main
 /// thread (`setSurfaceOffMain`) can replace the shown one.
-pub fn shownSize(self: *IOSurfaceLayer) ?struct { width: usize, height: usize } {
+pub fn shownSize(self: *IOSurfaceLayer) ?Size {
     const CATransaction = objc.getClass("CATransaction").?;
     CATransaction.msgSend(void, objc.sel("lock"), .{});
     defer CATransaction.msgSend(void, objc.sel("unlock"), .{});
@@ -137,18 +155,18 @@ pub fn shownSize(self: *IOSurfaceLayer) ?struct { width: usize, height: usize } 
     return .{ .width = surface.getWidth(), .height = surface.getHeight() };
 }
 
-/// Shows `surface`, the frame of present sequence `seq`, in the caller's
+/// Shows `frame`, the frame of present sequence `seq`, in the caller's
 /// Core Animation transaction (the embedder's, which gives the view its new
 /// bounds), unless the layer shows a newer frame (`setSurface`,
 /// `setSurfaceOffMain`). Returns whether it did. Main thread.
-pub fn setSurfacePresented(self: *IOSurfaceLayer, surface: *IOSurface, seq: u64) bool {
+pub fn setSurfacePresented(self: *IOSurfaceLayer, frame: Drawn, seq: u64) bool {
     const CATransaction = objc.getClass("CATransaction").?;
     CATransaction.msgSend(void, objc.sel("lock"), .{});
     defer CATransaction.msgSend(void, objc.sel("unlock"), .{});
     if (seq <= presentSeq(self.layer)) return false;
     setPresentSeq(self.layer, seq);
     setMainPending(self.layer, true);
-    self.layer.setProperty("contents", surface);
+    self.layer.setProperty("contents", frame.surface);
     return true;
 }
 
@@ -179,10 +197,11 @@ fn setMainPending(layer: objc.Object, pending: bool) void {
     layer.setInstanceVariable("main_pending", .{ .value = @ptrFromInt(stored) });
 }
 
-/// Sets the layer's `contents` to the provided IOSurface.
+/// Sets the layer's `contents` to the frame's IOSurface.
 ///
 /// Makes sure to do so on the main thread to avoid visual artifacts.
-pub inline fn setSurface(self: *IOSurfaceLayer, surface: *IOSurface, seq: u64) !void {
+pub inline fn setSurface(self: *IOSurfaceLayer, frame: Drawn, seq: u64) !void {
+    const surface = frame.surface;
     // We retain the surface to make sure it's not GC'd
     // before we can set it as the contents of the layer.
     //
@@ -214,10 +233,11 @@ pub inline fn setSurface(self: *IOSurfaceLayer, surface: *IOSurface, seq: u64) !
     }
 }
 
-/// Sets the layer's `contents` to the provided IOSurface.
+/// Sets the layer's `contents` to the frame's IOSurface.
 ///
 /// Does not ensure this happens on the main thread.
-pub inline fn setSurfaceSync(self: *IOSurfaceLayer, surface: *IOSurface) void {
+pub inline fn setSurfaceSync(self: *IOSurfaceLayer, frame: Drawn) void {
+    const surface = frame.surface;
     // Main thread (a display pass, ghostty_surface_draw): with the embedder
     // presenting host sizes, a new size goes with main's commit, so frames go
     // through main until the embedder reports it.
@@ -244,7 +264,8 @@ const SetSurfaceBlock = objc.Block(struct {
 /// thread is pending for it, and only if no newer frame was presented
 /// (`seq`). Returns false, and changes nothing, otherwise: the caller then
 /// presents it through the main thread (`setSurface`).
-pub fn setSurfaceOffMain(self: *IOSurfaceLayer, surface: *IOSurface, seq: u64) bool {
+pub fn setSurfaceOffMain(self: *IOSurfaceLayer, frame: Drawn, seq: u64) bool {
+    const surface = frame.surface;
     const width = surface.getWidth();
     const height = surface.getHeight();
     const host = hostSize(self.layer);
@@ -307,8 +328,8 @@ fn offMainDecisionLocked(layer: objc.Object, width: usize, height: usize, seq: u
 /// embedder's commit, through main) and bounds the embedder already set (it
 /// presents itself through main). Call under the Core Animation lock, which
 /// orders it against main's changes (`Metal.embedderShowsKeptFrame`).
-pub fn embedderShowsFrameLocked(self: *IOSurfaceLayer, surface: *IOSurface) bool {
-    return embedderDrops(self.layer, surface);
+pub fn embedderShowsFrameLocked(self: *IOSurfaceLayer, frame: Drawn) bool {
+    return embedderDrops(self.layer, frame.surface);
 }
 
 /// The one rule of `setSurfaceCallback` and `embedderShowsFrameLocked`: with
@@ -516,14 +537,14 @@ test "host present: a frame of a new host size on main keeps the shown frame whi
     defer shown.release();
     const drawn = try testSurface(120, 60);
     defer drawn.release();
-    layer.setSurfaceSync(shown);
+    layer.setSurfaceSync(.whole(shown));
     layer.setHostSize((120 << 32) | 60);
     layer.setEmbedderPresents(true);
 
     // A frame of the new size that reached the main thread (queued before the
     // embedder took over size changes): the embedder shows a new size with its
     // bounds in its own transaction, so this frame does not replace the shown one.
-    try layer.setSurface(drawn, 1);
+    try layer.setSurface(.whole(drawn), 1);
     try testing.expectEqual(@as(?usize, 80), testShownWidth(&layer));
 }
 
@@ -539,10 +560,10 @@ test "host present: a frame of a new host size on main is shown by default" {
     defer shown.release();
     const drawn = try testSurface(120, 60);
     defer drawn.release();
-    layer.setSurfaceSync(shown);
+    layer.setSurfaceSync(.whole(shown));
     layer.setHostSize((120 << 32) | 60);
 
-    try layer.setSurface(drawn, 1);
+    try layer.setSurface(.whole(drawn), 1);
     try testing.expectEqual(@as(?usize, 120), testShownWidth(&layer));
 }
 
@@ -558,7 +579,7 @@ test "host present: a frame of a new host size on main is shown when the layer's
     defer shown.release();
     const drawn = try testSurface(120, 60);
     defer drawn.release();
-    layer.setSurfaceSync(shown);
+    layer.setSurfaceSync(.whole(shown));
     layer.setHostSize((120 << 32) | 60);
     layer.setEmbedderPresents(true);
     // The embedder gave the view its new bounds without a present (a hidden
@@ -569,7 +590,7 @@ test "host present: a frame of a new host size on main is shown when the layer's
         .size = .{ .width = 120, .height = 60 },
     });
 
-    try layer.setSurface(drawn, 1);
+    try layer.setSurface(.whole(drawn), 1);
     try testing.expectEqual(@as(?usize, 120), testShownWidth(&layer));
 }
 
@@ -589,22 +610,22 @@ test "host present: an off-main frame never joins a present the embedder has not
     defer next.release();
     const after = try testSurface(120, 60);
     defer after.release();
-    layer.setSurfaceSync(shown);
+    layer.setSurfaceSync(.whole(shown));
     layer.setHostSize((120 << 32) | 60);
     layer.setEmbedderPresents(true);
 
     // The embedder showed the new size; its transaction (with the view's new
     // bounds) is not committed yet.
-    try testing.expect(layer.setSurfacePresented(presented, 5));
+    try testing.expect(layer.setSurfacePresented(.whole(presented), 5));
     // A newer frame at that size completes: an off-main transaction would
     // commit it, alone, before the embedder's bounds. It goes through main.
-    try testing.expect(!layer.setSurfaceOffMain(next, 6));
+    try testing.expect(!layer.setSurfaceOffMain(.whole(next), 6));
     const contents = layer.layer.getProperty(?*anyopaque, "contents");
     try testing.expectEqual(@as(?*anyopaque, @ptrCast(presented)), contents);
     // On main it shows; once the embedder committed, frames go off main again.
-    try layer.setSurface(next, 6);
+    try layer.setSurface(.whole(next), 6);
     layer.setEmbedderCommitted();
-    try testing.expect(layer.setSurfaceOffMain(after, 7));
+    try testing.expect(layer.setSurfaceOffMain(.whole(after), 7));
     const later = layer.layer.getProperty(?*anyopaque, "contents");
     try testing.expectEqual(@as(?*anyopaque, @ptrCast(after)), later);
 }
@@ -627,20 +648,20 @@ test "host present: a main-thread frame after the embedder's present keeps frame
     defer next.release();
     const later = try testSurface(120, 60);
     defer later.release();
-    layer.setSurfaceSync(shown);
+    layer.setSurfaceSync(.whole(shown));
     layer.setHostSize((120 << 32) | 60);
     layer.setEmbedderPresents(true);
 
-    try testing.expect(layer.setSurfacePresented(presented, 5));
+    try testing.expect(layer.setSurfacePresented(.whole(presented), 5));
     // A main-queue block runs before the embedder's commit (CFRunLoop runs
     // main-queue blocks before the before-waiting observers): it shows a
     // newer frame at that size in main's open transaction.
-    try layer.setSurface(queued, 6);
+    try layer.setSurface(.whole(queued), 6);
     // An off-main commit now would still go out ahead of the embedder's bounds.
-    try testing.expect(!layer.setSurfaceOffMain(next, 7));
+    try testing.expect(!layer.setSurfaceOffMain(.whole(next), 7));
     // The embedder committed: frames go off main again.
     layer.setEmbedderCommitted();
-    try testing.expect(layer.setSurfaceOffMain(later, 8));
+    try testing.expect(layer.setSurfaceOffMain(.whole(later), 8));
 }
 
 test "host present: a frame shown because the bounds already fit keeps frames on main until the embedder committed" {
@@ -657,7 +678,7 @@ test "host present: a frame shown because the bounds already fit keeps frames on
     defer drawn.release();
     const next = try testSurface(120, 60);
     defer next.release();
-    layer.setSurfaceSync(shown);
+    layer.setSurfaceSync(.whole(shown));
     layer.setHostSize((120 << 32) | 60);
     layer.setEmbedderPresents(true);
     layer.setEmbedderCommitted();
@@ -667,10 +688,10 @@ test "host present: a frame shown because the bounds already fit keeps frames on
         .origin = .{ .x = 0, .y = 0 },
         .size = .{ .width = 120, .height = 60 },
     });
-    try layer.setSurface(drawn, 1);
+    try layer.setSurface(.whole(drawn), 1);
     try testing.expectEqual(@as(?usize, 120), testShownWidth(&layer));
     // Those bounds are not committed yet either.
-    try testing.expect(!layer.setSurfaceOffMain(next, 2));
+    try testing.expect(!layer.setSurfaceOffMain(.whole(next), 2));
 }
 
 test "host present: a frame at the shown size shown on main keeps frames going off main" {
@@ -687,15 +708,15 @@ test "host present: a frame at the shown size shown on main keeps frames going o
     defer queued.release();
     const next = try testSurface(120, 60);
     defer next.release();
-    layer.setSurfaceSync(shown);
+    layer.setSurfaceSync(.whole(shown));
     layer.setHostSize((120 << 32) | 60);
     layer.setEmbedderPresents(true);
     layer.setEmbedderCommitted();
 
     // A frame of the shown size on main changes no geometry: terminal echo
     // after it still goes off main.
-    try layer.setSurface(queued, 1);
-    try testing.expect(layer.setSurfaceOffMain(next, 2));
+    try layer.setSurface(.whole(queued), 1);
+    try testing.expect(layer.setSurfaceOffMain(.whole(next), 2));
     const contents = layer.layer.getProperty(?*anyopaque, "contents");
     try testing.expectEqual(@as(?*anyopaque, @ptrCast(next)), contents);
 }
@@ -714,15 +735,15 @@ test "host present: the mode starts with frames on main until the embedder commi
     defer first.release();
     const later = try testSurface(120, 60);
     defer later.release();
-    layer.setSurfaceSync(shown);
+    layer.setSurfaceSync(.whole(shown));
     layer.setHostSize((120 << 32) | 60);
 
     // A change the main thread made before the mode may still be in its open
     // transaction.
     layer.setEmbedderPresents(true);
-    try testing.expect(!layer.setSurfaceOffMain(first, 1));
+    try testing.expect(!layer.setSurfaceOffMain(.whole(first), 1));
     layer.setEmbedderCommitted();
-    try testing.expect(layer.setSurfaceOffMain(later, 2));
+    try testing.expect(layer.setSurfaceOffMain(.whole(later), 2));
 }
 
 test "host present: a sync present of a new size keeps frames on main until the embedder committed" {
@@ -739,14 +760,14 @@ test "host present: a sync present of a new size keeps frames on main until the 
     defer drawn.release();
     const next = try testSurface(120, 60);
     defer next.release();
-    layer.setSurfaceSync(shown);
+    layer.setSurfaceSync(.whole(shown));
     layer.setHostSize((120 << 32) | 60);
     layer.setEmbedderPresents(true);
     layer.setEmbedderCommitted();
 
     // ghostty_surface_draw on main at the new size.
-    layer.setSurfaceSync(drawn);
-    try testing.expect(!layer.setSurfaceOffMain(next, 1));
+    layer.setSurfaceSync(.whole(drawn));
+    try testing.expect(!layer.setSurfaceOffMain(.whole(next), 1));
 }
 
 test "host present: a sync present at the shown size keeps frames going off main" {
@@ -763,13 +784,13 @@ test "host present: a sync present at the shown size keeps frames going off main
     defer drawn.release();
     const next = try testSurface(120, 60);
     defer next.release();
-    layer.setSurfaceSync(shown);
+    layer.setSurfaceSync(.whole(shown));
     layer.setHostSize((120 << 32) | 60);
     layer.setEmbedderPresents(true);
     layer.setEmbedderCommitted();
 
-    layer.setSurfaceSync(drawn);
-    try testing.expect(layer.setSurfaceOffMain(next, 1));
+    layer.setSurfaceSync(.whole(drawn));
+    try testing.expect(layer.setSurfaceOffMain(.whole(next), 1));
 }
 
 /// Counts, per thread, the transaction commits made while the thread holds [CATransaction lock] (the
@@ -831,7 +852,7 @@ const CommitOrder = struct {
     fn presentAt(layer: *IOSurfaceLayer, surface: *IOSurface, seq: u64, presented: *bool) void {
         const pool = objc.AutoreleasePool.init();
         defer pool.deinit();
-        presented.* = layer.setSurfaceOffMain(surface, seq);
+        presented.* = layer.setSurfaceOffMain(.whole(surface), seq);
         seen_commits = commits;
         seen_commits_under_lock = commits_under_lock;
     }
@@ -866,7 +887,7 @@ test "host present: an off-main present that does not show its frame commits no 
     defer resized.release();
     const same = try testSurface(80, 60);
     defer same.release();
-    layer.setSurfaceSync(shown);
+    layer.setSurfaceSync(.whole(shown));
 
     // No host size: the frame goes through main.
     var result = try testOffMainCommits(&layer, same, 1);
@@ -888,7 +909,7 @@ test "host present: an off-main present that does not show its frame commits no 
     try testing.expectEqual(@as(u32, 0), result.commits);
 
     // The embedder showed the new size in a transaction it has not reported committed: through main.
-    try testing.expect(layer.setSurfacePresented(resized, 4));
+    try testing.expect(layer.setSurfacePresented(.whole(resized), 4));
     const pending = try testSurface(120, 60);
     defer pending.release();
     result = try testOffMainCommits(&layer, pending, 5);
@@ -925,7 +946,7 @@ fn testOffMainCommitOrder(embedder: bool) !void {
     defer shown.release();
     const drawn = try testSurface(80, 60);
     defer drawn.release();
-    layer.setSurfaceSync(shown);
+    layer.setSurfaceSync(.whole(shown));
     layer.setHostSize((80 << 32) | 60);
     if (embedder) {
         layer.setEmbedderPresents(true);
@@ -958,4 +979,223 @@ test "host present: an off-main present never commits while it holds the Core An
 
 test "host present: an off-main present never commits while it holds the Core Animation lock (renderer)" {
     try testOffMainCommitOrder(false);
+}
+
+/// Fills `surface` with a picture in which every pixel has its own color: blue from its column, green from its row,
+/// and red high inside the top-left `drawn_width` x `drawn_height` pixels (the frame of a capacity target), low outside.
+fn testPicture(surface: *IOSurface, drawn_width: usize, drawn_height: usize) void {
+    surface.lock();
+    defer surface.unlock();
+    const base = surface.getBaseAddress().?;
+    const bytes_per_row = surface.getBytesPerRow();
+    for (0..surface.getHeight()) |y| {
+        for (0..surface.getWidth()) |x| {
+            const pixel = base + y * bytes_per_row + x * 4;
+            pixel[0] = @intCast(x * 30 + 10);
+            pixel[1] = @intCast(y * 30 + 10);
+            pixel[2] = if (x < drawn_width and y < drawn_height) 200 else 20;
+            pixel[3] = 255;
+        }
+    }
+}
+
+/// What Core Animation shows of `layer`: its layer tree rendered (CARenderer, on `device`) into a `width` x `height`
+/// BGRA texture, read back row by row. The layer has `width` x `height` points at scale 1, nearest filtering, so one
+/// point is one surface pixel.
+fn testRendered(device: objc.Object, layer: objc.Object, width: usize, height: usize, out: []u32) !void {
+    const rect: macos.graphics.Rect = .{
+        .origin = .{ .x = 0, .y = 0 },
+        .size = .{ .width = @floatFromInt(width), .height = @floatFromInt(height) },
+    };
+    layer.setProperty("contentsScale", @as(f64, 1));
+    layer.setProperty("anchorPoint", macos.graphics.Point{ .x = 0, .y = 0 });
+    layer.setProperty("position", macos.graphics.Point{ .x = 0, .y = 0 });
+    layer.setProperty("bounds", rect);
+    const NSString = objc.getClass("NSString").?;
+    const nearest = NSString.msgSend(objc.Object, objc.sel("stringWithUTF8String:"), .{"nearest"});
+    layer.setProperty("magnificationFilter", nearest.value);
+    layer.setProperty("minificationFilter", nearest.value);
+
+    const unified = device.getProperty(bool, "hasUnifiedMemory");
+    const descriptor = objc.getClass("MTLTextureDescriptor").?.msgSend(
+        objc.Object,
+        objc.sel("texture2DDescriptorWithPixelFormat:width:height:mipmapped:"),
+        .{ @as(c_ulong, 80), @as(c_ulong, width), @as(c_ulong, height), false },
+    );
+    descriptor.setProperty("usage", @as(c_ulong, 5)); // shader read | render target
+    descriptor.setProperty("storageMode", @as(c_ulong, if (unified) 0 else 1)); // shared | managed
+    const texture = objc.Object.fromId(
+        device.msgSend(?*anyopaque, objc.sel("newTextureWithDescriptor:"), .{descriptor}) orelse return error.MetalFailed,
+    );
+    defer texture.release();
+    const queue = device.msgSend(objc.Object, objc.sel("newCommandQueue"), .{});
+    defer queue.release();
+
+    const TestCA = struct {
+        extern "c" const kCARendererMetalCommandQueue: objc.c.id;
+        extern "c" fn CACurrentMediaTime() f64;
+    };
+    const options = objc.getClass("NSDictionary").?.msgSend(
+        objc.Object,
+        objc.sel("dictionaryWithObject:forKey:"),
+        .{ queue.value, TestCA.kCARendererMetalCommandQueue },
+    );
+    const renderer = objc.getClass("CARenderer").?.msgSend(
+        objc.Object,
+        objc.sel("rendererWithMTLTexture:options:"),
+        .{ texture.value, options.value },
+    );
+    renderer.setProperty("layer", layer.value);
+    renderer.setProperty("bounds", rect);
+    // The layer's changes reach the render tree with a commit.
+    objc.getClass("CATransaction").?.msgSend(void, objc.sel("flush"), .{});
+    renderer.msgSend(void, objc.sel("beginFrameAtTime:timeStamp:"), .{ TestCA.CACurrentMediaTime(), @as(?*anyopaque, null) });
+    renderer.msgSend(void, objc.sel("addUpdateRect:"), .{rect});
+    renderer.msgSend(void, objc.sel("render"), .{});
+    renderer.msgSend(void, objc.sel("endFrame"), .{});
+    // The renderer encodes on `queue`: a command buffer after its work completes after it.
+    const done = queue.msgSend(objc.Object, objc.sel("commandBuffer"), .{});
+    if (!unified) {
+        const blit = done.msgSend(objc.Object, objc.sel("blitCommandEncoder"), .{});
+        blit.msgSend(void, objc.sel("synchronizeResource:"), .{texture.value});
+        blit.msgSend(void, objc.sel("endEncoding"), .{});
+    }
+    done.msgSend(void, objc.sel("commit"), .{});
+    done.msgSend(void, objc.sel("waitUntilCompleted"), .{});
+    texture.msgSend(void, objc.sel("getBytes:bytesPerRow:fromRegion:mipmapLevel:"), .{
+        @as(*anyopaque, @ptrCast(out.ptr)),
+        @as(c_ulong, width * 4),
+        mtl.MTLRegion{
+            .origin = .{ .x = 0, .y = 0, .z = 0 },
+            .size = .{ .width = width, .height = height, .depth = 1 },
+        },
+        @as(c_ulong, 0),
+    });
+}
+
+test "host present: a capacity frame shows only its drawn pixels, top-left" {
+    // cmux FRAME OWNER S4, plan B: while the host sets a capacity, a frame is drawn in the top-left corner of a larger
+    // target, and the layer shows only that part (contentsRect). Rendered by Core Animation, the layer must show
+    // exactly the drawn pixels: none of the rest of the surface, unscaled, and the right way up (the surface's first
+    // row, the one Metal draws first, at the top, as when a frame fills its surface). This also settles which way
+    // the unit rect's y runs for an IOSurface (`contents_rect_y_up`).
+    const testing = std.testing;
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    var device = try Device.initForTest();
+    defer device.deinit();
+
+    // A capacity target of 8 x 8 pixels with a frame drawn at 6 x 4.
+    const surface = try testSurface(8, 8);
+    defer surface.release();
+    testPicture(surface, 6, 4);
+
+    // The whole surface, as a frame that fills its target shows: surface row y is layer row y from the top. Which
+    // way the rendered texture runs is the renderer's; the red marks of the drawn rows tell it.
+    var whole = try IOSurfaceLayer.init();
+    defer whole.release();
+    whole.setSurfaceSync(.whole(surface));
+    var reference: [8 * 8]u32 = undefined;
+    try testRendered(device.device, whole.layer, 8, 8, &reference);
+    const red = struct {
+        fn of(pixel: u32) u32 {
+            return (pixel >> 16) & 0xff;
+        }
+    }.of;
+    const first_drawn = red(reference[0]) > 100;
+    const last_drawn = red(reference[7 * 8]) > 100;
+    // Exactly one end of the texture holds the drawn rows: the picture is not stretched or empty.
+    try testing.expect(first_drawn != last_drawn);
+    const texture_row_0_is_top = first_drawn;
+
+    // The capacity frame, in a layer of its own size.
+    var layer = try IOSurfaceLayer.init();
+    defer layer.release();
+    layer.setSurfaceSync(.{ .surface = surface, .width = 6, .height = 4 });
+    try testing.expectEqual(@as(?Size, .{ .width = 6, .height = 4 }), layer.shownSize());
+    var shown: [6 * 4]u32 = undefined;
+    try testRendered(device.device, layer.layer, 6, 4, &shown);
+    // Layer row r from the top shows surface row r, column c shows column c: the pixel the whole surface showed there.
+    for (0..4) |row| {
+        for (0..6) |column| {
+            const shown_row = if (texture_row_0_is_top) row else 3 - row;
+            const whole_row = if (texture_row_0_is_top) row else 7 - row;
+            testing.expectEqual(reference[whole_row * 8 + column], shown[shown_row * 6 + column]) catch |err| {
+                std.debug.print("layer pixel ({d}, {d}) from the top-left is not surface pixel ({d}, {d})\n", .{ column, row, column, row });
+                return err;
+            };
+        }
+    }
+
+    // In bounds larger than the frame (a drag ahead of it), the frame stays in the top-left corner, unscaled.
+    var ahead = try IOSurfaceLayer.init();
+    defer ahead.release();
+    ahead.setSurfaceSync(.{ .surface = surface, .width = 6, .height = 4 });
+    var wide: [8 * 8]u32 = undefined;
+    try testRendered(device.device, ahead.layer, 8, 8, &wide);
+    for (0..4) |row| {
+        for (0..6) |column| {
+            const texture_row = if (texture_row_0_is_top) row else 7 - row;
+            try testing.expectEqual(reference[texture_row * 8 + column], wide[texture_row * 8 + column]);
+        }
+    }
+}
+
+test "host present: a frame that fills its surface keeps the whole surface as its contents rect" {
+    // No capacity (the default): every present sets the unit contentsRect, as the layer had before.
+    const testing = std.testing;
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    var layer = try IOSurfaceLayer.init();
+    defer layer.release();
+    const capacity = try testSurface(160, 60);
+    defer capacity.release();
+    const whole = try testSurface(80, 60);
+    defer whole.release();
+
+    layer.setSurfaceSync(.{ .surface = capacity, .width = 120, .height = 60 });
+    try testing.expectEqual(@as(?Size, .{ .width = 120, .height = 60 }), layer.shownSize());
+    layer.setSurfaceSync(.whole(whole));
+    const rect = layer.layer.getProperty(macos.graphics.Rect, "contentsRect");
+    try testing.expectEqual(@as(f64, 0), rect.origin.x);
+    try testing.expectEqual(@as(f64, 0), rect.origin.y);
+    try testing.expectEqual(@as(f64, 1), rect.size.width);
+    try testing.expectEqual(@as(f64, 1), rect.size.height);
+    try testing.expectEqual(@as(?Size, .{ .width = 80, .height = 60 }), layer.shownSize());
+}
+
+test "host present: an off-main frame of a capacity target compares its drawn size, not its surface's" {
+    // Every size rule of the S4 present mode compares drawn sizes: a capacity target's IOSurface is larger than the
+    // frame drawn in it. A content-only frame at the host size goes off main into a layer that shows a frame of that
+    // drawn size, and a frame of another drawn size in the same surface does not.
+    const testing = std.testing;
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    var layer = try IOSurfaceLayer.init();
+    defer layer.release();
+    const shown = try testSurface(160, 60);
+    defer shown.release();
+    const next = try testSurface(160, 60);
+    defer next.release();
+    layer.setSurfaceSync(.{ .surface = shown, .width = 120, .height = 60 });
+    layer.setHostSize((120 << 32) | 60);
+    layer.setEmbedderPresents(true);
+    layer.setEmbedderCommitted();
+
+    try testing.expect(layer.setSurfaceOffMain(.{ .surface = next, .width = 120, .height = 60 }, 1));
+    try testing.expectEqual(@as(?*anyopaque, @ptrCast(next)), layer.layer.getProperty(?*anyopaque, "contents"));
+    // The host moved on: a frame drawn at 130 in the same surface is a new size; it goes through main.
+    layer.setHostSize((130 << 32) | 60);
+    try testing.expect(!layer.setSurfaceOffMain(.{ .surface = shown, .width = 130, .height = 60 }, 2));
+    // The embedder shows it with its bounds: the layer's bounds (80 points) have neither size.
+    layer.layer.setProperty("contentsScale", @as(f64, 1));
+    layer.layer.setProperty("bounds", macos.graphics.Rect{
+        .origin = .{ .x = 0, .y = 0 },
+        .size = .{ .width = 80, .height = 60 },
+    });
+    try testing.expect(layer.embedderShowsFrameLocked(.{ .surface = shown, .width = 130, .height = 60 }));
+    try testing.expect(!layer.embedderShowsFrameLocked(.{ .surface = shown, .width = 120, .height = 60 }));
 }

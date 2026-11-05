@@ -82,14 +82,14 @@ pub const IOSurface = opaque {
     }
 
     pub inline fn lock(self: *IOSurface) void {
-        c.IOSurfaceLock(
+        _ = c.IOSurfaceLock(
             @ptrCast(self),
             0,
             null,
         );
     }
     pub inline fn unlock(self: *IOSurface) void {
-        c.IOSurfaceUnlock(
+        _ = c.IOSurfaceUnlock(
             @ptrCast(self),
             0,
             null,

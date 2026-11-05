@@ -775,6 +775,18 @@ typedef struct {
   uint64_t renderer_compression_timer_fires;
   uint64_t io_wakeups;
   uint64_t io_timer_fires;
+  // macOS: render targets created (one IOSurface and one MTLTexture each),
+  // all causes: a new swap chain (3 targets), a new frame size, a host
+  // capacity (ghostty_surface_set_host_capacity) or a config change. Without
+  // a capacity each new size makes one per frame drawn at it.
+  uint64_t host_target_allocs;
+  // macOS: the peak bytes of the surface's live render target IOSurfaces
+  // (its swap chain, plus a replaced target until it is freed).
+  uint64_t host_target_bytes;
+  // macOS: the bytes of the surface's live render target IOSurfaces now. A
+  // surface the layer still shows after its target was given back is not
+  // counted (the layer frees it when a newer frame replaces it).
+  uint64_t host_target_live_bytes;
 } ghostty_surface_render_counters_s;
 
 // Config types
@@ -1606,6 +1618,41 @@ GHOSTTY_API ghostty_host_frame_e ghostty_surface_host_frame(ghostty_surface_t,
 // (correct, slower). No effect outside GHOSTTY_HOST_PRESENT_EMBEDDER. Main
 // thread.
 GHOSTTY_API void ghostty_surface_host_frame_committed(ghostty_surface_t);
+// macOS, for a gesture (a held-key resize, a divider drag): with width_px and
+// height_px nonzero, each of the surface's render targets (one per swap-chain
+// frame, 3) keeps one IOSurface at least that large (clamped to the largest
+// texture), so a frame at a new size that fits allocates nothing: at most one
+// allocation per target per gesture, not one per frame and size (a target in
+// flight or on screen cannot be redrawn, so not one per surface). Each frame
+// is still drawn at the host size (ghostty_surface_set_size, or the bounds),
+// from the target's top-left corner, and the layer shows only those pixels:
+// its contentsRect selects them, set with its contents in one
+// [CATransaction lock] span, so the layer's IOSurface (layer.contents) can be
+// larger than the frame. Read the frame's size with
+// ghostty_surface_shown_frame_size, not from the IOSurface. A size larger
+// than the capacity grows the target it is drawn into once, to that size.
+// 0, 0 clears the capacity (at the landing; clear it before the landing
+// size's ghostty_surface_set_size): the renderer thread wakes (one
+// renderer_draw_now), gives back every target larger than the host size once
+// no frame is in flight (it waits for them at most 8 ms, else it tries again
+// at its next draw), and then draws a frame at the host size in a target of
+// that size, so the layer stops showing a capacity surface even when nothing
+// else draws. A given-back target makes a new one at its next frame. Counted
+// in host_target_allocs, host_target_bytes (peak) and host_target_live_bytes.
+// Default: no capacity (each target has its frame's size). No effect on iOS.
+// Main thread.
+GHOSTTY_API void ghostty_surface_set_host_capacity(ghostty_surface_t,
+                                                   uint32_t width_px,
+                                                   uint32_t height_px);
+// macOS: the pixel size the frame the layer shows was drawn at: the part of
+// the layer's contents IOSurface its contentsRect selects (its top-left
+// corner). The IOSurface itself is larger while a host capacity is set
+// (ghostty_surface_set_host_capacity). False, and nothing written, while the
+// layer shows no frame, or on iOS. Takes [CATransaction lock] briefly. Any
+// thread.
+GHOSTTY_API bool ghostty_surface_shown_frame_size(ghostty_surface_t,
+                                                  uint32_t* width_px,
+                                                  uint32_t* height_px);
 GHOSTTY_API ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
 // Fills the grid metrics. Returns false while a resize of an unlocked grid
 // is in flight; with a host-locked grid (ghostty_surface_set_grid) the

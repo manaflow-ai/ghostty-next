@@ -388,8 +388,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         };
         /// Swap chain which maintains multiple copies of the state needed to
         /// render a frame, so that we can start building the next frame while
-        /// the previous frame is still being processed on the GPU.
-        const SwapChain = struct {
+        /// the previous frame is still being processed on the GPU. Public for
+        /// the Metal render target tests.
+        pub const SwapChain = struct {
             // The count of buffers we use for double/triple buffering.
             // If this is one then we don't do any double+ buffering at all.
             // This is comptime because there isn't a good reason to change
@@ -405,7 +406,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             /// frame state struct so we can start working on a new frame.
             frame_sema: std.Io.Semaphore = .{ .permits = buf_count },
 
-            pub fn init(api: GraphicsAPI, custom_shaders: bool) !SwapChain {
+            pub fn init(api: *GraphicsAPI, custom_shaders: bool) !SwapChain {
                 var result: SwapChain = .{ .frames = undefined };
 
                 // Initialize all of our frame state.
@@ -464,6 +465,20 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             pub fn releaseFrame(self: *SwapChain) void {
                 self.frame_sema.post(global.io());
             }
+
+            /// After the host clears its capacity (Metal `setHostCapacity`):
+            /// gives back every render target larger than `width` x `height`,
+            /// so the surface keeps no capacity-sized target after the gesture.
+            /// Returns whether it gave one back: the caller then draws a frame
+            /// at this size now. Not implemented yet: a target is replaced only
+            /// when a frame is drawn into it.
+            pub fn trim(self: *SwapChain, api: *GraphicsAPI, width: usize, height: usize) bool {
+                _ = self;
+                _ = api;
+                _ = width;
+                _ = height;
+                return false;
+            }
         };
 
         /// State we need duplicated for every frame. Any state that could be
@@ -505,7 +520,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const CellTextBuffer = Buffer(shaderpkg.CellText);
             const BgImageBuffer = Buffer(shaderpkg.BgImage);
 
-            pub fn init(api: GraphicsAPI, custom_shaders: bool) !FrameState {
+            /// `api` by pointer: the API counts the targets it creates (Metal's `initTarget`).
+            pub fn init(api: *GraphicsAPI, custom_shaders: bool) !FrameState {
                 // Uniform buffer contains exactly 1 uniform struct. The
                 // uniform data will be undefined so this must be set before
                 // a frame is drawn.
@@ -549,7 +565,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 var custom_shader_state =
                     if (custom_shaders)
-                        try CustomShaderState.init(api)
+                        try CustomShaderState.init(api.*)
                     else
                         null;
                 errdefer if (custom_shader_state) |*state| state.deinit();
@@ -583,16 +599,44 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             pub fn resize(
                 self: *FrameState,
-                api: GraphicsAPI,
+                api: *GraphicsAPI,
                 width: usize,
                 height: usize,
             ) !void {
                 if (self.custom_shader_state) |*state| {
-                    try state.resize(api, width, height);
+                    try state.resize(api.*, width, height);
                 }
                 const target = try api.initTarget(width, height);
                 self.target.deinit();
                 self.target = target;
+            }
+
+            /// Gives this frame a render target and custom shader textures
+            /// for a frame of `width` x `height` pixels: new ones only when
+            /// those do not fit, or all new with `rebuild` (the target config
+            /// changed, such as the blending mode). An API with `fitTarget`
+            /// (Metal) chooses the target's size itself, and the frame is drawn
+            /// in its top-left corner. Custom shader textures always have the
+            /// frame's size.
+            pub fn fit(
+                self: *FrameState,
+                api: *GraphicsAPI,
+                width: usize,
+                height: usize,
+                rebuild: bool,
+            ) !void {
+                if (comptime !@hasDecl(GraphicsAPI, "fitTarget")) {
+                    if (rebuild or self.target.width != width or self.target.height != height) {
+                        try self.resize(api, width, height);
+                    }
+                    return;
+                }
+                if (self.custom_shader_state) |*state| {
+                    if (rebuild or state.front_texture.width != width or state.front_texture.height != height) {
+                        try state.resize(api.*, width, height);
+                    }
+                }
+                try api.fitTarget(&self.target, width, height, rebuild);
             }
         };
 
@@ -2069,11 +2113,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const swap_chain: *SwapChain, const swap_chain_rebuilt: bool =
                 if (self.swap_chain) |*sc| .{ sc, false } else rebuild: {
                     self.swap_chain = try SwapChain.init(
-                        self.api,
+                        &self.api,
                         self.has_custom_shaders,
                     );
                     break :rebuild .{ &self.swap_chain.?, true };
                 };
+
+            // A cleared host capacity (Metal `setHostCapacity`) gives the
+            // capacity-sized targets back (`SwapChain.trim`), and a frame is
+            // then drawn now at this size, so the layer stops showing a
+            // capacity surface. Never in the main thread's sync draws: the
+            // trim can wait for frames in flight.
+            const trimmed = !sync and swap_chain.trim(&self.api, surface_size.width, surface_size.height);
 
             const size_changed =
                 self.size.screen.width != surface_size.width or
@@ -2087,6 +2138,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const needs_redraw =
                 size_changed or
                 swap_chain_rebuilt or
+                trimmed or
                 self.cells_rebuilt or
                 self.animationWake() != null or
                 sync;
@@ -2141,20 +2193,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.updateScreenSizeUniforms();
             }
 
-            // If this frame's target isn't the correct size, or the target
-            // config has changed (such as when the blending mode changes),
-            // remove it and replace it with a new one with the right values.
-            if (frame.target.width != self.size.screen.width or
-                frame.target.height != self.size.screen.height or
-                frame.target_config_modified != self.target_config_modified)
-            {
-                try frame.resize(
-                    self.api,
-                    self.size.screen.width,
-                    self.size.screen.height,
-                );
-                frame.target_config_modified = self.target_config_modified;
-            }
+            // If this frame's target can't draw a frame of the screen size
+            // (Metal: a host capacity keeps a larger target, `FrameState.fit`),
+            // or the target config has changed (such as when the blending mode
+            // changes), replace it with a new one with the right values.
+            try frame.fit(
+                &self.api,
+                self.size.screen.width,
+                self.size.screen.height,
+                frame.target_config_modified != self.target_config_modified,
+            );
+            frame.target_config_modified = self.target_config_modified;
 
             // Upload images to the GPU as necessary.
             _ = self.images.upload(self.alloc, &self.api);
