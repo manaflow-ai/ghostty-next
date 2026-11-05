@@ -250,26 +250,52 @@ pub fn setSurfaceOffMain(self: *IOSurfaceLayer, surface: *IOSurface, seq: u64) b
     const host = hostSize(self.layer);
     if (host == 0 or (host >> 32) != width or (host & 0xffff_ffff) != height) return false;
     const CATransaction = objc.getClass("CATransaction").?;
+    // The Core Animation lock orders this against `setSurfaceCallback` on main.
+    CATransaction.msgSend(void, objc.sel("lock"), .{});
+    switch (offMainDecisionLocked(self.layer, width, height, seq)) {
+        // A transaction begins only for a frame shown here: a frame that goes through main, or an older one, commits
+        // nothing on this thread (cmux S4 profile 4b41c42c: while the embedder presents host sizes every frame of a
+        // new size goes through main, and each one's empty transaction cost a commit on the GPU completion thread
+        // against main's own).
+        .through_main => {
+            CATransaction.msgSend(void, objc.sel("unlock"), .{});
+            return false;
+        },
+        .superseded => {
+            CATransaction.msgSend(void, objc.sel("unlock"), .{});
+            return true;
+        },
+        .show => {},
+    }
     // Invariant: no thread commits a Core Animation transaction (or flushes) while it holds [CATransaction lock]. A
     // commit waits for locks another thread's commit holds while that commit's work takes [CATransaction lock]
     // (cmux S4 films, 2026-11-03: main in commit_transaction, this thread in an embedder-mode present that
-    // committed under the lock). Defers run last-first: the unlock below runs before the commit above.
+    // committed under the lock). The transaction begins under the lock (a begin takes no other lock and commits
+    // nothing), the frame becomes its contents, and it commits after the unlock.
     CATransaction.msgSend(void, objc.sel("begin"), .{});
-    defer CATransaction.msgSend(void, objc.sel("commit"), .{});
-    // The Core Animation lock orders this against `setSurfaceCallback` on main.
-    CATransaction.msgSend(void, objc.sel("lock"), .{});
-    defer CATransaction.msgSend(void, objc.sel("unlock"), .{});
-    const shown = self.layer.getProperty(?*anyopaque, "contents") orelse return false;
+    setPresentSeq(self.layer, seq);
+    self.layer.setProperty("contents", surface);
+    CATransaction.msgSend(void, objc.sel("unlock"), .{});
+    CATransaction.msgSend(void, objc.sel("commit"), .{});
+    return true;
+}
+
+/// What `setSurfaceOffMain` does with a frame of `width` x `height`, present sequence `seq`, at the host size.
+const OffMainDecision = enum { show, through_main, superseded };
+
+/// The off-main checks, read-only: the layer shows a frame of this size (else the size change goes through main),
+/// no newer frame was presented, and no main-thread change waits for the embedder's commit. Call under the Core
+/// Animation lock.
+fn offMainDecisionLocked(layer: objc.Object, width: usize, height: usize, seq: u64) OffMainDecision {
+    const shown = layer.getProperty(?*anyopaque, "contents") orelse return .through_main;
     const shown_surface: *IOSurface = @ptrCast(shown);
-    if (shown_surface.getWidth() != width or shown_surface.getHeight() != height) return false;
-    if (seq <= presentSeq(self.layer)) return true;
+    if (shown_surface.getWidth() != width or shown_surface.getHeight() != height) return .through_main;
+    if (seq <= presentSeq(layer)) return .superseded;
     // The embedder presents host sizes and the main thread changed the shown size in a transaction the embedder
     // has not reported committed: a transaction committed here could reach the screen ahead of the view's new
     // bounds. The frame goes through main (`setSurface`), after that commit.
-    if (embedderPresents(self.layer) and mainPending(self.layer)) return false;
-    setPresentSeq(self.layer, seq);
-    self.layer.setProperty("contents", surface);
-    return true;
+    if (embedderPresents(layer) and mainPending(layer)) return .through_main;
+    return .show;
 }
 
 /// While the embedder presents host sizes (`setEmbedderPresents`): whether
@@ -798,13 +824,95 @@ const CommitOrder = struct {
 
     /// The GPU completion thread's role: one off-main present of a frame at the shown size.
     fn present(layer: *IOSurfaceLayer, surface: *IOSurface, presented: *bool) void {
+        presentAt(layer, surface, 1, presented);
+    }
+
+    /// One off-main present of `surface` as frame `seq`, from a thread of its own.
+    fn presentAt(layer: *IOSurfaceLayer, surface: *IOSurface, seq: u64, presented: *bool) void {
         const pool = objc.AutoreleasePool.init();
         defer pool.deinit();
-        presented.* = layer.setSurfaceOffMain(surface, 1);
+        presented.* = layer.setSurfaceOffMain(surface, seq);
         seen_commits = commits;
         seen_commits_under_lock = commits_under_lock;
     }
 };
+
+/// The commits one off-main present of `surface` (frame `seq`) makes on its own thread, and whether it showed it.
+fn testOffMainCommits(layer: *IOSurfaceLayer, surface: *IOSurface, seq: u64) !struct { presented: bool, commits: u32 } {
+    CommitOrder.install();
+    defer CommitOrder.remove();
+    var presented = false;
+    const thread = try std.Thread.spawn(.{}, CommitOrder.presentAt, .{ layer, surface, seq, &presented });
+    thread.join();
+    return .{ .presented = presented, .commits = CommitOrder.seen_commits };
+}
+
+test "host present: an off-main present that does not show its frame commits no transaction" {
+    // cmux FRAME OWNER REFACTOR S4 profile 4b41c42c (2026-11-05): with the embedder presenting host sizes, every
+    // frame of a new size failed the off-main checks and went through main, but its off-main attempt first began and
+    // committed a Core Animation transaction: one empty commit on the GPU completion thread per present (405 ms of
+    // CA::Context::commit_transaction in a held-key round), against main's own commit. A present that shows nothing
+    // commits nothing.
+    const testing = std.testing;
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    var layer = try IOSurfaceLayer.init();
+    defer layer.release();
+    const shown = try testSurface(80, 60);
+    defer shown.release();
+    const resized = try testSurface(120, 60);
+    defer resized.release();
+    const same = try testSurface(80, 60);
+    defer same.release();
+    layer.setSurfaceSync(shown);
+
+    // No host size: the frame goes through main.
+    var result = try testOffMainCommits(&layer, same, 1);
+    try testing.expect(!result.presented);
+    try testing.expectEqual(@as(u32, 0), result.commits);
+
+    // A frame of another size than the host's: through main.
+    layer.setHostSize((80 << 32) | 60);
+    result = try testOffMainCommits(&layer, resized, 2);
+    try testing.expect(!result.presented);
+    try testing.expectEqual(@as(u32, 0), result.commits);
+
+    // The host has the new size, the layer still shows the old one (the embedder presents it with its bounds).
+    layer.setHostSize((120 << 32) | 60);
+    layer.setEmbedderPresents(true);
+    layer.setEmbedderCommitted();
+    result = try testOffMainCommits(&layer, resized, 3);
+    try testing.expect(!result.presented);
+    try testing.expectEqual(@as(u32, 0), result.commits);
+
+    // The embedder showed the new size in a transaction it has not reported committed: through main.
+    try testing.expect(layer.setSurfacePresented(resized, 4));
+    const pending = try testSurface(120, 60);
+    defer pending.release();
+    result = try testOffMainCommits(&layer, pending, 5);
+    try testing.expect(!result.presented);
+    try testing.expectEqual(@as(u32, 0), result.commits);
+
+    // An older frame than the one shown: dropped, nothing to commit.
+    layer.setEmbedderCommitted();
+    const older = try testSurface(120, 60);
+    defer older.release();
+    result = try testOffMainCommits(&layer, older, 3);
+    try testing.expect(result.presented);
+    try testing.expectEqual(@as(u32, 0), result.commits);
+    try testing.expectEqual(@as(?*anyopaque, @ptrCast(resized)), layer.layer.getProperty(?*anyopaque, "contents"));
+
+    // A frame it shows still commits once, outside the lock.
+    const next = try testSurface(120, 60);
+    defer next.release();
+    result = try testOffMainCommits(&layer, next, 6);
+    try testing.expect(result.presented);
+    try testing.expectEqual(@as(u32, 1), result.commits);
+    try testing.expectEqual(@as(u32, 0), CommitOrder.seen_commits_under_lock);
+    try testing.expectEqual(@as(?*anyopaque, @ptrCast(next)), layer.layer.getProperty(?*anyopaque, "contents"));
+}
 
 fn testOffMainCommitOrder(embedder: bool) !void {
     const testing = std.testing;
