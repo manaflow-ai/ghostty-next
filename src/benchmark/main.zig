@@ -14,6 +14,7 @@ pub const IsSymbol = @import("IsSymbol.zig");
 pub const PageCompression = @import("PageCompression.zig");
 pub const ScrollbackCompression = @import("ScrollbackCompression.zig");
 pub const ShaperRows = @import("ShaperRows.zig");
+pub const ReflowPreview = @import("ReflowPreview.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

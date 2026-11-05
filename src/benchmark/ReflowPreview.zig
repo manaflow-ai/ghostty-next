@@ -125,7 +125,7 @@ fn step(ptr: *anyopaque) Benchmark.Error!void {
         for (0..self.opts.frames) |i| {
             const d: u16 = @intCast(if (i < half) i else self.opts.frames - 1 - i);
             const fit: renderer.GridSize = .{
-                .columns = @max(10, cols - 1 - d),
+                .columns = @max(10, cols -| (1 + d)),
                 .rows = @max(2, rows - @as(u16, @intCast((i / 8) % 4))),
             };
             const t0: std.Io.Timestamp = .now(io, .awake);
