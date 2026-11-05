@@ -2245,6 +2245,26 @@ pub const CAPI = struct {
         api.hostFrameCommitted();
     }
 
+    /// Keep every render target at least this large for a gesture (0, 0
+    /// clears it). See ghostty.h.
+    export fn ghostty_surface_set_host_capacity(surface: *Surface, width_px: u32, height_px: u32) void {
+        if (comptime builtin.os.tag != .macos) return;
+        const api = &surface.core_surface.renderer.api;
+        if (comptime !@hasDecl(@TypeOf(api.*), "setHostCapacity")) return;
+        api.setHostCapacity(width_px, height_px);
+    }
+
+    /// The pixel size the shown frame was drawn at. See ghostty.h.
+    export fn ghostty_surface_shown_frame_size(surface: *Surface, width_px: *u32, height_px: *u32) bool {
+        if (comptime builtin.os.tag != .macos) return false;
+        const api = &surface.core_surface.renderer.api;
+        if (comptime !@hasField(@TypeOf(api.*), "layer")) return false;
+        const shown = api.layer.shownSize() orelse return false;
+        width_px.* = @intCast(shown.width);
+        height_px.* = @intCast(shown.height);
+        return true;
+    }
+
     /// Draw a reflow preview while the locked grid does not fit the view.
     /// See ghostty.h.
     export fn ghostty_surface_set_reflow_preview(surface: *Surface, enabled: bool) void {
@@ -2308,6 +2328,8 @@ pub const CAPI = struct {
         renderer_compression_timer_fires: u64,
         io_wakeups: u64,
         io_timer_fires: u64,
+        host_target_allocs: u64,
+        host_target_bytes: u64,
     };
 
     /// The renderer's frame counters. See ghostty.h.
@@ -2337,6 +2359,8 @@ pub const CAPI = struct {
             .renderer_compression_timer_fires = c.compression_timer_fires.load(.monotonic),
             .io_wakeups = surface.core_surface.io_thread.counters.wakeups.load(.monotonic),
             .io_timer_fires = surface.core_surface.io_thread.counters.timer_fires.load(.monotonic),
+            .host_target_allocs = hostCounter(surface, "target_allocs"),
+            .host_target_bytes = hostCounter(surface, "target_bytes_peak"),
         };
     }
 

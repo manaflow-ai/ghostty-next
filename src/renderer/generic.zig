@@ -405,7 +405,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             /// frame state struct so we can start working on a new frame.
             frame_sema: std.Io.Semaphore = .{ .permits = buf_count },
 
-            pub fn init(api: GraphicsAPI, custom_shaders: bool) !SwapChain {
+            pub fn init(api: *GraphicsAPI, custom_shaders: bool) !SwapChain {
                 var result: SwapChain = .{ .frames = undefined };
 
                 // Initialize all of our frame state.
@@ -505,7 +505,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const CellTextBuffer = Buffer(shaderpkg.CellText);
             const BgImageBuffer = Buffer(shaderpkg.BgImage);
 
-            pub fn init(api: GraphicsAPI, custom_shaders: bool) !FrameState {
+            /// `api` by pointer: the API counts the targets it creates (Metal's `initTarget`).
+            pub fn init(api: *GraphicsAPI, custom_shaders: bool) !FrameState {
                 // Uniform buffer contains exactly 1 uniform struct. The
                 // uniform data will be undefined so this must be set before
                 // a frame is drawn.
@@ -549,7 +550,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 var custom_shader_state =
                     if (custom_shaders)
-                        try CustomShaderState.init(api)
+                        try CustomShaderState.init(api.*)
                     else
                         null;
                 errdefer if (custom_shader_state) |*state| state.deinit();
@@ -583,16 +584,45 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             pub fn resize(
                 self: *FrameState,
-                api: GraphicsAPI,
+                api: *GraphicsAPI,
                 width: usize,
                 height: usize,
             ) !void {
                 if (self.custom_shader_state) |*state| {
-                    try state.resize(api, width, height);
+                    try state.resize(api.*, width, height);
                 }
                 const target = try api.initTarget(width, height);
                 self.target.deinit();
                 self.target = target;
+            }
+
+            /// Gives this frame a render target and custom shader textures
+            /// for a frame of `width` x `height` pixels, new ones only when
+            /// those do not fit, or all new with `rebuild` (the target config
+            /// changed, such as the blending mode). An API with `fitTarget`
+            /// (Metal) chooses the target's size itself: it can be larger
+            /// than the frame (a host capacity, `Metal.setHostCapacity`), and
+            /// the frame is drawn in its top-left corner. Custom shader
+            /// textures always have the frame's size.
+            pub fn fit(
+                self: *FrameState,
+                api: *GraphicsAPI,
+                width: usize,
+                height: usize,
+                rebuild: bool,
+            ) !void {
+                if (comptime !@hasDecl(GraphicsAPI, "fitTarget")) {
+                    if (rebuild or self.target.width != width or self.target.height != height) {
+                        try self.resize(api, width, height);
+                    }
+                    return;
+                }
+                if (self.custom_shader_state) |*state| {
+                    if (rebuild or state.front_texture.width != width or state.front_texture.height != height) {
+                        try state.resize(api.*, width, height);
+                    }
+                }
+                try api.fitTarget(&self.target, width, height, rebuild);
             }
         };
 
@@ -2069,7 +2099,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const swap_chain: *SwapChain, const swap_chain_rebuilt: bool =
                 if (self.swap_chain) |*sc| .{ sc, false } else rebuild: {
                     self.swap_chain = try SwapChain.init(
-                        self.api,
+                        &self.api,
                         self.has_custom_shaders,
                     );
                     break :rebuild .{ &self.swap_chain.?, true };
@@ -2141,20 +2171,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.updateScreenSizeUniforms();
             }
 
-            // If this frame's target isn't the correct size, or the target
-            // config has changed (such as when the blending mode changes),
-            // remove it and replace it with a new one with the right values.
-            if (frame.target.width != self.size.screen.width or
-                frame.target.height != self.size.screen.height or
-                frame.target_config_modified != self.target_config_modified)
-            {
-                try frame.resize(
-                    self.api,
-                    self.size.screen.width,
-                    self.size.screen.height,
-                );
-                frame.target_config_modified = self.target_config_modified;
-            }
+            // If this frame's target can't draw a frame of the screen size
+            // (Metal: a host capacity keeps a larger target, `FrameState.fit`),
+            // or the target config has changed (such as when the blending mode
+            // changes), replace it with a new one with the right values.
+            try frame.fit(
+                &self.api,
+                self.size.screen.width,
+                self.size.screen.height,
+                frame.target_config_modified != self.target_config_modified,
+            );
+            frame.target_config_modified = self.target_config_modified;
 
             // Upload images to the GPU as necessary.
             _ = self.images.upload(self.alloc, &self.api);

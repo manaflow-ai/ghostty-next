@@ -41,6 +41,20 @@ width: usize,
 /// Current height of this target.
 height: usize,
 
+/// The pixel size of the frame drawn into this target, from its top-left
+/// corner (the render pass's viewport and scissor). It is the target's size,
+/// except while the host sets a capacity (`Metal.setHostCapacity`): then the
+/// target can be larger and the layer shows only these pixels. Set before
+/// each draw (`Metal.fitTarget`).
+drawn_width: usize,
+drawn_height: usize,
+
+/// The renderer's count of live target bytes (`Metal.counters`), lowered by
+/// `bytes` when this target is freed; null for a target nothing counts.
+live_bytes: ?*std.atomic.Value(u64) = null,
+/// The IOSurface's allocation size, as counted in `live_bytes`.
+bytes: u64 = 0,
+
 /// The frame drawn into this target last had cells built at this target's
 /// size (macOS host-sized surfaces present only such frames in a display
 /// pass of a new size, `Metal.presentHostSized`). Set before each draw.
@@ -108,10 +122,13 @@ pub fn init(opts: Options) !Self {
         .texture = texture,
         .width = opts.width,
         .height = opts.height,
+        .drawn_width = opts.width,
+        .drawn_height = opts.height,
     };
 }
 
 pub fn deinit(self: *Self) void {
+    if (self.live_bytes) |live| _ = live.fetchSub(self.bytes, .monotonic);
     self.surface.deinit();
     self.texture.release();
 }

@@ -61,6 +61,15 @@ autorelease_pool: ?*objc.AutoreleasePool = null,
 /// Written on the main thread, read by `surfaceSize` on any thread.
 host_size: std.atomic.Value(u64) = .init(0),
 
+/// macOS, opt-in (`ghostty_surface_set_host_capacity`): the least pixel size
+/// of every render target, packed width << 32 | height, for a gesture whose
+/// sizes all fit in it (a held-key resize, a divider drag): each frame target
+/// keeps one IOSurface that large and each frame is drawn in its top-left
+/// corner at the host size, so a new size allocates nothing (`fitTarget`). 0
+/// (the default): a target has exactly the frame's size. Main thread writes,
+/// the renderer thread reads.
+host_capacity: std.atomic.Value(u64) = .init(0),
+
 /// macOS host-sized surfaces: the newest frame the renderer thread drew with
 /// cells built at that frame's size (`Target.cells_fresh`), for the display
 /// pass of a new host size to present in the same Core Animation transaction
@@ -112,6 +121,12 @@ pub const HostFrameCounters = struct {
     /// Frames handed to the main thread's present (`IOSurfaceLayer.setSurface`): from the GPU completion thread, one
     /// block on the main queue each.
     main_presents: std.atomic.Value(u64) = .init(0),
+    /// Render targets created (`initTarget`), all causes: a new swap chain, a new frame size, a capacity, a config
+    /// change. Each is one IOSurface and one MTLTexture.
+    target_allocs: std.atomic.Value(u64) = .init(0),
+    /// The bytes of the live targets' IOSurfaces (`Target.live_bytes`), and their peak.
+    target_bytes_live: std.atomic.Value(u64) = .init(0),
+    target_bytes_peak: std.atomic.Value(u64) = .init(0),
 };
 
 const FreshFrame = struct {
@@ -125,6 +140,10 @@ const FreshFrame = struct {
     mutex: std.Io.Mutex = .init,
     /// Retained; null after a take or before the first fresh frame.
     surface: ?*IOSurface = null,
+    /// The pixel size `surface` was drawn at (`IOSurfaceLayer.Drawn`): the
+    /// surface is larger while the host sets a capacity.
+    width: usize = 0,
+    height: usize = 0,
     /// The present sequence number (`Metal.present_seq`) of `surface`.
     surface_seq: u64 = 0,
     /// Bumped on each publish; the display pass waits on it (futex).
@@ -132,9 +151,9 @@ const FreshFrame = struct {
 };
 
 /// A fresh frame taken for a present (`takeFresh`): retained, the caller
-/// releases `surface`.
+/// releases `frame.surface`.
 const TakenFrame = struct {
-    surface: *IOSurface,
+    frame: IOSurfaceLayer.Drawn,
     /// Its present sequence number (`Metal.present_seq`).
     seq: u64,
 };
@@ -309,6 +328,25 @@ pub fn setHostDrawableSize(self: *Metal, enabled: bool, width_px: u32, height_px
     self.layer.layer.msgSend(void, objc.sel("setNeedsDisplay"), .{});
 }
 
+/// macOS (`ghostty_surface_set_host_capacity`): every render target is at
+/// least `width_px` x `height_px` until the capacity is cleared (0, 0), so the
+/// frames of a gesture whose sizes all fit draw into the same targets: one
+/// IOSurface per swap-chain frame for the whole gesture instead of one per
+/// frame and size. A frame is drawn at the host size from the target's
+/// top-left corner (the render pass's viewport and scissor), and the layer
+/// shows only those pixels (`IOSurfaceLayer.showLocked`). A larger size grows
+/// a target to that size. Cleared, the next frame of each target gets a target
+/// of its own size again. Clamped to the largest texture. Main thread.
+pub fn setHostCapacity(self: *Metal, width_px: u32, height_px: u32) void {
+    if (comptime builtin.os.tag != .macos) return;
+    const max = self.device.max_texture_size;
+    const value: u64 = if (width_px > 0 and height_px > 0)
+        (@as(u64, @min(width_px, max)) << 32) | @min(height_px, max)
+    else
+        0;
+    self.host_capacity.store(value, .release);
+}
+
 /// macOS host-sized surfaces (`ghostty_surface_set_host_present`): with
 /// `enabled`, the embedder shows each frame of a new host size itself
 /// (`hostFrame`), in the Core Animation transaction that changes the view's
@@ -434,8 +472,9 @@ pub fn surfaceSize(self: *const Metal) !struct { width: u32, height: u32 } {
 }
 
 /// Initialize a new render target which can be presented by this API.
-pub fn initTarget(self: *const Metal, width: usize, height: usize) !Target {
-    return Target.init(.{
+/// Counted in `counters` (`target_allocs`, the live and peak bytes).
+pub fn initTarget(self: *Metal, width: usize, height: usize) !Target {
+    var target = try Target.init(.{
         .device = self.device.device,
         // Using an `*_srgb` pixel format makes Metal gamma encode the pixels
         // written to it *after* blending, which means we get linear alpha
@@ -448,12 +487,64 @@ pub fn initTarget(self: *const Metal, width: usize, height: usize) !Target {
         .width = width,
         .height = height,
     });
+    target.bytes = target.surface.getAllocSize();
+    target.live_bytes = &self.counters.target_bytes_live;
+    _ = self.counters.target_allocs.fetchAdd(1, .monotonic);
+    const live = self.counters.target_bytes_live.fetchAdd(target.bytes, .monotonic) + target.bytes;
+    _ = self.counters.target_bytes_peak.fetchMax(live, .monotonic);
+    return target;
+}
+
+/// Gives `target` (a swap-chain frame's) the size to draw a frame of `width` x
+/// `height` pixels, and records that drawn size (`Target.drawn_width`): a new
+/// target only when it does not fit (`targetSize`), or with `rebuild` (its
+/// config changed, such as the blending mode). Renderer thread.
+pub fn fitTarget(self: *Metal, target: *Target, width: usize, height: usize, rebuild: bool) !void {
+    if (self.targetSize(target.width, target.height, width, height, rebuild)) |size| {
+        const fitted = try self.initTarget(size.width, size.height);
+        target.deinit();
+        target.* = fitted;
+    }
+    target.drawn_width = width;
+    target.drawn_height = height;
+}
+
+/// The size of the new render target a frame of `width` x `height` pixels
+/// needs, given a target of `have_width` x `have_height`; null keeps that
+/// target. Without a host capacity a target has the frame's size, as it always
+/// had. With one (`setHostCapacity`) a target is at least the capacity and
+/// never shrinks while it is set: it fits any frame up to its size, and a
+/// larger frame grows it to that size.
+fn targetSize(
+    self: *const Metal,
+    have_width: usize,
+    have_height: usize,
+    width: usize,
+    height: usize,
+    rebuild: bool,
+) ?IOSurfaceLayer.Size {
+    const capacity = self.host_capacity.load(.acquire);
+    if (capacity == 0) {
+        if (!rebuild and have_width == width and have_height == height) return null;
+        return .{ .width = width, .height = height };
+    }
+    const want_width = @max(width, @as(usize, @intCast(capacity >> 32)));
+    const want_height = @max(height, @as(usize, @intCast(capacity & 0xffff_ffff)));
+    if (rebuild) return .{ .width = want_width, .height = want_height };
+    if (have_width >= want_width and have_height >= want_height) return null;
+    return .{ .width = @max(have_width, want_width), .height = @max(have_height, want_height) };
 }
 
 /// Present the provided target.
 pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
+    // The frame and the size it was drawn at: the target is larger while the host sets a capacity.
+    const frame: IOSurfaceLayer.Drawn = .{
+        .surface = target.surface,
+        .width = target.drawn_width,
+        .height = target.drawn_height,
+    };
     if (sync) {
-        self.layer.setSurfaceSync(target.surface);
+        self.layer.setSurfaceSync(frame);
     } else {
         const seq = self.present_seq.fetchAdd(1, .monotonic) + 1;
         var published = false;
@@ -462,7 +553,7 @@ pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
                 target.size_generation == self.fresh.generation.load(.acquire) and
                 self.host_size.load(.acquire) != 0)
             {
-                self.publishFresh(target.surface, seq);
+                self.publishFresh(frame, seq);
                 published = true;
             }
         }
@@ -470,7 +561,7 @@ pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
         // this (completion) thread: a terminal echo does not wait for main.
         if (comptime builtin.os.tag == .macos) {
             const host = self.host_size.load(.acquire);
-            if (host != 0 and self.layer.setSurfaceOffMain(target.surface, seq)) {
+            if (host != 0 and self.layer.setSurfaceOffMain(frame, seq)) {
                 _ = self.counters.off_main_presents.fetchAdd(1, .monotonic);
                 return;
             }
@@ -479,15 +570,15 @@ pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
             // its bounds (`hostFrame`). Any other frame still goes through main, which rechecks it then: one the host
             // no longer has the size of, or one no longer kept (a host change dropped it since it was published).
             if (host != 0 and published and self.embedder_presents.load(.acquire) and
-                self.embedderShowsKeptFrame(target.surface, seq, target.size_generation)) return;
+                self.embedderShowsKeptFrame(frame, seq, target.size_generation)) return;
         }
         _ = self.counters.main_presents.fetchAdd(1, .monotonic);
-        try self.layer.setSurface(target.surface, seq);
+        try self.layer.setSurface(frame, seq);
     }
 }
 
 /// While the embedder presents host sizes: whether the embedder shows
-/// `surface` (present sequence `seq`, drawn under host size generation
+/// `frame` (present sequence `seq`, drawn under host size generation
 /// `generation`) itself, so no main-thread present is needed. True only while
 /// the layer shows a frame of another size in bounds of another size
 /// (`setSurfaceCallback` would drop it) and the kept fresh frame is still this
@@ -502,30 +593,32 @@ pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
 /// draws now), and that frame is published and presented; while frames are
 /// held or the surface is hidden, the layer keeps its last frame. GPU
 /// completion thread.
-fn embedderShowsKeptFrame(self: *Metal, surface: *IOSurface, seq: u64, generation: u64) bool {
+fn embedderShowsKeptFrame(self: *Metal, frame: IOSurfaceLayer.Drawn, seq: u64, generation: u64) bool {
     const CATransaction = objc.getClass("CATransaction").?;
     CATransaction.msgSend(void, objc.sel("lock"), .{});
     defer CATransaction.msgSend(void, objc.sel("unlock"), .{});
-    if (!self.layer.embedderShowsFrameLocked(surface)) return false;
+    if (!self.layer.embedderShowsFrameLocked(frame.width, frame.height)) return false;
     const io = global.io();
     self.fresh.mutex.lockUncancelable(io);
     defer self.fresh.mutex.unlock(io);
-    return self.fresh.surface == surface and self.fresh.surface_seq == seq and
+    return self.fresh.surface == frame.surface and self.fresh.surface_seq == seq and
         self.fresh.generation.load(.acquire) == generation;
 }
 
-/// Keeps `surface`, the frame of present sequence `seq`, as the newest fresh
+/// Keeps `frame`, the frame of present sequence `seq`, as the newest fresh
 /// frame and wakes a display pass that waits for it. A frame older than the
 /// one kept (completions that raced) is not kept. GPU completion thread.
-fn publishFresh(self: *Metal, surface: *IOSurface, seq: u64) void {
+fn publishFresh(self: *Metal, frame: IOSurfaceLayer.Drawn, seq: u64) void {
     const io = global.io();
     const old = old: {
         self.fresh.mutex.lockUncancelable(io);
         defer self.fresh.mutex.unlock(io);
         if (self.fresh.surface != null and seq <= self.fresh.surface_seq) return;
-        surface.retain();
+        frame.surface.retain();
         const old = self.fresh.surface;
-        self.fresh.surface = surface;
+        self.fresh.surface = frame.surface;
+        self.fresh.width = frame.width;
+        self.fresh.height = frame.height;
         self.fresh.surface_seq = seq;
         break :old old;
     };
@@ -547,27 +640,31 @@ fn dropFresh(self: *Metal) void {
     if (old) |o| o.release();
 }
 
-/// The fresh frame if it has `width` x `height` pixels (retained; the caller
-/// releases it). A fresh frame of another size stays for its own pass.
+/// The fresh frame if it was drawn at `width` x `height` pixels (retained;
+/// the caller releases it). A fresh frame of another size stays for its own
+/// pass.
 fn takeFresh(self: *Metal, width: usize, height: usize) ?TakenFrame {
     const io = global.io();
     self.fresh.mutex.lockUncancelable(io);
     defer self.fresh.mutex.unlock(io);
     const surface = self.fresh.surface orelse return null;
-    if (surface.getWidth() != width or surface.getHeight() != height) return null;
+    if (self.fresh.width != width or self.fresh.height != height) return null;
     self.fresh.surface = null;
     self.fresh.armed.store(false, .release);
-    return .{ .surface = surface, .seq = self.fresh.surface_seq };
+    return .{
+        .frame = .{ .surface = surface, .width = width, .height = height },
+        .seq = self.fresh.surface_seq,
+    };
 }
 
-/// Whether a fresh frame of `width` x `height` pixels waits (`takeFresh`
-/// would take it). Main thread.
+/// Whether a fresh frame drawn at `width` x `height` pixels waits
+/// (`takeFresh` would take it). Main thread.
 fn hasFresh(self: *Metal, width: usize, height: usize) bool {
     const io = global.io();
     self.fresh.mutex.lockUncancelable(io);
     defer self.fresh.mutex.unlock(io);
-    const surface = self.fresh.surface orelse return false;
-    return surface.getWidth() == width and surface.getHeight() == height;
+    if (self.fresh.surface == null) return false;
+    return self.fresh.width == width and self.fresh.height == height;
 }
 
 /// Shows the fresh frame of `width` x `height` pixels in the caller's Core
@@ -575,8 +672,8 @@ fn hasFresh(self: *Metal, width: usize, height: usize) bool {
 /// whether it did. Main thread.
 fn presentFresh(self: *Metal, width: usize, height: usize) bool {
     const taken = self.takeFresh(width, height) orelse return false;
-    defer taken.surface.release();
-    if (!self.layer.setSurfacePresented(taken.surface, taken.seq)) {
+    defer taken.frame.surface.release();
+    if (!self.layer.setSurfacePresented(taken.frame, taken.seq)) {
         // Not shown (the layer shows a newer frame): the next frame of this
         // size publishes for the next present.
         self.fresh.armed.store(true, .release);
@@ -613,11 +710,11 @@ pub fn presentHostSizedWait(self: *Metal, wait: bool) bool {
     if (!self.visible_hint.load(.acquire)) return true;
     const width: usize = @intCast(host >> 32);
     const height: usize = @intCast(host & 0xffff_ffff);
-    const shown = self.layer.layer.getProperty(?*anyopaque, "contents") orelse return false;
-    const shown_surface: *IOSurface = @ptrCast(shown);
-    if (shown_surface.getWidth() == width and shown_surface.getHeight() == height) {
+    // The drawn size of the shown frame, not its surface's (a capacity target is larger).
+    const shown = self.layer.shownSize() orelse return false;
+    if (shown.width == width and shown.height == height) {
         // The renderer thread's frame at this size already landed.
-        if (self.takeFresh(width, height)) |taken| taken.surface.release();
+        if (self.takeFresh(width, height)) |taken| taken.frame.surface.release();
         return true;
     }
 
@@ -626,8 +723,8 @@ pub fn presentHostSizedWait(self: *Metal, wait: bool) bool {
     while (true) {
         const seq = self.fresh.seq.load(.acquire);
         if (self.takeFresh(width, height)) |taken| {
-            defer taken.surface.release();
-            self.layer.setSurfaceSync(taken.surface);
+            defer taken.frame.surface.release();
+            self.layer.setSurfaceSync(taken.frame);
             _ = self.counters.fresh_presents.fetchAdd(1, .monotonic);
             return true;
         }
@@ -671,7 +768,7 @@ pub fn hostFrame(self: *Metal, show: bool) apprt.HostFrame {
         // bounds the embedder had set, or an earlier present): a kept fresh
         // frame is not newer, and no frame needs to publish until the next
         // size (frames at this size go off main).
-        if (self.takeFresh(width, height)) |taken| taken.surface.release();
+        if (self.takeFresh(width, height)) |taken| taken.frame.surface.release();
         self.fresh.armed.store(false, .release);
         return .shown;
     }
@@ -935,6 +1032,8 @@ fn testTarget(self: *const Metal, surface: *IOSurface) Target {
         .texture = undefined,
         .width = surface.getWidth(),
         .height = surface.getHeight(),
+        .drawn_width = surface.getWidth(),
+        .drawn_height = surface.getHeight(),
         .cells_fresh = true,
         .size_generation = self.sizeGeneration(),
     };
@@ -953,7 +1052,7 @@ test "host present: a new host size asks no display pass while the embedder pres
     defer testDeinit(&metal);
     const shown = try testSurface(80, 60);
     defer shown.release();
-    metal.layer.setSurfaceSync(shown);
+    metal.layer.setSurfaceSync(.whole(shown));
     metal.setEmbedderPresents(true);
     metal.layer.layer.msgSend(void, objc.sel("displayIfNeeded"), .{});
     try testing.expect(!metal.layer.layer.getProperty(bool, "needsDisplay"));
@@ -973,7 +1072,7 @@ test "host present: a new host size asks a display pass by default" {
     defer testDeinit(&metal);
     const shown = try testSurface(80, 60);
     defer shown.release();
-    metal.layer.setSurfaceSync(shown);
+    metal.layer.setSurfaceSync(.whole(shown));
     metal.layer.layer.msgSend(void, objc.sel("displayIfNeeded"), .{});
     try testing.expect(!metal.layer.layer.getProperty(bool, "needsDisplay"));
 
@@ -994,7 +1093,7 @@ test "host present: the renderer never shows a frame of a new host size while th
     defer shown.release();
     const drawn = try testSurface(120, 60);
     defer drawn.release();
-    metal.layer.setSurfaceSync(shown);
+    metal.layer.setSurfaceSync(.whole(shown));
     metal.setEmbedderPresents(true);
     metal.setHostDrawableSize(true, 120, 60);
 
@@ -1022,7 +1121,7 @@ test "host present: a frame of a new host size that the embedder presents wakes 
     defer shown.release();
     const drawn = try testSurface(120, 60);
     defer drawn.release();
-    metal.layer.setSurfaceSync(shown);
+    metal.layer.setSurfaceSync(.whole(shown));
     metal.layer.layer.setProperty("contentsScale", @as(f64, 1));
     metal.layer.layer.setProperty("bounds", macos.graphics.Rect{
         .origin = .{ .x = 0, .y = 0 },
@@ -1055,7 +1154,7 @@ test "host present: a kept frame that a host change dropped since its publish st
     defer shown.release();
     const drawn = try testSurface(120, 60);
     defer drawn.release();
-    metal.layer.setSurfaceSync(shown);
+    metal.layer.setSurfaceSync(.whole(shown));
     metal.layer.layer.setProperty("contentsScale", @as(f64, 1));
     metal.layer.layer.setProperty("bounds", macos.graphics.Rect{
         .origin = .{ .x = 0, .y = 0 },
@@ -1064,12 +1163,12 @@ test "host present: a kept frame that a host change dropped since its publish st
     metal.setEmbedderPresents(true);
     metal.setHostDrawableSize(true, 120, 60);
     const target = testTarget(&metal, drawn);
-    metal.publishFresh(drawn, 1);
-    try testing.expect(metal.embedderShowsKeptFrame(drawn, 1, target.size_generation));
+    metal.publishFresh(.whole(drawn), 1);
+    try testing.expect(metal.embedderShowsKeptFrame(.whole(drawn), 1, target.size_generation));
 
     metal.setHostDrawableSize(true, 160, 60);
     metal.setHostDrawableSize(true, 120, 60);
-    try testing.expect(!metal.embedderShowsKeptFrame(drawn, 1, target.size_generation));
+    try testing.expect(!metal.embedderShowsKeptFrame(.whole(drawn), 1, target.size_generation));
 }
 
 test "host present: after a host change drops a skipped frame, the new size's frame replaces it" {
@@ -1091,7 +1190,7 @@ test "host present: after a host change drops a skipped frame, the new size's fr
     defer first.release();
     const second = try testSurface(120, 60);
     defer second.release();
-    metal.layer.setSurfaceSync(shown);
+    metal.layer.setSurfaceSync(.whole(shown));
     metal.layer.layer.setProperty("contentsScale", @as(f64, 1));
     metal.layer.layer.setProperty("bounds", macos.graphics.Rect{
         .origin = .{ .x = 0, .y = 0 },
@@ -1132,7 +1231,7 @@ test "host present: a frame for bounds the embedder already set presents itself 
     defer shown.release();
     const drawn = try testSurface(120, 60);
     defer drawn.release();
-    metal.layer.setSurfaceSync(shown);
+    metal.layer.setSurfaceSync(.whole(shown));
     metal.setEmbedderPresents(true);
     metal.setHostDrawableSize(true, 120, 60);
     metal.layer.layer.setProperty("contentsScale", @as(f64, 1));
@@ -1160,7 +1259,7 @@ test "host present: a frame of a size the host no longer has still goes through 
     defer shown.release();
     const drawn = try testSurface(120, 60);
     defer drawn.release();
-    metal.layer.setSurfaceSync(shown);
+    metal.layer.setSurfaceSync(.whole(shown));
     metal.setEmbedderPresents(true);
     metal.setHostDrawableSize(true, 120, 60);
     const target = testTarget(&metal, drawn);
@@ -1184,7 +1283,7 @@ test "host present: a frame of a size the host no longer has still goes through 
     defer shown.release();
     const drawn = try testSurface(120, 60);
     defer drawn.release();
-    metal.layer.setSurfaceSync(shown);
+    metal.layer.setSurfaceSync(.whole(shown));
     metal.setHostDrawableSize(true, 120, 60);
     const target = testTarget(&metal, drawn);
     metal.setHostDrawableSize(true, 160, 60);
@@ -1206,7 +1305,7 @@ test "host present: the renderer shows a frame of a new host size by default" {
     defer shown.release();
     const drawn = try testSurface(120, 60);
     defer drawn.release();
-    metal.layer.setSurfaceSync(shown);
+    metal.layer.setSurfaceSync(.whole(shown));
     metal.setHostDrawableSize(true, 120, 60);
 
     try metal.present(testTarget(&metal, drawn), false);
@@ -1242,7 +1341,7 @@ test "host present: a frame at the shown size goes to the screen off main while 
     defer shown.release();
     const drawn = try testSurface(120, 60);
     defer drawn.release();
-    metal.layer.setSurfaceSync(shown);
+    metal.layer.setSurfaceSync(.whole(shown));
     metal.setEmbedderPresents(true);
     metal.setHostDrawableSize(true, 120, 60);
     // The embedder committed its last change: frames at the shown size may go off main.
@@ -1270,7 +1369,7 @@ test "host present: a frame at the shown size goes through main until the embedd
     defer shown.release();
     const drawn = try testSurface(120, 60);
     defer drawn.release();
-    metal.layer.setSurfaceSync(shown);
+    metal.layer.setSurfaceSync(.whole(shown));
     metal.setEmbedderPresents(true);
     metal.setHostDrawableSize(true, 120, 60);
 
@@ -1294,7 +1393,7 @@ test "host present: hostFrame reports the frame drawn for a new host size and sh
     defer shown.release();
     const drawn = try testSurface(120, 60);
     defer drawn.release();
-    metal.layer.setSurfaceSync(shown);
+    metal.layer.setSurfaceSync(.whole(shown));
     metal.setEmbedderPresents(true);
     metal.setHostDrawableSize(true, 120, 60);
     try metal.present(testTarget(&metal, drawn), false);
@@ -1321,7 +1420,7 @@ test "host present: hostFrame keeps the shown frame until the renderer drew the 
     defer testDeinit(&metal);
     const shown = try testSurface(80, 60);
     defer shown.release();
-    metal.layer.setSurfaceSync(shown);
+    metal.layer.setSurfaceSync(.whole(shown));
     metal.setEmbedderPresents(true);
     metal.setHostDrawableSize(true, 120, 60);
 
@@ -1349,7 +1448,7 @@ test "host present: hostFrame reports nothing to keep, held frames and a hidden 
     try testing.expectEqual(HostFrame.none, metal.hostFrame(true));
     const shown = try testSurface(80, 60);
     defer shown.release();
-    metal.layer.setSurfaceSync(shown);
+    metal.layer.setSurfaceSync(.whole(shown));
     // Synchronized output or a restore holds frame updates: no frame can come now.
     metal.setFramesHeld(true);
     try testing.expectEqual(HostFrame.held, metal.hostFrame(false));
@@ -1376,7 +1475,7 @@ test "host present: a frame that reaches the main thread late never replaces the
     defer stale.release();
     const fresh = try testSurface(120, 60);
     defer fresh.release();
-    metal.layer.setSurfaceSync(shown);
+    metal.layer.setSurfaceSync(.whole(shown));
     metal.setEmbedderPresents(true);
     metal.setHostDrawableSize(true, 120, 60);
 
@@ -1390,7 +1489,7 @@ test "host present: a frame that reaches the main thread late never replaces the
 
     // The older frame's main-thread present runs after that (a block queued
     // before it): it must not replace the newer frame.
-    try metal.layer.setSurface(stale, 1);
+    try metal.layer.setSurface(.whole(stale), 1);
     const contents = metal.layer.layer.getProperty(?*anyopaque, "contents");
     try testing.expectEqual(@as(?*anyopaque, @ptrCast(fresh)), contents);
 }
@@ -1407,7 +1506,7 @@ test "host present: back to the renderer, a frame drawn for the host size goes t
     defer shown.release();
     const drawn = try testSurface(120, 60);
     defer drawn.release();
-    metal.layer.setSurfaceSync(shown);
+    metal.layer.setSurfaceSync(.whole(shown));
     metal.setEmbedderPresents(true);
     metal.setHostDrawableSize(true, 120, 60);
     try metal.present(testTarget(&metal, drawn), false);
@@ -1431,13 +1530,13 @@ test "host present: a refused present keeps the next frame of the host size publ
     defer newer.release();
     const drawn = try testSurface(120, 60);
     defer drawn.release();
-    metal.layer.setSurfaceSync(shown);
+    metal.layer.setSurfaceSync(.whole(shown));
     metal.setEmbedderPresents(true);
     metal.setHostDrawableSize(true, 120, 60);
     try metal.present(testTarget(&metal, drawn), false);
     // The layer shows a newer frame (of the old size) than the one drawn for the
     // host size, so the present refuses it.
-    try testing.expect(metal.layer.setSurfacePresented(newer, 50));
+    try testing.expect(metal.layer.setSurfacePresented(.whole(newer), 50));
 
     try testing.expectEqual(HostFrame.pending, metal.hostFrame(true));
     // The next frame at the host size must publish for the next present.
@@ -1458,7 +1557,7 @@ test "host present: the old present calls follow the embedder's ordered present"
     defer stale.release();
     const fresh = try testSurface(120, 60);
     defer fresh.release();
-    metal.layer.setSurfaceSync(shown);
+    metal.layer.setSurfaceSync(.whole(shown));
     metal.setEmbedderPresents(true);
     metal.setHostDrawableSize(true, 120, 60);
     var stale_target = testTarget(&metal, stale);
@@ -1468,7 +1567,7 @@ test "host present: the old present calls follow the embedder's ordered present"
 
     // ghostty_surface_present_host_frame(_ready) while the embedder presents sizes.
     try testing.expect(metal.presentHostSizedWait(true));
-    try metal.layer.setSurface(stale, 1);
+    try metal.layer.setSurface(.whole(stale), 1);
     const contents = metal.layer.layer.getProperty(?*anyopaque, "contents");
     try testing.expectEqual(@as(?*anyopaque, @ptrCast(fresh)), contents);
 }

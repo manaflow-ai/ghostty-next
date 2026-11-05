@@ -423,6 +423,14 @@ pub const MTLViewport = extern struct {
     zfar: f64,
 };
 
+/// https://developer.apple.com/documentation/metal/mtlscissorrect?language=objc
+pub const MTLScissorRect = extern struct {
+    x: c_ulong,
+    y: c_ulong,
+    width: c_ulong,
+    height: c_ulong,
+};
+
 pub const MTLRegion = extern struct {
     origin: MTLOrigin,
     size: MTLSize,
