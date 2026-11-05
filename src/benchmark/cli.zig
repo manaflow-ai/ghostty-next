@@ -22,6 +22,7 @@ pub const Action = enum {
     @"is-symbol",
     @"osc-parser",
     @"shaper-rows",
+    @"reflow-preview",
 
     /// Returns the struct associated with the action. The struct
     /// should have a few decls:
@@ -48,6 +49,7 @@ pub const Action = enum {
             .@"is-symbol" => @import("IsSymbol.zig"),
             .@"osc-parser" => @import("OscParser.zig"),
             .@"shaper-rows" => @import("ShaperRows.zig"),
+            .@"reflow-preview" => @import("ReflowPreview.zig"),
         };
     }
 };
