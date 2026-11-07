@@ -122,6 +122,11 @@ const FreshFrame = struct {
     /// A host size changed and its frame was not taken yet: only then does a
     /// completed frame publish itself (no retain, lock or wake per frame at rest).
     armed: std.atomic.Value(bool) = .init(false),
+    /// The generation of the last frame the renderer showed itself, off main,
+    /// at the host size (`present`): that size's frame is on screen, so no
+    /// update waits for an embedder present (`hostFrameWaits`) even while no
+    /// present takes the kept frame (a host size set back to the shown size).
+    shown_generation: std.atomic.Value(u64) = .init(0),
     mutex: std.Io.Mutex = .init,
     /// Retained; null after a take or before the first fresh frame.
     surface: ?*IOSurface = null,
@@ -471,6 +476,7 @@ pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
         if (comptime builtin.os.tag == .macos) {
             const host = self.host_size.load(.acquire);
             if (host != 0 and self.layer.setSurfaceOffMain(target.surface, seq)) {
+                self.fresh.shown_generation.store(target.size_generation, .release);
                 _ = self.counters.off_main_presents.fetchAdd(1, .monotonic);
                 return;
             }
@@ -687,14 +693,16 @@ pub fn hostFrame(self: *Metal, show: bool) apprt.HostFrame {
 }
 
 /// While the embedder presents host sizes: a frame of the host size waits for
-/// its present (the size changed and its frame was not taken yet). The
+/// its present (the size changed, its frame was not taken yet and the renderer
+/// did not show a frame of it itself). The
 /// renderer thread draws every update at once then (`Thread` drawsNow), so the
 /// frame the embedder presents has the newest content. Any thread.
 pub fn hostFrameWaits(self: *const Metal) bool {
     if (comptime builtin.os.tag != .macos) return false;
     return self.embedder_presents.load(.acquire) and
         self.host_size.load(.acquire) != 0 and
-        self.fresh.armed.load(.acquire);
+        self.fresh.armed.load(.acquire) and
+        self.fresh.shown_generation.load(.acquire) != self.fresh.generation.load(.acquire);
 }
 
 /// The embedder committed the transaction of its last present or bounds change
