@@ -50,6 +50,7 @@ enums:
     8: kitty_image_storage
     9: kitty_image_payload
     10: kitty_image_page_placements
+    11: prompt_redraw
   kitty_format:
     0: rgb
     1: rgba

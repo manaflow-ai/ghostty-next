@@ -219,7 +219,8 @@ Conflicts and how each was resolved (45 files):
   the fork's additions used. The fork's options moved to 1024 and up so an
   upstream number never collides again: `KITTY_IMAGE_COUNT_LIMIT` 1024,
   `KITTY_PLACEMENT_COUNT_LIMIT` 1025, `KITTY_IMAGE_ID_CURSORS` 1026,
-  `SHELL_REDRAWS_PROMPT` 1027. The fork's `GhosttyTerminalData` values
+  `SHELL_REDRAWS_PROMPT` 1027 (`PROMPT_REDRAW_WAITS_FOR_SHELL` 1028 came
+  later, see the fork changes list). The fork's `GhosttyTerminalData` values
   moved the same way, 43-48 to 1024-1029. This is an ABI change for
   libghostty-vt embedders: cmux-tui's bindgen reads the names from the
   header, so a rebuild against the new header is enough; nothing may

@@ -11,6 +11,7 @@ const test_fixture = @import("fixture.zig");
 const history = @import("history.zig");
 const kitty = @import("kitty.zig");
 const page = @import("page.zig");
+const prompt_redraw = @import("prompt_redraw.zig");
 const record = @import("record.zig");
 const screen = @import("screen.zig");
 const size = @import("../size.zig");
@@ -31,7 +32,8 @@ pub const EncodeError = terminal.EncodeError ||
     history.EncodeError ||
     kitty.EncodeError ||
     checkpoint.EncodeError ||
-    continuation.EncodeError;
+    continuation.EncodeError ||
+    prompt_redraw.EncodeError;
 
 pub const EncodeOptions = struct {
     continuation: Continuation,
@@ -100,7 +102,13 @@ pub fn encode(
     // 4. Standard Stream continuation.
     try continuation.encode(options.continuation, &stream);
 
-    // 5. Ready marker.
+    // 5. The prompt clear a resize put off, only while one is pending, so
+    // the restored terminal clears the prompt at the same byte.
+    if (t.prompt_redraw_pending) |pending| {
+        try prompt_redraw.encode(pending, &stream);
+    }
+
+    // 6. Ready marker.
     try checkpoint.encode(.ready, &stream);
 
     // Kitty graphics pixels are written in the order the reader needs
@@ -407,6 +415,7 @@ pub const Decoder = struct {
         screen.DecodeError ||
         continuation.DecodeError ||
         checkpoint.DecodeError ||
+        prompt_redraw.DecodeError ||
         error{
             /// A SCREEN names a key not declared by TERMINAL.
             UnexpectedScreenKey,
@@ -539,8 +548,16 @@ pub const Decoder = struct {
             .bytes => |bytes| alloc.free(bytes),
         };
 
+        // An optional PROMPT_REDRAW record restores the prompt clear a
+        // resize put off until the shell's next byte.
+        header = try record.nextHeader(reader);
+        if (header.tag == .prompt_redraw) {
+            result.prompt_redraw_pending = try prompt_redraw.decode(reader, header);
+            header = try record.nextHeader(reader);
+        }
+
         // READY marks the exact envelope-through-CONTINUATION boundary.
-        try checkpoint.decode(.ready, reader, try record.nextHeader(reader));
+        try checkpoint.decode(.ready, reader, header);
 
         // Record where history may be applied. The declared keys route the
         // HISTORY sequences, and the generations detect declared screens
@@ -1394,6 +1411,77 @@ test "complete snapshot restores semantic prompt state for an input cursor" {
     try testing.expect(
         t.screens.active.pages.total_rows > t.screens.active.pages.rows,
     );
+}
+
+test "complete snapshot restores a prompt clear that waits for the shell" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var source_terminal = try Terminal.init(testing.io, alloc, .{ .cols = 34, .rows = 6 });
+    defer source_terminal.deinit(alloc);
+    source_terminal.flags.prompt_redraw_waits_for_shell = true;
+    var source_stream = TerminalStream.init(.{
+        .allocator = alloc,
+        .handler = .init(&source_terminal),
+    });
+    defer source_stream.deinit();
+    source_stream.nextSlice("\x1b]133;A\x07J> \x1b]133;B\x07");
+
+    // A real resize: the clear waits for the shell's next byte, and a
+    // snapshot taken now carries it.
+    try source_terminal.resize(alloc, .{ .cols = 40, .rows = 6 });
+    try testing.expect(source_terminal.prompt_redraw_pending != null);
+
+    var encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer encoded.deinit();
+    try encode(alloc, &encoded.writer, &source_terminal, test_encode_options);
+
+    var encoded_source: std.Io.Reader = .fixed(encoded.written());
+    var decoded = try decode(alloc, testing.io, &encoded_source, test_decode_options);
+    defer decoded.deinit(alloc);
+    var restored = decoded.toOwned();
+    defer restored.deinit(alloc);
+    try testing.expectEqual(
+        source_terminal.prompt_redraw_pending,
+        restored.prompt_redraw_pending,
+    );
+    var restored_stream = TerminalStream.init(.{
+        .allocator = alloc,
+        .handler = .init(&restored),
+    });
+    defer restored_stream.deinit();
+
+    // The shell's redraw at the new width reaches both. The first byte
+    // clears the old prompt on both, so both screens are the same.
+    const redraw = "\r\x1b[J\x1b]133;A\x07K> \x1b]133;B\x07";
+    source_stream.nextSlice(redraw);
+    restored_stream.nextSlice(redraw);
+    const source_str = try source_terminal.plainString(alloc);
+    defer alloc.free(source_str);
+    const restored_str = try restored.plainString(alloc);
+    defer alloc.free(restored_str);
+    try testing.expectEqualStrings("K> ", source_str);
+    try testing.expectEqualStrings(source_str, restored_str);
+}
+
+test "complete snapshot has no prompt clear record while none is pending" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 4 });
+    defer t.deinit(alloc);
+    var encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer encoded.deinit();
+    try encode(alloc, &encoded.writer, &t, test_encode_options);
+
+    var encoded_source: std.Io.Reader = .fixed(encoded.written());
+    try envelope.decode(&encoded_source);
+    while (true) {
+        const header = try record.Header.decode(&encoded_source);
+        try testing.expect(header.tag != .prompt_redraw);
+        if (header.tag == .finish) break;
+        try encoded_source.discardAll(header.payload_len);
+    }
 }
 
 test "complete snapshot validates continuation before writing" {

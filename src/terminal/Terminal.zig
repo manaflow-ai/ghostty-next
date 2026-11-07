@@ -5304,6 +5304,7 @@ pub inline fn settlePromptRedraw(self: *Terminal) void {
         pending.redraw,
         pending.rows_before,
     );
+    self.flags.dirty.clear = true;
 }
 
 test "Terminal forwards optional scrollback limits" {
