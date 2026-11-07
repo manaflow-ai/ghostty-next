@@ -5271,7 +5271,10 @@ pub fn resize(
     self.cols = opts.cols;
     self.rows = opts.rows;
 
-    if (prompt_redraw_waits) self.prompt_redraw_pending = prompt_redraw_pending;
+    // With the option off, this resize cleared the prompt at once, so a
+    // pending clear (from a snapshot restored onto a terminal without the
+    // option) is done and must not run again at the next byte.
+    self.prompt_redraw_pending = if (prompt_redraw_waits) prompt_redraw_pending else null;
 
     // Reset the scrolling region
     self.scrolling_region = .{
