@@ -105,6 +105,10 @@ jobs:
             -Dtest-filter="ghostty.h surface grid" \
             -Dtest-filter="ghostty.h SurfaceSnapshotPhase" \
             -Dtest-filter="renderer mailbox: " \
+            -Dtest-filter="renderer thread: " \
+            -Dtest-filter="host present: a frame of a new host size waits" \
+            -Dtest-filter="host present: no frame waits" \
+            -Dtest-filter="host present: nothing waits once" \
             -Dtest-filter="renderCellMap link filter" \
             -Dtest-filter="StringMap match text" \
             -Dtest-filter="loadString " \
