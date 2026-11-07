@@ -3095,33 +3095,39 @@ fn resizeWithoutReflowGrowCols(
             page.size.rows,
         );
 
+        const prev_start = prev_page.size.rows;
         const src_rows = page.rows.ptr(page.memory)[0..len];
-        const dst_rows = prev_page.rows.ptr(prev_page.memory)[prev_page.size.rows..];
+        const dst_rows = prev_page.rows.ptr(prev_page.memory)[prev_start..];
         for (dst_rows, src_rows) |*dst_row, *src_row| {
             prev_page.size.rows += 1;
-            copied += 1;
             prev_page.cloneRowFrom(
                 page,
                 dst_row,
                 src_row,
             ) catch {
-                // If an error happens, we undo our row copy and break out
-                // into creating a new page.
+                // If an error happens, we undo this row's partial copy
+                // and stop. The rows copied so far stay in prev and the
+                // rest go into new pages below. The retired row must be
+                // left in the default state (see resetRow).
+                prev_page.resetRow(dst_row);
                 prev_page.size.rows -= 1;
-                copied -= 1;
-                break :prev;
+                break;
             };
+            copied += 1;
         }
 
-        assert(copied == len);
+        assert(copied <= len);
         assert(prev_page.size.rows <= prev_page.capacity.rows);
 
-        // Remap any tracked pins that pointed to rows we just copied to prev.
+        // Remap any tracked pins that pointed to rows we just copied to
+        // prev. This must also run when the copy stopped early, since the
+        // loop below only remaps the rows it copies and the source page
+        // is destroyed at the end.
         const pin_keys = self.tracked_pins.keys();
         for (pin_keys) |p| {
-            if (p.node != chunk.node or p.y >= len) continue;
+            if (p.node != chunk.node or p.y >= copied) continue;
             p.node = prev_node;
-            p.y += prev_page.size.rows - len;
+            p.y += prev_start;
         }
     }
 
