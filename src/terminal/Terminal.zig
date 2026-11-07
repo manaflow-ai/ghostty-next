@@ -112,16 +112,6 @@ kitty_image_generation_floor: u64 = 0,
 /// `flags.prompt_redraw_waits_for_shell`), or null.
 prompt_redraw_pending: ?PromptRedrawPending = null,
 
-/// The grid the shell last drew its prompt at, and that prompt's rows down
-/// to the cursor at that grid, kept from the first resize the shell has not
-/// answered yet.
-pub const PromptRedrawPending = struct {
-    cols: size.CellCountInt,
-    rows: size.CellCountInt,
-    redraw: osc.semantic_prompt.Redraw,
-    rows_before: ?usize,
-};
-
 /// These are just a packed set of flags we may set on the terminal.
 flags: packed struct {
     // This supports a Kitty extension where programs using semantic
@@ -5291,6 +5281,16 @@ pub fn resize(
         .right = opts.cols - 1,
     };
 }
+
+/// The grid the shell last drew its prompt at, and that prompt's rows down
+/// to the cursor at that grid, kept from the first resize the shell has not
+/// answered yet.
+pub const PromptRedrawPending = struct {
+    cols: size.CellCountInt,
+    rows: size.CellCountInt,
+    redraw: osc.semantic_prompt.Redraw,
+    rows_before: ?usize,
+};
 
 /// Run the prompt clear a resize put off (`prompt_redraw_waits_for_shell`),
 /// before the shell's next byte is handled. If the grid is back at the size
