@@ -1005,6 +1005,35 @@ test "host present: a frame of a new host size waits for its present until the e
     try testing.expect(!metal.hostFrameWaits());
 }
 
+test "host present: nothing waits once the renderer shows the host size's frame itself" {
+    const testing = std.testing;
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    const device = testDevice();
+    var metal = try testMetal(&device);
+    defer testDeinit(&metal);
+    const shown = try testSurface(80, 60);
+    defer shown.release();
+    const drawn = try testSurface(80, 60);
+    defer drawn.release();
+    metal.layer.setSurfaceSync(shown);
+    metal.setEmbedderPresents(true);
+    metal.setHostDrawableSize(true, 80, 60);
+    _ = metal.hostFrame(true);
+    metal.hostFrameCommitted();
+    // A size drawn ahead, then back to the shown size with no embedder
+    // present (a spring that ends at the bounds it has): the frame of that
+    // size goes to the screen off main, and no embedder present follows.
+    metal.setHostDrawableSize(true, 120, 60);
+    metal.setHostDrawableSize(true, 80, 60);
+    try testing.expect(metal.hostFrameWaits());
+    try metal.present(testTarget(&metal, drawn), false);
+    try testing.expectEqual(@as(u64, 1), metal.counters.off_main_presents.load(.acquire));
+    // The host size's frame is on screen: no update draws unpaced any more.
+    try testing.expect(!metal.hostFrameWaits());
+}
+
 test "host present: no frame waits for an embedder present by default" {
     const testing = std.testing;
     const pool = objc.AutoreleasePool.init();
