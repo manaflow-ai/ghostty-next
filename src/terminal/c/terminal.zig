@@ -1503,6 +1503,7 @@ pub const Option = enum(c_int) {
     kitty_placement_count_limit = 1025,
     kitty_image_id_cursors = 1026,
     shell_redraws_prompt = 1027,
+    prompt_redraw_waits_for_shell = 1028,
 
     /// Input type expected for setting the option.
     pub fn InType(comptime self: Option) type {
@@ -1543,6 +1544,7 @@ pub const Option = enum(c_int) {
             .xt_checksum_report,
             .resize_pull_scrollback,
             .shell_redraws_prompt,
+            .prompt_redraw_waits_for_shell,
             => ?*const bool,
             .kitty_image_medium_temp_file => ?*const lib.String,
             .apc_max_bytes,
@@ -1831,6 +1833,11 @@ fn setTyped(
             if (value) |ptr| ptr.* else true,
         .shell_redraws_prompt => wrapper.terminal.flags.shell_redraws_prompt =
             if (value) |ptr| (if (ptr.*) .true else .false) else .false,
+        .prompt_redraw_waits_for_shell => {
+            const waits = if (value) |ptr| ptr.* else false;
+            wrapper.terminal.flags.prompt_redraw_waits_for_shell = waits;
+            if (!waits) wrapper.terminal.settlePromptRedraw();
+        },
         .xt_checksum_extension => {
             const bits = if (value) |ptr| ptr.* else 0;
             const flags = std.math.cast(u5, bits) orelse return .invalid_value;

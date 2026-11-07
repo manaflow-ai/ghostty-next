@@ -1232,6 +1232,9 @@ fn swapTerminalLocked(
 ) terminalpkg.Terminal {
     const old = self.terminal;
     self.terminal = new;
+    // Surface configuration, not owner state: the restored terminal keeps
+    // this surface's prompt clear policy.
+    self.terminal.flags.prompt_redraw_waits_for_shell = old.flags.prompt_redraw_waits_for_shell;
 
     // The parser state belonged to the old byte stream. The snapshot's
     // continuation is the unfinished sequence of the new one; replaying it
@@ -2803,6 +2806,7 @@ const TestOwner = struct {
             .reflow = !io.suppress_terminal_responses,
         });
         self.t.flags.shell_redraws_prompt = io.terminal.flags.shell_redraws_prompt;
+        self.t.flags.prompt_redraw_waits_for_shell = io.terminal.flags.prompt_redraw_waits_for_shell;
         self.t.modes.set(.grapheme_cluster, io.terminal.modes.get(.grapheme_cluster));
         self.t.modes.set(.wraparound, io.terminal.modes.get(.wraparound));
         self.stream = self.t.vtStream();

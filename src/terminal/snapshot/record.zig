@@ -128,6 +128,10 @@ pub const Tag = enum(u16) {
     /// before this record. Optional. See `kitty.zig`.
     kitty_image_page_placements = 10,
 
+    /// The prompt clear a resize put off until the shell's next byte.
+    /// Optional. See `prompt_redraw.zig`.
+    prompt_redraw = 11,
+
     _,
 
     /// Returns true if this build decodes records with this tag, and false
@@ -149,6 +153,7 @@ pub const Tag = enum(u16) {
             .ready,
             .finish,
             .continuation,
+            .prompt_redraw,
             => true,
 
             // A build without Kitty graphics skips these records and

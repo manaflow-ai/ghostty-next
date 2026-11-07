@@ -203,6 +203,7 @@ pub const history = @import("history.zig");
 pub const hyperlink = @import("hyperlink.zig");
 pub const kitty = @import("kitty.zig");
 pub const page = @import("page.zig");
+pub const prompt_redraw = @import("prompt_redraw.zig");
 pub const record = @import("record.zig");
 pub const screen = @import("screen.zig");
 pub const style = @import("style.zig");

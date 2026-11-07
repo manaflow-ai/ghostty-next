@@ -108,6 +108,10 @@ kitty_dnd: ?*kitty.dnd.State = null,
 /// then.
 kitty_image_generation_floor: u64 = 0,
 
+/// A prompt clear that a resize put off until the shell answers (see
+/// `flags.prompt_redraw_waits_for_shell`), or null.
+prompt_redraw_pending: ?PromptRedrawPending = null,
+
 /// These are just a packed set of flags we may set on the terminal.
 flags: packed struct {
     // This supports a Kitty extension where programs using semantic
@@ -147,6 +151,17 @@ flags: packed struct {
     /// sync with it. See PageList.Resize for details. This is configuration
     /// rather than terminal state so it is preserved across a full reset.
     resize_pull_scrollback: bool = true,
+
+    /// Put the prompt clear of a resize (shell_redraws_prompt) off until the
+    /// shell sends its next byte, and clear only if the grid then differs
+    /// from the grid the shell drew at. A shell that gets the SIGWINCHes of
+    /// a bounce (34 -> 35 -> 34 columns) as one reads its old size and
+    /// redraws nothing, so an immediate clear would leave the prompt blank
+    /// for good. With a real size change the shell redraws as before, and
+    /// the clear runs just before its first byte, so no leftovers stay.
+    /// Only the stream handler's input settles it (`settlePromptRedraw`).
+    /// This is configuration, so a full reset keeps it.
+    prompt_redraw_waits_for_shell: bool = false,
 
     /// True if the terminal is in a password entry mode. This is set
     /// to true based on termios state. This is set
@@ -5134,11 +5149,29 @@ pub fn resize(
     // and alt fails than the reverse.
     try tw.check(.primary_screen);
     const primary = self.screens.get(.primary).?;
+
+    // When the prompt clear waits for the shell, keep the grid and prompt
+    // rows the shell drew at from the first resize it has not answered;
+    // `settlePromptRedraw` clears against them.
+    const prompt_redraw = self.flags.shell_redraws_prompt;
+    const prompt_redraw_waits = self.flags.prompt_redraw_waits_for_shell and
+        prompt_redraw != .false;
+    const prompt_redraw_pending: ?PromptRedrawPending = if (!prompt_redraw_waits)
+        null
+    else if (self.prompt_redraw_pending) |pending|
+        pending
+    else if (primary.cursor.semantic_content != .output) .{
+        .cols = self.cols,
+        .rows = self.rows,
+        .redraw = prompt_redraw,
+        .rows_before = if (prompt_redraw == .true) primary.cursorPromptRows() else null,
+    } else null;
+
     try primary.resize(.{
         .cols = opts.cols,
         .rows = opts.rows,
         .reflow = opts.reflow and self.modes.get(.wraparound),
-        .prompt_redraw = self.flags.shell_redraws_prompt,
+        .prompt_redraw = if (prompt_redraw_waits) .false else prompt_redraw,
         .pull_scrollback = self.flags.resize_pull_scrollback,
     });
 
@@ -5238,6 +5271,11 @@ pub fn resize(
     self.cols = opts.cols;
     self.rows = opts.rows;
 
+    // With the option off, this resize cleared the prompt at once, so a
+    // pending clear (from a snapshot restored onto a terminal without the
+    // option) is done and must not run again at the next byte.
+    self.prompt_redraw_pending = if (prompt_redraw_waits) prompt_redraw_pending else null;
+
     // Reset the scrolling region
     self.scrolling_region = .{
         .top = 0,
@@ -5245,6 +5283,31 @@ pub fn resize(
         .left = 0,
         .right = opts.cols - 1,
     };
+}
+
+/// The grid the shell last drew its prompt at, and that prompt's rows down
+/// to the cursor at that grid, kept from the first resize the shell has not
+/// answered yet.
+pub const PromptRedrawPending = struct {
+    cols: size.CellCountInt,
+    rows: size.CellCountInt,
+    redraw: osc.semantic_prompt.Redraw,
+    rows_before: ?usize,
+};
+
+/// Run the prompt clear a resize put off (`prompt_redraw_waits_for_shell`),
+/// before the shell's next byte is handled. If the grid is back at the size
+/// the shell drew its prompt at, the shell will not redraw it, so the prompt
+/// stays as it is.
+pub inline fn settlePromptRedraw(self: *Terminal) void {
+    const pending = self.prompt_redraw_pending orelse return;
+    self.prompt_redraw_pending = null;
+    if (pending.cols == self.cols and pending.rows == self.rows) return;
+    self.screens.get(.primary).?.clearPromptAfterResize(
+        pending.redraw,
+        pending.rows_before,
+    );
+    self.flags.dirty.clear = true;
 }
 
 test "Terminal forwards optional scrollback limits" {
@@ -6067,9 +6130,11 @@ pub fn fullReset(self: *Terminal) void {
         // This is configuration based on the pty rather than terminal
         // state, so a terminal reset must not change it.
         .resize_pull_scrollback = self.flags.resize_pull_scrollback,
+        .prompt_redraw_waits_for_shell = self.flags.prompt_redraw_waits_for_shell,
 
         .xt_checksum = self.default_xt_checksum,
     };
+    self.prompt_redraw_pending = null;
     self.modes.reset();
     self.tabstops.reset(TABSTOP_INTERVAL);
     self.previous_char = null;
@@ -18426,6 +18491,119 @@ test "Terminal: narrowing a multi-line prompt lets zsh redraw it without leftove
     const str = try t.plainString(alloc);
     defer alloc.free(str);
     try testing.expectEqualStrings("out\nabcde\n> ", str);
+}
+
+test "Terminal: a size bounce the shell never answers keeps its prompt when the clear waits for the shell" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .cols = 34, .rows = 6 });
+    defer t.deinit(alloc);
+    t.flags.prompt_redraw_waits_for_shell = true;
+
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.printString("J> ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+
+    // zsh gets both SIGWINCHes as one, reads 34 columns again and redraws
+    // nothing. Its next byte (here the echo of a typed key) finds the grid
+    // it drew at, so the prompt stays.
+    try t.resize(alloc, .{ .cols = 35, .rows = 6 });
+    try t.resize(alloc, .{ .cols = 34, .rows = 6 });
+    t.settlePromptRedraw();
+    try t.printString("l");
+
+    const str = try t.plainString(alloc);
+    defer alloc.free(str);
+    try testing.expectEqualStrings("J> l", str);
+}
+
+test "Terminal: a size bounce clears the prompt at once when the clear does not wait" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .cols = 34, .rows = 6 });
+    defer t.deinit(alloc);
+
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.printString("J> ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try t.resize(alloc, .{ .cols = 35, .rows = 6 });
+    try t.resize(alloc, .{ .cols = 34, .rows = 6 });
+
+    const str = try t.plainString(alloc);
+    defer alloc.free(str);
+    try testing.expectEqualStrings("", str);
+}
+
+test "Terminal: narrowing a multi-line prompt clears it before zsh's redraw when the clear waits for the shell" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .cols = 10, .rows = 6 });
+    defer t.deinit(alloc);
+    t.flags.prompt_redraw_waits_for_shell = true;
+
+    try t.printString("out");
+    t.carriageReturn();
+    try t.linefeed();
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.printString("abcdefghi");
+    t.carriageReturn();
+    try t.linefeed();
+    try t.printString("> ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+    try t.semanticPrompt(.{ .action = .prompt_start, .options_unvalidated = "k=i" });
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+
+    // Two resizes before the shell answers: the clear counts the prompt's
+    // rows at the width the shell drew it at (10), as zsh does.
+    try t.resize(alloc, .{ .cols = 8, .rows = 6 });
+    try t.resize(alloc, .{ .cols = 6, .rows = 6 });
+
+    // zsh's first byte runs the clear, then its SIGWINCH redraw moves up
+    // one row, erases below and draws the prompt for the new width.
+    t.settlePromptRedraw();
+    t.carriageReturn();
+    t.cursorUp(1);
+    t.eraseDisplay(.below, false);
+    try t.semanticPrompt(.init(.fresh_line_new_prompt));
+    try t.printString("abcde");
+    t.carriageReturn();
+    try t.linefeed();
+    try t.printString("> ");
+    try t.semanticPrompt(.init(.end_prompt_start_input));
+
+    const str = try t.plainString(alloc);
+    defer alloc.free(str);
+    try testing.expectEqualStrings("out\nabcde\n> ", str);
+}
+
+test "Terminal: a stream byte settles a waiting prompt clear" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .cols = 34, .rows = 6 });
+    defer t.deinit(alloc);
+    t.flags.prompt_redraw_waits_for_shell = true;
+
+    var s: Stream = .init(.{ .allocator = alloc, .handler = .init(&t) });
+    defer s.deinit();
+    s.nextSlice("\x1b]133;A\x07J> \x1b]133;B\x07");
+    try t.resize(alloc, .{ .cols = 40, .rows = 6 });
+
+    // The prompt waits for the shell: it is still there after the resize.
+    {
+        const str = try t.plainString(alloc);
+        defer alloc.free(str);
+        try testing.expectEqualStrings("J> ", str);
+    }
+    try testing.expect(t.prompt_redraw_pending != null);
+
+    // The shell's redraw at the new size: its first byte clears first.
+    s.nextSlice("\r");
+    try testing.expect(t.prompt_redraw_pending == null);
+    {
+        const str = try t.plainString(alloc);
+        defer alloc.free(str);
+        try testing.expectEqualStrings("", str);
+    }
 }
 
 test "Terminal: OSC133P k=i after a PS2 line of input still starts a prompt" {

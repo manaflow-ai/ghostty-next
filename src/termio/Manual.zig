@@ -66,6 +66,10 @@ pub fn initTerminal(_: *Manual, t: *terminal.Terminal) void {
     // reflow alike and their GHOSTSNP TERMINAL records match. A shell can
     // still opt in with OSC 133;A;redraw=1, which both parse.
     t.flags.shell_redraws_prompt = .false;
+    // The host terminal's prompt clear waits for the shell (cmux-tui sets
+    // GHOSTTY_TERMINAL_OPT_PROMPT_REDRAW_WAITS_FOR_SHELL). Wait here too, so
+    // a size bounce the shell never answers keeps the prompt on both.
+    t.flags.prompt_redraw_waits_for_shell = true;
 }
 
 pub fn threadEnter(
