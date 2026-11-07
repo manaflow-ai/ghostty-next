@@ -668,6 +668,7 @@ pub const Handler = struct {
         comptime action: Action.Tag,
         value: Action.Value(action),
     ) void {
+        self.terminal.settlePromptRedraw();
         self.vtFallible(action, value) catch |err| {
             self.semantic_failure = true;
             log.warn("error handling VT action action={} err={}", .{ action, err });
@@ -676,6 +677,7 @@ pub const Handler = struct {
 
     /// The stream's hook for runs it knows are printable ASCII.
     pub fn vtPrintAscii(self: *Handler, bytes: []const u8) void {
+        self.terminal.settlePromptRedraw();
         self.terminal.printSliceAscii(bytes) catch |err| {
             self.semantic_failure = true;
             log.warn("error handling VT action action=print_slice err={}", .{err});

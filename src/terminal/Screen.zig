@@ -2640,9 +2640,33 @@ fn clearPromptForRedraw(
     }
 }
 
+/// The prompt clear of a resize, run later (Terminal.settlePromptRedraw):
+/// `rows_before` counts the prompt's rows at the grid the shell drew it at.
+/// As in `resize`, cleared cells take the default style, not the cursor's.
+pub fn clearPromptAfterResize(
+    self: *Screen,
+    redraw: osc.semantic_prompt.Redraw,
+    rows_before: ?usize,
+) void {
+    if (self.cursor.style_id == style.default_id) {
+        self.clearPromptForRedraw(redraw, rows_before);
+        return;
+    }
+    const cursor_style = self.cursor.style;
+    self.cursor.style = .{};
+    self.manualStyleUpdate() catch unreachable;
+    self.clearPromptForRedraw(redraw, rows_before);
+    self.cursor.style = cursor_style;
+    self.manualStyleUpdate() catch |err| {
+        log.err("failed to update style after a prompt clear err={}", .{err});
+        self.cursor.style = .{};
+        self.cursor.style_id = 0;
+    };
+}
+
 /// Rows from the start of the prompt the cursor is in down to the cursor's
 /// row, or null if the cursor isn't at a prompt.
-fn cursorPromptRows(self: *const Screen) ?usize {
+pub fn cursorPromptRows(self: *const Screen) ?usize {
     if (self.cursor.semantic_content == .output) return null;
     var it = self.cursor.page_pin.promptIterator(.left_up, null);
     return self.cursorRowsBelow(it.next() orelse return null);

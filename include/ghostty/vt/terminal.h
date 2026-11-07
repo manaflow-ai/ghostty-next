@@ -2913,6 +2913,22 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Input type: bool*
    */
   GHOSTTY_TERMINAL_OPT_SHELL_REDRAWS_PROMPT = 1027,
+
+  /**
+   * Whether the prompt clear of a resize waits for the shell. When true, a
+   * resize that would clear a redrawable prompt keeps it and remembers the
+   * grid the shell drew it at. On the shell's next byte through
+   * `ghostty_terminal_vt_write`, the prompt is cleared only if the grid
+   * then differs from that grid. A shell that gets the SIGWINCHes of a
+   * size bounce (34 -> 35 -> 34 columns) as one reads its old size and
+   * redraws nothing; without this the bounce leaves its prompt blank.
+   *
+   * Defaults to false. A full reset keeps the value. Setting it to false
+   * runs a clear that is still waiting. A NULL value pointer sets false.
+   *
+   * Input type: bool*
+   */
+  GHOSTTY_TERMINAL_OPT_PROMPT_REDRAW_WAITS_FOR_SHELL = 1028,
   GHOSTTY_TERMINAL_OPT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalOption;
 
