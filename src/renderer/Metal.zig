@@ -691,8 +691,10 @@ pub fn hostFrame(self: *Metal, show: bool) apprt.HostFrame {
 /// renderer thread draws every update at once then (`Thread` drawsNow), so the
 /// frame the embedder presents has the newest content. Any thread.
 pub fn hostFrameWaits(self: *const Metal) bool {
-    _ = self;
-    return false;
+    if (comptime builtin.os.tag != .macos) return false;
+    return self.embedder_presents.load(.acquire) and
+        self.host_size.load(.acquire) != 0 and
+        self.fresh.armed.load(.acquire);
 }
 
 /// The embedder committed the transaction of its last present or bounds change

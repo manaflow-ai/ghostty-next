@@ -752,11 +752,12 @@ fn cursorTimerCallback(
 
 /// Whether a frame update draws at once rather than at the next
 /// display-link tick: the link is stopped (the first frame after idle), a
-/// resize waits for it, or the update follows a quiet interval (the last
-/// tick drew nothing and nothing was drawn since).
+/// resize waits for it, a frame of a new host size waits for the embedder's
+/// present (the present shows the newest content, never a frame one tick
+/// older), or the update follows a quiet interval (the last tick drew nothing
+/// and nothing was drawn since).
 fn drawsNow(paced: bool, resized: bool, host_frame_waits: bool, drawn_since_tick: bool, last_tick_drew: bool) bool {
-    _ = host_frame_waits;
-    return !paced or resized or (!drawn_since_tick and !last_tick_drew);
+    return !paced or resized or host_frame_waits or (!drawn_since_tick and !last_tick_drew);
 }
 
 /// Whether a frame of a new host size waits for the embedder's present
