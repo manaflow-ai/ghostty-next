@@ -626,7 +626,7 @@ fn renderCallback(
     // display pass of the new size waits for this frame.
     const resized = t.flags.resized;
     t.flags.resized = false;
-    const now = drawsNow(paced, resized, t.flags.drawn_since_tick, t.flags.last_tick_drew);
+    const now = drawsNow(paced, resized, hostFrameWaits(t.renderer), t.flags.drawn_since_tick, t.flags.last_tick_drew);
     t.drawFrame(now);
     if (now and paced) t.flags.drawn_since_tick = true;
     // A stopped link starts fresh when it runs again: no stale interval state.
@@ -754,19 +754,42 @@ fn cursorTimerCallback(
 /// display-link tick: the link is stopped (the first frame after idle), a
 /// resize waits for it, or the update follows a quiet interval (the last
 /// tick drew nothing and nothing was drawn since).
-fn drawsNow(paced: bool, resized: bool, drawn_since_tick: bool, last_tick_drew: bool) bool {
+fn drawsNow(paced: bool, resized: bool, host_frame_waits: bool, drawn_since_tick: bool, last_tick_drew: bool) bool {
+    _ = host_frame_waits;
     return !paced or resized or (!drawn_since_tick and !last_tick_drew);
+}
+
+/// Whether a frame of a new host size waits for the embedder's present
+/// (macOS Metal, `Metal.hostFrameWaits`); false for other graphics APIs.
+fn hostFrameWaits(r: *const rendererpkg.Renderer) bool {
+    if (comptime !@hasDecl(@TypeOf(r.api), "hostFrameWaits")) return false;
+    return r.api.hostFrameWaits();
+}
+
+test "renderer thread: an update draws at once while a frame of a new host size waits for its present" {
+    // cmux RESIZE P0 10 (T render hop): in a key-resize spring the size of the next refresh goes to Ghostty after each
+    // commit and draws at once (`resized`); the program's redraw for the grid just sent is parsed ~3 ms later, while the
+    // link runs and that resize frame counts as drawn since the tick, so it waited for the next display-link tick and
+    // raced the embedder's present: the present showed the resize frame (old bytes) and the next host size dropped the
+    // newer one. While the host size's frame waits for the present, every update draws at once.
+    const testing = std.testing;
+    try testing.expect(drawsNow(true, false, true, true, false));
+    try testing.expect(drawsNow(true, false, true, false, true));
+    try testing.expect(drawsNow(true, false, true, true, true));
+    // Nothing waits: busy output stays paced to the display.
+    try testing.expect(!drawsNow(true, false, false, true, false));
+    try testing.expect(!drawsNow(true, false, false, false, true));
 }
 
 test "renderer thread: an early frame only after a quiet interval while the link runs" {
     const testing = std.testing;
-    try testing.expect(drawsNow(false, false, true, true));
-    try testing.expect(drawsNow(true, true, true, true));
+    try testing.expect(drawsNow(false, false, false, true, true));
+    try testing.expect(drawsNow(true, true, false, true, true));
     // An echo after a tick that drew nothing.
-    try testing.expect(drawsNow(true, false, false, false));
+    try testing.expect(drawsNow(true, false, false, false, false));
     // Busy output: the last tick drew, so this interval's update waits.
-    try testing.expect(!drawsNow(true, false, false, true));
-    try testing.expect(!drawsNow(true, false, true, false));
+    try testing.expect(!drawsNow(true, false, false, false, true));
+    try testing.expect(!drawsNow(true, false, false, true, false));
 }
 
 /// Whether a cursor blink tick can change the frame of `state` (the
