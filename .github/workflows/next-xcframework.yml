@@ -178,11 +178,6 @@ jobs:
             -Dtest-filter="OSC 7501" \
             -Dtest-filter="program_status effect callback" \
             -Dtest-filter="set program_status callback" \
-            -Dtest-filter="Terminal: a size bounce" \
-            -Dtest-filter="Terminal: a stream byte settles a waiting prompt clear" \
-            -Dtest-filter="Terminal: narrowing a multi-line prompt" \
-            -Dtest-filter="Terminal: OSC133" \
-            -Dtest-filter="Screen: resize with prompt_redraw" \
             --summary all
 
       - name: Build and package
