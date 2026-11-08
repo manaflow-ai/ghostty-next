@@ -1588,9 +1588,12 @@ typedef enum {
   // is not shown yet. A call with present true shows it (PRESENTED). READY
   // is then a frame of the size only (the program's last picture clipped or
   // padded): an embedder may keep its old frame and bounds for a bounded
-  // time. A frame is drawn after the program's output when the terminal
-  // parsed PTY output after its last grid change and its grid is the grid
-  // that fits the host size; a reflow preview never is. While the embedder
+  // time. A frame is drawn after the program's output when, after the
+  // terminal's last grid change, the program drew a whole picture for that
+  // grid (a synchronized update, or a repaint from the cursor home, that
+  // reached the grid's last row and column and went past neither; output
+  // for the old grid does not count) and the grid is the grid that fits the
+  // host size; a reflow preview never is. While the embedder
   // presents host sizes, such a frame also wakes the main run loop when it
   // completes, so a pre-commit observer can present it in that display
   // refresh.

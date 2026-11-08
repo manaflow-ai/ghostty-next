@@ -2223,9 +2223,9 @@ fn processOutputLocked(self: *Termio, buf: []const u8) void {
         self.terminal_stream.nextSlice(buf);
     }
 
-    // The screen now shows what the program drew at the current grid
-    // (`Terminal.output_since_grid_change`, read by the renderer).
-    if (buf.len > 0) self.terminal.output_since_grid_change = true;
+    // A picture the program drew without synchronized output is whole at
+    // the end of a read (`Terminal.ProgramRedraw`, read by the renderer).
+    if (buf.len > 0) self.terminal.programOutputEnd();
 
     // If our stream handling caused messages to be sent to the mailbox
     // thread, then we need to wake it up so that it processes them.
@@ -2584,25 +2584,26 @@ test "manual: a mirror never reflows" {
     try testManualTermio(true, body);
 }
 
-test "manual: output after a grid change marks the program drawn at that grid" {
-    // cmux RESIZE P0 12: a host-size frame is program fresh only when the terminal parsed the program's output after
-    // its last grid change (Target.program_fresh).
+test "manual: a whole picture after a grid change marks the program drawn at that grid" {
+    // cmux RESIZE P0 12/13: a host-size frame is program fresh only when the program drew a whole picture for the
+    // terminal's grid after its last grid change (Target.program_fresh).
     const body = struct {
         fn run(io: *Termio, _: *TestSink, _: bool) !void {
             const testing = std.testing;
-            try testing.expect(!io.terminal.output_since_grid_change);
-            io.processOutput("before\r\n");
-            try testing.expect(io.terminal.output_since_grid_change);
+            var buf: [8192]u8 = undefined;
+            try testing.expect(!io.terminal.programDrewGrid());
+            io.processOutput(try testGridPicture(&buf, io.terminal.cols, io.terminal.rows, true));
+            try testing.expect(io.terminal.programDrewGrid());
 
             // A grid change clears it; a lock at the same grid does not.
             try testing.expect(io.setGrid(20, 5, 1));
-            try testing.expect(!io.terminal.output_since_grid_change);
+            try testing.expect(!io.terminal.programDrewGrid());
             io.processOutput("");
-            try testing.expect(!io.terminal.output_since_grid_change);
-            io.processOutput("after");
-            try testing.expect(io.terminal.output_since_grid_change);
+            try testing.expect(!io.terminal.programDrewGrid());
+            io.processOutput(try testGridPicture(&buf, 20, 5, true));
+            try testing.expect(io.terminal.programDrewGrid());
             try testing.expect(io.setGrid(20, 5, 2));
-            try testing.expect(io.terminal.output_since_grid_change);
+            try testing.expect(io.terminal.programDrewGrid());
 
             // A pixel-only resize of a locked grid keeps it.
             io.queueMessage(.{ .resize = .{
@@ -2610,9 +2611,9 @@ test "manual: output after a grid change marks the program drawn at that grid" {
                 .cell = .{ .width = 10, .height = 20 },
                 .padding = .{},
             } }, .unlocked);
-            try testing.expect(io.terminal.output_since_grid_change);
+            try testing.expect(io.terminal.programDrewGrid());
             try testing.expect(io.setGrid(30, 6, 3));
-            try testing.expect(!io.terminal.output_since_grid_change);
+            try testing.expect(!io.terminal.programDrewGrid());
         }
     }.run;
 
@@ -2624,17 +2625,223 @@ test "manual: a view resize that changes the grid clears the program's output ma
     const body = struct {
         fn run(io: *Termio, _: *TestSink, _: bool) !void {
             const testing = std.testing;
-            io.processOutput("before\r\n");
-            try testing.expect(io.terminal.output_since_grid_change);
+            var buf: [8192]u8 = undefined;
+            io.processOutput(try testGridPicture(&buf, io.terminal.cols, io.terminal.rows, true));
+            try testing.expect(io.terminal.programDrewGrid());
             io.queueMessage(.{ .resize = .{
                 .screen = .{ .width = 400, .height = 480 },
                 .cell = .{ .width = 10, .height = 20 },
                 .padding = .{},
             } }, .unlocked);
             try testing.expectEqual(@as(usize, 40), io.terminal.cols);
-            try testing.expect(!io.terminal.output_since_grid_change);
-            io.processOutput("after");
-            try testing.expect(io.terminal.output_since_grid_change);
+            try testing.expect(!io.terminal.programDrewGrid());
+            io.processOutput(try testGridPicture(&buf, io.terminal.cols, io.terminal.rows, true));
+            try testing.expect(io.terminal.programDrewGrid());
+        }
+    }.run;
+
+    try testManualTermio(false, body);
+    try testManualTermio(true, body);
+}
+
+/// A whole-screen picture for a COLSxROWS grid as the cmux resize films'
+/// fixture draws it (scripts/journeys/pixel/tui_border.py): every row
+/// addressed with CUP and filled to the grid's last column, in one
+/// synchronized update (`sync`) or after a cursor home without one.
+fn testGridPicture(buf: []u8, cols: usize, rows: usize, sync: bool) ![]const u8 {
+    var len: usize = 0;
+    const head: []const u8 = if (sync) "\x1b[?2026h" else "\x1b[H";
+    @memcpy(buf[len..][0..head.len], head);
+    len += head.len;
+    for (0..rows) |r| len += (try testGridRow(buf[len..], r, cols)).len;
+    if (sync) {
+        const tail = "\x1b[?2026l";
+        @memcpy(buf[len..][0..tail.len], tail);
+        len += tail.len;
+    }
+    return buf[0..len];
+}
+
+/// Row R (0-based) of `testGridPicture`: CUP to its first column, then COLS cells.
+fn testGridRow(buf: []u8, r: usize, cols: usize) ![]const u8 {
+    const cup = try std.fmt.bufPrint(buf, "\x1b[{d};1H", .{r + 1});
+    @memset(buf[cup.len..][0..cols], 'x');
+    return buf[0 .. cup.len + cols];
+}
+
+test "manual: a picture drawn for the old grid after a grid change is not the program's redraw" {
+    // cmux RESIZE P0 13: a program that redraws on its own (tui_border.py --fps 60, spinners, htop) writes frames at
+    // the OLD grid that the embedder parses after the grid change. Such a frame must not make a host frame
+    // READY_PROGRAM: the embedder would end its hold and show the old picture at the new size (bands of padding).
+    // Only a whole picture for the new grid, begun after the change, does.
+    const body = struct {
+        fn run(io: *Termio, _: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            var buf: [8192]u8 = undefined;
+            for ([_]bool{ false, true }) |wrap| {
+                // tui_border.py turns autowrap off; programs that keep it on must not pass either.
+                io.processOutput(if (wrap) "\x1b[?7h" else "\x1b[?7l");
+                var gen: u64 = if (wrap) 100 else 0;
+                gen += 1;
+                try testing.expect(io.setGrid(20, 5, gen));
+                io.processOutput(try testGridPicture(&buf, 20, 5, true));
+                try testing.expect(io.terminal.programDrewGrid());
+
+                // Each old grid, then the new grid: wider, narrower, taller, shorter.
+                const steps = [_][4]u16{
+                    .{ 20, 5, 30, 5 },
+                    .{ 30, 5, 20, 5 },
+                    .{ 20, 5, 20, 8 },
+                    .{ 20, 8, 20, 5 },
+                };
+                for (steps) |step| {
+                    gen += 1;
+                    try testing.expect(io.setGrid(step[2], step[3], gen));
+                    try testing.expect(!io.terminal.programDrewGrid());
+                    io.processOutput(try testGridPicture(&buf, step[0], step[1], true));
+                    try testing.expect(!io.terminal.programDrewGrid());
+                    io.processOutput(try testGridPicture(&buf, step[2], step[3], true));
+                    try testing.expect(io.terminal.programDrewGrid());
+                }
+            }
+        }
+    }.run;
+
+    try testManualTermio(false, body);
+    try testManualTermio(true, body);
+}
+
+test "manual: a synchronized update begun before a grid change is not the program's redraw at the new grid" {
+    // cmux RESIZE P0 13: the program began its frame for the old grid; the grid changed in the middle of it (the
+    // resize ends the update); the rest of the frame, even when it reaches the new grid's last row and column, is
+    // still the old frame.
+    const body = struct {
+        fn run(io: *Termio, _: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            var buf: [8192]u8 = undefined;
+            io.processOutput("\x1b[?7l");
+            try testing.expect(io.setGrid(20, 5, 1));
+            io.processOutput("\x1b[?2026h");
+            io.processOutput(try testGridRow(&buf, 0, 20));
+            io.processOutput(try testGridRow(&buf, 1, 20));
+            try testing.expect(io.setGrid(30, 5, 2));
+            for (2..5) |r| io.processOutput(try testGridRow(&buf, r, 30));
+            io.processOutput("\x1b[?2026l");
+            try testing.expect(!io.terminal.programDrewGrid());
+            io.processOutput(try testGridPicture(&buf, 30, 5, true));
+            try testing.expect(io.terminal.programDrewGrid());
+        }
+    }.run;
+
+    try testManualTermio(false, body);
+    try testManualTermio(true, body);
+}
+
+test "manual: output that is not a whole picture for the grid is not the program's redraw" {
+    // cmux RESIZE P0 13: a line of shell output, a spinner tick or a frame cut in two by the reads is not a picture
+    // for the new grid. A repaint without synchronized output counts once it began at the cursor home after the
+    // change and, at the end of a read, reached the grid's last row and last column without going past them.
+    const body = struct {
+        fn run(io: *Termio, _: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            var buf: [8192]u8 = undefined;
+            io.processOutput("\x1b[?7l");
+            try testing.expect(io.setGrid(20, 5, 1));
+            io.processOutput("ok\r\n");
+            try testing.expect(!io.terminal.programDrewGrid());
+            io.processOutput("\x1b[3;1H|");
+            try testing.expect(!io.terminal.programDrewGrid());
+
+            // A synchronized update cut by the reads is whole only at its end.
+            io.processOutput("\x1b[?2026h");
+            for (0..5) |r| io.processOutput(try testGridRow(&buf, r, 20));
+            try testing.expect(!io.terminal.programDrewGrid());
+            io.processOutput("\x1b[?2026l");
+            try testing.expect(io.terminal.programDrewGrid());
+
+            // Without synchronized output: the old grid's repaint does not count, the new grid's does.
+            try testing.expect(io.setGrid(30, 5, 2));
+            io.processOutput(try testGridPicture(&buf, 20, 5, false));
+            try testing.expect(!io.terminal.programDrewGrid());
+            const picture = try testGridPicture(&buf, 30, 5, false);
+            io.processOutput(picture[0 .. picture.len / 2]);
+            io.processOutput(picture[picture.len / 2 ..]);
+            try testing.expect(io.terminal.programDrewGrid());
+        }
+    }.run;
+
+    try testManualTermio(false, body);
+    try testManualTermio(true, body);
+}
+
+test "manual: a repaint that homes the cursor again or erases to the edges is the program's redraw" {
+    // cmux RESIZE P0 13 (lead review, recorded programs at a resize): vim and less clear the screen and print their
+    // lines with CR LF, homing the cursor again after the clear; tmux homes again after its status line; nvim, less
+    // and Ink erase to the end of a row or of the screen instead of printing to the last column; less after a grow
+    // writes its lines up from the bottom row with no home and no clear. Each must still mark
+    // the grid drawn, as any output did before (otherwise the embedder's hold runs to its bound: added lag).
+    const body = struct {
+        fn run(io: *Termio, _: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            try testing.expect(io.setGrid(20, 5, 1));
+
+            // vim -u NONE: home, clear, home again, lines with CR LF, the cursor home at the end.
+            try testing.expect(io.setGrid(30, 5, 2));
+            io.processOutput("\x1b[H\x1b[2J\x1b[?25l\x1b[1;1H1\r\n2\r\n3\r\n4\r\n5\x1b[1;1H\x1b[?25h");
+            try testing.expect(io.terminal.programDrewGrid());
+
+            // tmux: home, rows erased to the end, the status line on the last row, then home again.
+            try testing.expect(io.setGrid(20, 5, 3));
+            io.processOutput("\x1b[H$ \x1b[K\r\n\x1b[K\r\n\x1b[K\r\n\x1b[K\r\n[0] status\x1b[K\x1b[1;3H\x1b[H$ \x1b[K");
+            try testing.expect(io.terminal.programDrewGrid());
+
+            // A synchronized update that erases below instead of printing to the edges (Ink, nvim).
+            try testing.expect(io.setGrid(25, 6, 4));
+            io.processOutput("\x1b[?2026h\x1b[H> prompt\x1b[K\r\n\x1b[J\x1b[?2026l");
+            try testing.expect(io.terminal.programDrewGrid());
+
+            // An old picture that went past the grid still does not count, erase or not.
+            try testing.expect(io.setGrid(20, 4, 5));
+            io.processOutput("\x1b[?2026h\x1b[H\x1b[J\x1b[6;1Hold\x1b[?2026l");
+            try testing.expect(!io.terminal.programDrewGrid());
+
+            // less after a grow: no home and no clear, its lines written up from the bottom row until they reach
+            // the top, then its prompt erased to the end of the last row.
+            try testing.expect(io.setGrid(20, 5, 6));
+            io.processOutput("\x1b[?1049h\x1b[5;1H:");
+            try testing.expect(io.setGrid(20, 8, 7));
+            io.processOutput("...skipping...\r\n1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n7\r\n:\x1b[K");
+            try testing.expect(io.terminal.programDrewGrid());
+
+            // The same pager writing only the lines of the old, shorter grid does not reach the top row.
+            io.processOutput("\x1b[5;1H:");
+            try testing.expect(io.setGrid(20, 9, 8));
+            io.processOutput("...skipping...\r\n1\r\n2\r\n3\r\n4\r\n5\r\n:\x1b[K");
+            try testing.expect(!io.terminal.programDrewGrid());
+        }
+    }.run;
+
+    try testManualTermio(false, body);
+    try testManualTermio(true, body);
+}
+
+test "manual: a repaint with line feeds for an old, taller grid is not the program's redraw" {
+    // cmux RESIZE P0 13: a program that clears and prints its rows with CR LF (vim -u NONE, less) and draws a frame for
+    // the OLD, taller grid after the change scrolls the new grid's whole screen: it went past the grid's last row.
+    const body = struct {
+        fn run(io: *Termio, _: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            const row = "xxxxxxxxxxxxxxxxxxxx";
+            const line = row ++ "\r\n";
+            const old = "\x1b[H\x1b[2J" ++ line ++ line ++ line ++ line ++ line ++ line ++ line ++ row;
+            const new = "\x1b[H\x1b[2J" ++ line ++ line ++ line ++ line ++ row;
+            io.processOutput("\x1b[?1049h");
+            try testing.expect(io.setGrid(20, 8, 1));
+            try testing.expect(io.setGrid(20, 5, 2));
+            io.processOutput(old);
+            try testing.expect(!io.terminal.programDrewGrid());
+            io.processOutput(new);
+            try testing.expect(io.terminal.programDrewGrid());
         }
     }.run;
 

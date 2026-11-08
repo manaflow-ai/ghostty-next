@@ -231,8 +231,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// last built for. Under `draw_mutex`.
         cells_screen: u64 = 0,
         /// The cells were built from the live terminal at the grid that fits
-        /// `cells_screen`, after the program's output at that grid
-        /// (`Terminal.output_since_grid_change`): the program redrew for this
+        /// `cells_screen`, after the program drew a whole picture for that
+        /// grid (`Terminal.programDrewGrid`): the program redrew for this
         /// size. Never for a reflow preview. Under `draw_mutex`.
         cells_program_fresh: bool = false,
         /// Set to true after the Kitty image placements are rebuilt. Like
@@ -1817,11 +1817,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .resized = resized,
                     .color_config_at = state.color_config_at,
                     .color_transition = state.color_transition,
-                    // The program drew at the grid of this size: the live
+                    // The program drew for the grid of this size: the live
                     // terminal (not a reflow preview) has the grid that fits
-                    // and parsed output since its last grid change.
+                    // and a whole picture the program drew for it after its
+                    // last grid change.
                     .program_fresh = drawn == state.terminal and
-                        state.terminal.output_since_grid_change and
+                        state.terminal.programDrewGrid() and
                         state.terminal.cols == fit.columns and
                         state.terminal.rows == fit.rows,
                 };

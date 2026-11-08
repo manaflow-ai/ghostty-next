@@ -865,6 +865,9 @@ pub const StreamHandler = struct {
             // We need to start a timer to prevent the emulator being hung
             // forever.
             .synchronized_output => {
+                // An update begun after a grid change is the program's
+                // picture for it (`Terminal.ProgramRedraw`).
+                self.terminal.programSyncUpdate(enabled);
                 if (enabled) self.messageWriter(.{ .start_synchronized_output = {} });
             },
 
