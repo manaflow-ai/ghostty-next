@@ -2825,6 +2825,29 @@ test "manual: a repaint that homes the cursor again or erases to the edges is th
     try testManualTermio(true, body);
 }
 
+test "manual: a repaint with line feeds for an old, taller grid is not the program's redraw" {
+    // cmux RESIZE P0 13: a program that clears and prints its rows with CR LF (vim -u NONE, less) and draws a frame for
+    // the OLD, taller grid after the change scrolls the new grid's whole screen: it went past the grid's last row.
+    const body = struct {
+        fn run(io: *Termio, _: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            const row = "xxxxxxxxxxxxxxxxxxxx";
+            const old = "\x1b[H\x1b[2J" ++ (row ++ "\r\n") ** 7 ++ row;
+            const new = "\x1b[H\x1b[2J" ++ (row ++ "\r\n") ** 4 ++ row;
+            io.processOutput("\x1b[?1049h");
+            try testing.expect(io.setGrid(20, 8, 1));
+            try testing.expect(io.setGrid(20, 5, 2));
+            io.processOutput(old);
+            try testing.expect(!io.terminal.programDrewGrid());
+            io.processOutput(new);
+            try testing.expect(io.terminal.programDrewGrid());
+        }
+    }.run;
+
+    try testManualTermio(false, body);
+    try testManualTermio(true, body);
+}
+
 test "manual: the shell is not assumed to redraw the prompt" {
     const body = struct {
         fn run(io: *Termio, _: *TestSink, _: bool) !void {
