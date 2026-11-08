@@ -125,6 +125,10 @@ jobs:
             -Dtest-filter="no frame shows the READY terminal" \
             -Dtest-filter="OSC 7501" \
             -Dtest-filter="reflow preview: " \
+            -Dtest-filter="host present: hold: " \
+            -Dtest-filter="host present: a frame of a new host size that the embedder presents wakes no main-thread present" \
+            -Dtest-filter="host present: hostFrame reports the frame drawn" \
+            -Dtest-filter="ghostty.h HostFrame" \
             --summary all
           # libghostty-vt patches (VT replay formatter, terminal and Kitty
           # graphics C API). These live in the lib-vt test modules.
