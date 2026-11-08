@@ -3048,6 +3048,22 @@ pub fn programOutputEnd(self: *Terminal) void {
     self.program_redraw.end(false);
 }
 
+/// A line feed (`ProgramRedraw`). Without synchronized output and with no
+/// picture open, it begins a picture drawn by scrolling at the cursor row (a
+/// pager that redraws by writing its lines up from the bottom: less after a
+/// grow); a line feed on the scrolling region's bottom row scrolls that
+/// picture up one row. Nothing to do once the grid is drawn.
+fn programIndex(self: *Terminal) void {
+    const redraw = &self.program_redraw;
+    if (redraw.drew_grid) return;
+    const y = self.screens.active.cursor.y;
+    if (!redraw.open) {
+        if (self.modes.get(.synchronized_output)) return;
+        redraw.* = .{ .open = true, .scroll = true, .top = y };
+    }
+    if (redraw.scroll and y == self.scrolling_region.bottom and redraw.top > 0) redraw.top -= 1;
+}
+
 /// A print filled the cursor's cell and set the pending wrap: a cell at the
 /// grid's last column is the picture's right edge (`ProgramRedraw`).
 inline fn programRowEnd(self: *Terminal) void {
@@ -3069,20 +3085,25 @@ inline fn programRowEnd(self: *Terminal) void {
 ///
 /// - It began after the change: a synchronized update (mode 2026) the
 ///   program began after it (the resize ends one in progress), or, without
-///   synchronized output, a cursor home (CUP 1;1) or a full clear.
+///   synchronized output, a cursor home (CUP 1;1) or a full clear. A home
+///   inside an open picture is part of it (vim homes again after its clear,
+///   tmux after its status line) unless that picture went past the grid or
+///   was drawn by scrolling. Without synchronized output, a line feed with no
+///   picture open begins a picture drawn by scrolling (less after a grow): it
+///   counts once its lines scrolled up to the top row.
 /// - It is whole at the update's end, or without synchronized output at the
 ///   end of a PTY read.
 /// - It drew for this grid: it reached the grid's last row (CUP to it, or a
 ///   print or erase that ends on it) and last column (a print that fills it,
-///   or an erase to the end of a row), and went past neither: no CUP beyond
+///   or an erase to the end of a row), an erase of the display to its end
+///   reaches both (nvim, Ink), and it went past neither: no CUP beyond
 ///   the grid and no print past the last column (a wrap, or an overwrite of
 ///   the last cell with autowrap off). A picture for a wider or taller old
 ///   grid goes past; one for a narrower or shorter grid never reaches the new
 ///   edges.
 ///
 /// A program that never draws a whole picture this way (a shell redrawing
-/// its prompt, a picture that leaves the last row blank after a clear) is
-/// never marked: an embedder's hold then ends at its bound. A frame for the
+/// its prompt) is never marked: an embedder's hold then ends at its bound. A frame for the
 /// old grid can still pass when it addresses every cell of the new grid
 /// without going past it; then it is not distinguishable from a redraw.
 pub const ProgramRedraw = struct {
@@ -3097,6 +3118,11 @@ pub const ProgramRedraw = struct {
     /// The open picture went past the grid (a CUP beyond it, a print past
     /// the last column).
     beyond: bool = false,
+    /// The open picture began at a line feed and is drawn by scrolling.
+    scroll: bool = false,
+    /// For a picture drawn by scrolling: its first row (scrolled up with
+    /// it). It covers the grid once this is the top row.
+    top: size.CellCountInt = 0,
 
     fn begin(self: *ProgramRedraw) void {
         self.* = .{ .drew_grid = self.drew_grid, .open = true };
@@ -3106,7 +3132,7 @@ pub const ProgramRedraw = struct {
     /// of a synchronized update); otherwise it stays open until it is.
     fn end(self: *ProgramRedraw, closes: bool) void {
         if (!self.open) return;
-        if (self.last_row and self.last_col and !self.beyond) {
+        if (self.last_row and self.last_col and !self.beyond and (!self.scroll or self.top == 0)) {
             self.drew_grid = true;
             self.open = false;
         } else if (closes) {
@@ -3192,6 +3218,7 @@ pub fn tabReset(self: *Terminal) void {
 ///
 /// This unsets the pending wrap state without wrapping.
 pub fn index(self: *Terminal) !void {
+    self.programIndex();
     return self.indexOpts(false);
 }
 
@@ -3466,7 +3493,11 @@ pub fn setCursorPos(self: *Terminal, row_req: usize, col_req: usize) void {
     // A picture without synchronized output begins at the cursor home; a
     // position past the grid is a picture for a larger grid
     // (`ProgramRedraw`).
-    if (row == 1 and col == 1 and !self.modes.get(.synchronized_output)) self.program_redraw.begin();
+    if (row == 1 and col == 1 and !self.modes.get(.synchronized_output) and
+        (!self.program_redraw.open or self.program_redraw.beyond or self.program_redraw.scroll))
+    {
+        self.program_redraw.begin();
+    }
     if (row +| params.y_offset > params.y_max or col +| params.x_offset > params.x_max) self.program_redraw.beyond = true;
     if (y == self.rows - 1) self.program_redraw.last_row = true;
 
@@ -4687,13 +4718,17 @@ pub fn eraseDisplay(
     // not currently set.
     const protected = self.screens.active.protected_mode == .iso or protected_req;
 
-    // A picture without synchronized output begins at a full clear
-    // (`ProgramRedraw`). The clear reaches no edge: the program still draws
-    // its picture into it.
+    // A picture without synchronized output begins at a full clear; an
+    // erase to the end of the display reaches the grid's last row and last
+    // column (`ProgramRedraw`).
     if (!self.modes.get(.synchronized_output) and (mode == .complete or
         (mode == .below and self.screens.active.cursor.x == 0 and self.screens.active.cursor.y == 0)))
     {
         self.program_redraw.begin();
+    }
+    if (mode == .complete or mode == .below) {
+        self.program_redraw.last_row = true;
+        self.program_redraw.last_col = true;
     }
 
     switch (mode) {
