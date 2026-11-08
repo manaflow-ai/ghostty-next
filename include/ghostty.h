@@ -1813,12 +1813,14 @@ typedef void (*ghostty_surface_snapshot_write_cb)(void* GHOSTTY_NULLABLE,
 // cursor-style-blink; a program's explicit DECSCUSR stays). In the
 // MANUAL modes, ghostty_surface_update_config applies new scrollback
 // limits to the live terminal too: the oldest complete history pages
-// are freed, never the screen or the Kitty images on it. Snapshot format version 1 carries no Kitty
-// images: a READY restore leaves no images. The owner then sends the
-// stream of ghostty_terminal_kitty_replay_encode (libghostty-vt), which
-// the caller applies with ghostty_surface_apply_kitty_replay after the
-// restore (after HISTORY for placements above the screen). Never pass
-// that stream to ghostty_surface_process_output.
+// are freed, never the screen or the Kitty images on it. The snapshot
+// carries the Kitty images (see ghostty/vt/snapshot.h): a READY restore
+// restores each screen's images and placements (KITTY_IMAGE_STORAGE)
+// with their pixels pending; the pixels follow after READY
+// (KITTY_IMAGE_PAYLOAD) and the placements on history pages with HISTORY
+// (KITTY_IMAGE_PAGE_PLACEMENTS), so no Kitty replay stream is needed. A
+// replay stream (ghostty_surface_apply_kitty_replay) never goes to
+// ghostty_surface_process_output.
 //
 // A restored synchronized update (mode 2026) gets the same safety
 // timeout as one the output starts.
