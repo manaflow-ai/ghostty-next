@@ -487,10 +487,9 @@ pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
             // its bounds now (`setSurfaceCallback` drops it) goes to no main-queue block: the embedder shows it with
             // its bounds (`hostFrame`). Any other frame still goes through main, which rechecks it then: one the host
             // no longer has the size of, or one no longer kept (a host change dropped it since it was published).
-            // A program-fresh frame goes through main too: its block turns the main run loop at once, so the
-            // embedder's pre-commit pass (a run-loop observer) that holds the size for the program's redraw presents
-            // it in this display refresh. `setSurfaceCallback` drops it there and keeps the fresh frame.
-            if (host != 0 and published and !target.program_fresh and self.embedder_presents.load(.acquire) and
+            // A/B ONLY (RESIZE P0 15 condition C, -nomerge): a program-fresh frame takes this path too, so it does
+            // not turn the main run loop; the embedder's next display pass presents it from the kept fresh frame.
+            if (host != 0 and published and self.embedder_presents.load(.acquire) and
                 self.embedderShowsKeptFrame(target.surface, seq, target.size_generation)) return;
         }
         _ = self.counters.main_presents.fetchAdd(1, .monotonic);
