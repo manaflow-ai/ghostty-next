@@ -2774,6 +2774,57 @@ test "manual: output that is not a whole picture for the grid is not the program
     try testManualTermio(true, body);
 }
 
+test "manual: a repaint that homes the cursor again or erases to the edges is the program's redraw" {
+    // cmux RESIZE P0 13 (lead review, recorded programs at a resize): vim and less clear the screen and print their
+    // lines with CR LF, homing the cursor again after the clear; tmux homes again after its status line; nvim, less
+    // and Ink erase to the end of a row or of the screen instead of printing to the last column; less after a grow
+    // writes its lines up from the bottom row with no home and no clear. Each must still mark
+    // the grid drawn, as any output did before (otherwise the embedder's hold runs to its bound: added lag).
+    const body = struct {
+        fn run(io: *Termio, _: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            try testing.expect(io.setGrid(20, 5, 1));
+
+            // vim -u NONE: home, clear, home again, lines with CR LF, the cursor home at the end.
+            try testing.expect(io.setGrid(30, 5, 2));
+            io.processOutput("\x1b[H\x1b[2J\x1b[?25l\x1b[1;1H1\r\n2\r\n3\r\n4\r\n5\x1b[1;1H\x1b[?25h");
+            try testing.expect(io.terminal.programDrewGrid());
+
+            // tmux: home, rows erased to the end, the status line on the last row, then home again.
+            try testing.expect(io.setGrid(20, 5, 3));
+            io.processOutput("\x1b[H$ \x1b[K\r\n\x1b[K\r\n\x1b[K\r\n\x1b[K\r\n[0] status\x1b[K\x1b[1;3H\x1b[H$ \x1b[K");
+            try testing.expect(io.terminal.programDrewGrid());
+
+            // A synchronized update that erases below instead of printing to the edges (Ink, nvim).
+            try testing.expect(io.setGrid(25, 6, 4));
+            io.processOutput("\x1b[?2026h\x1b[H> prompt\x1b[K\r\n\x1b[J\x1b[?2026l");
+            try testing.expect(io.terminal.programDrewGrid());
+
+            // An old picture that went past the grid still does not count, erase or not.
+            try testing.expect(io.setGrid(20, 4, 5));
+            io.processOutput("\x1b[?2026h\x1b[H\x1b[J\x1b[6;1Hold\x1b[?2026l");
+            try testing.expect(!io.terminal.programDrewGrid());
+
+            // less after a grow: no home and no clear, its lines written up from the bottom row until they reach
+            // the top, then its prompt erased to the end of the last row.
+            try testing.expect(io.setGrid(20, 5, 6));
+            io.processOutput("\x1b[?1049h\x1b[5;1H:");
+            try testing.expect(io.setGrid(20, 8, 7));
+            io.processOutput("...skipping...\r\n1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n7\r\n:\x1b[K");
+            try testing.expect(io.terminal.programDrewGrid());
+
+            // The same pager writing only the lines of the old, shorter grid does not reach the top row.
+            io.processOutput("\x1b[5;1H:");
+            try testing.expect(io.setGrid(20, 9, 8));
+            io.processOutput("...skipping...\r\n1\r\n2\r\n3\r\n4\r\n5\r\n:\x1b[K");
+            try testing.expect(!io.terminal.programDrewGrid());
+        }
+    }.run;
+
+    try testManualTermio(false, body);
+    try testManualTermio(true, body);
+}
+
 test "manual: the shell is not assumed to redraw the prompt" {
     const body = struct {
         fn run(io: *Termio, _: *TestSink, _: bool) !void {
