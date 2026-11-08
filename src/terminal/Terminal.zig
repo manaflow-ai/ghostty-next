@@ -60,6 +60,14 @@ tabstops: Tabstops,
 rows: size.CellCountInt,
 cols: size.CellCountInt,
 
+/// The program's output was parsed after the last change of the grid
+/// (`cols`, `rows`): the screen shows what the program drew at this grid,
+/// not only its old picture reflowed or clipped. `resize` clears it when the
+/// grid changes; the embedder's PTY reader sets it after it parses output
+/// (Ghostty's `Termio.processOutput`). The renderer reads it under the
+/// terminal lock (`Target.program_fresh`).
+output_since_grid_change: bool = false,
+
 /// The size of the screen in pixels. This is used for pty events and images
 width_px: u32 = 0,
 height_px: u32 = 0,

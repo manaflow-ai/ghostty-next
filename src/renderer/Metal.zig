@@ -1132,6 +1132,83 @@ test "host present: a frame of a new host size that the embedder presents wakes 
     try testing.expectEqual(@as(?usize, 120), testShownWidth(&metal));
 }
 
+test "host present: hold: hostFrame says whether the program drew the kept frame at its grid" {
+    // cmux RESIZE P0 12: the embedder holds a new size's frame until the program redrew at its grid, for a bounded
+    // number of refreshes. A frame of the size only (the program's last picture clipped or padded) is READY; one drawn
+    // after the program's output at that grid is READY_PROGRAM.
+    const testing = std.testing;
+    const HostFrame = apprt.HostFrame;
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    const device = testDevice();
+    var metal = try testMetal(&device);
+    defer testDeinit(&metal);
+    const shown = try testSurface(80, 60);
+    defer shown.release();
+    const size_only = try testSurface(120, 60);
+    defer size_only.release();
+    const program = try testSurface(120, 60);
+    defer program.release();
+    metal.layer.setSurfaceSync(shown);
+    metal.setEmbedderPresents(true);
+    metal.setHostDrawableSize(true, 120, 60);
+
+    try metal.present(testTarget(&metal, size_only), false);
+    try testing.expectEqual(HostFrame.ready, metal.hostFrame(false));
+
+    var target = testTarget(&metal, program);
+    target.program_fresh = true;
+    try metal.present(target, false);
+    try testing.expectEqual(HostFrame.ready_program, metal.hostFrame(false));
+    // A query shows nothing; a present shows the program's frame.
+    try testing.expectEqual(@as(?usize, 80), testShownWidth(&metal));
+    try testing.expectEqual(HostFrame.presented, metal.hostFrame(true));
+    const contents = metal.layer.layer.getProperty(?*anyopaque, "contents");
+    try testing.expectEqual(@as(?*anyopaque, @ptrCast(program)), contents);
+}
+
+test "host present: hold: a frame the program drew at its grid wakes the main-thread present" {
+    // cmux RESIZE P0 12: while the embedder holds a new size for the program's redraw, the frame that has it must reach
+    // the embedder's pre-commit pass at once: its main-queue block turns the main run loop. A frame of the size only
+    // wakes nothing (cmux FRAME OWNER S4).
+    const testing = std.testing;
+    const HostFrame = apprt.HostFrame;
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    const device = testDevice();
+    var metal = try testMetal(&device);
+    defer testDeinit(&metal);
+    const shown = try testSurface(80, 60);
+    defer shown.release();
+    const size_only = try testSurface(120, 60);
+    defer size_only.release();
+    const program = try testSurface(120, 60);
+    defer program.release();
+    metal.layer.setSurfaceSync(shown);
+    metal.layer.layer.setProperty("contentsScale", @as(f64, 1));
+    metal.layer.layer.setProperty("bounds", macos.graphics.Rect{
+        .origin = .{ .x = 0, .y = 0 },
+        .size = .{ .width = 80, .height = 60 },
+    });
+    metal.setEmbedderPresents(true);
+    metal.setHostDrawableSize(true, 120, 60);
+
+    try metal.present(testTarget(&metal, size_only), false);
+    try testing.expectEqual(@as(u64, 0), metal.counters.main_presents.load(.monotonic));
+
+    var target = testTarget(&metal, program);
+    target.program_fresh = true;
+    try metal.present(target, false);
+    try testing.expectEqual(@as(u64, 1), metal.counters.main_presents.load(.monotonic));
+    // The main-thread present keeps the shown frame in the old bounds and keeps the frame for the embedder.
+    try testing.expectEqual(@as(?usize, 80), testShownWidth(&metal));
+    try testing.expectEqual(HostFrame.ready_program, metal.hostFrame(false));
+    try testing.expectEqual(HostFrame.presented, metal.hostFrame(true));
+    try testing.expectEqual(@as(?usize, 120), testShownWidth(&metal));
+}
+
 test "host present: a kept frame that a host change dropped since its publish still goes through main" {
     // Review of this change (Codex FIX at 3d209283a): the frame of host size A was kept for the embedder, then the host
     // changed to B and back to A (each change drops the kept frame); the completion must not skip the main-thread
