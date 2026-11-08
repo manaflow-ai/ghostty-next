@@ -2849,6 +2849,50 @@ test "manual: a repaint with line feeds for an old, taller grid is not the progr
     try testManualTermio(true, body);
 }
 
+test "manual: a clear that begins a repaint is not the program's redraw until it drew the bottom rows" {
+    // cmux RESIZE P0 16 (films of htop at a held-key resize, cmux21, 3 of 3 films): ncurses clears the screen and
+    // then writes its new picture in several reads. A clear erases to the grid's last row and last column, so at
+    // 8e881185b the first read's end (the clear and the meter rows only) marked the grid drawn: the embedder showed
+    // that almost empty frame at once. fzf writes its clear in a read of its own. The clear blanks the grid; it does
+    // not draw it: a picture begun at a clear covers the grid once the program printed on its last two rows.
+    const body = struct {
+        fn run(io: *Termio, _: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            try testing.expect(io.setGrid(20, 6, 1));
+            io.processOutput("\x1b[?1049h");
+
+            // htop: home, clear, the meters, then the rest of the picture in the next reads.
+            try testing.expect(io.setGrid(30, 6, 2));
+            io.processOutput("\x1b[H\x1b[2J\x1b[1;3HCPU[|| 2.0%]\x1b[2;3HMem[|  1G]\x1b[3;1H");
+            try testing.expect(!io.terminal.programDrewGrid());
+            io.processOutput("  PID USER\x1b[K\x1b[4;1H    1 root\x1b[K");
+            try testing.expect(!io.terminal.programDrewGrid());
+            io.processOutput("\x1b[5;1H    2 root\x1b[K\x1b[6;1HF1Help F10Quit\x1b[K");
+            try testing.expect(io.terminal.programDrewGrid());
+
+            // fzf: the clear (an erase below from the home position) in a read of its own, then the picture.
+            try testing.expect(io.setGrid(25, 6, 3));
+            io.processOutput("\x1b[?25l\x1b[H\x1b[J\x1b[?25h");
+            try testing.expect(!io.terminal.programDrewGrid());
+            io.processOutput("\x1b[6;1H> query\x1b[K\x1b[5;1H  2/2\x1b[K\x1b[4;1H  b\x1b[3;1H  a");
+            try testing.expect(io.terminal.programDrewGrid());
+
+            // vim: clear, its lines down to the row above the last, the command line left blank by the clear.
+            try testing.expect(io.setGrid(30, 6, 4));
+            io.processOutput("\x1b[H\x1b[2J\x1b[1;1H1\r\n2\r\n3\r\n4\r\n5\x1b[1;1H");
+            try testing.expect(io.terminal.programDrewGrid());
+
+            // An erase to the end after the picture (Ink, nvim) still reaches the edges.
+            try testing.expect(io.setGrid(25, 6, 5));
+            io.processOutput("\x1b[H> prompt\x1b[K\r\n\x1b[J");
+            try testing.expect(io.terminal.programDrewGrid());
+        }
+    }.run;
+
+    try testManualTermio(false, body);
+    try testManualTermio(true, body);
+}
+
 test "manual: the shell is not assumed to redraw the prompt" {
     const body = struct {
         fn run(io: *Termio, _: *TestSink, _: bool) !void {
