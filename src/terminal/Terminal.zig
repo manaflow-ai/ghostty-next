@@ -60,13 +60,10 @@ tabstops: Tabstops,
 rows: size.CellCountInt,
 cols: size.CellCountInt,
 
-/// The program's output was parsed after the last change of the grid
-/// (`cols`, `rows`): the screen shows what the program drew at this grid,
-/// not only its old picture reflowed or clipped. `resize` clears it when the
-/// grid changes; the embedder's PTY reader sets it after it parses output
-/// (Ghostty's `Termio.processOutput`). The renderer reads it under the
-/// terminal lock (`Target.program_fresh`).
-output_since_grid_change: bool = false,
+/// What the program drew since the last change of the grid (`cols`,
+/// `rows`): whether the screen shows a whole picture the program drew for
+/// this grid (`programDrewGrid`). `resize` resets it when the grid changes.
+program_redraw: ProgramRedraw = .{},
 
 /// The size of the screen in pixels. This is used for pty events and images
 width_px: u32 = 0,
@@ -1128,7 +1125,11 @@ fn printSliceFill(
     outer: while (printed < run_len) {
         // If we're soft-wrapping, handle that first so that our cursor
         // is in the row/column that will receive the next codepoint.
-        if (screen.cursor.pending_wrap) try self.printWrap();
+        // A print past the last column (`ProgramRedraw`).
+        if (screen.cursor.pending_wrap) {
+            self.program_redraw.beyond = true;
+            try self.printWrap();
+        }
 
         // Our right margin depends on where our cursor is now,
         // matching the logic in print().
@@ -1444,6 +1445,7 @@ fn printSliceFill(
                 assert(cursor.x + k == right_limit);
                 screen.cursorRight(@intCast(k - 1));
                 cursor.pending_wrap = true;
+                self.programRowEnd();
             } else {
                 screen.cursorRight(@intCast(k));
             }
@@ -1505,8 +1507,12 @@ fn printSliceMixed(
         // The caller validated cps[0], and each row below stops only
         // after classifying the codepoint it stops at, so a pending
         // wrap here is followed by an eligible codepoint: print()
-        // would wrap for it.
-        if (cursor.pending_wrap) try self.printWrap();
+        // would wrap for it. A print past the last column
+        // (`ProgramRedraw`).
+        if (cursor.pending_wrap) {
+            self.program_redraw.beyond = true;
+            try self.printWrap();
+        }
 
         const right_limit: usize = if (cursor.x > self.scrolling_region.right)
             self.cols
@@ -1604,6 +1610,7 @@ fn printSliceMixed(
             if (state.k == state.avail) {
                 screen.cursorRight(@intCast(state.k - 1));
                 cursor.pending_wrap = true;
+                self.programRowEnd();
             } else {
                 screen.cursorRight(@intCast(state.k));
             }
@@ -2232,6 +2239,8 @@ pub fn print(self: *Terminal, c: u21) !void {
     self.previous_char = c;
 
     if (self.screens.active.cursor.pending_wrap) {
+        // A print past the last column (`ProgramRedraw`).
+        self.program_redraw.beyond = true;
         if (self.modes.get(.wraparound)) {
             try self.printWrap();
             right_limit = self.scrolling_region.right + 1;
@@ -2304,6 +2313,7 @@ pub fn print(self: *Terminal, c: u21) !void {
     // In this case, we don't move the cursor.
     if (self.screens.active.cursor.x == right_limit - 1) {
         self.screens.active.cursor.pending_wrap = true;
+        self.programRowEnd();
         return;
     }
 
@@ -3016,8 +3026,94 @@ pub const SemanticPrompt = enum {
 /// not only its old picture reflowed, clipped or padded. The renderer reads
 /// it under the terminal lock (`Target.program_fresh`).
 pub fn programDrewGrid(self: *const Terminal) bool {
-    return self.output_since_grid_change;
+    return self.program_redraw.drew_grid;
 }
+
+/// The program began (`begin`) or ended a synchronized update (mode 2026):
+/// an update begun after the last grid change is a picture
+/// (`ProgramRedraw`). The stream handler calls this when the mode is set.
+pub fn programSyncUpdate(self: *Terminal, begin: bool) void {
+    if (begin) {
+        self.program_redraw.begin();
+    } else {
+        self.program_redraw.end(true);
+    }
+}
+
+/// The end of a parsed PTY read: a picture drawn without synchronized
+/// output is whole once it reached the grid's last row and last column
+/// (`ProgramRedraw`). In a synchronized update only its end counts.
+pub fn programOutputEnd(self: *Terminal) void {
+    if (self.modes.get(.synchronized_output)) return;
+    self.program_redraw.end(false);
+}
+
+/// A print filled the cursor's cell and set the pending wrap: a cell at the
+/// grid's last column is the picture's right edge (`ProgramRedraw`).
+inline fn programRowEnd(self: *Terminal) void {
+    const cursor = &self.screens.active.cursor;
+    if (cursor.x != self.cols - 1) return;
+    self.program_redraw.last_col = true;
+    if (cursor.y == self.rows - 1) self.program_redraw.last_row = true;
+}
+
+/// What the program drew since the last change of the grid, so a frame can
+/// say whether it shows a picture the program drew for this grid or only its
+/// old picture reflowed, clipped or padded (cmux RESIZE P0 13: an embedder
+/// holds a new size until the program redrew for it).
+///
+/// Any output after the change is not enough: a program that redraws on its
+/// own (a spinner, htop, a 60 fps TUI) writes frames for the OLD grid that
+/// are parsed after the change, before it handled SIGWINCH. A picture counts
+/// when it began after the change and is whole:
+///
+/// - It began after the change: a synchronized update (mode 2026) the
+///   program began after it (the resize ends one in progress), or, without
+///   synchronized output, a cursor home (CUP 1;1) or a full clear.
+/// - It is whole at the update's end, or without synchronized output at the
+///   end of a PTY read.
+/// - It drew for this grid: it reached the grid's last row (CUP to it, or a
+///   print or erase that ends on it) and last column (a print that fills it,
+///   or an erase to the end of a row), and went past neither: no CUP beyond
+///   the grid and no print past the last column (a wrap, or an overwrite of
+///   the last cell with autowrap off). A picture for a wider or taller old
+///   grid goes past; one for a narrower or shorter grid never reaches the new
+///   edges.
+///
+/// A program that never draws a whole picture this way (a shell redrawing
+/// its prompt, a picture that leaves the last row blank after a clear) is
+/// never marked: an embedder's hold then ends at its bound. A frame for the
+/// old grid can still pass when it addresses every cell of the new grid
+/// without going past it; then it is not distinguishable from a redraw.
+pub const ProgramRedraw = struct {
+    /// A whole picture for the current grid was drawn after its last change.
+    drew_grid: bool = false,
+    /// A picture began after the last grid change and is not over.
+    open: bool = false,
+    /// The open picture reached the grid's last row.
+    last_row: bool = false,
+    /// The open picture reached the grid's last column.
+    last_col: bool = false,
+    /// The open picture went past the grid (a CUP beyond it, a print past
+    /// the last column).
+    beyond: bool = false,
+
+    fn begin(self: *ProgramRedraw) void {
+        self.* = .{ .drew_grid = self.drew_grid, .open = true };
+    }
+
+    /// `closes`: the picture ends here whether or not it is whole (the end
+    /// of a synchronized update); otherwise it stays open until it is.
+    fn end(self: *ProgramRedraw, closes: bool) void {
+        if (!self.open) return;
+        if (self.last_row and self.last_col and !self.beyond) {
+            self.drew_grid = true;
+            self.open = false;
+        } else if (closes) {
+            self.open = false;
+        }
+    }
+};
 
 pub fn cursorIsAtPrompt(self: *Terminal) bool {
     // If we're on the secondary screen, we're never at a prompt.
@@ -3366,6 +3462,13 @@ pub fn setCursorPos(self: *Terminal, row_req: usize, col_req: usize) void {
     const col = if (col_req == 0) 1 else col_req;
     const x = @min(params.x_max, col +| params.x_offset) -| 1;
     const y = @min(params.y_max, row +| params.y_offset) -| 1;
+
+    // A picture without synchronized output begins at the cursor home; a
+    // position past the grid is a picture for a larger grid
+    // (`ProgramRedraw`).
+    if (row == 1 and col == 1 and !self.modes.get(.synchronized_output)) self.program_redraw.begin();
+    if (row +| params.y_offset > params.y_max or col +| params.x_offset > params.x_max) self.program_redraw.beyond = true;
+    if (y == self.rows - 1) self.program_redraw.last_row = true;
 
     // If the y is unchanged then this is fast pointer math
     if (y == self.screens.active.cursor.y) {
@@ -4503,6 +4606,11 @@ pub fn eraseLine(
         },
     };
 
+    // An erase to the end of a row reaches the grid's last column, any erase
+    // on the last row the last row (`ProgramRedraw`).
+    if (end == self.cols) self.program_redraw.last_col = true;
+    if (self.screens.active.cursor.y == self.rows - 1) self.program_redraw.last_row = true;
+
     // All modes will clear the pending wrap state and we know we have
     // a valid mode at this point.
     self.screens.active.cursor.pending_wrap = false;
@@ -4578,6 +4686,15 @@ pub fn eraseDisplay(
     // a DECSEL sequence) or if our last protected mode was ISO even if its
     // not currently set.
     const protected = self.screens.active.protected_mode == .iso or protected_req;
+
+    // A picture without synchronized output begins at a full clear
+    // (`ProgramRedraw`). The clear reaches no edge: the program still draws
+    // its picture into it.
+    if (!self.modes.get(.synchronized_output) and (mode == .complete or
+        (mode == .below and self.screens.active.cursor.x == 0 and self.screens.active.cursor.y == 0)))
+    {
+        self.program_redraw.begin();
+    }
 
     switch (mode) {
         .scroll_complete => {
@@ -5287,8 +5404,8 @@ pub fn resize(
     self.cols = opts.cols;
     self.rows = opts.rows;
     // The screen shows the program's old picture at the new grid until the
-    // program's next output.
-    self.output_since_grid_change = false;
+    // program draws a whole picture for it (`ProgramRedraw`).
+    self.program_redraw = .{};
 
     // With the option off, this resize cleared the prompt at once, so a
     // pending clear (from a snapshot restored onto a terminal without the

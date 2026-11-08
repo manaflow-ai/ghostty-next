@@ -52,8 +52,8 @@ size_generation: u64 = 0,
 
 /// The frame drawn into this target is program fresh: its cells were built
 /// at this target's size (`cells_fresh`), the terminal it drew has the grid
-/// that fits this size, and that terminal parsed the program's output after
-/// its last grid change (the program redrew for the grid). A reflow preview
+/// that fits this size, and the program drew a whole picture for that grid
+/// after its last change (`Terminal.programDrewGrid`). A reflow preview
 /// never is. `Metal.hostFrame` reports such a kept frame as `ready_program`.
 /// Set before each draw.
 program_fresh: bool = false,
