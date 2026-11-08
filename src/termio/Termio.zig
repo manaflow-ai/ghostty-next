@@ -2642,6 +2642,136 @@ test "manual: a view resize that changes the grid clears the program's output ma
     try testManualTermio(true, body);
 }
 
+/// A whole-screen picture for a COLSxROWS grid as the cmux resize films'
+/// fixture draws it (scripts/journeys/pixel/tui_border.py): every row
+/// addressed with CUP and filled to the grid's last column, in one
+/// synchronized update (`sync`) or after a cursor home without one.
+fn testGridPicture(buf: []u8, cols: usize, rows: usize, sync: bool) ![]const u8 {
+    var len: usize = 0;
+    const head: []const u8 = if (sync) "\x1b[?2026h" else "\x1b[H";
+    @memcpy(buf[len..][0..head.len], head);
+    len += head.len;
+    for (0..rows) |r| len += (try testGridRow(buf[len..], r, cols)).len;
+    if (sync) {
+        const tail = "\x1b[?2026l";
+        @memcpy(buf[len..][0..tail.len], tail);
+        len += tail.len;
+    }
+    return buf[0..len];
+}
+
+/// Row R (0-based) of `testGridPicture`: CUP to its first column, then COLS cells.
+fn testGridRow(buf: []u8, r: usize, cols: usize) ![]const u8 {
+    const cup = try std.fmt.bufPrint(buf, "\x1b[{d};1H", .{r + 1});
+    @memset(buf[cup.len..][0..cols], 'x');
+    return buf[0 .. cup.len + cols];
+}
+
+test "manual: a picture drawn for the old grid after a grid change is not the program's redraw" {
+    // cmux RESIZE P0 13: a program that redraws on its own (tui_border.py --fps 60, spinners, htop) writes frames at
+    // the OLD grid that the embedder parses after the grid change. Such a frame must not make a host frame
+    // READY_PROGRAM: the embedder would end its hold and show the old picture at the new size (bands of padding).
+    // Only a whole picture for the new grid, begun after the change, does.
+    const body = struct {
+        fn run(io: *Termio, _: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            var buf: [8192]u8 = undefined;
+            for ([_]bool{ false, true }) |wrap| {
+                // tui_border.py turns autowrap off; programs that keep it on must not pass either.
+                io.processOutput(if (wrap) "\x1b[?7h" else "\x1b[?7l");
+                var gen: u64 = if (wrap) 100 else 0;
+                gen += 1;
+                try testing.expect(io.setGrid(20, 5, gen));
+                io.processOutput(try testGridPicture(&buf, 20, 5, true));
+                try testing.expect(io.terminal.programDrewGrid());
+
+                // Each old grid, then the new grid: wider, narrower, taller, shorter.
+                const steps = [_][4]u16{
+                    .{ 20, 5, 30, 5 },
+                    .{ 30, 5, 20, 5 },
+                    .{ 20, 5, 20, 8 },
+                    .{ 20, 8, 20, 5 },
+                };
+                for (steps) |step| {
+                    gen += 1;
+                    try testing.expect(io.setGrid(step[2], step[3], gen));
+                    try testing.expect(!io.terminal.programDrewGrid());
+                    io.processOutput(try testGridPicture(&buf, step[0], step[1], true));
+                    try testing.expect(!io.terminal.programDrewGrid());
+                    io.processOutput(try testGridPicture(&buf, step[2], step[3], true));
+                    try testing.expect(io.terminal.programDrewGrid());
+                }
+            }
+        }
+    }.run;
+
+    try testManualTermio(false, body);
+    try testManualTermio(true, body);
+}
+
+test "manual: a synchronized update begun before a grid change is not the program's redraw at the new grid" {
+    // cmux RESIZE P0 13: the program began its frame for the old grid; the grid changed in the middle of it (the
+    // resize ends the update); the rest of the frame, even when it reaches the new grid's last row and column, is
+    // still the old frame.
+    const body = struct {
+        fn run(io: *Termio, _: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            var buf: [8192]u8 = undefined;
+            io.processOutput("\x1b[?7l");
+            try testing.expect(io.setGrid(20, 5, 1));
+            io.processOutput("\x1b[?2026h");
+            io.processOutput(try testGridRow(&buf, 0, 20));
+            io.processOutput(try testGridRow(&buf, 1, 20));
+            try testing.expect(io.setGrid(30, 5, 2));
+            for (2..5) |r| io.processOutput(try testGridRow(&buf, r, 30));
+            io.processOutput("\x1b[?2026l");
+            try testing.expect(!io.terminal.programDrewGrid());
+            io.processOutput(try testGridPicture(&buf, 30, 5, true));
+            try testing.expect(io.terminal.programDrewGrid());
+        }
+    }.run;
+
+    try testManualTermio(false, body);
+    try testManualTermio(true, body);
+}
+
+test "manual: output that is not a whole picture for the grid is not the program's redraw" {
+    // cmux RESIZE P0 13: a line of shell output, a spinner tick or a frame cut in two by the reads is not a picture
+    // for the new grid. A repaint without synchronized output counts once it began at the cursor home after the
+    // change and, at the end of a read, reached the grid's last row and last column without going past them.
+    const body = struct {
+        fn run(io: *Termio, _: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            var buf: [8192]u8 = undefined;
+            io.processOutput("\x1b[?7l");
+            try testing.expect(io.setGrid(20, 5, 1));
+            io.processOutput("ok\r\n");
+            try testing.expect(!io.terminal.programDrewGrid());
+            io.processOutput("\x1b[3;1H|");
+            try testing.expect(!io.terminal.programDrewGrid());
+
+            // A synchronized update cut by the reads is whole only at its end.
+            io.processOutput("\x1b[?2026h");
+            for (0..5) |r| io.processOutput(try testGridRow(&buf, r, 20));
+            try testing.expect(!io.terminal.programDrewGrid());
+            io.processOutput("\x1b[?2026l");
+            try testing.expect(io.terminal.programDrewGrid());
+
+            // Without synchronized output: the old grid's repaint does not count, the new grid's does.
+            try testing.expect(io.setGrid(30, 5, 2));
+            io.processOutput(try testGridPicture(&buf, 20, 5, false));
+            try testing.expect(!io.terminal.programDrewGrid());
+            const picture = try testGridPicture(&buf, 30, 5, false);
+            io.processOutput(picture[0 .. picture.len / 2]);
+            io.processOutput(picture[picture.len / 2 ..]);
+            try testing.expect(io.terminal.programDrewGrid());
+        }
+    }.run;
+
+    try testManualTermio(false, body);
+    try testManualTermio(true, body);
+}
+
 test "manual: the shell is not assumed to redraw the prompt" {
     const body = struct {
         fn run(io: *Termio, _: *TestSink, _: bool) !void {

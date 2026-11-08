@@ -3011,6 +3011,14 @@ pub const SemanticPrompt = enum {
 /// This requires shell integration (semantic prompt integration).
 ///
 /// If the shell integration doesn't exist, this will always return false.
+/// Whether the program drew a whole picture for the current grid after the
+/// grid's last change: the screen shows what the program drew for this grid,
+/// not only its old picture reflowed, clipped or padded. The renderer reads
+/// it under the terminal lock (`Target.program_fresh`).
+pub fn programDrewGrid(self: *const Terminal) bool {
+    return self.output_since_grid_change;
+}
+
 pub fn cursorIsAtPrompt(self: *Terminal) bool {
     // If we're on the secondary screen, we're never at a prompt.
     if (self.screens.active_key == .alternate) return false;
