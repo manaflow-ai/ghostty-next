@@ -3052,7 +3052,9 @@ pub fn programOutputEnd(self: *Terminal) void {
 /// picture open, it begins a picture drawn by scrolling at the cursor row (a
 /// pager that redraws by writing its lines up from the bottom: less after a
 /// grow); a line feed on the scrolling region's bottom row scrolls that
-/// picture up one row. Nothing to do once the grid is drawn.
+/// picture up one row. Any other picture that scrolls the whole screen has
+/// more rows than the grid: it goes past it. Nothing to do once the grid is
+/// drawn.
 fn programIndex(self: *Terminal) void {
     const redraw = &self.program_redraw;
     if (redraw.drew_grid) return;
@@ -3061,7 +3063,12 @@ fn programIndex(self: *Terminal) void {
         if (self.modes.get(.synchronized_output)) return;
         redraw.* = .{ .open = true, .scroll = true, .top = y };
     }
-    if (redraw.scroll and y == self.scrolling_region.bottom and redraw.top > 0) redraw.top -= 1;
+    if (y != self.scrolling_region.bottom) return;
+    if (redraw.scroll) {
+        if (redraw.top > 0) redraw.top -= 1;
+    } else if (self.scrolling_region.top == 0 and y == self.rows - 1) {
+        redraw.beyond = true;
+    }
 }
 
 /// A print filled the cursor's cell and set the pending wrap: a cell at the
@@ -3097,8 +3104,9 @@ inline fn programRowEnd(self: *Terminal) void {
 ///   print or erase that ends on it) and last column (a print that fills it,
 ///   or an erase to the end of a row), an erase of the display to its end
 ///   reaches both (nvim, Ink), and it went past neither: no CUP beyond
-///   the grid and no print past the last column (a wrap, or an overwrite of
-///   the last cell with autowrap off). A picture for a wider or taller old
+///   the grid, no line feed that scrolls the whole screen (except in a
+///   picture begun at a line feed) and no print past the last column (a
+///   wrap, or an overwrite of the last cell with autowrap off). A picture for a wider or taller old
 ///   grid goes past; one for a narrower or shorter grid never reaches the new
 ///   edges.
 ///
