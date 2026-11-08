@@ -5278,6 +5278,9 @@ pub fn resize(
     // Set our size
     self.cols = opts.cols;
     self.rows = opts.rows;
+    // The screen shows the program's old picture at the new grid until the
+    // program's next output.
+    self.output_since_grid_change = false;
 
     // With the option off, this resize cleared the prompt at once, so a
     // pending clear (from a snapshot restored onto a terminal without the
