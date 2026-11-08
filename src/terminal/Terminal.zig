@@ -3045,7 +3045,23 @@ pub fn programSyncUpdate(self: *Terminal, begin: bool) void {
 /// (`ProgramRedraw`). In a synchronized update only its end counts.
 pub fn programOutputEnd(self: *Terminal) void {
     if (self.modes.get(.synchronized_output)) return;
-    self.program_redraw.end(false);
+    const redraw = &self.program_redraw;
+    if (redraw.open and redraw.cleared and !redraw.last_row) redraw.last_row = self.programDrewBottomRows();
+    redraw.end(false);
+}
+
+/// Whether a cell of the grid's last two rows has text. After a clear that
+/// began the picture, only the program printed there: a top-down repaint
+/// (ncurses, vim) reached the bottom, and the clear covers the rows it leaves
+/// blank (vim's command line). Read once per PTY read, only while such a
+/// picture is open (`ProgramRedraw`).
+fn programDrewBottomRows(self: *Terminal) bool {
+    var y: size.CellCountInt = self.rows -| 2;
+    while (y < self.rows) : (y += 1) {
+        const row = self.screens.active.pages.pin(.{ .active = .{ .y = y } }) orelse continue;
+        if (Cell.hasTextAny(row.cells(.all))) return true;
+    }
+    return false;
 }
 
 /// A line feed (`ProgramRedraw`). Without synchronized output and with no
@@ -3103,7 +3119,10 @@ inline fn programRowEnd(self: *Terminal) void {
 /// - It drew for this grid: it reached the grid's last row (CUP to it, or a
 ///   print or erase that ends on it) and last column (a print that fills it,
 ///   or an erase to the end of a row), an erase of the display to its end
-///   reaches both (nvim, Ink), and it went past neither: no CUP beyond
+///   reaches both (nvim, Ink) unless it is the clear that began the picture
+///   (ncurses writes its repaint after it in several reads: then it reaches
+///   the last row once the program printed on the grid's last two rows), and
+///   it went past neither: no CUP beyond
 ///   the grid, no line feed that scrolls the whole screen (except in a
 ///   picture begun at a line feed) and no print past the last column (a
 ///   wrap, or an overwrite of the last cell with autowrap off). A picture for a wider or taller old
@@ -3128,6 +3147,11 @@ pub const ProgramRedraw = struct {
     beyond: bool = false,
     /// The open picture began at a line feed and is drawn by scrolling.
     scroll: bool = false,
+    /// The open picture began at a full clear without synchronized output:
+    /// it reaches the last row once the program printed on one of the grid's
+    /// last two rows (`Terminal.programDrewBottomRows`), not at the clear (a
+    /// clear and the first rows of a repaint written in several reads).
+    cleared: bool = false,
     /// For a picture drawn by scrolling: its first row (scrolled up with
     /// it). It covers the grid once this is the top row.
     top: size.CellCountInt = 0,
@@ -4726,17 +4750,20 @@ pub fn eraseDisplay(
     // not currently set.
     const protected = self.screens.active.protected_mode == .iso or protected_req;
 
-    // A picture without synchronized output begins at a full clear; an
-    // erase to the end of the display reaches the grid's last row and last
-    // column (`ProgramRedraw`).
-    if (!self.modes.get(.synchronized_output) and (mode == .complete or
-        (mode == .below and self.screens.active.cursor.x == 0 and self.screens.active.cursor.y == 0)))
-    {
-        self.program_redraw.begin();
-    }
+    // A picture without synchronized output begins at a full clear; it
+    // blanks the grid but does not draw it, so it reaches only the last
+    // column. Any other erase to the end of the display reaches the grid's
+    // last row and last column (`ProgramRedraw`).
+    const begins_picture = !self.modes.get(.synchronized_output) and (mode == .complete or
+        (mode == .below and self.screens.active.cursor.x == 0 and self.screens.active.cursor.y == 0));
+    if (begins_picture) self.program_redraw.begin();
     if (mode == .complete or mode == .below) {
-        self.program_redraw.last_row = true;
         self.program_redraw.last_col = true;
+        if (begins_picture) {
+            self.program_redraw.cleared = true;
+        } else {
+            self.program_redraw.last_row = true;
+        }
     }
 
     switch (mode) {
