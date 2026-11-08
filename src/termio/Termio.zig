@@ -2832,8 +2832,9 @@ test "manual: a repaint with line feeds for an old, taller grid is not the progr
         fn run(io: *Termio, _: *TestSink, _: bool) !void {
             const testing = std.testing;
             const row = "xxxxxxxxxxxxxxxxxxxx";
-            const old = "\x1b[H\x1b[2J" ++ (row ++ "\r\n") ** 7 ++ row;
-            const new = "\x1b[H\x1b[2J" ++ (row ++ "\r\n") ** 4 ++ row;
+            const line = row ++ "\r\n";
+            const old = "\x1b[H\x1b[2J" ++ line ++ line ++ line ++ line ++ line ++ line ++ line ++ row;
+            const new = "\x1b[H\x1b[2J" ++ line ++ line ++ line ++ line ++ row;
             io.processOutput("\x1b[?1049h");
             try testing.expect(io.setGrid(20, 8, 1));
             try testing.expect(io.setGrid(20, 5, 2));
