@@ -122,6 +122,11 @@ const FreshFrame = struct {
     /// A host size changed and its frame was not taken yet: only then does a
     /// completed frame publish itself (no retain, lock or wake per frame at rest).
     armed: std.atomic.Value(bool) = .init(false),
+    /// The generation of the last frame the renderer showed itself, off main,
+    /// at the host size (`present`): that size's frame is on screen, so no
+    /// update waits for an embedder present (`hostFrameWaits`) even while no
+    /// present takes the kept frame (a host size set back to the shown size).
+    shown_generation: std.atomic.Value(u64) = .init(0),
     mutex: std.Io.Mutex = .init,
     /// Retained; null after a take or before the first fresh frame.
     surface: ?*IOSurface = null,
@@ -471,6 +476,7 @@ pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
         if (comptime builtin.os.tag == .macos) {
             const host = self.host_size.load(.acquire);
             if (host != 0 and self.layer.setSurfaceOffMain(target.surface, seq)) {
+                self.fresh.shown_generation.store(target.size_generation, .release);
                 _ = self.counters.off_main_presents.fetchAdd(1, .monotonic);
                 return;
             }
@@ -684,6 +690,19 @@ pub fn hostFrame(self: *Metal, show: bool) apprt.HostFrame {
     // The layer keeps its frame; the new one waits, published, for the next call.
     _ = self.counters.late.fetchAdd(1, .monotonic);
     return if (self.frames_held.load(.acquire)) .held else .pending;
+}
+
+/// While the embedder presents host sizes: a frame of the host size waits for
+/// its present (the size changed, its frame was not taken yet and the renderer
+/// did not show a frame of it itself). The
+/// renderer thread draws every update at once then (`Thread` drawsNow), so the
+/// frame the embedder presents has the newest content. Any thread.
+pub fn hostFrameWaits(self: *const Metal) bool {
+    if (comptime builtin.os.tag != .macos) return false;
+    return self.embedder_presents.load(.acquire) and
+        self.host_size.load(.acquire) != 0 and
+        self.fresh.armed.load(.acquire) and
+        self.fresh.shown_generation.load(.acquire) != self.fresh.generation.load(.acquire);
 }
 
 /// The embedder committed the transaction of its last present or bounds change
@@ -963,6 +982,78 @@ test "host present: a new host size asks no display pass while the embedder pres
     // No display pass: Core Animation never presents (or waits for) the new
     // size's frame on its own; the embedder shows it with its bounds.
     try testing.expect(!metal.layer.layer.getProperty(bool, "needsDisplay"));
+}
+
+test "host present: a frame of a new host size waits for its present until the embedder shows it" {
+    const testing = std.testing;
+    const HostFrame = apprt.HostFrame;
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    const device = testDevice();
+    var metal = try testMetal(&device);
+    defer testDeinit(&metal);
+    const shown = try testSurface(80, 60);
+    defer shown.release();
+    const drawn = try testSurface(120, 60);
+    defer drawn.release();
+    metal.layer.setSurfaceSync(shown);
+    metal.setEmbedderPresents(true);
+    metal.setHostDrawableSize(true, 80, 60);
+    _ = metal.hostFrame(true);
+    // At rest (the host size's frame is shown): nothing waits.
+    try testing.expect(!metal.hostFrameWaits());
+
+    metal.setHostDrawableSize(true, 120, 60);
+    try testing.expect(metal.hostFrameWaits());
+    // Drawn but not presented yet: it still waits (a newer update replaces it).
+    try metal.present(testTarget(&metal, drawn), false);
+    try testing.expect(metal.hostFrameWaits());
+    try testing.expectEqual(HostFrame.presented, metal.hostFrame(true));
+    try testing.expect(!metal.hostFrameWaits());
+}
+
+test "host present: nothing waits once the renderer shows the host size's frame itself" {
+    const testing = std.testing;
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    const device = testDevice();
+    var metal = try testMetal(&device);
+    defer testDeinit(&metal);
+    const shown = try testSurface(80, 60);
+    defer shown.release();
+    const drawn = try testSurface(80, 60);
+    defer drawn.release();
+    metal.layer.setSurfaceSync(shown);
+    metal.setEmbedderPresents(true);
+    metal.setHostDrawableSize(true, 80, 60);
+    _ = metal.hostFrame(true);
+    metal.hostFrameCommitted();
+    // A size drawn ahead, then back to the shown size with no embedder
+    // present (a spring that ends at the bounds it has): the frame of that
+    // size goes to the screen off main, and no embedder present follows.
+    metal.setHostDrawableSize(true, 120, 60);
+    metal.setHostDrawableSize(true, 80, 60);
+    try testing.expect(metal.hostFrameWaits());
+    try metal.present(testTarget(&metal, drawn), false);
+    try testing.expectEqual(@as(u64, 1), metal.counters.off_main_presents.load(.acquire));
+    // The host size's frame is on screen: no update draws unpaced any more.
+    try testing.expect(!metal.hostFrameWaits());
+}
+
+test "host present: no frame waits for an embedder present by default" {
+    const testing = std.testing;
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    const device = testDevice();
+    var metal = try testMetal(&device);
+    defer testDeinit(&metal);
+    const shown = try testSurface(80, 60);
+    defer shown.release();
+    metal.layer.setSurfaceSync(shown);
+    metal.setHostDrawableSize(true, 120, 60);
+    try testing.expect(!metal.hostFrameWaits());
 }
 
 test "host present: a new host size asks a display pass by default" {
