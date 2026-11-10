@@ -41,21 +41,18 @@ width: usize,
 /// Current height of this target.
 height: usize,
 
-/// The frame drawn into this target last had cells built at this target's
-/// size (macOS host-sized surfaces present only such frames in a display
-/// pass of a new size, `Metal.presentHostSized`). Set before each draw.
-cells_fresh: bool = false,
-
-/// The host size generation (`Metal.sizeGeneration`) when this frame's draw
-/// began: a frame publishes for a display pass only in its own generation.
-size_generation: u64 = 0,
+/// The frame drawn into this target shows the alternate screen (a
+/// full-screen program): in the synced host present mode, its frame of a new
+/// host size waits for the program's redraw at the new grid
+/// (`program_fresh`) or the resize hold's bound (`Metal.present`). Set before
+/// each draw.
+alternate: bool = false,
 
 /// The frame drawn into this target is program fresh: its cells were built
-/// at this target's size (`cells_fresh`), the terminal it drew has the grid
-/// that fits this size, and the program drew a whole picture for that grid
-/// after its last change (`Terminal.programDrewGrid`). A reflow preview
-/// never is. `Metal.hostFrame` reports such a kept frame as `ready_program`.
-/// Set before each draw.
+/// at this target's size, the terminal it drew has the grid that fits this
+/// size, and the program drew a whole picture for that grid after its last
+/// change (`Terminal.programDrewGrid`). A reflow preview never is. Set before
+/// each draw.
 program_fresh: bool = false,
 
 pub fn init(opts: Options) !Self {

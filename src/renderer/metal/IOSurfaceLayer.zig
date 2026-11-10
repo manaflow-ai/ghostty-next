@@ -38,10 +38,10 @@ pub fn init() !IOSurfaceLayer {
     layer.setInstanceVariable("display_ctx", .{ .value = null });
     layer.setInstanceVariable("host_size", .{ .value = null });
     layer.setInstanceVariable("present_seq", .{ .value = null });
-    layer.setInstanceVariable("embedder_presents", .{ .value = null });
     layer.setInstanceVariable("main_pending", .{ .value = null });
     layer.setInstanceVariable("present_cb", .{ .value = null });
     layer.setInstanceVariable("present_ctx", .{ .value = null });
+    layer.setInstanceVariable("commit_observer", .{ .value = null });
 
     return .{ .layer = layer };
 }
@@ -51,7 +51,43 @@ pub fn release(self: *IOSurfaceLayer) void {
     // Clear the callback first so that a later display pass can't access the
     // renderer that owned this wrapper after it has been freed.
     self.setDisplayCallback(null, null);
+    // An observer still waiting for main's commit holds the layer: remove it,
+    // so it never fires for a released wrapper and does not keep the layer.
+    const CATransaction = objc.getClass("CATransaction").?;
+    CATransaction.msgSend(void, objc.sel("lock"), .{});
+    const observer = commitObserver(self.layer);
+    setCommitObserver(self.layer, null);
+    CATransaction.msgSend(void, objc.sel("unlock"), .{});
+    if (observer) |o| {
+        // Invalidate on main: invalidating releases the layer the observer
+        // holds, and a fire may be reading it on main now. A fire before the
+        // block sees the cleared ivar and does nothing.
+        if (objc.getClass("NSThread").?.msgSend(bool, "isMainThread", .{})) {
+            dropCommitObserver(o);
+        } else {
+            var block = DropObserverBlock.init(.{ .observer = @ptrCast(o) }, &dropObserverCallback);
+            macos.dispatch.dispatch_async(
+                @ptrCast(macos.dispatch.queue.getMain()),
+                @ptrCast(&block),
+            );
+        }
+    }
     self.layer.release();
+}
+
+const DropObserverBlock = objc.Block(struct {
+    observer: *anyopaque,
+}, .{}, void);
+
+fn dropObserverCallback(block: *const DropObserverBlock.Context) callconv(.c) void {
+    dropCommitObserver(@ptrCast(block.observer));
+}
+
+/// Removes an observer of `clearAfterMainCommit` that has not fired and
+/// releases the layer's reference to it. Main thread.
+fn dropCommitObserver(observer: macos.c.CFRunLoopObserverRef) void {
+    macos.c.CFRunLoopObserverInvalidate(observer);
+    macos.c.CFRelease(observer);
 }
 
 /// Detach this layer from its host (the embedder's view layer) if its
@@ -163,22 +199,6 @@ fn hostSize(layer: objc.Object) u64 {
     return @as(u64, @intFromPtr(layer.getInstanceVariable("host_size").value)) >> 3;
 }
 
-/// Records whether the embedder presents the frames of a new host size
-/// (`Metal.setEmbedderPresents`, ghostty_surface_set_host_present), which
-/// `setSurfaceCallback` checks frames against. Main thread.
-pub fn setEmbedderPresents(self: *IOSurfaceLayer, enabled: bool) void {
-    // Stored like `setHostSize`: an 8-aligned value in an object-typed ivar,
-    // never retained or released.
-    const stored: usize = @as(usize, @intFromBool(enabled)) << 3;
-    const CATransaction = objc.getClass("CATransaction").?;
-    CATransaction.msgSend(void, objc.sel("lock"), .{});
-    defer CATransaction.msgSend(void, objc.sel("unlock"), .{});
-    self.layer.setInstanceVariable("embedder_presents", .{ .value = @ptrFromInt(stored) });
-    // The mode starts closed: a change the main thread made before it may
-    // still be in its open transaction. Leaving it, nothing is pending.
-    setMainPending(self.layer, enabled);
-}
-
 /// Whether showing `surface` changes the size of the frame the layer shows
 /// (or shows a first frame): only such a change can leave the view's bounds
 /// behind. Call under the Core Animation lock.
@@ -186,11 +206,6 @@ fn changesShownSize(layer: objc.Object, surface: *IOSurface) bool {
     const shown = layer.getProperty(?*anyopaque, "contents") orelse return true;
     const shown_surface: *IOSurface = @ptrCast(shown);
     return shown_surface.getWidth() != surface.getWidth() or shown_surface.getHeight() != surface.getHeight();
-}
-
-/// The value `setEmbedderPresents` stored.
-fn embedderPresents(layer: objc.Object) bool {
-    return @intFromPtr(layer.getInstanceVariable("embedder_presents").value) != 0;
 }
 
 /// The pixel size of the frame the layer shows, or null while it shows
@@ -205,43 +220,14 @@ pub fn shownSize(self: *IOSurfaceLayer) ?struct { width: usize, height: usize } 
     return .{ .width = surface.getWidth(), .height = surface.getHeight() };
 }
 
-/// Shows `surface`, the frame of present sequence `seq`, in the caller's
-/// Core Animation transaction (the embedder's, which gives the view its new
-/// bounds), unless the layer shows a newer frame (`setSurface`,
-/// `setSurfaceOffMain`). Returns whether it did. Main thread.
-pub fn setSurfacePresented(self: *IOSurfaceLayer, surface: *IOSurface, seq: u64) bool {
-    const CATransaction = objc.getClass("CATransaction").?;
-    CATransaction.msgSend(void, objc.sel("lock"), .{});
-    if (seq <= presentSeq(self.layer)) {
-        CATransaction.msgSend(void, objc.sel("unlock"), .{});
-        return false;
-    }
-    setPresentSeq(self.layer, seq);
-    setMainPending(self.layer, true);
-    var report = presentReportLocked(self.layer, surface, seq);
-    self.layer.setProperty("contents", surface);
-    CATransaction.msgSend(void, objc.sel("unlock"), .{});
-    if (report) |*r| r.call();
-    return true;
-}
-
-/// The embedder committed the transaction of its last present or bounds change
-/// (`ghostty_surface_host_frame_committed`): frames at the shown size go to the
-/// screen off the main thread again. Main thread.
-pub fn setEmbedderCommitted(self: *IOSurfaceLayer) void {
-    const CATransaction = objc.getClass("CATransaction").?;
-    CATransaction.msgSend(void, objc.sel("lock"), .{});
-    defer CATransaction.msgSend(void, objc.sel("unlock"), .{});
-    setMainPending(self.layer, false);
-}
-
-/// Whether, while the embedder presents host sizes, the main thread changed
-/// the layer's contents in a transaction the embedder has not reported
-/// committed (`setEmbedderCommitted`). Ghostty cannot see the main thread's
-/// commit: until the embedder reports it, a frame committed off the main
-/// thread in its own transaction could reach the screen ahead of the view's
-/// new bounds, so frames go through main. Read and written under the Core
-/// Animation lock.
+/// Whether the main thread changed the size of the frame a host-sized layer
+/// shows in a transaction main has not committed yet: until then, a frame
+/// committed off the main thread in its own transaction could reach the
+/// screen ahead of the view's new bounds, so frames go through main. Set by
+/// a main-thread present that changes the shown size (`markMainSizeChange`),
+/// cleared right after main's commit (`clearAfterMainCommit`): it lasts one
+/// main run loop pass, and no report of the embedder is needed. Read and
+/// written under the Core Animation lock.
 fn mainPending(layer: objc.Object) bool {
     return @intFromPtr(layer.getInstanceVariable("main_pending").value) != 0;
 }
@@ -250,6 +236,104 @@ fn setMainPending(layer: objc.Object, pending: bool) void {
     // Stored like `setHostSize`: an 8-aligned value in an object-typed ivar, never retained.
     const stored: usize = @as(usize, @intFromBool(pending)) << 3;
     layer.setInstanceVariable("main_pending", .{ .value = @ptrFromInt(stored) });
+}
+
+/// The main thread is about to show `surface` in its open transaction: if
+/// the layer is host-sized and this changes the shown size, frames go
+/// through main until main's commit. Main thread, under the Core Animation
+/// lock.
+fn markMainSizeChange(layer: objc.Object, surface: *IOSurface) void {
+    if (hostSize(layer) == 0 or !changesShownSize(layer, surface)) return;
+    setMainPending(layer, true);
+    clearAfterMainCommit(layer);
+}
+
+/// The observer `clearAfterMainCommit` added that has not fired, or null.
+/// The ivar holds the one reference this layer owns (Create's), never
+/// retained by the runtime. Under the Core Animation lock.
+fn commitObserver(layer: objc.Object) macos.c.CFRunLoopObserverRef {
+    return @ptrCast(layer.getInstanceVariable("commit_observer").value);
+}
+
+fn setCommitObserver(layer: objc.Object, observer: macos.c.CFRunLoopObserverRef) void {
+    layer.setInstanceVariable("commit_observer", objc.Object.fromId(observer));
+}
+
+/// Core Animation commits the main thread's implicit transaction in its run
+/// loop observer of this order (before waiting, and at a run loop's exit);
+/// the observer of `clearAfterMainCommit` runs right after it.
+const main_commit_order: macos.c.CFIndex = 2_000_000;
+
+/// The main thread set `main_pending`: a one-shot observer of the main run
+/// loop, right after Core Animation's commit observer, clears it. One
+/// observer per layer at a time: a second change before it fires is in the
+/// same transaction. Off the main thread nothing is added (main's commit
+/// does not carry that thread's change; no caller does this). Known limit:
+/// the exit of a nested run loop inside an explicit transaction that is
+/// still open also fires it, before that transaction commits (no Ghostty or
+/// cmux path changes the shown size in one). Call under the Core Animation
+/// lock.
+fn clearAfterMainCommit(layer: objc.Object) void {
+    if (!objc.getClass("NSThread").?.msgSend(bool, "isMainThread", .{})) {
+        log.warn("clearAfterMainCommit(): called off the main thread", .{});
+        setMainPending(layer, false);
+        return;
+    }
+    if (commitObserver(layer) != null) return;
+    var context: macos.c.CFRunLoopObserverContext = .{
+        .version = 0,
+        .info = @ptrCast(layer.value),
+        .retain = &retainObserverLayer,
+        .release = &releaseObserverLayer,
+        .copyDescription = null,
+    };
+    const activities: macos.c.CFRunLoopActivity = @intCast(macos.c.kCFRunLoopBeforeWaiting | macos.c.kCFRunLoopExit);
+    // repeats false: the run loop removes the observer after its one fire.
+    const observer = macos.c.CFRunLoopObserverCreate(
+        null,
+        activities,
+        0,
+        main_commit_order + 1,
+        &mainCommitted,
+        &context,
+    ) orelse {
+        // No observer: nothing would clear the flag, so frames keep going off main as before the change.
+        setMainPending(layer, false);
+        return;
+    };
+    setCommitObserver(layer, observer);
+    macos.c.CFRunLoopAddObserver(macos.c.CFRunLoopGetMain(), observer, macos.c.kCFRunLoopCommonModes);
+}
+
+/// Main's commit ran (`clearAfterMainCommit`): frames go off main again. Main thread.
+fn mainCommitted(
+    observer: macos.c.CFRunLoopObserverRef,
+    activity: macos.c.CFRunLoopActivity,
+    info: ?*anyopaque,
+) callconv(.c) void {
+    _ = activity;
+    // The run loop keeps the observer, and so the layer it holds, alive for this call.
+    const layer = objc.Object.fromId(info);
+    const CATransaction = objc.getClass("CATransaction").?;
+    CATransaction.msgSend(void, objc.sel("lock"), .{});
+    // A released wrapper took the observer back (`release`): nothing to do.
+    if (commitObserver(layer) != observer) {
+        CATransaction.msgSend(void, objc.sel("unlock"), .{});
+        return;
+    }
+    setCommitObserver(layer, null);
+    setMainPending(layer, false);
+    CATransaction.msgSend(void, objc.sel("unlock"), .{});
+    macos.c.CFRelease(observer);
+}
+
+fn retainObserverLayer(info: ?*const anyopaque) callconv(.c) ?*const anyopaque {
+    _ = objc.Object.fromId(@constCast(info)).retain();
+    return info;
+}
+
+fn releaseObserverLayer(info: ?*const anyopaque) callconv(.c) void {
+    objc.Object.fromId(@constCast(info)).release();
 }
 
 /// Sets the layer's `contents` to the provided IOSurface.
@@ -291,14 +375,13 @@ pub inline fn setSurface(self: *IOSurfaceLayer, surface: *IOSurface, seq: u64) !
 ///
 /// Does not ensure this happens on the main thread.
 pub inline fn setSurfaceSync(self: *IOSurfaceLayer, surface: *IOSurface) void {
-    // Main thread (a display pass, ghostty_surface_draw): with the embedder
-    // presenting host sizes, a new size goes with main's commit, so frames go
-    // through main until the embedder reports it. The present callback's
-    // report is read under the lock too (an off-main present can change the
-    // shown frame).
+    // Main thread (a display pass, ghostty_surface_draw): a new size on a
+    // host-sized layer goes with main's commit, so frames go through main
+    // until that commit. The present callback's report is read under the
+    // lock too (an off-main present can change the shown frame).
     const CATransaction = objc.getClass("CATransaction").?;
     CATransaction.msgSend(void, objc.sel("lock"), .{});
-    if (embedderPresents(self.layer) and changesShownSize(self.layer, surface)) setMainPending(self.layer, true);
+    markMainSizeChange(self.layer, surface);
     var report = presentReportLocked(self.layer, surface, 0);
     self.layer.setProperty("contents", surface);
     CATransaction.msgSend(void, objc.sel("unlock"), .{});
@@ -318,7 +401,7 @@ const SetSurfaceBlock = objc.Block(struct {
 /// already shows a frame of that size, so no geometry change of the main
 /// thread is pending for it, and only if no newer frame was presented
 /// (`seq`). Returns false, and changes nothing, otherwise: the caller then
-/// presents it through the main thread (`setSurface`).
+/// presents it through the main thread (`setSurface`) or holds it.
 pub fn setSurfaceOffMain(self: *IOSurfaceLayer, surface: *IOSurface, seq: u64) bool {
     const width = surface.getWidth();
     const height = surface.getHeight();
@@ -329,9 +412,8 @@ pub fn setSurfaceOffMain(self: *IOSurfaceLayer, surface: *IOSurface, seq: u64) b
     CATransaction.msgSend(void, objc.sel("lock"), .{});
     switch (offMainDecisionLocked(self.layer, width, height, seq)) {
         // A transaction begins only for a frame shown here: a frame that goes through main, or an older one, commits
-        // nothing on this thread (cmux S4 profile 4b41c42c: while the embedder presents host sizes every frame of a
-        // new size goes through main, and each one's empty transaction cost a commit on the GPU completion thread
-        // against main's own).
+        // nothing on this thread (cmux S4 profile 4b41c42c: each such empty transaction cost a commit on the GPU
+        // completion thread against main's own).
         .through_main => {
             CATransaction.msgSend(void, objc.sel("unlock"), .{});
             return false;
@@ -344,9 +426,9 @@ pub fn setSurfaceOffMain(self: *IOSurfaceLayer, surface: *IOSurface, seq: u64) b
     }
     // Invariant: no thread commits a Core Animation transaction (or flushes) while it holds [CATransaction lock]. A
     // commit waits for locks another thread's commit holds while that commit's work takes [CATransaction lock]
-    // (cmux S4 films, 2026-11-03: main in commit_transaction, this thread in an embedder-mode present that
-    // committed under the lock). The transaction begins under the lock (a begin takes no other lock and commits
-    // nothing), the frame becomes its contents, and it commits after the unlock.
+    // (cmux S4 films, 2026-11-03: main in commit_transaction, this thread in a present that committed under the
+    // lock). The transaction begins under the lock (a begin takes no other lock and commits nothing), the frame
+    // becomes its contents, and it commits after the unlock.
     CATransaction.msgSend(void, objc.sel("begin"), .{});
     setPresentSeq(self.layer, seq);
     var report = presentReportLocked(self.layer, surface, seq);
@@ -362,51 +444,18 @@ pub fn setSurfaceOffMain(self: *IOSurfaceLayer, surface: *IOSurface, seq: u64) b
 const OffMainDecision = enum { show, through_main, superseded };
 
 /// The off-main checks, read-only: the layer shows a frame of this size (else the size change goes through main),
-/// no newer frame was presented, and no main-thread change waits for the embedder's commit. Call under the Core
-/// Animation lock.
+/// no newer frame was presented, and no main-thread change of the shown size waits for main's commit. Call under the
+/// Core Animation lock.
 fn offMainDecisionLocked(layer: objc.Object, width: usize, height: usize, seq: u64) OffMainDecision {
     const shown = layer.getProperty(?*anyopaque, "contents") orelse return .through_main;
     const shown_surface: *IOSurface = @ptrCast(shown);
     if (shown_surface.getWidth() != width or shown_surface.getHeight() != height) return .through_main;
     if (seq <= presentSeq(layer)) return .superseded;
-    // The embedder presents host sizes and the main thread changed the shown size in a transaction the embedder
-    // has not reported committed: a transaction committed here could reach the screen ahead of the view's new
-    // bounds. The frame goes through main (`setSurface`), after that commit.
-    if (embedderPresents(layer) and mainPending(layer)) return .through_main;
+    // The main thread changed the shown size in a transaction it has not committed: a transaction committed here
+    // could reach the screen ahead of the view's new bounds. The frame goes through main, after that commit; the
+    // flag clears right after it (`clearAfterMainCommit`), one main run loop pass at most.
+    if (mainPending(layer)) return .through_main;
     return .show;
-}
-
-/// While the embedder presents host sizes (`setEmbedderPresents`): whether
-/// the layer cannot show `surface`, a frame of the host size, in its bounds
-/// now, so `setSurfaceCallback` would drop it and the embedder presents it
-/// with its bounds (`Metal.hostFrame`). True when the layer shows a frame of
-/// another size and its bounds do not have this frame's size. False for a
-/// first frame (nothing shown), a frame at the shown size (it waits for the
-/// embedder's commit, through main) and bounds the embedder already set (it
-/// presents itself through main). Call under the Core Animation lock, which
-/// orders it against main's changes (`Metal.embedderShowsKeptFrame`).
-pub fn embedderShowsFrameLocked(self: *IOSurfaceLayer, surface: *IOSurface) bool {
-    return embedderDrops(self.layer, surface);
-}
-
-/// The one rule of `setSurfaceCallback` and `embedderShowsFrameLocked`: with
-/// the embedder presenting host sizes, whether the main-thread present must
-/// not show `surface` now, because the layer shows a frame of another size
-/// and its bounds do not have `surface`'s size (the embedder shows it with its
-/// bounds). A first frame (nothing shown), a frame at the shown size and a
-/// frame for bounds the embedder already set are shown. Call under the Core
-/// Animation lock.
-fn embedderDrops(layer: objc.Object, surface: *IOSurface) bool {
-    if (!embedderPresents(layer)) return false;
-    const shown = layer.getProperty(?*anyopaque, "contents") orelse return false;
-    const shown_surface: *IOSurface = @ptrCast(shown);
-    if (shown_surface.getWidth() == surface.getWidth() and
-        shown_surface.getHeight() == surface.getHeight()) return false;
-    const bounds = layer.getProperty(macos.graphics.Rect, "bounds");
-    const scale = layer.getProperty(f64, "contentsScale");
-    const width: usize = @intFromFloat(bounds.size.width * scale);
-    const height: usize = @intFromFloat(bounds.size.height * scale);
-    return width != surface.getWidth() or height != surface.getHeight();
 }
 
 /// The sequence number of the newest frame presented (`setSurface`,
@@ -483,20 +532,14 @@ fn setSurfaceCallback(
 }
 
 /// The part of `setSurfaceCallback` under the Core Animation lock: shows `surface` (frame `seq`) unless a newer frame
-/// or the embedder's rule keeps the shown one. Returns the present callback's report of a frame it showed.
+/// is shown. Returns the present callback's report of a frame it showed.
 fn showLocked(layer: objc.Object, surface: *IOSurface, seq: u64) ?PresentReport {
     if (seq != 0 and seq <= presentSeq(layer)) return null;
 
-    // An embedder that presents host sizes shows a frame of another size
-    // than the shown one itself, in the transaction that gives the view its
-    // bounds (`Metal.hostFrame`): such a frame shows here only if the bounds
-    // already have its size (the embedder set them without a present), so a
-    // commit never carries new pixels in the old bounds. A first frame
-    // (nothing shown) presents itself.
-    if (embedderDrops(layer, surface)) return null;
-
     if (seq != 0) setPresentSeq(layer, seq);
-    if (embedderPresents(layer) and changesShownSize(layer, surface)) setMainPending(layer, true);
+    // A new size shows in main's open transaction, with any bounds change of
+    // this pass: frames at it go through main until that commit.
+    markMainSizeChange(layer, surface);
     const report = presentReportLocked(layer, surface, seq);
     layer.setProperty("contents", surface);
     return report;
@@ -533,10 +576,10 @@ fn getSubclass() error{ObjCFailed}!objc.Class {
     if (!subclass.addIvar("display_ctx")) return error.ObjCFailed;
     if (!subclass.addIvar("host_size")) return error.ObjCFailed;
     if (!subclass.addIvar("present_seq")) return error.ObjCFailed;
-    if (!subclass.addIvar("embedder_presents")) return error.ObjCFailed;
     if (!subclass.addIvar("main_pending")) return error.ObjCFailed;
     if (!subclass.addIvar("present_cb")) return error.ObjCFailed;
     if (!subclass.addIvar("present_ctx")) return error.ObjCFailed;
+    if (!subclass.addIvar("commit_observer")) return error.ObjCFailed;
 
     subclass.replaceMethod("display", struct {
         fn display(target: objc.c.id, sel: objc.c.SEL) callconv(.c) void {
@@ -593,30 +636,6 @@ fn testIsMainThread() bool {
     return objc.getClass("NSThread").?.msgSend(bool, "isMainThread", .{});
 }
 
-test "host present: a frame of a new host size on main keeps the shown frame while the embedder presents sizes" {
-    const testing = std.testing;
-    // setSurface runs the main-thread present at once only on the main thread.
-    try testing.expect(testIsMainThread());
-    const pool = objc.AutoreleasePool.init();
-    defer pool.deinit();
-
-    var layer = try IOSurfaceLayer.init();
-    defer layer.release();
-    const shown = try testSurface(80, 60);
-    defer shown.release();
-    const drawn = try testSurface(120, 60);
-    defer drawn.release();
-    layer.setSurfaceSync(shown);
-    layer.setHostSize((120 << 32) | 60);
-    layer.setEmbedderPresents(true);
-
-    // A frame of the new size that reached the main thread (queued before the
-    // embedder took over size changes): the embedder shows a new size with its
-    // bounds in its own transaction, so this frame does not replace the shown one.
-    try layer.setSurface(drawn, 1);
-    try testing.expectEqual(@as(?usize, 80), testShownWidth(&layer));
-}
-
 test "host present: a frame of a new host size on main is shown by default" {
     const testing = std.testing;
     try testing.expect(testIsMainThread());
@@ -636,7 +655,7 @@ test "host present: a frame of a new host size on main is shown by default" {
     try testing.expectEqual(@as(?usize, 120), testShownWidth(&layer));
 }
 
-test "host present: a frame of a new host size on main is shown when the layer's bounds already have that size" {
+test "host present: a frame of a size the host no longer has is dropped on main" {
     const testing = std.testing;
     try testing.expect(testIsMainThread());
     const pool = objc.AutoreleasePool.init();
@@ -646,121 +665,13 @@ test "host present: a frame of a new host size on main is shown when the layer's
     defer layer.release();
     const shown = try testSurface(80, 60);
     defer shown.release();
-    const drawn = try testSurface(120, 60);
-    defer drawn.release();
+    const stale = try testSurface(100, 60);
+    defer stale.release();
     layer.setSurfaceSync(shown);
     layer.setHostSize((120 << 32) | 60);
-    layer.setEmbedderPresents(true);
-    // The embedder gave the view its new bounds without a present (a hidden
-    // surface, a frame that came too late): the new frame fits them.
-    layer.layer.setProperty("contentsScale", @as(f64, 1));
-    layer.layer.setProperty("bounds", macos.graphics.Rect{
-        .origin = .{ .x = 0, .y = 0 },
-        .size = .{ .width = 120, .height = 60 },
-    });
 
-    try layer.setSurface(drawn, 1);
-    try testing.expectEqual(@as(?usize, 120), testShownWidth(&layer));
-}
-
-test "host present: an off-main frame never joins a present the embedder has not committed yet" {
-    const testing = std.testing;
-    try testing.expect(testIsMainThread());
-    const pool = objc.AutoreleasePool.init();
-    defer pool.deinit();
-
-    var layer = try IOSurfaceLayer.init();
-    defer layer.release();
-    const shown = try testSurface(80, 60);
-    defer shown.release();
-    const presented = try testSurface(120, 60);
-    defer presented.release();
-    const next = try testSurface(120, 60);
-    defer next.release();
-    const after = try testSurface(120, 60);
-    defer after.release();
-    layer.setSurfaceSync(shown);
-    layer.setHostSize((120 << 32) | 60);
-    layer.setEmbedderPresents(true);
-
-    // The embedder showed the new size; its transaction (with the view's new
-    // bounds) is not committed yet.
-    try testing.expect(layer.setSurfacePresented(presented, 5));
-    // A newer frame at that size completes: an off-main transaction would
-    // commit it, alone, before the embedder's bounds. It goes through main.
-    try testing.expect(!layer.setSurfaceOffMain(next, 6));
-    const contents = layer.layer.getProperty(?*anyopaque, "contents");
-    try testing.expectEqual(@as(?*anyopaque, @ptrCast(presented)), contents);
-    // On main it shows; once the embedder committed, frames go off main again.
-    try layer.setSurface(next, 6);
-    layer.setEmbedderCommitted();
-    try testing.expect(layer.setSurfaceOffMain(after, 7));
-    const later = layer.layer.getProperty(?*anyopaque, "contents");
-    try testing.expectEqual(@as(?*anyopaque, @ptrCast(after)), later);
-}
-
-test "host present: a main-thread frame after the embedder's present keeps frames on main until the embedder committed" {
-    const testing = std.testing;
-    try testing.expect(testIsMainThread());
-    const pool = objc.AutoreleasePool.init();
-    defer pool.deinit();
-
-    var layer = try IOSurfaceLayer.init();
-    defer layer.release();
-    const shown = try testSurface(80, 60);
-    defer shown.release();
-    const presented = try testSurface(120, 60);
-    defer presented.release();
-    const queued = try testSurface(120, 60);
-    defer queued.release();
-    const next = try testSurface(120, 60);
-    defer next.release();
-    const later = try testSurface(120, 60);
-    defer later.release();
-    layer.setSurfaceSync(shown);
-    layer.setHostSize((120 << 32) | 60);
-    layer.setEmbedderPresents(true);
-
-    try testing.expect(layer.setSurfacePresented(presented, 5));
-    // A main-queue block runs before the embedder's commit (CFRunLoop runs
-    // main-queue blocks before the before-waiting observers): it shows a
-    // newer frame at that size in main's open transaction.
-    try layer.setSurface(queued, 6);
-    // An off-main commit now would still go out ahead of the embedder's bounds.
-    try testing.expect(!layer.setSurfaceOffMain(next, 7));
-    // The embedder committed: frames go off main again.
-    layer.setEmbedderCommitted();
-    try testing.expect(layer.setSurfaceOffMain(later, 8));
-}
-
-test "host present: a frame shown because the bounds already fit keeps frames on main until the embedder committed" {
-    const testing = std.testing;
-    try testing.expect(testIsMainThread());
-    const pool = objc.AutoreleasePool.init();
-    defer pool.deinit();
-
-    var layer = try IOSurfaceLayer.init();
-    defer layer.release();
-    const shown = try testSurface(80, 60);
-    defer shown.release();
-    const drawn = try testSurface(120, 60);
-    defer drawn.release();
-    const next = try testSurface(120, 60);
-    defer next.release();
-    layer.setSurfaceSync(shown);
-    layer.setHostSize((120 << 32) | 60);
-    layer.setEmbedderPresents(true);
-    layer.setEmbedderCommitted();
-    // The embedder gave the view its new bounds without a present.
-    layer.layer.setProperty("contentsScale", @as(f64, 1));
-    layer.layer.setProperty("bounds", macos.graphics.Rect{
-        .origin = .{ .x = 0, .y = 0 },
-        .size = .{ .width = 120, .height = 60 },
-    });
-    try layer.setSurface(drawn, 1);
-    try testing.expectEqual(@as(?usize, 120), testShownWidth(&layer));
-    // Those bounds are not committed yet either.
-    try testing.expect(!layer.setSurfaceOffMain(next, 2));
+    try layer.setSurface(stale, 1);
+    try testing.expectEqual(@as(?usize, 80), testShownWidth(&layer));
 }
 
 test "host present: a frame at the shown size shown on main keeps frames going off main" {
@@ -777,66 +688,16 @@ test "host present: a frame at the shown size shown on main keeps frames going o
     defer queued.release();
     const next = try testSurface(120, 60);
     defer next.release();
-    layer.setSurfaceSync(shown);
     layer.setHostSize((120 << 32) | 60);
-    layer.setEmbedderPresents(true);
-    layer.setEmbedderCommitted();
+    layer.setSurfaceSync(shown);
+    testRunMainLoopOnce();
 
     // A frame of the shown size on main changes no geometry: terminal echo
-    // after it still goes off main.
+    // after it still goes off main, in the same main run loop pass.
     try layer.setSurface(queued, 1);
     try testing.expect(layer.setSurfaceOffMain(next, 2));
     const contents = layer.layer.getProperty(?*anyopaque, "contents");
     try testing.expectEqual(@as(?*anyopaque, @ptrCast(next)), contents);
-}
-
-test "host present: the mode starts with frames on main until the embedder committed" {
-    const testing = std.testing;
-    try testing.expect(testIsMainThread());
-    const pool = objc.AutoreleasePool.init();
-    defer pool.deinit();
-
-    var layer = try IOSurfaceLayer.init();
-    defer layer.release();
-    const shown = try testSurface(120, 60);
-    defer shown.release();
-    const first = try testSurface(120, 60);
-    defer first.release();
-    const later = try testSurface(120, 60);
-    defer later.release();
-    layer.setSurfaceSync(shown);
-    layer.setHostSize((120 << 32) | 60);
-
-    // A change the main thread made before the mode may still be in its open
-    // transaction.
-    layer.setEmbedderPresents(true);
-    try testing.expect(!layer.setSurfaceOffMain(first, 1));
-    layer.setEmbedderCommitted();
-    try testing.expect(layer.setSurfaceOffMain(later, 2));
-}
-
-test "host present: a sync present of a new size keeps frames on main until the embedder committed" {
-    const testing = std.testing;
-    try testing.expect(testIsMainThread());
-    const pool = objc.AutoreleasePool.init();
-    defer pool.deinit();
-
-    var layer = try IOSurfaceLayer.init();
-    defer layer.release();
-    const shown = try testSurface(80, 60);
-    defer shown.release();
-    const drawn = try testSurface(120, 60);
-    defer drawn.release();
-    const next = try testSurface(120, 60);
-    defer next.release();
-    layer.setSurfaceSync(shown);
-    layer.setHostSize((120 << 32) | 60);
-    layer.setEmbedderPresents(true);
-    layer.setEmbedderCommitted();
-
-    // ghostty_surface_draw on main at the new size.
-    layer.setSurfaceSync(drawn);
-    try testing.expect(!layer.setSurfaceOffMain(next, 1));
 }
 
 test "host present: a sync present at the shown size keeps frames going off main" {
@@ -853,13 +714,30 @@ test "host present: a sync present at the shown size keeps frames going off main
     defer drawn.release();
     const next = try testSurface(120, 60);
     defer next.release();
-    layer.setSurfaceSync(shown);
     layer.setHostSize((120 << 32) | 60);
-    layer.setEmbedderPresents(true);
-    layer.setEmbedderCommitted();
+    layer.setSurfaceSync(shown);
+    testRunMainLoopOnce();
 
     layer.setSurfaceSync(drawn);
     try testing.expect(layer.setSurfaceOffMain(next, 1));
+}
+
+test "host present: a released layer's observer that waits for main's commit does nothing" {
+    const testing = std.testing;
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    var layer = try IOSurfaceLayer.init();
+    const shown = try testSurface(80, 60);
+    defer shown.release();
+    layer.setHostSize((80 << 32) | 60);
+    // A first frame on main: an observer now waits for main's commit, holding the layer.
+    layer.setSurfaceSync(shown);
+    try testing.expect(commitObserver(layer.layer) != null);
+    layer.release();
+    // The observer was invalidated with the wrapper: the pass runs no callback on a freed layer.
+    testRunMainLoopOnce();
 }
 
 /// Counts, per thread, the transaction commits made while the thread holds [CATransaction lock] (the
@@ -938,9 +816,9 @@ fn testOffMainCommits(layer: *IOSurfaceLayer, surface: *IOSurface, seq: u64) !st
 }
 
 test "host present: an off-main present that does not show its frame commits no transaction" {
-    // cmux FRAME OWNER REFACTOR S4 profile 4b41c42c (2026-11-05): with the embedder presenting host sizes, every
-    // frame of a new size failed the off-main checks and went through main, but its off-main attempt first began and
-    // committed a Core Animation transaction: one empty commit on the GPU completion thread per present (405 ms of
+    // cmux FRAME OWNER REFACTOR S4 profile 4b41c42c (2026-11-05): every frame of a new size failed the off-main
+    // checks and went through main, but its off-main attempt first began and committed a Core Animation
+    // transaction: one empty commit on the GPU completion thread per present (405 ms of
     // CA::Context::commit_transaction in a held-key round), against main's own commit. A present that shows nothing
     // commits nothing.
     const testing = std.testing;
@@ -969,16 +847,14 @@ test "host present: an off-main present that does not show its frame commits no 
     try testing.expect(!result.presented);
     try testing.expectEqual(@as(u32, 0), result.commits);
 
-    // The host has the new size, the layer still shows the old one (the embedder presents it with its bounds).
+    // The host has the new size, the layer still shows the old one: the size change goes through main.
     layer.setHostSize((120 << 32) | 60);
-    layer.setEmbedderPresents(true);
-    layer.setEmbedderCommitted();
     result = try testOffMainCommits(&layer, resized, 3);
     try testing.expect(!result.presented);
     try testing.expectEqual(@as(u32, 0), result.commits);
 
-    // The embedder showed the new size in a transaction it has not reported committed: through main.
-    try testing.expect(layer.setSurfacePresented(resized, 4));
+    // Main showed the new size in a transaction it has not committed: through main.
+    try layer.setSurface(resized, 4);
     const pending = try testSurface(120, 60);
     defer pending.release();
     result = try testOffMainCommits(&layer, pending, 5);
@@ -986,7 +862,7 @@ test "host present: an off-main present that does not show its frame commits no 
     try testing.expectEqual(@as(u32, 0), result.commits);
 
     // An older frame than the one shown: dropped, nothing to commit.
-    layer.setEmbedderCommitted();
+    testRunMainLoopOnce();
     const older = try testSurface(120, 60);
     defer older.release();
     result = try testOffMainCommits(&layer, older, 3);
@@ -1004,8 +880,12 @@ test "host present: an off-main present that does not show its frame commits no 
     try testing.expectEqual(@as(?*anyopaque, @ptrCast(next)), layer.layer.getProperty(?*anyopaque, "contents"));
 }
 
-fn testOffMainCommitOrder(embedder: bool) !void {
+test "host present: an off-main present never commits while it holds the Core Animation lock" {
+    // cmux FRAME OWNER REFACTOR S4 films, 2026-11-03: the main thread hung in CA::Transaction::commit and the Metal
+    // completion thread in setSurfaceOffMain, which committed while it held [CATransaction lock] (defers run
+    // last-first: commit, then unlock).
     const testing = std.testing;
+    try testing.expect(testIsMainThread());
     const pool = objc.AutoreleasePool.init();
     defer pool.deinit();
 
@@ -1015,13 +895,10 @@ fn testOffMainCommitOrder(embedder: bool) !void {
     defer shown.release();
     const drawn = try testSurface(80, 60);
     defer drawn.release();
-    layer.setSurfaceSync(shown);
     layer.setHostSize((80 << 32) | 60);
-    if (embedder) {
-        layer.setEmbedderPresents(true);
-        // Its last change is committed: the next frame at the shown size may go off main.
-        layer.setEmbedderCommitted();
-    }
+    layer.setSurfaceSync(shown);
+    // Main's commit of the first frame: the next frame at the shown size may go off main.
+    testRunMainLoopOnce();
 
     CommitOrder.install();
     defer CommitOrder.remove();
@@ -1039,13 +916,71 @@ fn testOffMainCommitOrder(embedder: bool) !void {
     try testing.expectEqual(@as(u32, 0), CommitOrder.seen_commits_under_lock);
 }
 
-test "host present: an off-main present never commits while it holds the Core Animation lock (embedder)" {
-    // cmux FRAME OWNER REFACTOR S4 films, 2026-11-03: with the embedder presenting host sizes, the main thread hung
-    // in CA::Transaction::commit and the Metal completion thread in setSurfaceOffMain, whose embedder branch
-    // committed while it held [CATransaction lock] (defers run last-first: commit, then unlock).
-    try testOffMainCommitOrder(true);
+/// Turns the main run loop once, so the observers of a pass run: Core Animation's commit, then the one
+/// `clearAfterMainCommit` adds right after it.
+fn testRunMainLoopOnce() void {
+    _ = macos.c.CFRunLoopRunInMode(macos.c.kCFRunLoopDefaultMode, 0, 0);
 }
 
-test "host present: an off-main present never commits while it holds the Core Animation lock (renderer)" {
-    try testOffMainCommitOrder(false);
+test "resize sync: a main-thread frame of a new size keeps frames on main only until main's commit" {
+    // S-P3 (cmux NIGHTLY REGRESSION, IOSurfaceLayer.zig:297 at b3a5ebfdf): a main-thread change of the shown size set
+    // `main_pending`, and only the embedder's report (`ghostty_surface_host_frame_committed`) cleared it. When cmux
+    // dropped its watch after 240 ticks without that report, every later frame of the terminal, scroll and output
+    // too, went through main. Ghostty now clears it itself after main's commit: no report of the embedder exists.
+    // Before main's commit, an off-main transaction could reach the screen ahead of the view's new bounds.
+    const testing = std.testing;
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    var layer = try IOSurfaceLayer.init();
+    defer layer.release();
+    const shown = try testSurface(80, 60);
+    defer shown.release();
+    const drawn = try testSurface(120, 60);
+    defer drawn.release();
+    const next = try testSurface(120, 60);
+    defer next.release();
+    const after = try testSurface(120, 60);
+    defer after.release();
+    layer.setSurfaceSync(shown);
+    layer.setHostSize((120 << 32) | 60);
+    testRunMainLoopOnce();
+
+    // The renderer's frame of the new size, on main (setSurface runs its block at once on the main thread).
+    try layer.setSurface(drawn, 1);
+    try testing.expectEqual(@as(?usize, 120), testShownWidth(&layer));
+    // Main has not committed that change: a frame at that size goes through main.
+    try testing.expect(!layer.setSurfaceOffMain(next, 2));
+    // Main's commit: frames at the shown size go off main again, with no report from the embedder.
+    testRunMainLoopOnce();
+    try testing.expect(layer.setSurfaceOffMain(after, 3));
+    try testing.expectEqual(@as(?*anyopaque, @ptrCast(after)), layer.layer.getProperty(?*anyopaque, "contents"));
+}
+
+test "resize sync: a sync draw of a new size keeps frames on main only until main's commit" {
+    const testing = std.testing;
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    var layer = try IOSurfaceLayer.init();
+    defer layer.release();
+    const shown = try testSurface(80, 60);
+    defer shown.release();
+    const drawn = try testSurface(120, 60);
+    defer drawn.release();
+    const next = try testSurface(120, 60);
+    defer next.release();
+    const after = try testSurface(120, 60);
+    defer after.release();
+    layer.setSurfaceSync(shown);
+    layer.setHostSize((120 << 32) | 60);
+    testRunMainLoopOnce();
+
+    // ghostty_surface_draw (or a display pass) on main at the new size.
+    layer.setSurfaceSync(drawn);
+    try testing.expect(!layer.setSurfaceOffMain(next, 1));
+    testRunMainLoopOnce();
+    try testing.expect(layer.setSurfaceOffMain(after, 2));
 }

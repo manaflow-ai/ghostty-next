@@ -2234,26 +2234,6 @@ pub const CAPI = struct {
         surface.setHostSized(enabled);
     }
 
-    /// The same present without waiting: the frame at the host size only if
-    /// it is already drawn. See ghostty.h.
-    export fn ghostty_surface_present_host_frame_ready(surface: *Surface) bool {
-        if (comptime builtin.os.tag != .macos) return false;
-        const api = &surface.core_surface.renderer.api;
-        if (comptime !@hasDecl(@TypeOf(api.*), "presentHostSizedWait")) return false;
-        _ = api.counters.present_calls.fetchAdd(1, .monotonic);
-        return api.presentHostSizedWait(false);
-    }
-
-    /// Present the frame at the host size in the caller's Core Animation
-    /// transaction. See ghostty.h.
-    export fn ghostty_surface_present_host_frame(surface: *Surface) bool {
-        if (comptime builtin.os.tag != .macos) return false;
-        const api = &surface.core_surface.renderer.api;
-        if (comptime !@hasDecl(@TypeOf(api.*), "presentHostSized")) return false;
-        _ = api.counters.present_calls.fetchAdd(1, .monotonic);
-        return api.presentHostSized();
-    }
-
     /// Install (or with a null callback remove) the present callback: each
     /// frame that becomes the surface layer's contents is reported on the
     /// presenting thread. See ghostty.h.
@@ -2267,34 +2247,14 @@ pub const CAPI = struct {
         api.setPresentCallback(callback, userdata);
     }
 
-    /// Who shows the frame of a new host size: the renderer (default) or the
-    /// embedder (ghostty_surface_host_frame). See ghostty.h.
+    /// When the frame of a new host size shows: when drawn, or after the
+    /// resize hold of a full-screen program (RENDERER_SYNCED). See ghostty.h.
     export fn ghostty_surface_set_host_present(surface: *Surface, mode_raw: c_int) void {
         if (comptime builtin.os.tag != .macos) return;
         const mode = std.enums.fromInt(apprt.HostPresent, mode_raw) orelse return;
         const api = &surface.core_surface.renderer.api;
-        if (comptime !@hasDecl(@TypeOf(api.*), "setEmbedderPresents")) return;
-        api.setEmbedderPresents(mode == .embedder);
-    }
-
-    /// What the embedder can show for the host size; with present, shows the
-    /// frame the renderer drew for it in the caller's Core Animation
-    /// transaction. See ghostty.h.
-    export fn ghostty_surface_host_frame(surface: *Surface, present: bool) apprt.HostFrame {
-        if (comptime builtin.os.tag != .macos) return .none;
-        const api = &surface.core_surface.renderer.api;
-        if (comptime !@hasDecl(@TypeOf(api.*), "hostFrame")) return .none;
-        if (present) _ = api.counters.present_calls.fetchAdd(1, .monotonic);
-        return api.hostFrame(present);
-    }
-
-    /// The embedder committed the transaction of its last host frame present or
-    /// bounds change. See ghostty.h.
-    export fn ghostty_surface_host_frame_committed(surface: *Surface) void {
-        if (comptime builtin.os.tag != .macos) return;
-        const api = &surface.core_surface.renderer.api;
-        if (comptime !@hasDecl(@TypeOf(api.*), "hostFrameCommitted")) return;
-        api.hostFrameCommitted();
+        if (comptime !@hasDecl(@TypeOf(api.*), "setHostPresent")) return;
+        api.setHostPresent(mode);
     }
 
     /// Draw a reflow preview while the locked grid does not fit the view.
@@ -2348,10 +2308,10 @@ pub const CAPI = struct {
         full_swap: u64,
         full_resize: u64,
         host_display_passes: u64,
-        host_present_calls: u64,
+        host_main_presents: u64,
         host_main_draws: u64,
-        host_fresh_presents: u64,
-        host_late_presents: u64,
+        host_size_presents: u64,
+        host_held_frames: u64,
         host_off_main_presents: u64,
         renderer_wakeups: u64,
         renderer_draw_now: u64,
@@ -2377,10 +2337,10 @@ pub const CAPI = struct {
             .full_swap = c.full_swap.load(.monotonic),
             .full_resize = c.full_resize.load(.monotonic),
             .host_display_passes = hostCounter(surface, "display_passes"),
-            .host_present_calls = hostCounter(surface, "present_calls"),
+            .host_main_presents = hostCounter(surface, "main_presents"),
             .host_main_draws = hostCounter(surface, "main_draws"),
-            .host_fresh_presents = hostCounter(surface, "fresh_presents"),
-            .host_late_presents = hostCounter(surface, "late"),
+            .host_size_presents = hostCounter(surface, "size_presents"),
+            .host_held_frames = hostCounter(surface, "held"),
             .host_off_main_presents = hostCounter(surface, "off_main_presents"),
             .renderer_wakeups = c.thread_wakeups.load(.monotonic),
             .renderer_draw_now = c.thread_draw_now.load(.monotonic),
@@ -2415,7 +2375,15 @@ pub const CAPI = struct {
         rows: u16,
         generation: u64,
     ) bool {
-        return surface.core_surface.io.setGrid(cols, rows, generation);
+        const set = surface.core_surface.io.setGrid(cols, rows, generation);
+        // The program learns this grid now: a running resize hold's bound
+        // counts from here (RENDERER_SYNCED).
+        if (comptime builtin.os.tag == .macos and
+            @hasDecl(@TypeOf(surface.core_surface.renderer.api), "restartResizeHold"))
+        {
+            if (set) surface.core_surface.renderer.api.restartResizeHold();
+        }
+        return set;
     }
 
     /// Return the terminal grid and its lock. See ghostty.h.
