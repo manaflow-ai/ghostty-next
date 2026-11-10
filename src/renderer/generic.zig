@@ -902,7 +902,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 .uniforms = .{
                     .projection_matrix = undefined,
                     .cell_size = undefined,
-                    .grid_size = undefined,
+                    // No cells yet. `drawFrame` sets it from the cells of
+                    // each frame (`Contents.framePlan`).
+                    .grid_size = .{ 0, 0 },
                     .grid_padding = undefined,
                     .screen_size = undefined,
                     .padding_extend = .{},
@@ -2223,8 +2225,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 if (blending) _ = self.counters.blend_frames.fetchAdd(1, .monotonic);
             }
 
-            // What this frame draws from the cells.
+            // What this frame draws from the cells. The grid the shaders
+            // index the cell buffers with is the size of the cells that
+            // this frame uploads, and a frame with no cells (none built
+            // yet) runs no cell pass: it shows the background only.
             const cell_plan = self.cells.framePlan();
+            self.uniforms.grid_size = cell_plan.grid_size;
 
             // Setup our frame data
             try frame.uniforms.sync(&.{self.uniforms});
@@ -3087,9 +3093,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 new_size.columns = state.cols;
                 try self.cells.resize(self.alloc, new_size);
 
-                // Update our uniforms accordingly, otherwise
-                // our background cells will be out of place.
-                self.uniforms.grid_size = .{ new_size.columns, new_size.rows };
+                // `drawFrame` gives the shaders this grid with these cells
+                // (`Contents.framePlan`): no second copy of it to keep here.
             }
 
             // Rows keep their cells when only the drawn terminal changed

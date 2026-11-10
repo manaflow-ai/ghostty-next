@@ -74,17 +74,33 @@ pub const Contents = struct {
     fg_rows: []CellTextRow = &.{},
 
     /// What one frame draws from these cells.
+    ///
+    /// The cell background and cell text shaders read
+    /// `bg_cells[y * grid_size.x + x]` with no bounds check. So the grid a
+    /// frame gives them is always the size of the cells it uploads, and a
+    /// frame with no cells does not run them.
     pub const FramePlan = struct {
         /// The grid for the frame's `Uniforms.grid_size`: columns, rows.
+        /// `grid_size[0] * grid_size[1]` is `bg_cells.len`.
         grid_size: [2]u16,
 
         /// The frame runs the cell background pass and the cell text pass.
+        /// False while there is no cell: before the first `resize` (a
+        /// renderer that did not build its cells yet) and for a grid with
+        /// no column or no row. Such a frame shows the background only.
         cell_passes: bool,
     };
 
     /// The plan of a frame that draws these cells, for the renderer's
     /// `drawFrame`.
     pub fn framePlan(self: *const Contents) FramePlan {
+        if (self.bg_cells.len == 0) return .{
+            .grid_size = .{ 0, 0 },
+            .cell_passes = false,
+        };
+
+        assert(self.bg_cells.len ==
+            @as(usize, self.size.columns) * @as(usize, self.size.rows));
         return .{
             .grid_size = .{ self.size.columns, self.size.rows },
             .cell_passes = true,
