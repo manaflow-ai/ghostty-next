@@ -378,6 +378,40 @@ test "ghostty.h HostFrame" {
     );
 }
 
+/// Why a frame reached a surface's layer (ghostty_surface_present_s).
+///
+/// If this is changed, you must also update ghostty.h
+/// (ghostty_present_reason_e).
+pub const PresentReason = enum(c_int) {
+    /// The same pixel size as the frame the layer showed before it.
+    content = 0,
+    /// Another pixel size than the frame shown before it, or the first frame.
+    resize = 1,
+};
+
+test "present callback: ghostty.h PresentReason" {
+    try @import("../lib/enum.zig").checkGhosttyHEnum(
+        PresentReason,
+        "GHOSTTY_PRESENT_",
+    );
+}
+
+/// One frame that became a surface layer's contents (ghostty.h
+/// ghostty_surface_present_s).
+pub const Present = extern struct {
+    width_px: u32,
+    height_px: u32,
+    reason: PresentReason,
+    /// The renderer's present sequence number; 0 for a main-thread draw.
+    seq: u64,
+    /// mach_absolute_time() just after the frame became the contents.
+    host_time: u64,
+};
+
+/// ghostty.h ghostty_surface_present_cb: called on the presenting thread,
+/// never blocks, never calls into Ghostty.
+pub const PresentCallback = *const fn (?*anyopaque, *const Present) callconv(.c) void;
+
 test "present callback: ghostty.h present struct" {
     const testing = std.testing;
     const c = @import("ghostty.h");

@@ -317,6 +317,13 @@ pub fn setHostDrawableSize(self: *Metal, enabled: bool, width_px: u32, height_px
     self.layer.layer.msgSend(void, objc.sel("setNeedsDisplay"), .{});
 }
 
+/// Installs the embedder's present callback (`ghostty_surface_set_present_callback`), or with null removes it: each
+/// frame that becomes the layer's contents is reported, with its pixel size and why it changed (content or resize),
+/// on the thread that sets it. Main thread.
+pub fn setPresentCallback(self: *Metal, cb: ?apprt.PresentCallback, userdata: ?*anyopaque) void {
+    self.layer.setPresentCallback(cb, userdata);
+}
+
 /// macOS host-sized surfaces (`ghostty_surface_set_host_present`): with
 /// `enabled`, the embedder shows each frame of a new host size itself
 /// (`hostFrame`), in the Core Animation transaction that changes the view's

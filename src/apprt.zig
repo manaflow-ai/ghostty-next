@@ -41,6 +41,9 @@ pub const SurfaceSnapshotPhase = structs.SurfaceSnapshotPhase;
 pub const SurfaceLocalHistoryResult = structs.SurfaceLocalHistoryResult;
 pub const HostPresent = structs.HostPresent;
 pub const HostFrame = structs.HostFrame;
+pub const PresentReason = structs.PresentReason;
+pub const Present = structs.Present;
+pub const PresentCallback = structs.PresentCallback;
 
 /// The implementation to use for the app runtime. This is comptime chosen
 /// so that every build has exactly one application runtime implementation.
