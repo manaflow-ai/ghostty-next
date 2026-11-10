@@ -1641,6 +1641,49 @@ GHOSTTY_API ghostty_host_frame_e ghostty_surface_host_frame(ghostty_surface_t,
 // (correct, slower). No effect outside GHOSTTY_HOST_PRESENT_EMBEDDER. Main
 // thread.
 GHOSTTY_API void ghostty_surface_host_frame_committed(ghostty_surface_t);
+// Why a frame reached the layer (ghostty_surface_present_s).
+typedef enum {
+  // The frame has the pixel size of the frame the layer showed before it:
+  // only its content changed (output, an echo, a scroll, the cursor).
+  GHOSTTY_PRESENT_CONTENT = 0,
+  // The frame has another pixel size than the frame the layer showed before
+  // it (a resize, a new content scale), or it is the first frame.
+  GHOSTTY_PRESENT_RESIZE = 1,
+} ghostty_present_reason_e;
+// One frame that became the surface layer's contents.
+typedef struct {
+  // The frame's size in pixels.
+  uint32_t width_px;
+  uint32_t height_px;
+  ghostty_present_reason_e reason;
+  // The renderer's present sequence number: it grows with each frame the
+  // renderer thread completes, so a larger number is a newer frame. 0 for a
+  // frame drawn on the main thread (a display pass, ghostty_surface_draw).
+  uint64_t seq;
+  // mach_absolute_time() just after the frame became the layer's contents.
+  uint64_t host_time;
+} ghostty_surface_present_s;
+// Called once for each frame that becomes the surface layer's contents, on
+// the thread that sets them: the GPU completion thread for a frame that goes
+// to the screen off the main thread (after its Core Animation transaction
+// committed), the main thread otherwise (the frame is in the main thread's
+// open transaction and commits with it). The struct is valid only during the
+// call. The callback must return at once: no lock waits, no call into
+// Ghostty. Frames that never reach the layer (dropped at a wrong size,
+// superseded by a newer frame) are not reported.
+typedef void (*ghostty_surface_present_cb)(
+    void* GHOSTTY_NULLABLE userdata,
+    const ghostty_surface_present_s* present);
+// Installs the present callback of this surface, replacing the one before; a
+// NULL callback removes it. Opt-in: without it nothing is called. Every
+// userdata given here must stay valid until ghostty_surface_free returns: a
+// frame that completes while the callback changes may still report to the
+// one before. No effect on a renderer without a Core Animation layer. Main
+// thread.
+GHOSTTY_API void ghostty_surface_set_present_callback(
+    ghostty_surface_t,
+    ghostty_surface_present_cb GHOSTTY_NULLABLE,
+    void* GHOSTTY_NULLABLE userdata);
 GHOSTTY_API ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
 // Fills the grid metrics. Returns false while a resize of an unlocked grid
 // is in flight; with a host-locked grid (ghostty_surface_set_grid) the

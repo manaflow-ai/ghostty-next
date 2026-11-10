@@ -2254,6 +2254,19 @@ pub const CAPI = struct {
         return api.presentHostSized();
     }
 
+    /// Install (or with a null callback remove) the present callback: each
+    /// frame that becomes the surface layer's contents is reported on the
+    /// presenting thread. See ghostty.h.
+    export fn ghostty_surface_set_present_callback(
+        surface: *Surface,
+        callback: ?apprt.PresentCallback,
+        userdata: ?*anyopaque,
+    ) void {
+        const api = &surface.core_surface.renderer.api;
+        if (comptime !@hasDecl(@TypeOf(api.*), "setPresentCallback")) return;
+        api.setPresentCallback(callback, userdata);
+    }
+
     /// Who shows the frame of a new host size: the renderer (default) or the
     /// embedder (ghostty_surface_host_frame). See ghostty.h.
     export fn ghostty_surface_set_host_present(surface: *Surface, mode_raw: c_int) void {

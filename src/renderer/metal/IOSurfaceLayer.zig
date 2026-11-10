@@ -6,6 +6,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const objc = @import("objc");
 const macos = @import("macos");
+const apprt = @import("../../apprt.zig");
 
 const IOSurface = macos.iosurface.IOSurface;
 
@@ -39,6 +40,8 @@ pub fn init() !IOSurfaceLayer {
     layer.setInstanceVariable("present_seq", .{ .value = null });
     layer.setInstanceVariable("embedder_presents", .{ .value = null });
     layer.setInstanceVariable("main_pending", .{ .value = null });
+    layer.setInstanceVariable("present_cb", .{ .value = null });
+    layer.setInstanceVariable("present_ctx", .{ .value = null });
 
     return .{ .layer = layer };
 }
@@ -77,6 +80,71 @@ pub fn detachFromHostIfDisplayCallbackOwned(
             @ptrCast(&block),
         );
     }
+}
+
+/// Installs the embedder's present callback (`ghostty_surface_set_present_callback`), or with null removes it: each
+/// frame that becomes the layer's contents is reported on the thread that sets them. Written under the Core
+/// Animation lock, which every present holds when it reads the callback. Main thread.
+pub fn setPresentCallback(self: *IOSurfaceLayer, cb: ?apprt.PresentCallback, ctx: ?*anyopaque) void {
+    const CATransaction = objc.getClass("CATransaction").?;
+    CATransaction.msgSend(void, objc.sel("lock"), .{});
+    defer CATransaction.msgSend(void, objc.sel("unlock"), .{});
+    setPacked(self.layer, "present_cb", if (cb) |f| @intFromPtr(f) else 0);
+    setPacked(self.layer, "present_ctx", @intFromPtr(ctx));
+}
+
+/// Stores `value`, a pointer value or a number, in an object-typed ivar, shifted left by 3 like `setHostSize`: the
+/// ivar then holds an 8-aligned value whatever the alignment of `value` (a C function pointer is 4-aligned on arm64),
+/// so safe builds' alignment checks pass. Never retained or released (no ARC layout on this class).
+fn setPacked(layer: objc.Object, comptime name: [:0]const u8, value: usize) void {
+    layer.setInstanceVariable(name, .{ .value = @ptrFromInt(value << 3) });
+}
+
+/// The value `setPacked` stored.
+fn getPacked(layer: objc.Object, comptime name: [:0]const u8) usize {
+    return @intFromPtr(layer.getInstanceVariable(name).value) >> 3;
+}
+
+extern "c" fn mach_absolute_time() u64;
+
+/// One frame that became the layer's contents, for the embedder's present callback (`setPresentCallback`). Read
+/// under the Core Animation lock just before the contents change (`presentReportLocked`), called after the lock is
+/// released (`call`): the callback never runs under the lock.
+const PresentReport = struct {
+    cb: apprt.PresentCallback,
+    ctx: ?*anyopaque,
+    present: apprt.Present,
+
+    /// Reports the frame, stamped now.
+    fn call(self: *PresentReport) void {
+        self.present.host_time = mach_absolute_time();
+        self.cb(self.ctx, &self.present);
+    }
+};
+
+/// The report of `surface` (present sequence `seq`, 0 for a main-thread draw) becoming the layer's contents, or null
+/// without a callback. Call under the Core Animation lock, before the contents change: the reason compares the
+/// frame with the one the layer shows now.
+fn presentReportLocked(layer: objc.Object, surface: *IOSurface, seq: u64) ?PresentReport {
+    const cb_value = getPacked(layer, "present_cb");
+    if (cb_value == 0) return null;
+    const width = surface.getWidth();
+    const height = surface.getHeight();
+    const reason: apprt.PresentReason = if (layer.getProperty(?*anyopaque, "contents")) |shown| reason: {
+        const shown_surface: *IOSurface = @ptrCast(shown);
+        break :reason if (shown_surface.getWidth() == width and shown_surface.getHeight() == height) .content else .resize;
+    } else .resize;
+    return .{
+        .cb = @ptrFromInt(cb_value),
+        .ctx = @ptrFromInt(getPacked(layer, "present_ctx")),
+        .present = .{
+            .width_px = @intCast(width),
+            .height_px = @intCast(height),
+            .reason = reason,
+            .seq = seq,
+            .host_time = 0,
+        },
+    };
 }
 
 /// Records the host-set target size (`Metal.setHostDrawableSize`, packed
@@ -144,11 +212,16 @@ pub fn shownSize(self: *IOSurfaceLayer) ?struct { width: usize, height: usize } 
 pub fn setSurfacePresented(self: *IOSurfaceLayer, surface: *IOSurface, seq: u64) bool {
     const CATransaction = objc.getClass("CATransaction").?;
     CATransaction.msgSend(void, objc.sel("lock"), .{});
-    defer CATransaction.msgSend(void, objc.sel("unlock"), .{});
-    if (seq <= presentSeq(self.layer)) return false;
+    if (seq <= presentSeq(self.layer)) {
+        CATransaction.msgSend(void, objc.sel("unlock"), .{});
+        return false;
+    }
     setPresentSeq(self.layer, seq);
     setMainPending(self.layer, true);
+    var report = presentReportLocked(self.layer, surface, seq);
     self.layer.setProperty("contents", surface);
+    CATransaction.msgSend(void, objc.sel("unlock"), .{});
+    if (report) |*r| r.call();
     return true;
 }
 
@@ -220,14 +293,16 @@ pub inline fn setSurface(self: *IOSurfaceLayer, surface: *IOSurface, seq: u64) !
 pub inline fn setSurfaceSync(self: *IOSurfaceLayer, surface: *IOSurface) void {
     // Main thread (a display pass, ghostty_surface_draw): with the embedder
     // presenting host sizes, a new size goes with main's commit, so frames go
-    // through main until the embedder reports it.
-    if (embedderPresents(self.layer)) {
-        const CATransaction = objc.getClass("CATransaction").?;
-        CATransaction.msgSend(void, objc.sel("lock"), .{});
-        defer CATransaction.msgSend(void, objc.sel("unlock"), .{});
-        if (changesShownSize(self.layer, surface)) setMainPending(self.layer, true);
-    }
+    // through main until the embedder reports it. The present callback's
+    // report is read under the lock too (an off-main present can change the
+    // shown frame).
+    const CATransaction = objc.getClass("CATransaction").?;
+    CATransaction.msgSend(void, objc.sel("lock"), .{});
+    if (embedderPresents(self.layer) and changesShownSize(self.layer, surface)) setMainPending(self.layer, true);
+    var report = presentReportLocked(self.layer, surface, 0);
     self.layer.setProperty("contents", surface);
+    CATransaction.msgSend(void, objc.sel("unlock"), .{});
+    if (report) |*r| r.call();
 }
 
 const SetSurfaceBlock = objc.Block(struct {
@@ -274,9 +349,12 @@ pub fn setSurfaceOffMain(self: *IOSurfaceLayer, surface: *IOSurface, seq: u64) b
     // nothing), the frame becomes its contents, and it commits after the unlock.
     CATransaction.msgSend(void, objc.sel("begin"), .{});
     setPresentSeq(self.layer, seq);
+    var report = presentReportLocked(self.layer, surface, seq);
     self.layer.setProperty("contents", surface);
     CATransaction.msgSend(void, objc.sel("unlock"), .{});
     CATransaction.msgSend(void, objc.sel("commit"), .{});
+    // After the commit: the frame is on its way to the screen.
+    if (report) |*r| r.call();
     return true;
 }
 
@@ -398,8 +476,16 @@ fn setSurfaceCallback(
     // (`setSurfaceOffMain`): this older one must not replace it.
     const CATransaction = objc.getClass("CATransaction").?;
     CATransaction.msgSend(void, objc.sel("lock"), .{});
-    defer CATransaction.msgSend(void, objc.sel("unlock"), .{});
-    if (block.seq != 0 and block.seq <= presentSeq(layer)) return;
+    var report = showLocked(layer, surface, block.seq);
+    CATransaction.msgSend(void, objc.sel("unlock"), .{});
+    // Outside the lock: the callback never runs under it.
+    if (report) |*r| r.call();
+}
+
+/// The part of `setSurfaceCallback` under the Core Animation lock: shows `surface` (frame `seq`) unless a newer frame
+/// or the embedder's rule keeps the shown one. Returns the present callback's report of a frame it showed.
+fn showLocked(layer: objc.Object, surface: *IOSurface, seq: u64) ?PresentReport {
+    if (seq != 0 and seq <= presentSeq(layer)) return null;
 
     // An embedder that presents host sizes shows a frame of another size
     // than the shown one itself, in the transaction that gives the view its
@@ -407,11 +493,13 @@ fn setSurfaceCallback(
     // already have its size (the embedder set them without a present), so a
     // commit never carries new pixels in the old bounds. A first frame
     // (nothing shown) presents itself.
-    if (embedderDrops(layer, surface)) return;
+    if (embedderDrops(layer, surface)) return null;
 
-    if (block.seq != 0) setPresentSeq(layer, block.seq);
+    if (seq != 0) setPresentSeq(layer, seq);
     if (embedderPresents(layer) and changesShownSize(layer, surface)) setMainPending(layer, true);
+    const report = presentReportLocked(layer, surface, seq);
     layer.setProperty("contents", surface);
+    return report;
 }
 
 pub const DisplayCallback = ?*align(8) const fn (?*anyopaque) void;
@@ -447,6 +535,8 @@ fn getSubclass() error{ObjCFailed}!objc.Class {
     if (!subclass.addIvar("present_seq")) return error.ObjCFailed;
     if (!subclass.addIvar("embedder_presents")) return error.ObjCFailed;
     if (!subclass.addIvar("main_pending")) return error.ObjCFailed;
+    if (!subclass.addIvar("present_cb")) return error.ObjCFailed;
+    if (!subclass.addIvar("present_ctx")) return error.ObjCFailed;
 
     subclass.replaceMethod("display", struct {
         fn display(target: objc.c.id, sel: objc.c.SEL) callconv(.c) void {
