@@ -40,7 +40,6 @@ pub const SurfaceGrid = structs.SurfaceGrid;
 pub const SurfaceSnapshotPhase = structs.SurfaceSnapshotPhase;
 pub const SurfaceLocalHistoryResult = structs.SurfaceLocalHistoryResult;
 pub const HostPresent = structs.HostPresent;
-pub const HostFrame = structs.HostFrame;
 pub const PresentReason = structs.PresentReason;
 pub const Present = structs.Present;
 pub const PresentCallback = structs.PresentCallback;

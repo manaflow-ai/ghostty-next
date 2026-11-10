@@ -764,18 +764,18 @@ typedef struct {
   uint64_t full_swap;
   uint64_t full_resize;
   // macOS: Core Animation display passes of the surface's layer. Host-sized
-  // surfaces (ghostty_surface_set_host_sized), per display pass of a new
-  // size: frames the main thread drew itself (the first frame,
-  // or a surface that is not host-sized), frames the renderer thread drew at
-  // the new size with cells rebuilt for it and the pass presented in its
-  // transaction, and passes that kept the last frame because that frame was
-  // not ready within 4 ms of the size change (it lands at the next pass).
+  // surfaces (ghostty_surface_set_host_sized): frames handed to a main-thread
+  // present (a main-queue block each), frames the main thread drew itself in
+  // a display pass (the first frame, or a surface that is not host-sized),
+  // frames of the host size handed to the main thread's present (a size
+  // change, or a frame while main's commit of one is pending), and frames of
+  // a new host size not shown because the resize hold ran
+  // (GHOSTTY_HOST_PRESENT_RENDERER_SYNCED).
   uint64_t host_display_passes;
-  // ghostty_surface_present_host_frame calls.
-  uint64_t host_present_calls;
+  uint64_t host_main_presents;
   uint64_t host_main_draws;
-  uint64_t host_fresh_presents;
-  uint64_t host_late_presents;
+  uint64_t host_size_presents;
+  uint64_t host_held_frames;
   // Content-only frames of a host-sized surface (the drawable size
   // unchanged) that went to the screen from the renderer's GPU completion
   // thread, in their own Core Animation transaction, without the main thread.
@@ -1498,149 +1498,42 @@ GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t)
 // is drawn or allocated: the layer keeps the last frame at its top-left
 // corner (clip the view to keep it inside), and new output still draws at the
 // held size. Each new size draws at once on the renderer thread, with the
-// cells rebuilt for it (the reflow preview included); the next display pass
-// presents that frame in its Core Animation transaction, waiting for it at
-// most 4 ms after the size was set, and otherwise keeps the last frame (the
-// new one lands at the following pass). The main thread draws only the first
-// frame. A hidden surface's display pass draws nothing. Until the first
-// ghostty_surface_set_size the target follows the bounds.
+// cells rebuilt for it (the reflow preview included), and that frame shows
+// through the main thread, in main's Core Animation transaction (with the
+// view's bounds of that pass); a frame of a size the host no longer has is
+// dropped. A frame at the shown size goes to the screen from the renderer's
+// GPU completion thread, in its own transaction, without the main thread,
+// except right after the main thread changed the shown size: until main's
+// commit (one run loop pass) such a frame goes through main, so it never
+// reaches the screen ahead of the view's new bounds. An off-main present
+// never commits while it holds [CATransaction lock]. The main thread draws
+// only the first frame. A hidden surface's display pass draws nothing. Until
+// the first ghostty_surface_set_size the target follows the bounds.
 // Default false (the target follows the bounds). No effect on iOS, where the
 // target always follows ghostty_surface_set_size. Main thread.
 GHOSTTY_API void ghostty_surface_set_host_sized(ghostty_surface_t, bool);
-// macOS, host-sized surfaces: present the frame the renderer thread draws
-// for the last ghostty_surface_set_size (cells rebuilt at that size) in the
-// caller's Core Animation transaction, waiting for it at most 4 ms after the
-// size was set; otherwise keep the last frame (the new one lands later).
-// For an embedder whose layer gets no display pass for a size change: call
-// it once per size change, after every surface of the transaction got its
-// size (so their renderers build in parallel) and before the commit, e.g. in
-// a run-loop observer ahead of Core Animation's. Returns false when there is
-// nothing to present this way (not host-sized, nothing shown yet, iOS); true
-// otherwise. Never draws on the calling thread. A surface shown again
-// (ghostty_surface_set_occlusion true) counts as a size change: call it in
-// that turn too, and its frame is waited for from the reveal. Main thread.
-GHOSTTY_API bool ghostty_surface_present_host_frame(ghostty_surface_t);
-// ghostty_surface_present_host_frame without waiting: presents the frame at
-// the host size only if the renderer thread already drew it, otherwise keeps
-// the last frame (counted in host_late_presents) and the new frame lands when
-// it completes. Never blocks the main thread.
-GHOSTTY_API bool ghostty_surface_present_host_frame_ready(ghostty_surface_t);
-// macOS, host-sized surfaces: who shows the frame of a new host size.
+// macOS, host-sized surfaces: when a frame of a new host size shows.
 typedef enum {
-  // The renderer (default): see ghostty_surface_set_host_sized.
+  // When drawn (default): see ghostty_surface_set_host_sized.
   GHOSTTY_HOST_PRESENT_RENDERER = 0,
-  // The embedder, with ghostty_surface_host_frame, in the Core Animation
-  // transaction that gives the view its new bounds, so a commit never
-  // carries new pixels in the old bounds or old pixels in the new bounds.
-  // A new size asks for no display pass and a display pass never waits.
-  // The renderer still draws each new size at once on its renderer thread
-  // (cells rebuilt for it, the reflow preview included) and keeps that frame
-  // for the embedder, but never shows a frame of another size than the one
-  // the layer shows, unless the view's bounds already have that size (the
-  // embedder set them without a present). A frame at the shown size still
-  // reaches the screen off the main thread, and a first frame (nothing
-  // shown yet) presents itself. ghostty_surface_draw (a synchronous draw the
-  // embedder asks for) still shows its frame at once; it and the first
-  // frame's display pass wait on the main thread for a free frame and the
-  // GPU, as they do by default. In this mode
-  // ghostty_surface_present_host_frame(_ready) are ghostty_surface_host_frame
-  // with present true (no wait). From the start of the mode, and after the
-  // main thread changed the size of the frame the layer shows (a present, a
-  // first frame, a new-size frame shown on main), every frame goes through
-  // the main thread until ghostty_surface_host_frame_committed: Ghostty cannot
-  // see the main thread's commit, and a frame committed off the main thread
-  // could reach the screen ahead of the view's new bounds. An off-main present
-  // never commits while it holds [CATransaction lock]. Going back to the
-  // renderer shows a frame drawn for the host size at once.
-  GHOSTTY_HOST_PRESENT_EMBEDDER = 1,
+  // Value 1 (the embedder presented new sizes) is removed: ignored.
+  // Resize sync in the renderer: on the primary screen a new size shows when
+  // drawn. On the alternate screen (a full-screen program) the layer keeps
+  // the last frame (top-left, clipped or padded, never stretched) until the
+  // renderer drew the new size after the program redrew a whole picture at
+  // the new grid, or until the bound (3 refreshes of 120 Hz) after the size
+  // change passed; a grid the PTY owner announced (ghostty_surface_set_grid)
+  // restarts the bound. Frames during the hold go to no main-thread present;
+  // a scroll or output frame at the shown size goes off main as always.
+  // Synchronized output (mode 2026) is unchanged: a resize ends it. A first
+  // frame and the frame after a reveal (ghostty_surface_set_occlusion true)
+  // are never held.
+  GHOSTTY_HOST_PRESENT_RENDERER_SYNCED = 2,
 } ghostty_host_present_e;
 // Default GHOSTTY_HOST_PRESENT_RENDERER. No effect on iOS or on a surface
 // that is not host-sized. Main thread.
 GHOSTTY_API void ghostty_surface_set_host_present(ghostty_surface_t,
                                                   ghostty_host_present_e);
-// What ghostty_surface_host_frame found for the host size (the size of the
-// last ghostty_surface_set_size).
-typedef enum {
-  // Nothing to keep: not host-sized, iOS, or no frame shown yet (the first
-  // frame presents itself). Give the view its new bounds now.
-  GHOSTTY_HOST_FRAME_NONE = 0,
-  // The surface does not draw (occluded). No frame comes until it is shown
-  // again (ghostty_surface_set_occlusion true), which arms the present for
-  // its host size.
-  GHOSTTY_HOST_FRAME_HIDDEN = 1,
-  // The layer shows a frame at the host size: nothing is left to present.
-  GHOSTTY_HOST_FRAME_SHOWN = 2,
-  // present false: the renderer drew the host size's frame; it is not shown
-  // yet. A call with present true shows it.
-  GHOSTTY_HOST_FRAME_READY = 3,
-  // present true: that frame is the layer's contents now, in the caller's
-  // Core Animation transaction. Give the view its new bounds in the same
-  // transaction.
-  GHOSTTY_HOST_FRAME_PRESENTED = 4,
-  // Not drawn yet: the layer keeps the frame it shows. Keep the view's old
-  // bounds and call again before a later commit.
-  GHOSTTY_HOST_FRAME_PENDING = 5,
-  // Frame updates are held (synchronized output, a snapshot restore): no
-  // frame can come now, and the layer keeps the frame it shows.
-  GHOSTTY_HOST_FRAME_HELD = 6,
-  // present false: the renderer drew the host size's frame after the
-  // program's PTY output at that size's grid (the program redrew for it); it
-  // is not shown yet. A call with present true shows it (PRESENTED). READY
-  // is then a frame of the size only (the program's last picture clipped or
-  // padded): an embedder may keep its old frame and bounds for a bounded
-  // time. A frame is drawn after the program's output when, after the
-  // terminal's last grid change, the program drew a whole picture for that
-  // grid (a synchronized update, or a repaint from the cursor home, that
-  // reached the grid's last row and column and went past neither; output
-  // for the old grid does not count) and the grid is the grid that fits the
-  // host size; a reflow preview never is. While the embedder
-  // presents host sizes, such a frame also wakes the main run loop when it
-  // completes, so a pre-commit observer can present it in that display
-  // refresh.
-  GHOSTTY_HOST_FRAME_READY_PROGRAM = 7,
-} ghostty_host_frame_e;
-// macOS, a surface whose new host sizes the embedder presents
-// (ghostty_surface_set_host_present): what it can show for its host size.
-// With present false the layer does not change (a query: for example to
-// present a group of surfaces together or not at all). With present true,
-// a READY frame becomes the layer's contents in the caller's Core Animation
-// transaction (PRESENTED); call it after every surface of the transaction
-// got its size (their renderers draw in parallel) and before the commit, for
-// example from a main run-loop observer that runs just before Core
-// Animation's commit. A frame that reaches the main thread later never
-// replaces a newer one. Never waits and never draws. Counted in
-// host_present_calls (present true), host_fresh_presents (PRESENTED) and
-// host_late_presents (PENDING or HELD with present true). A view whose
-// bounds were given without a present shows a frame that completes after that
-// by itself; a frame whose completion already left its present to the
-// embedder (it completed while the bounds were old) waits for a present: after
-// giving bounds without a present, call with present true when it returns
-// READY. Until the frame shows, or while the bounds stay old, call again until
-// it returns SHOWN, NONE or HIDDEN. READY does not reserve the frame: a hide can
-// drop it before the present (HIDDEN then), and a change of the host size
-// drops it too, even back to an equal size after another one (A->B->A): a
-// frame kept for a present before that change is not presented for the new
-// size (the renderer draws a new size at once; while it holds its frames, the
-// layer keeps its last frame).
-// Call it with present true, and give the view its bounds, in one explicit
-// [CATransaction lock] span. An open transaction, a layout pass or a display
-// pass alone is not such a span. No off-main present runs its checks or sets
-// its frame in between, and none holds the lock while it commits. In the
-// span, never commit or flush, and never draw: not ghostty_surface_draw, and
-// not a display pass of a surface with nothing shown (a first frame draws on
-// main). A draw waits for a free frame, and the GPU completion thread that
-// frees it needs the lock. Each of these can deadlock against a commit that
-// waits for the lock. Main thread.
-GHOSTTY_API ghostty_host_frame_e ghostty_surface_host_frame(ghostty_surface_t,
-                                                            bool present);
-// The embedder's transaction that carried its last present or bounds change
-// was committed (for example: called after each commit while the embedder
-// presents host sizes; a call with nothing pending does nothing). Frames at
-// the shown size go to the screen off the main thread again, which keeps a
-// terminal echo off the main thread. Without the call they go through main
-// (correct, slower). No effect outside GHOSTTY_HOST_PRESENT_EMBEDDER. Main
-// thread.
-GHOSTTY_API void ghostty_surface_host_frame_committed(ghostty_surface_t);
 // Why a frame reached the layer (ghostty_surface_present_s).
 typedef enum {
   // The frame has the pixel size of the frame the layer showed before it:
