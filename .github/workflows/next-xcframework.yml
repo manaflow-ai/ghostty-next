@@ -125,6 +125,7 @@ jobs:
             -Dtest-filter="no frame shows the READY terminal" \
             -Dtest-filter="OSC 7501" \
             -Dtest-filter="reflow preview: " \
+            -Dtest-filter="present callback: " \
             --summary all
           # libghostty-vt patches (VT replay formatter, terminal and Kitty
           # graphics C API). These live in the lib-vt test modules.
