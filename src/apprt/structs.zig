@@ -378,6 +378,18 @@ test "ghostty.h HostFrame" {
     );
 }
 
+test "present callback: ghostty.h present struct" {
+    const testing = std.testing;
+    const c = @import("ghostty.h");
+    const T = c.ghostty_surface_present_s;
+    try testing.expectEqual(@offsetOf(Present, "width_px"), @offsetOf(T, "width_px"));
+    try testing.expectEqual(@offsetOf(Present, "height_px"), @offsetOf(T, "height_px"));
+    try testing.expectEqual(@offsetOf(Present, "reason"), @offsetOf(T, "reason"));
+    try testing.expectEqual(@offsetOf(Present, "seq"), @offsetOf(T, "seq"));
+    try testing.expectEqual(@offsetOf(Present, "host_time"), @offsetOf(T, "host_time"));
+    try testing.expectEqual(@sizeOf(Present), @sizeOf(T));
+}
+
 test "ghostty.h SurfaceLocalHistoryResult" {
     try @import("../lib/enum.zig").checkGhosttyHEnum(
         SurfaceLocalHistoryResult,

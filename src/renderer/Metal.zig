@@ -983,6 +983,106 @@ fn testIsMainThread() bool {
     return objc.getClass("NSThread").?.msgSend(bool, "isMainThread", .{});
 }
 
+/// What the present callback saw (the present callback tests): the last report and the number of calls.
+const TestPresents = struct {
+    calls: u32 = 0,
+    last: apprt.Present = undefined,
+
+    fn record(userdata: ?*anyopaque, report: *const apprt.Present) callconv(.c) void {
+        const self: *TestPresents = @ptrCast(@alignCast(userdata.?));
+        self.calls += 1;
+        self.last = report.*;
+    }
+};
+
+test "present callback: a present at size S reports S and the reason content" {
+    const testing = std.testing;
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    const device = testDevice();
+    var metal = try testMetal(&device);
+    defer testDeinit(&metal);
+    const shown = try testSurface(80, 60);
+    defer shown.release();
+    const drawn = try testSurface(80, 60);
+    defer drawn.release();
+    metal.layer.setSurfaceSync(shown);
+    metal.setHostDrawableSize(true, 80, 60);
+
+    var presents: TestPresents = .{};
+    metal.setPresentCallback(&TestPresents.record, &presents);
+    // The renderer thread's next frame at the shown size S (output, an echo, a scroll): it goes to the layer off main,
+    // and the callback reports S, the reason content and the frame's sequence number.
+    try metal.present(testTarget(&metal, drawn), false);
+    try testing.expectEqual(@as(u64, 1), metal.counters.off_main_presents.load(.acquire));
+    try testing.expectEqual(@as(u32, 1), presents.calls);
+    try testing.expectEqual(@as(u32, 80), presents.last.width_px);
+    try testing.expectEqual(@as(u32, 60), presents.last.height_px);
+    try testing.expectEqual(apprt.PresentReason.content, presents.last.reason);
+    try testing.expectEqual(@as(u64, 1), presents.last.seq);
+    try testing.expect(presents.last.host_time != 0);
+}
+
+test "present callback: a frame of a new size reports the reason resize, and a removed callback hears nothing" {
+    const testing = std.testing;
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    const device = testDevice();
+    var metal = try testMetal(&device);
+    defer testDeinit(&metal);
+    const shown = try testSurface(80, 60);
+    defer shown.release();
+    const resized = try testSurface(120, 60);
+    defer resized.release();
+    const later = try testSurface(120, 60);
+    defer later.release();
+
+    var presents: TestPresents = .{};
+    metal.setPresentCallback(&TestPresents.record, &presents);
+    // The first frame (a display pass on main): nothing was shown, so it is a resize, with no renderer sequence.
+    metal.layer.setSurfaceSync(shown);
+    try testing.expectEqual(@as(u32, 1), presents.calls);
+    try testing.expectEqual(apprt.PresentReason.resize, presents.last.reason);
+    try testing.expectEqual(@as(u64, 0), presents.last.seq);
+
+    // A new host size: its frame goes through the main thread (on main here, at once) and reports its size.
+    metal.setHostDrawableSize(true, 120, 60);
+    try metal.present(testTarget(&metal, resized), false);
+    try testing.expectEqual(@as(u32, 2), presents.calls);
+    try testing.expectEqual(@as(u32, 120), presents.last.width_px);
+    try testing.expectEqual(apprt.PresentReason.resize, presents.last.reason);
+
+    // Removed: the next frame still shows, and nothing is reported.
+    metal.setPresentCallback(null, null);
+    try metal.present(testTarget(&metal, later), false);
+    try testing.expectEqual(@as(?usize, 120), testShownWidth(&metal));
+    try testing.expectEqual(@as(u32, 2), presents.calls);
+}
+
+test "present callback: a frame dropped at the wrong size is not reported" {
+    const testing = std.testing;
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    const device = testDevice();
+    var metal = try testMetal(&device);
+    defer testDeinit(&metal);
+    const shown = try testSurface(80, 60);
+    defer shown.release();
+    const stale = try testSurface(100, 60);
+    defer stale.release();
+    metal.layer.setSurfaceSync(shown);
+    metal.setHostDrawableSize(true, 80, 60);
+
+    var presents: TestPresents = .{};
+    metal.setPresentCallback(&TestPresents.record, &presents);
+    // A late frame of a size the host no longer has: the main-thread present drops it, so it never reaches the layer.
+    try metal.present(testTarget(&metal, stale), false);
+    try testing.expectEqual(@as(?usize, 80), testShownWidth(&metal));
+    try testing.expectEqual(@as(u32, 0), presents.calls);
+}
+
 test "host present: a new host size asks no display pass while the embedder presents sizes" {
     const testing = std.testing;
     const pool = objc.AutoreleasePool.init();
