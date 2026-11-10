@@ -2223,6 +2223,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 if (blending) _ = self.counters.blend_frames.fetchAdd(1, .monotonic);
             }
 
+            // What this frame draws from the cells.
+            const cell_plan = self.cells.framePlan();
+
             // Setup our frame data
             try frame.uniforms.sync(&.{self.uniforms});
             try frame.cells_bg.sync(self.cells.bg_cells);
@@ -2321,7 +2324,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 );
 
                 // Then we draw any opaque cell backgrounds.
-                pass.step(.{
+                if (cell_plan.cell_passes) pass.step(.{
                     .pipeline = self.shaders.pipelines.cell_bg,
                     .uniforms = frame.uniforms.buffer,
                     .buffers = &.{ null, frame.cells_bg.buffer },
@@ -2337,7 +2340,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 );
 
                 // Text.
-                pass.step(.{
+                if (cell_plan.cell_passes) pass.step(.{
                     .pipeline = self.shaders.pipelines.cell_text,
                     .uniforms = frame.uniforms.buffer,
                     .buffers = &.{
