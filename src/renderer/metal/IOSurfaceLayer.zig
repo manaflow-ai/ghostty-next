@@ -1049,3 +1049,72 @@ test "host present: an off-main present never commits while it holds the Core An
 test "host present: an off-main present never commits while it holds the Core Animation lock (renderer)" {
     try testOffMainCommitOrder(false);
 }
+
+/// Turns the main run loop once, so the observers of a pass run: Core Animation's commit, then the one
+/// `clearAfterMainCommit` adds right after it.
+fn testRunMainLoopOnce() void {
+    _ = macos.c.CFRunLoopRunInMode(macos.c.kCFRunLoopDefaultMode, 0, 0);
+}
+
+test "resize sync: a main-thread frame of a new size keeps frames on main only until main's commit" {
+    // S-P3 (cmux NIGHTLY REGRESSION, IOSurfaceLayer.zig:297 at b3a5ebfdf): a main-thread change of the shown size set
+    // `main_pending`, and only the embedder's report (`ghostty_surface_host_frame_committed`) cleared it. When cmux
+    // dropped its watch after 240 ticks without that report, every later frame of the terminal, scroll and output
+    // too, went through main. Ghostty now clears it itself after main's commit: no report of the embedder exists.
+    // Before main's commit, an off-main transaction could reach the screen ahead of the view's new bounds.
+    const testing = std.testing;
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    var layer = try IOSurfaceLayer.init();
+    defer layer.release();
+    const shown = try testSurface(80, 60);
+    defer shown.release();
+    const drawn = try testSurface(120, 60);
+    defer drawn.release();
+    const next = try testSurface(120, 60);
+    defer next.release();
+    const after = try testSurface(120, 60);
+    defer after.release();
+    layer.setSurfaceSync(shown);
+    layer.setHostSize((120 << 32) | 60);
+    testRunMainLoopOnce();
+
+    // The renderer's frame of the new size, on main (setSurface runs its block at once on the main thread).
+    try layer.setSurface(drawn, 1);
+    try testing.expectEqual(@as(?usize, 120), testShownWidth(&layer));
+    // Main has not committed that change: a frame at that size goes through main.
+    try testing.expect(!layer.setSurfaceOffMain(next, 2));
+    // Main's commit: frames at the shown size go off main again, with no report from the embedder.
+    testRunMainLoopOnce();
+    try testing.expect(layer.setSurfaceOffMain(after, 3));
+    try testing.expectEqual(@as(?*anyopaque, @ptrCast(after)), layer.layer.getProperty(?*anyopaque, "contents"));
+}
+
+test "resize sync: a sync draw of a new size keeps frames on main only until main's commit" {
+    const testing = std.testing;
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    var layer = try IOSurfaceLayer.init();
+    defer layer.release();
+    const shown = try testSurface(80, 60);
+    defer shown.release();
+    const drawn = try testSurface(120, 60);
+    defer drawn.release();
+    const next = try testSurface(120, 60);
+    defer next.release();
+    const after = try testSurface(120, 60);
+    defer after.release();
+    layer.setSurfaceSync(shown);
+    layer.setHostSize((120 << 32) | 60);
+    testRunMainLoopOnce();
+
+    // ghostty_surface_draw (or a display pass) on main at the new size.
+    layer.setSurfaceSync(drawn);
+    try testing.expect(!layer.setSurfaceOffMain(next, 1));
+    testRunMainLoopOnce();
+    try testing.expect(layer.setSurfaceOffMain(after, 2));
+}
