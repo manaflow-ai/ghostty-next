@@ -1104,3 +1104,100 @@ test "resize sync: no frame is held in the renderer mode, for a first frame, or 
         try testing.expectEqual(@as(?usize, 120), testShownWidth(&metal));
     }
 }
+
+/// A host-sized surface in cmux's mode that shows `shown` at the host size, committed (frames at that size go off
+/// main).
+fn testHostSized(metal: *Metal, shown: *IOSurface) void {
+    metal.setHostPresent(.renderer_synced);
+    metal.setHostDrawableSize(true, @intCast(shown.getWidth()), @intCast(shown.getHeight()));
+    metal.layer.setSurfaceSync(shown);
+    testRunMainLoopOnce();
+}
+
+/// The frames of a resize burst that the layer showed at a size other than the host size, by refresh.
+const TestBurst = struct {
+    /// Refreshes after which the layer showed a frame wider or higher than the host size: the view cuts it.
+    cut: usize = 0,
+    /// Refreshes after which it showed a frame narrower or lower than the host size: the view pads it.
+    padded: usize = 0,
+    /// The frames the burst drew, kept to its end (the layer shows one of them).
+    frames: [max_frames]*IOSurface = undefined,
+    count: usize = 0,
+
+    const max_frames = 256;
+
+    fn deinit(self: *TestBurst) void {
+        for (self.frames[0..self.count]) |frame| frame.release();
+    }
+
+    /// One display refresh of a pane resize, as cmux drives it: the pane's size goes to the host size on the main
+    /// thread, the renderer draws a frame at that size and presents it, and the main thread commits. The frame is of
+    /// a full-screen program that has not redrawn at the new grid (it redraws only after SIGWINCH, a refresh or more
+    /// late). Counts what the layer shows after the commit against the host size.
+    fn refresh(self: *TestBurst, metal: *Metal, width: u32, height: u32) !void {
+        metal.setHostDrawableSize(true, width, height);
+        const frame = try testSurface(@intCast(width), @intCast(height));
+        self.frames[self.count] = frame;
+        self.count += 1;
+        try metal.present(testFrame(frame, .{ .alternate = true }), false);
+        testRunMainLoopOnce();
+        const shown = metal.layer.shownSize() orelse return error.TestUnexpectedResult;
+        if (shown.width > width or shown.height > height) {
+            self.cut += 1;
+        } else if (shown.width < width or shown.height < height) {
+            self.padded += 1;
+        }
+    }
+};
+
+test "resize sync: in a key-resize burst no shown frame is wider or higher than the host size" {
+    // cmux GI LAND 3 (the film of #40174, 19 of 255 frames wider than the pane by 2 cells or more; hold c1 on
+    // aws-m4pro-8: 16, 13 and 20 such frames in 3 bursts, and in each of them only `host_held_frames` moved). A key
+    // resize is a spring: the pane has a new size at each display refresh, for 6 steps one way and 6 steps back. The
+    // resize hold kept the last frame of a full-screen program while the pane went on, and each new host size (and
+    // each grid the PTY owner announced) started the hold's bound again, so the hold had no end in a spring: the pane
+    // cut the kept frame (smaller pane) or padded it (larger pane). The pane's size is not Ghostty's to hold, so the
+    // frame of the host size must show in the commit that follows its draw.
+    const testing = std.testing;
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    const device = testDevice();
+    var metal = try testMetal(&device);
+    defer testDeinit(&metal);
+    // The pane before the burst.
+    const shown = try testSurface(240, 120);
+    defer shown.release();
+    testHostSized(&metal, shown);
+
+    var burst: TestBurst = .{};
+    defer burst.deinit();
+
+    const steps = 6;
+    const refreshes_per_step = 4;
+    const px_per_refresh = 6;
+    // A vertical divider: 6 steps that make the pane narrower, then 6 steps back.
+    var width: u32 = 240;
+    for (0..steps * refreshes_per_step) |_| {
+        width -= px_per_refresh;
+        try burst.refresh(&metal, width, 120);
+    }
+    for (0..steps * refreshes_per_step) |_| {
+        width += px_per_refresh;
+        try burst.refresh(&metal, width, 120);
+    }
+    // A horizontal divider: the same for the height.
+    var height: u32 = 120;
+    for (0..steps * refreshes_per_step / 2) |_| {
+        height -= px_per_refresh;
+        try burst.refresh(&metal, 240, height);
+    }
+    for (0..steps * refreshes_per_step / 2) |_| {
+        height += px_per_refresh;
+        try burst.refresh(&metal, 240, height);
+    }
+
+    try testing.expectEqual(@as(usize, 0), burst.cut);
+    try testing.expectEqual(@as(usize, 0), burst.padded);
+    try testing.expectEqual(@as(?usize, 240), testShownWidth(&metal));
+}
