@@ -199,6 +199,13 @@ fn hostSize(layer: objc.Object) u64 {
     return @as(u64, @intFromPtr(layer.getInstanceVariable("host_size").value)) >> 3;
 }
 
+/// The embedder's display scale for a host-sized surface (`ghostty_surface_set_content_scale`; the embedder then
+/// leaves the layer's `contentsScale` to Ghostty). Main thread.
+pub fn setContentScale(self: *IOSurfaceLayer, scale: f64) void {
+    if (!(scale > 0)) return;
+    self.layer.setProperty("contentsScale", scale);
+}
+
 /// Whether showing `surface` changes the size of the frame the layer shows
 /// (or shows a first frame): only such a change can leave the view's bounds
 /// behind. Call under the Core Animation lock.
@@ -983,4 +990,147 @@ test "resize sync: a sync draw of a new size keeps frames on main only until mai
     try testing.expect(!layer.setSurfaceOffMain(next, 1));
     testRunMainLoopOnce();
     try testing.expect(layer.setSurfaceOffMain(after, 2));
+}
+
+fn testScale(self: *const IOSurfaceLayer) f64 {
+    return self.layer.getProperty(f64, "contentsScale");
+}
+
+test "host present: a new content scale goes to the layer with the first frame at the new host size" {
+    // cmux P12 (TerminalSurfaceCommitSizeTests "a new display scale lands with the frame drawn at it"): the window
+    // moved to a display of another scale and the embedder set the layer's `contentsScale` at once, so the frame
+    // drawn at the old scale showed at the new scale (half or double size) for 1-4 refreshes. The scale and the
+    // frame drawn at it must change in one Core Animation transaction.
+    const testing = std.testing;
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    var layer = try IOSurfaceLayer.init();
+    defer layer.release();
+    layer.layer.setProperty("contentsScale", @as(f64, 2));
+    const shown = try testSurface(160, 120);
+    defer shown.release();
+    const stale = try testSurface(160, 120);
+    defer stale.release();
+    const drawn = try testSurface(80, 60);
+    defer drawn.release();
+    const next = try testSurface(80, 60);
+    defer next.release();
+    layer.setHostSize((160 << 32) | 120);
+    layer.setSurfaceSync(shown);
+    testRunMainLoopOnce();
+
+    // The window is on a 1x display now: the embedder sets the scale, then the size in pixels.
+    layer.setContentScale(1);
+    // The frame the layer shows was drawn at 2x: it keeps its scale.
+    try testing.expectEqual(@as(f64, 2), testScale(&layer));
+    // A frame drawn before the change does not go off main while the scale waits, and main drops it: its size is
+    // not the host's.
+    try testing.expect(!layer.setSurfaceOffMain(stale, 1));
+    layer.setHostSize((80 << 32) | 60);
+    try layer.setSurface(stale, 1);
+    try testing.expectEqual(@as(?usize, 160), testShownWidth(&layer));
+    try testing.expectEqual(@as(f64, 2), testScale(&layer));
+
+    // The frame at the new host size: it and the scale change together, in main's transaction.
+    try layer.setSurface(drawn, 2);
+    try testing.expectEqual(@as(?usize, 80), testShownWidth(&layer));
+    try testing.expectEqual(@as(f64, 1), testScale(&layer));
+    // Until main's commit a frame goes through main; after it frames go off main again.
+    try testing.expect(!layer.setSurfaceOffMain(next, 3));
+    testRunMainLoopOnce();
+    try testing.expect(layer.setSurfaceOffMain(next, 3));
+    try testing.expectEqual(@as(f64, 1), testScale(&layer));
+}
+
+test "host present: a new content scale at the same pixel size shows with the next frame, through main" {
+    const testing = std.testing;
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    var layer = try IOSurfaceLayer.init();
+    defer layer.release();
+    layer.layer.setProperty("contentsScale", @as(f64, 2));
+    const shown = try testSurface(160, 120);
+    defer shown.release();
+    const drawn = try testSurface(160, 120);
+    defer drawn.release();
+    const next = try testSurface(160, 120);
+    defer next.release();
+    layer.setHostSize((160 << 32) | 120);
+    layer.setSurfaceSync(shown);
+    testRunMainLoopOnce();
+
+    // Half the scale and twice the points: the same pixels.
+    layer.setContentScale(1);
+    try testing.expectEqual(@as(f64, 2), testScale(&layer));
+    try testing.expect(!layer.setSurfaceOffMain(drawn, 1));
+    try layer.setSurface(drawn, 1);
+    try testing.expectEqual(@as(?*anyopaque, @ptrCast(drawn)), layer.layer.getProperty(?*anyopaque, "contents"));
+    try testing.expectEqual(@as(f64, 1), testScale(&layer));
+    // The scale is in main's open transaction: a frame goes through main until main's commit.
+    try testing.expect(!layer.setSurfaceOffMain(next, 2));
+    testRunMainLoopOnce();
+    try testing.expect(layer.setSurfaceOffMain(next, 2));
+}
+
+test "host present: a content scale set back before its frame leaves frames going off main" {
+    const testing = std.testing;
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    var layer = try IOSurfaceLayer.init();
+    defer layer.release();
+    layer.layer.setProperty("contentsScale", @as(f64, 2));
+    const shown = try testSurface(160, 120);
+    defer shown.release();
+    const next = try testSurface(160, 120);
+    defer next.release();
+    layer.setHostSize((160 << 32) | 120);
+    layer.setSurfaceSync(shown);
+    testRunMainLoopOnce();
+
+    layer.setContentScale(1);
+    layer.setContentScale(2);
+    try testing.expectEqual(@as(f64, 2), testScale(&layer));
+    try testing.expect(layer.setSurfaceOffMain(next, 1));
+    try testing.expectEqual(@as(f64, 2), testScale(&layer));
+}
+
+test "host present: a content scale goes to the layer at once when no frame can show at another scale" {
+    const testing = std.testing;
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+
+    // No frame shown yet: nothing can show at the wrong scale.
+    var first = try IOSurfaceLayer.init();
+    defer first.release();
+    first.setHostSize((160 << 32) | 120);
+    first.setContentScale(2);
+    try testing.expectEqual(@as(f64, 2), testScale(&first));
+
+    // The target follows the bounds (no host size): the bounds and the scale give the frame's size, so the scale
+    // cannot wait for a frame.
+    var following = try IOSurfaceLayer.init();
+    defer following.release();
+    const shown = try testSurface(160, 120);
+    defer shown.release();
+    following.setSurfaceSync(shown);
+    following.setContentScale(2);
+    try testing.expectEqual(@as(f64, 2), testScale(&following));
+
+    // A scale that waits when the surface stops being host-sized goes to the layer then.
+    var released = try IOSurfaceLayer.init();
+    defer released.release();
+    released.layer.setProperty("contentsScale", @as(f64, 2));
+    released.setHostSize((160 << 32) | 120);
+    released.setSurfaceSync(shown);
+    testRunMainLoopOnce();
+    released.setContentScale(1);
+    released.setHostSize(0);
+    try testing.expectEqual(@as(f64, 1), testScale(&released));
 }
