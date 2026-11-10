@@ -1090,6 +1090,7 @@ pub const Surface = struct {
             .x = @floatCast(x_scaled),
             .y = @floatCast(y_scaled),
         };
+        self.syncHostContentScale();
         self.syncHostedLayer();
 
         self.core_surface.contentScaleCallback(self.content_scale) catch |err| {
@@ -1125,6 +1126,18 @@ pub const Surface = struct {
     pub fn setHostSized(self: *Surface, enabled: bool) void {
         self.host_sized = enabled;
         self.syncHostedLayer();
+        self.syncHostContentScale();
+    }
+
+    /// macOS: a host-sized surface's layer takes the display scale from Ghostty, with the frame drawn at it
+    /// (`Metal.setHostContentScale`); the embedder does not set the layer's `contentsScale`. A surface that follows
+    /// its bounds keeps the embedder's `contentsScale`, as before.
+    fn syncHostContentScale(self: *Surface) void {
+        if (comptime builtin.os.tag == .macos and
+            @hasDecl(@TypeOf(self.core_surface.renderer.api), "setHostContentScale"))
+        {
+            if (self.host_sized) self.core_surface.renderer.api.setHostContentScale(self.content_scale.x);
+        }
     }
 
     pub fn updateSize(self: *Surface, width: u32, height: u32) void {

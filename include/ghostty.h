@@ -1509,6 +1509,11 @@ GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t)
 // never commits while it holds [CATransaction lock]. The main thread draws
 // only the first frame. A hidden surface's display pass draws nothing. Until
 // the first ghostty_surface_set_size the target follows the bounds.
+// The layer's contentsScale is Ghostty's too: ghostty_surface_set_content_scale
+// sets it with the first frame at the host size, in one Core Animation
+// transaction (at once while the layer shows no frame), so a frame never
+// shows at a scale it was not drawn at. The embedder sets the scale, then the
+// size in pixels, in one main-thread turn, and never sets contentsScale.
 // Default false (the target follows the bounds). No effect on iOS, where the
 // target always follows ghostty_surface_set_size. Main thread.
 GHOSTTY_API void ghostty_surface_set_host_sized(ghostty_surface_t, bool);

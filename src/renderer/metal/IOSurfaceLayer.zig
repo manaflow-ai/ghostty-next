@@ -42,6 +42,7 @@ pub fn init() !IOSurfaceLayer {
     layer.setInstanceVariable("present_cb", .{ .value = null });
     layer.setInstanceVariable("present_ctx", .{ .value = null });
     layer.setInstanceVariable("commit_observer", .{ .value = null });
+    layer.setInstanceVariable("pending_scale", .{ .value = null });
 
     return .{ .layer = layer };
 }
@@ -192,6 +193,16 @@ pub fn setHostSize(self: *IOSurfaceLayer, value: u64) void {
     // ivar is never retained or released (no ARC layout on this class).
     const stored: usize = @intCast(value << 3);
     self.layer.setInstanceVariable("host_size", .{ .value = @ptrFromInt(stored) });
+    if (value != 0) return;
+    // The target follows the bounds again: the bounds and the scale give the frame's size, so a content scale that
+    // waits for a frame at the host size (`setContentScale`) goes to the layer now.
+    const CATransaction = objc.getClass("CATransaction").?;
+    CATransaction.msgSend(void, objc.sel("lock"), .{});
+    defer CATransaction.msgSend(void, objc.sel("unlock"), .{});
+    const scale = getPacked(self.layer, "pending_scale");
+    if (scale == 0) return;
+    setPacked(self.layer, "pending_scale", 0);
+    self.layer.setProperty("contentsScale", @as(f64, @floatFromInt(scale)) / scale_one);
 }
 
 /// The value `setHostSize` stored.
@@ -199,11 +210,51 @@ fn hostSize(layer: objc.Object) u64 {
     return @as(u64, @intFromPtr(layer.getInstanceVariable("host_size").value)) >> 3;
 }
 
+/// One, in the fixed point `pending_scale` holds (an object-typed ivar holds no f64: `setPacked`). Exact for 1x, 2x
+/// and every scale with at most 20 binary places.
+const scale_one: f64 = 1 << 20;
+
 /// The embedder's display scale for a host-sized surface (`ghostty_surface_set_content_scale`; the embedder then
-/// leaves the layer's `contentsScale` to Ghostty). Main thread.
+/// leaves the layer's `contentsScale` to Ghostty). The frame the layer shows was drawn at the old scale, so the layer
+/// keeps its scale until the first frame at the host size shows: that frame and the scale change in one Core
+/// Animation transaction (`applyPendingScaleLocked`), and until then frames go through main
+/// (`offMainDecisionLocked`). It goes to the layer at once when no frame can show at another scale: the layer shows
+/// none, or its target follows its bounds (no host size; the bounds and this scale then give the frame's size).
+/// Known limit: a frame at the host size that the renderer drew before it applied the new scale's font grid also
+/// lands the scale (the embedder sets the scale and then the size in one main-thread turn, and the renderer thread
+/// takes both in that order, so this needs a frame drawn between the two). Main thread.
 pub fn setContentScale(self: *IOSurfaceLayer, scale: f64) void {
     if (!(scale > 0)) return;
-    self.layer.setProperty("contentsScale", scale);
+    const CATransaction = objc.getClass("CATransaction").?;
+    CATransaction.msgSend(void, objc.sel("lock"), .{});
+    defer CATransaction.msgSend(void, objc.sel("unlock"), .{});
+    const layer = self.layer;
+    if (layer.getProperty(f64, "contentsScale") == scale) {
+        setPacked(layer, "pending_scale", 0);
+        return;
+    }
+    if (hostSize(layer) == 0 or layer.getProperty(?*anyopaque, "contents") == null) {
+        setPacked(layer, "pending_scale", 0);
+        layer.setProperty("contentsScale", scale);
+        return;
+    }
+    setPacked(layer, "pending_scale", @intFromFloat(@round(scale * scale_one)));
+}
+
+/// `surface` is about to become the layer's contents on the main thread: a content scale that waits
+/// (`setContentScale`) goes to the layer with it, in the same transaction, when the frame has the host size (a frame
+/// of another size was drawn before the change). Frames then go through main until main's commit, like after a
+/// change of the shown size: a frame committed off main must not reach the screen ahead of the scale. Main thread,
+/// under the Core Animation lock.
+fn applyPendingScaleLocked(layer: objc.Object, surface: *IOSurface) void {
+    const stored = getPacked(layer, "pending_scale");
+    if (stored == 0) return;
+    const host = hostSize(layer);
+    if (host != 0 and ((host >> 32) != surface.getWidth() or (host & 0xffff_ffff) != surface.getHeight())) return;
+    setPacked(layer, "pending_scale", 0);
+    layer.setProperty("contentsScale", @as(f64, @floatFromInt(stored)) / scale_one);
+    setMainPending(layer, true);
+    clearAfterMainCommit(layer);
 }
 
 /// Whether showing `surface` changes the size of the frame the layer shows
@@ -389,6 +440,7 @@ pub inline fn setSurfaceSync(self: *IOSurfaceLayer, surface: *IOSurface) void {
     const CATransaction = objc.getClass("CATransaction").?;
     CATransaction.msgSend(void, objc.sel("lock"), .{});
     markMainSizeChange(self.layer, surface);
+    applyPendingScaleLocked(self.layer, surface);
     var report = presentReportLocked(self.layer, surface, 0);
     self.layer.setProperty("contents", surface);
     CATransaction.msgSend(void, objc.sel("unlock"), .{});
@@ -451,8 +503,8 @@ pub fn setSurfaceOffMain(self: *IOSurfaceLayer, surface: *IOSurface, seq: u64) b
 const OffMainDecision = enum { show, through_main, superseded };
 
 /// The off-main checks, read-only: the layer shows a frame of this size (else the size change goes through main),
-/// no newer frame was presented, and no main-thread change of the shown size waits for main's commit. Call under the
-/// Core Animation lock.
+/// no newer frame was presented, no main-thread change of the shown size waits for main's commit and no content
+/// scale waits for its frame. Call under the Core Animation lock.
 fn offMainDecisionLocked(layer: objc.Object, width: usize, height: usize, seq: u64) OffMainDecision {
     const shown = layer.getProperty(?*anyopaque, "contents") orelse return .through_main;
     const shown_surface: *IOSurface = @ptrCast(shown);
@@ -462,6 +514,8 @@ fn offMainDecisionLocked(layer: objc.Object, width: usize, height: usize, seq: u
     // could reach the screen ahead of the view's new bounds. The frame goes through main, after that commit; the
     // flag clears right after it (`clearAfterMainCommit`), one main run loop pass at most.
     if (mainPending(layer)) return .through_main;
+    // A content scale waits for its frame (`setContentScale`): it lands on main, with the frame, in one transaction.
+    if (getPacked(layer, "pending_scale") != 0) return .through_main;
     return .show;
 }
 
@@ -547,6 +601,7 @@ fn showLocked(layer: objc.Object, surface: *IOSurface, seq: u64) ?PresentReport 
     // A new size shows in main's open transaction, with any bounds change of
     // this pass: frames at it go through main until that commit.
     markMainSizeChange(layer, surface);
+    applyPendingScaleLocked(layer, surface);
     const report = presentReportLocked(layer, surface, seq);
     layer.setProperty("contents", surface);
     return report;
@@ -587,6 +642,7 @@ fn getSubclass() error{ObjCFailed}!objc.Class {
     if (!subclass.addIvar("present_cb")) return error.ObjCFailed;
     if (!subclass.addIvar("present_ctx")) return error.ObjCFailed;
     if (!subclass.addIvar("commit_observer")) return error.ObjCFailed;
+    if (!subclass.addIvar("pending_scale")) return error.ObjCFailed;
 
     subclass.replaceMethod("display", struct {
         fn display(target: objc.c.id, sel: objc.c.SEL) callconv(.c) void {

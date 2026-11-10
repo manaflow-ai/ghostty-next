@@ -280,6 +280,14 @@ pub fn setHostDrawableSize(self: *Metal, enabled: bool, width_px: u32, height_px
     self.layer.layer.msgSend(void, objc.sel("setNeedsDisplay"), .{});
 }
 
+/// macOS host-sized surfaces: the embedder's display scale (`ghostty_surface_set_content_scale`). The layer takes it
+/// with the first frame at the host size, in one Core Animation transaction, so a frame never shows at a scale it was
+/// not drawn at (`IOSurfaceLayer.setContentScale`). Main thread.
+pub fn setHostContentScale(self: *Metal, scale: f64) void {
+    if (comptime builtin.os.tag != .macos) return;
+    self.layer.setContentScale(scale);
+}
+
 /// Installs the embedder's present callback (`ghostty_surface_set_present_callback`), or with null removes it: each
 /// frame that becomes the layer's contents is reported, with its pixel size and why it changed (content or resize),
 /// on the thread that sets it. Main thread.
