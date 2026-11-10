@@ -1090,6 +1090,27 @@ test "present callback: a frame dropped at the wrong size is not reported" {
     try testing.expectEqual(@as(u32, 0), presents.calls);
 }
 
+test "present callback: a frame shown after the renderer goes is not reported" {
+    const testing = std.testing;
+    try testing.expect(testIsMainThread());
+    const pool = objc.AutoreleasePool.init();
+    defer pool.deinit();
+    const device = testDevice();
+    var metal = try testMetal(&device);
+    defer testDeinit(&metal);
+    const late = try testSurface(80, 60);
+    defer late.release();
+
+    var presents: TestPresents = .{};
+    metal.setPresentCallback(&TestPresents.record, &presents);
+    // The surface goes (`ghostty_surface_free`): its userdata may be freed once free returns, but a frame queued for
+    // the main thread before it (`setSurfaceCallback`) can still reach the layer, which the embedder's view keeps.
+    metal.prepareDeinit();
+    metal.layer.setSurfaceSync(late);
+    try testing.expectEqual(@as(?usize, 80), testShownWidth(&metal));
+    try testing.expectEqual(@as(u32, 0), presents.calls);
+}
+
 test "host present: a new host size asks no display pass while the embedder presents sizes" {
     const testing = std.testing;
     const pool = objc.AutoreleasePool.init();
