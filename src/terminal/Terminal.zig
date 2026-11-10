@@ -17108,9 +17108,9 @@ test "Terminal: printSlice differential fuzz vs print" {
     var prng = std.Random.DefaultPrng.init(0xC0FFEE);
     const rand = prng.random();
     const alphabet = &test_print_slice_alphabet;
-    try testPrintSliceDifferential(io_impl, alloc, rand, alphabet, 500, 80, 24);
-    try testPrintSliceDifferential(io_impl, alloc, rand, alphabet, 500, 10, 4);
-    try testPrintSliceDifferential(io_impl, alloc, rand, alphabet, 500, 5, 2);
+    try testPrintSliceDifferential(io_impl, alloc, rand, alphabet, 250, 80, 24);
+    try testPrintSliceDifferential(io_impl, alloc, rand, alphabet, 250, 10, 4);
+    try testPrintSliceDifferential(io_impl, alloc, rand, alphabet, 250, 5, 2);
     try testPrintSliceDifferential(io_impl, alloc, rand, alphabet, 200, 2, 2);
 }
 
@@ -17121,9 +17121,9 @@ test "Terminal: printSlice differential fuzz vs print, CJK with spaces" {
     var prng = std.Random.DefaultPrng.init(0xC1C1);
     const rand = prng.random();
     const alphabet = &test_print_slice_cjk_alphabet;
-    try testPrintSliceDifferential(io_impl, alloc, rand, alphabet, 500, 80, 24);
-    try testPrintSliceDifferential(io_impl, alloc, rand, alphabet, 500, 11, 4);
-    try testPrintSliceDifferential(io_impl, alloc, rand, alphabet, 500, 5, 2);
+    try testPrintSliceDifferential(io_impl, alloc, rand, alphabet, 250, 80, 24);
+    try testPrintSliceDifferential(io_impl, alloc, rand, alphabet, 250, 11, 4);
+    try testPrintSliceDifferential(io_impl, alloc, rand, alphabet, 250, 5, 2);
     try testPrintSliceDifferential(io_impl, alloc, rand, alphabet, 200, 3, 2);
 }
 

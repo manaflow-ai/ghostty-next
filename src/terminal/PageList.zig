@@ -1343,12 +1343,24 @@ pub fn resize(self: *PageList, opts: Resize) Allocator.Error!void {
         .lt => {
             // We first change our row count so that we have the proper amount
             // we can use when shrinking our cols.
+            const old_active_top = self.total_rows - self.rows;
             try self.resizeWithoutReflow(opts: {
                 var copy = opts;
                 copy.cols = self.cols;
                 break :opts copy;
             });
-            try self.resizeCols(cols, opts);
+
+            // Changing the row count doesn't move any content, only the top of
+            // the active area (e.g. when pulling down scrollback), so the
+            // cursor's row in the active area moves by the opposite amount.
+            var cols_opts = opts;
+            if (cols_opts.cursor) |*c| {
+                const screen_y = old_active_top + c.y;
+                const new_active_top = self.total_rows - self.rows;
+                if (screen_y >= new_active_top) c.y = @intCast(screen_y - new_active_top);
+            }
+
+            try self.resizeCols(cols, cols_opts);
         },
     }
 
@@ -3095,33 +3107,46 @@ fn resizeWithoutReflowGrowCols(
             page.size.rows,
         );
 
+        const prev_start = prev_page.size.rows;
         const src_rows = page.rows.ptr(page.memory)[0..len];
-        const dst_rows = prev_page.rows.ptr(prev_page.memory)[prev_page.size.rows..];
-        for (dst_rows, src_rows) |*dst_row, *src_row| {
-            prev_page.size.rows += 1;
-            copied += 1;
-            prev_page.cloneRowFrom(
-                page,
-                dst_row,
-                src_row,
-            ) catch {
-                // If an error happens, we undo our row copy and break out
-                // into creating a new page.
-                prev_page.size.rows -= 1;
-                copied -= 1;
-                break :prev;
-            };
+        const dst_rows = prev_page.rows.ptr(prev_page.memory)[prev_start..];
+        {
+            // As in Page.cloneFrom, check the page once after the loop
+            // rather than after every row.
+            prev_page.pauseIntegrityChecks(true);
+            defer prev_page.pauseIntegrityChecks(false);
+            for (dst_rows, src_rows) |*dst_row, *src_row| {
+                prev_page.size.rows += 1;
+                prev_page.cloneRowFrom(
+                    page,
+                    dst_row,
+                    src_row,
+                ) catch {
+                    // If an error happens, we undo this row's partial copy
+                    // and stop. The rows copied so far stay in prev and the
+                    // rest go into new pages below. The retired row must be
+                    // left in the default state (see resetRow).
+                    prev_page.resetRow(dst_row);
+                    prev_page.size.rows -= 1;
+                    break;
+                };
+                copied += 1;
+            }
         }
+        prev_page.assertIntegrity();
 
-        assert(copied == len);
+        assert(copied <= len);
         assert(prev_page.size.rows <= prev_page.capacity.rows);
 
-        // Remap any tracked pins that pointed to rows we just copied to prev.
+        // Remap any tracked pins that pointed to rows we just copied to
+        // prev. This must also run when the copy stopped early, since the
+        // loop below only remaps the rows it copies and the source page
+        // is destroyed at the end.
         const pin_keys = self.tracked_pins.keys();
         for (pin_keys) |p| {
-            if (p.node != chunk.node or p.y >= len) continue;
+            if (p.node != chunk.node or p.y >= copied) continue;
             p.node = prev_node;
-            p.y += prev_page.size.rows - len;
+            p.y += prev_start;
         }
     }
 
@@ -3152,6 +3177,12 @@ fn resizeWithoutReflowGrowCols(
         const new_node = try self.createPage(.{ .cap = cap });
         const new_page = new_node.page();
         defer new_page.assertIntegrity();
+
+        // Check the page once when it is full, not after every row.
+        // Defers run in reverse order, so the pause ends before the
+        // check above runs.
+        new_page.pauseIntegrityChecks(true);
+        defer new_page.pauseIntegrityChecks(false);
 
         // The length we can copy into the new page is at most the number
         // of rows in our cap. But if we can finish our source page we use that.
@@ -21201,8 +21232,24 @@ test "PageList resize (no reflow) more cols remaps viewport pin when backfill st
     var s = try init(alloc, .{ .cols = cols, .rows = 10 });
     defer s.deinit();
 
-    // Three pages with the active area entirely in the last one.
-    while (s.totalPages() < 3) _ = try s.grow();
+    // Three pages with the active area entirely in the last one. In Debug
+    // builds every grow checks the whole last page, so filling a page one
+    // row at a time checks it thousands of times. Pause each page's checks
+    // while it fills, and check it once when the next page starts.
+    {
+        var cur = s.pages.last.?;
+        cur.page().pauseIntegrityChecks(true);
+        while (s.totalPages() < 3) {
+            if (try s.grow()) |new_node| {
+                cur.page().pauseIntegrityChecks(false);
+                cur.page().assertIntegrity();
+                cur = new_node;
+                cur.page().pauseIntegrityChecks(true);
+            }
+        }
+        cur.page().pauseIntegrityChecks(false);
+        cur.page().assertIntegrity();
+    }
     for (0..s.rows) |_| _ = try s.grow();
     try testing.expectEqual(3, s.totalPages());
 

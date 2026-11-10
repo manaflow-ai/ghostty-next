@@ -2466,6 +2466,10 @@ pub inline fn resize(
     // state is correct.
     self.cursorReload();
 
+    // Erasing history marks a cursor pin in the erased rows as garbage, but
+    // the cursor stays live wherever the pin moved to.
+    self.cursor.page_pin.garbage = false;
+
     // If resize moved a cursor with pending wrap away from the right edge,
     // advance to the next cell instead of wrapping on the next print.
     if (self.cursor.pending_wrap and self.cursor.x != opts.cols - 1) {
