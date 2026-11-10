@@ -353,7 +353,14 @@ pub fn setEmbedderPresents(self: *Metal, enabled: bool) void {
 /// queue, while they still name this renderer, closes that window. A
 /// layer whose callback was rebound to another renderer is left alone.
 /// Ported from manaflow-ai/ghostty adee7043fc and dd726a9a60.
+///
+/// Every platform: the embedder's present callback goes first. Its userdata
+/// may be freed once `ghostty_surface_free` returns, while a frame queued for
+/// the main thread before the free (`setSurfaceCallback`) can still reach the
+/// layer the embedder's view keeps. Frames in flight on the GPU completion
+/// thread finish before the free returns (`releaseGpuResources` waits).
 pub fn prepareDeinit(self: *Metal) void {
+    self.layer.setPresentCallback(null, null);
     if (comptime builtin.os.tag != .ios) return;
     const renderer: *align(1) Renderer = @fieldParentPtr("api", self);
     self.layer.detachFromHostIfDisplayCallbackOwned(
