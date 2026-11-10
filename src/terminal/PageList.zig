@@ -21185,6 +21185,107 @@ test "PageList resize (no reflow) more cols remaps pins in backfill path" {
     try testing.expectEqual(marker, cell.content.codepoint.data);
 }
 
+test "PageList resize (no reflow) more cols remaps viewport pin when backfill stops early" {
+    // Regression test: the backfill in resizeWithoutReflowGrowCols stops
+    // at the first row that doesn't fit in the previous page (here, its
+    // graphemes exceed that page's capacity). The rows copied before it
+    // must still have their tracked pins remapped, or a viewport scrolled
+    // onto one of them is left on the destroyed page.
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const cols: size.CellCountInt = 5;
+    const new_cols: size.CellCountInt = cols + 1;
+    const new_cap = try std_capacity.adjust(.{ .cols = new_cols });
+
+    var s = try init(alloc, .{ .cols = cols, .rows = 10 });
+    defer s.deinit();
+
+    // Three pages with the active area entirely in the last one.
+    while (s.totalPages() < 3) _ = try s.grow();
+    for (0..s.rows) |_| _ = try s.grow();
+    try testing.expectEqual(3, s.totalPages());
+
+    // Leave the first page one row longer than a page at the new width
+    // holds, so its copy ends in a one-row page with spare capacity that
+    // the second page backfills.
+    {
+        const first = s.pages.first.?;
+        try testing.expect(first.rows() > new_cap.rows + 1);
+        s.eraseHistory(.{ .history = .{
+            .y = first.rows() - (new_cap.rows + 1) - 1,
+        } });
+        try testing.expectEqual(first, s.pages.first.?);
+        try testing.expectEqual(new_cap.rows + 1, first.rows());
+    }
+
+    // Give the second page more grapheme capacity than the backfill
+    // target has and fill its row 1 past the target's capacity. Row 0
+    // is plain, so the backfill copies it and then stops at row 1.
+    const cps: [64]u21 = @splat(0x0301);
+    const second = second: {
+        var node = s.pages.first.?.next.?;
+        for (0..3) |_| node = try s.increaseCapacity(node, .grapheme_bytes);
+        break :second node;
+    };
+    {
+        const page = second.page();
+        const rac = page.getRowAndCell(0, 0);
+        rac.cell.* = .{
+            .content_tag = .codepoint,
+            .content = .{ .codepoint = .{ .data = 'X' } },
+        };
+
+        for (0..cols) |x| {
+            const g = page.getRowAndCell(x, 1);
+            g.cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = .{ .data = 'G' } },
+            };
+            try page.setGraphemes(g.row, g.cell, &cps);
+        }
+    }
+
+    // Scroll the viewport to the row the backfill copies.
+    s.scroll(.{ .pin = .{ .node = second, .y = 0 } });
+    try testing.expect(s.viewport == .pin);
+    const offset = s.scrollbar().offset;
+
+    try s.resize(.{ .cols = new_cols, .reflow = false });
+
+    // The viewport is still on the same row, in a live page.
+    try testing.expect(s.viewport == .pin);
+    try testing.expectEqual(offset, s.scrollbar().offset);
+    {
+        const cell = s.viewport_pin.rowAndCell().cell;
+        try testing.expectEqual('X', cell.content.codepoint.data);
+    }
+
+    // The backfilled page ends at the viewport row. The row that didn't
+    // fit was retired from it in the default state, without leaking the
+    // graphemes it partially copied.
+    {
+        const node = s.viewport_pin.node;
+        const page = node.page();
+        try testing.expectEqual(s.viewport_pin.y + 1, node.rows());
+        const retired = &page.rows.ptr(page.memory)[node.rows()];
+        try testing.expect(!retired.managedMemory());
+        try testing.expectEqual(0, page.graphemeCount());
+    }
+
+    // The row that didn't fit keeps its graphemes in the next page.
+    {
+        const p = s.viewport_pin.down(1).?;
+        try testing.expect(p.node != s.viewport_pin.node);
+        const rac = p.rowAndCell();
+        try testing.expectEqual('G', rac.cell.content.codepoint.data);
+        try testing.expectEqual(
+            cps.len,
+            p.node.page().lookupGrapheme(rac.cell).?.len,
+        );
+    }
+}
+
 test "PageList compact pool page produces exact-size heap page" {
     const testing = std.testing;
     const alloc = testing.allocator;

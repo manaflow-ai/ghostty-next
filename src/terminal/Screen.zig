@@ -4255,6 +4255,24 @@ test "Screen reset cursor pin is not garbage" {
     try testing.expect(!s.cursor.page_pin.garbage);
 }
 
+test "Screen resize erasing the cursor row leaves its pin not garbage" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try Screen.init(io, alloc, .{ .cols = 12, .rows = 6, .max_scrollback_bytes = 0 });
+    defer s.deinit();
+
+    // Content on the bottom row stops the resize from trimming blank rows,
+    // so shrinking pushes the top rows and the cursor into erased history.
+    s.cursorAbsolute(0, 5);
+    try s.testWriteString("x");
+    s.cursorAbsolute(0, 0);
+
+    try s.resize(.{ .cols = 12, .rows = 3 });
+    try testing.expect(!s.cursor.page_pin.garbage);
+}
+
 test "Screen read and write" {
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -9187,6 +9205,34 @@ test "Screen: resize more rows, less cols with reflow with scrollback" {
         const expected = "1A\nBC\nD\n2E\nFG\nH3\nIJ\nKL\n4M\nNO\nP";
         try testing.expectEqualStrings(expected, contents);
     }
+}
+
+test "Screen: resize more rows, less cols pulls scrollback like separate resizes" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{ .cols = 5, .rows = 2, .max_scrollback_bytes = null });
+    defer s.deinit();
+    try s.testWriteString("1A\n2B\n3C\n");
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("3C", contents);
+    }
+    try testing.expectEqual(@as(size.CellCountInt, 1), s.cursor.y);
+
+    // Growing the rows pulls the scrollback down because the cursor is at
+    // the bottom, and shrinking the cols in the same resize must not push
+    // it back.
+    try s.resize(.{ .cols = 4, .rows = 4 });
+
+    {
+        const contents = try s.dumpStringAlloc(alloc, .{ .viewport = .{} });
+        defer alloc.free(contents);
+        try testing.expectEqualStrings("1A\n2B\n3C", contents);
+    }
+    try testing.expectEqual(@as(size.CellCountInt, 3), s.cursor.y);
 }
 
 // This seems like it should work fine but for some reason in practice
