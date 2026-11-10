@@ -129,12 +129,6 @@ const log = std.log.scoped(.generic_renderer);
 ///                     in case that the frame needs to be composited with
 ///                     UI elements by the graphical toolkit manually.
 ///
-/// A screen size as one value (width << 32 | height), for comparing the
-/// size cells were built for with the size a frame draws at.
-fn packScreen(screen: renderer.ScreenSize) u64 {
-    return (@as(u64, screen.width) << 32) | screen.height;
-}
-
 pub fn Renderer(comptime GraphicsAPI: type) type {
     return struct {
         const Self = @This();
@@ -227,17 +221,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// cells for the draw call.
         cells_rebuilt: bool = false,
 
-        /// The screen size (packed width << 32 | height) the cells were
-        /// last built for. Under `draw_mutex`.
-        cells_screen: u64 = 0,
-        /// The cells were built from the live terminal at the grid that fits
-        /// `cells_screen`, after the program drew a whole picture for that
-        /// grid (`Terminal.programDrewGrid`): the program redrew for this
-        /// size. Never for a reflow preview. Under `draw_mutex`.
-        cells_program_fresh: bool = false,
-        /// The cells were built from the alternate screen (a full-screen
-        /// program). Under `draw_mutex`.
-        cells_alternate: bool = false,
         /// Set to true after the Kitty image placements are rebuilt. Like
         /// `cells_rebuilt`, this means the next frame must be drawn. This
         /// matters when the images change but no cell does, for example
@@ -1323,13 +1306,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 break :kitty @max(next -| now_ms, draw_interval_ms);
             };
 
-            // The synced resize hold (macOS Metal): a redraw at its bound
-            // shows the new size with the program's last picture.
-            const hold_delay: ?u64 = if (@hasDecl(GraphicsAPI, "resizeHoldWakeMs"))
-                self.api.resizeHoldWakeMs()
-            else
-                null;
-
             // A theme color blend redraws every frame until it ends: draw
             // only, the cells stay (ColorBlend).
             if (self.color_blend.isRunning()) {
@@ -1341,18 +1317,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // An update wake includes a draw, so it wins ties.
             if (kitty_delay) |k| {
-                if ((shader_delay == null or k <= shader_delay.?) and
-                    (hold_delay == null or k <= hold_delay.?))
-                {
+                if (shader_delay == null or k <= shader_delay.?) {
                     return .{ .delay_ms = k, .kind = .update };
                 }
             }
 
-            if (shader_delay) |s| {
-                if (hold_delay == null or s <= hold_delay.?) return .{ .delay_ms = s, .kind = .draw };
-            }
-
-            if (hold_delay) |h| return .{ .delay_ms = h, .kind = .draw };
+            if (shader_delay) |s| return .{ .delay_ms = s, .kind = .draw };
 
             return null;
         }
@@ -1634,8 +1604,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 swapped: bool,
                 resized: bool,
                 color_transition: ColorBlend.Spec,
-                program_fresh: bool,
-                alternate: bool,
             };
 
             // Update all our data as tightly as possible within the mutex.
@@ -1834,17 +1802,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .resized = resized,
                     .color_config_at = state.color_config_at,
                     .color_transition = state.color_transition,
-                    // The program drew for the grid of this size: the live
-                    // terminal (not a reflow preview) has the grid that fits
-                    // and a whole picture the program drew for it after its
-                    // last grid change.
-                    .program_fresh = drawn == state.terminal and
-                        state.terminal.programDrewGrid() and
-                        state.terminal.cols == fit.columns and
-                        state.terminal.rows == fit.rows,
-                    // A full-screen program's screen: the synced resize hold
-                    // keeps its frame of a new size for its redraw.
-                    .alternate = state.terminal.screens.active_key == .alternate,
                 };
             };
 
@@ -2000,12 +1957,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     comptime assert(@TypeOf(err) == error{OutOfMemory});
                     log.warn("error rebuilding GPU cells err={}", .{err});
                 };
-                // The screen size these cells were laid out for (the grid
-                // that fits it, the reflow preview's too): a frame drawn at
-                // another size shows them clipped or padded.
-                self.cells_screen = packScreen(self.size.screen);
-                self.cells_program_fresh = critical.program_fresh;
-                self.cells_alternate = critical.alternate;
 
                 // The scrollbar is only emitted during draws so we also
                 // check the scrollbar cache here and update if needed.
@@ -2110,15 +2061,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.api.drawFrameStart();
             defer self.api.drawFrameEnd();
 
-            // The synced resize hold reached its bound: this draw shows the
-            // size, so it draws even when nothing else changed. Read first,
-            // so a draw that returns early still ends the hold (its wake
-            // would come again at once otherwise).
-            const resize_hold_ends = if (@hasDecl(GraphicsAPI, "resizeHoldEnds"))
-                self.api.resizeHoldEnds()
-            else
-                false;
-
             // Retrieve the most up-to-date surface size from the Graphics API
             const surface_size = try self.api.surfaceSize();
 
@@ -2160,7 +2102,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.cells_rebuilt or
                 self.images_rebuilt or
                 self.animationWake() != null or
-                resize_hold_ends or
                 sync;
 
             if (!needs_redraw) {
@@ -2289,17 +2230,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 defer self.font_grid.lock.unlockShared(global.io());
                 frame.color_modified = self.font_grid.atlas_color.modified.load(.monotonic);
                 try self.syncAtlasTexture(&self.font_grid.atlas_color, &frame.color);
-            }
-
-            // Whether the program redrew at this size's grid before these
-            // cells were built, and whether they show the alternate screen
-            // (the synced host present mode's resize hold, `Metal.present`).
-            if (@hasField(GraphicsAPI.Target, "program_fresh")) {
-                frame.target.program_fresh = self.cells_program_fresh and
-                    self.cells_screen == packScreen(self.size.screen);
-            }
-            if (@hasField(GraphicsAPI.Target, "alternate")) {
-                frame.target.alternate = self.cells_alternate;
             }
 
             // Get a frame context from the graphics API.

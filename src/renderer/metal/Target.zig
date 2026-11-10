@@ -41,20 +41,6 @@ width: usize,
 /// Current height of this target.
 height: usize,
 
-/// The frame drawn into this target shows the alternate screen (a
-/// full-screen program): in the synced host present mode, its frame of a new
-/// host size waits for the program's redraw at the new grid
-/// (`program_fresh`) or the resize hold's bound (`Metal.present`). Set before
-/// each draw.
-alternate: bool = false,
-
-/// The frame drawn into this target is program fresh: its cells were built
-/// at this target's size, the terminal it drew has the grid that fits this
-/// size, and the program drew a whole picture for that grid after its last
-/// change (`Terminal.programDrewGrid`). A reflow preview never is. Set before
-/// each draw.
-program_fresh: bool = false,
-
 pub fn init(opts: Options) !Self {
     // We set our surface's color space to Display P3.
     // This allows us to have "Apple-style" alpha blending,

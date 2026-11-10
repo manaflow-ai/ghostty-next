@@ -2260,16 +2260,6 @@ pub const CAPI = struct {
         api.setPresentCallback(callback, userdata);
     }
 
-    /// When the frame of a new host size shows: when drawn, or after the
-    /// resize hold of a full-screen program (RENDERER_SYNCED). See ghostty.h.
-    export fn ghostty_surface_set_host_present(surface: *Surface, mode_raw: c_int) void {
-        if (comptime builtin.os.tag != .macos) return;
-        const mode = std.enums.fromInt(apprt.HostPresent, mode_raw) orelse return;
-        const api = &surface.core_surface.renderer.api;
-        if (comptime !@hasDecl(@TypeOf(api.*), "setHostPresent")) return;
-        api.setHostPresent(mode);
-    }
-
     /// Draw a reflow preview while the locked grid does not fit the view.
     /// See ghostty.h.
     export fn ghostty_surface_set_reflow_preview(surface: *Surface, enabled: bool) void {
@@ -2324,7 +2314,6 @@ pub const CAPI = struct {
         host_main_presents: u64,
         host_main_draws: u64,
         host_size_presents: u64,
-        host_held_frames: u64,
         host_off_main_presents: u64,
         renderer_wakeups: u64,
         renderer_draw_now: u64,
@@ -2353,7 +2342,6 @@ pub const CAPI = struct {
             .host_main_presents = hostCounter(surface, "main_presents"),
             .host_main_draws = hostCounter(surface, "main_draws"),
             .host_size_presents = hostCounter(surface, "size_presents"),
-            .host_held_frames = hostCounter(surface, "held"),
             .host_off_main_presents = hostCounter(surface, "off_main_presents"),
             .renderer_wakeups = c.thread_wakeups.load(.monotonic),
             .renderer_draw_now = c.thread_draw_now.load(.monotonic),
@@ -2388,15 +2376,7 @@ pub const CAPI = struct {
         rows: u16,
         generation: u64,
     ) bool {
-        const set = surface.core_surface.io.setGrid(cols, rows, generation);
-        // The program learns this grid now: a running resize hold's bound
-        // counts from here (RENDERER_SYNCED).
-        if (comptime builtin.os.tag == .macos and
-            @hasDecl(@TypeOf(surface.core_surface.renderer.api), "restartResizeHold"))
-        {
-            if (set) surface.core_surface.renderer.api.restartResizeHold();
-        }
-        return set;
+        return surface.core_surface.io.setGrid(cols, rows, generation);
     }
 
     /// Return the terminal grid and its lock. See ghostty.h.

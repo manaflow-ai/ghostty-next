@@ -2585,8 +2585,8 @@ test "manual: a mirror never reflows" {
 }
 
 test "manual: a whole picture after a grid change marks the program drawn at that grid" {
-    // cmux RESIZE P0 12/13: a host-size frame is program fresh only when the program drew a whole picture for the
-    // terminal's grid after its last grid change (Target.program_fresh).
+    // cmux RESIZE P0 12/13: the program drew at a grid only when it drew a whole picture for the terminal's grid
+    // after its last grid change (`Terminal.programDrewGrid`).
     const body = struct {
         fn run(io: *Termio, _: *TestSink, _: bool) !void {
             const testing = std.testing;

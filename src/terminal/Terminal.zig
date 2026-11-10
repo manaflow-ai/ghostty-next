@@ -3023,8 +3023,9 @@ pub const SemanticPrompt = enum {
 /// If the shell integration doesn't exist, this will always return false.
 /// Whether the program drew a whole picture for the current grid after the
 /// grid's last change: the screen shows what the program drew for this grid,
-/// not only its old picture reflowed, clipped or padded. The renderer reads
-/// it under the terminal lock (`Target.program_fresh`).
+/// not only its old picture reflowed, clipped or padded. Read under
+/// the terminal lock. The renderer does not read it now (the resize hold that
+/// did is deleted, NEXT.md "resize sync in the renderer").
 pub fn programDrewGrid(self: *const Terminal) bool {
     return self.program_redraw.drew_grid;
 }

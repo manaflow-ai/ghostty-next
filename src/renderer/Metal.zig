@@ -14,7 +14,6 @@ const configpkg = @import("../config.zig");
 const rendererpkg = @import("../renderer.zig");
 const Renderer = rendererpkg.GenericRenderer(Metal);
 const shadertoy = @import("shadertoy.zig");
-const global = @import("../global.zig");
 const IOSurface = macos.iosurface.IOSurface;
 
 const mtl = @import("metal/api.zig");
@@ -66,29 +65,6 @@ host_size: std.atomic.Value(u64) = .init(0),
 /// surface's display pass draws nothing.
 visible_hint: std.atomic.Value(bool) = .init(true),
 
-/// macOS host-sized surfaces (`ghostty_surface_set_host_present`): in the
-/// synced mode, the renderer keeps a full-screen program's last frame after
-/// a new host size until the program redrew at the new grid or the bound
-/// passed (`resize_hold_bound_ns`). Main thread writes; the GPU completion
-/// thread reads.
-host_present: std.atomic.Value(apprt.HostPresent) = .init(.renderer),
-
-/// The resize hold of the current host size runs (synced mode): a frame of
-/// that size on the alternate screen without the program's redraw at its
-/// grid is not shown before `resize_hold_until_ns`. Armed by a new host size
-/// (`setHostDrawableSize`, main thread); disarmed when a frame of the host
-/// size is shown (GPU completion thread), when the renderer thread draws at
-/// the bound (`resizeHoldEnds`) or at a reveal (`setShownFromMain`).
-resize_hold_armed: std.atomic.Value(bool) = .init(false),
-
-/// When the resize hold ends, on the awake clock (nanoseconds). Set with
-/// the hold, moved by a grid the PTY owner announced (`restartResizeHold`).
-resize_hold_until_ns: std.atomic.Value(i64) = .init(0),
-
-/// The resize hold's bound (`default_resize_hold_bound_ns`; tests set a
-/// longer one).
-resize_hold_bound_ns: i64 = default_resize_hold_bound_ns,
-
 /// Numbers presented frames in completion order, so a frame the main thread
 /// presents late never replaces a newer one presented off main. GPU
 /// completion thread.
@@ -106,19 +82,10 @@ pub const HostFrameCounters = struct {
     /// Frames of the host size handed to the main thread's present (a size change, or a frame while main's commit of one
     /// is pending).
     size_presents: std.atomic.Value(u64) = .init(0),
-    /// Frames of a new host size not shown because the resize hold runs (synced mode).
-    held: std.atomic.Value(u64) = .init(0),
     /// Frames handed to the main thread's present (`IOSurfaceLayer.setSurface`): from the GPU completion thread, one
     /// block on the main queue each.
     main_presents: std.atomic.Value(u64) = .init(0),
 };
-
-/// The resize hold's bound in refreshes (design: `resizeHoldTicks` of cmux's
-/// hold, 3), and the refresh it counts: 120 Hz, the panel the bound was set
-/// on. A 60 Hz display holds for 3 of its 120 Hz refreshes, 1.5 of its own.
-const resize_hold_refreshes = 3;
-const resize_hold_refresh_ns = std.time.ns_per_s / 120;
-const default_resize_hold_bound_ns: i64 = resize_hold_refreshes * resize_hold_refresh_ns;
 
 pub fn init(
     alloc: Allocator,
@@ -252,8 +219,10 @@ pub fn setHostedLayerSize(
 /// the last frame from its top-left corner (`contentsGravity`; the embedder
 /// clips the view), and new output still draws at the held size. A new size
 /// draws at once on the renderer thread (`Thread` resize), and its frame
-/// shows through the main thread (`present`), in the synced mode after the
-/// resize hold for a full-screen program.
+/// shows through the main thread (`present`) in the commit that follows its
+/// draw, for each screen and each program: the renderer never keeps the frame
+/// of an older size while the host size goes on, because the embedder's view
+/// has the new size and would cut or pad the kept frame.
 pub fn setHostDrawableSize(self: *Metal, enabled: bool, width_px: u32, height_px: u32) void {
     if (comptime builtin.os.tag != .macos) return;
     const max = self.device.max_texture_size;
@@ -264,14 +233,6 @@ pub fn setHostDrawableSize(self: *Metal, enabled: bool, width_px: u32, height_px
     if (self.host_size.swap(value, .acq_rel) == value) return;
     self.layer.setHostSize(value);
     self.layer.layer.setProperty("needsDisplayOnBoundsChange", value == 0);
-    // The hold of the new size starts now. The renderer thread wakes at its
-    // bound (`resizeHoldWakeMs`).
-    if (value != 0 and self.host_present.load(.acquire) == .renderer_synced) {
-        self.resize_hold_until_ns.store(nowNs() + self.resize_hold_bound_ns, .release);
-        self.resize_hold_armed.store(true, .release);
-    } else {
-        self.resize_hold_armed.store(false, .release);
-    }
     // The renderer thread draws and presents a new host size itself. A
     // display pass draws only a first frame (nothing shown yet) or a surface
     // that follows its bounds again. Only the main thread makes the layer
@@ -293,51 +254,6 @@ pub fn setHostContentScale(self: *Metal, scale: f64) void {
 /// on the thread that sets it. Main thread.
 pub fn setPresentCallback(self: *Metal, cb: ?apprt.PresentCallback, userdata: ?*anyopaque) void {
     self.layer.setPresentCallback(cb, userdata);
-}
-
-/// macOS host-sized surfaces (`ghostty_surface_set_host_present`): who
-/// decides when a frame of a new host size shows. `.renderer` shows it when
-/// drawn; `.renderer_synced` keeps a full-screen program's last frame until
-/// its redraw at the new grid or the bound (`present`). Main thread.
-pub fn setHostPresent(self: *Metal, mode: apprt.HostPresent) void {
-    if (comptime builtin.os.tag != .macos) return;
-    if (self.host_present.swap(mode, .acq_rel) == mode) return;
-    if (mode != .renderer_synced) self.resize_hold_armed.store(false, .release);
-}
-
-/// A grid the PTY owner announced for this surface (`ghostty_surface_set_grid`,
-/// a mirror surface): its program learns the grid now, so the bound of a
-/// running resize hold counts from now. Any thread.
-pub fn restartResizeHold(self: *Metal) void {
-    if (comptime builtin.os.tag != .macos) return;
-    if (!self.resize_hold_armed.load(.acquire)) return;
-    self.resize_hold_until_ns.store(nowNs() + self.resize_hold_bound_ns, .release);
-}
-
-/// The renderer thread's wake for the resize hold (`GenericRenderer.animationWake`):
-/// milliseconds until its bound while it runs (0 once due), null otherwise.
-pub fn resizeHoldWakeMs(self: *const Metal) ?u64 {
-    if (comptime builtin.os.tag != .macos) return null;
-    if (!self.resize_hold_armed.load(.acquire)) return null;
-    const remaining = self.resize_hold_until_ns.load(.acquire) - nowNs();
-    if (remaining <= 0) return 0;
-    return @intCast(std.math.divCeil(i64, remaining, std.time.ns_per_ms) catch 0);
-}
-
-/// The resize hold reached its bound: it ends here, once, and the frame drawn
-/// now shows the size (with the program's last picture). Renderer thread, at
-/// each draw (`GenericRenderer.drawFrame`).
-pub fn resizeHoldEnds(self: *Metal) bool {
-    if (comptime builtin.os.tag != .macos) return false;
-    if (!self.resize_hold_armed.load(.acquire)) return false;
-    if (nowNs() < self.resize_hold_until_ns.load(.acquire)) return false;
-    return self.resize_hold_armed.swap(false, .acq_rel);
-}
-
-/// The awake clock in nanoseconds.
-fn nowNs() i64 {
-    const now: std.Io.Timestamp = .now(global.io(), .awake);
-    return @intCast(now.nanoseconds);
 }
 
 /// iOS only: detach the IOSurfaceLayer from the embedder's view before
@@ -491,23 +407,15 @@ pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
         if (host != 0) {
             const at_host = (host >> 32) == target.width and (host & 0xffff_ffff) == target.height;
             // A frame at the shown size goes to the screen from this (completion) thread: a terminal echo, a scroll
-            // or output never waits for main, during a resize hold too.
+            // or output never waits for main.
             if (self.layer.setSurfaceOffMain(target.surface, seq)) {
                 _ = self.counters.off_main_presents.fetchAdd(1, .monotonic);
-                if (at_host) self.resize_hold_armed.store(false, .release);
                 return;
             }
-            if (at_host) {
-                // The synced mode's resize hold: a full-screen program's frame of a new size without its redraw at
-                // the new grid is not shown (nor handed to main) until the bound; the layer keeps the last frame,
-                // top-left, clipped or padded, never stretched. The renderer thread draws again at the bound.
-                if (self.holdsFrame(target)) {
-                    _ = self.counters.held.fetchAdd(1, .monotonic);
-                    return;
-                }
-                self.resize_hold_armed.store(false, .release);
-                _ = self.counters.size_presents.fetchAdd(1, .monotonic);
-            }
+            // A frame of the host size that the layer does not show yet always goes to main, whatever it shows (a
+            // full-screen program that has not redrawn at the new grid too): the view has that size now, so a kept
+            // frame of an older size would be cut or padded by it.
+            if (at_host) _ = self.counters.size_presents.fetchAdd(1, .monotonic);
         }
     }
     // Through main: a new size shows in main's transaction, with the bounds of that pass, and frames at it go through
@@ -517,26 +425,9 @@ pub inline fn present(self: *Metal, target: Target, sync: bool) !void {
     try self.layer.setSurface(target.surface, seq);
 }
 
-/// Whether the resize hold keeps `target`, a frame of the host size that the
-/// layer cannot show off main: the synced mode's hold runs and has not
-/// reached its bound, the frame is of the alternate screen (a full-screen
-/// program) and the program has not redrawn at its grid, and the layer shows
-/// a frame of another size (a first frame, or one held only for main's
-/// commit, is never kept). GPU completion thread.
-fn holdsFrame(self: *Metal, target: Target) bool {
-    if (!target.alternate or target.program_fresh) return false;
-    if (self.host_present.load(.acquire) != .renderer_synced) return false;
-    if (!self.resize_hold_armed.load(.acquire)) return false;
-    if (nowNs() >= self.resize_hold_until_ns.load(.acquire)) return false;
-    const shown = self.layer.shownSize() orelse return false;
-    return shown.width != target.width or shown.height != target.height;
-}
-
 /// The surface was shown or hidden (`ghostty_surface_set_occlusion`, main
-/// thread). Shown: the frame due now was resized while hidden or replaces a
-/// purged one; the program had time to redraw, so no resize hold keeps it.
+/// thread).
 pub fn setShownFromMain(self: *Metal, visible: bool) void {
-    if (visible) self.resize_hold_armed.store(false, .release);
     self.setVisibleHint(visible);
 }
 
@@ -703,8 +594,6 @@ fn testMetal(device: *const Device) !Metal {
         .device = device,
         .queue = undefined,
         .blending = .native,
-        // A bound no test reaches by itself: a test ends a hold by moving `resize_hold_until_ns`.
-        .resize_hold_bound_ns = 60 * std.time.ns_per_s,
     };
 }
 
@@ -763,7 +652,7 @@ test "present callback: a present at size S reports S and the reason content" {
     metal.setPresentCallback(&TestPresents.record, &presents);
     // The renderer thread's next frame at the shown size S (output, an echo, a scroll): it goes to the layer off main,
     // and the callback reports S, the reason content and the frame's sequence number.
-    try metal.present(testFrame(drawn, .{}), false);
+    try metal.present(testFrame(drawn), false);
     try testing.expectEqual(@as(u64, 1), metal.counters.off_main_presents.load(.acquire));
     try testing.expectEqual(@as(u32, 1), presents.calls);
     try testing.expectEqual(@as(u32, 80), presents.last.width_px);
@@ -798,14 +687,14 @@ test "present callback: a frame of a new size reports the reason resize, and a r
 
     // A new host size: its frame goes through the main thread (on main here, at once) and reports its size.
     metal.setHostDrawableSize(true, 120, 60);
-    try metal.present(testFrame(resized, .{}), false);
+    try metal.present(testFrame(resized), false);
     try testing.expectEqual(@as(u32, 2), presents.calls);
     try testing.expectEqual(@as(u32, 120), presents.last.width_px);
     try testing.expectEqual(apprt.PresentReason.resize, presents.last.reason);
 
     // Removed: the next frame still shows, and nothing is reported.
     metal.setPresentCallback(null, null);
-    try metal.present(testFrame(later, .{}), false);
+    try metal.present(testFrame(later), false);
     try testing.expectEqual(@as(?usize, 120), testShownWidth(&metal));
     try testing.expectEqual(@as(u32, 2), presents.calls);
 }
@@ -828,7 +717,7 @@ test "present callback: a frame dropped at the wrong size is not reported" {
     var presents: TestPresents = .{};
     metal.setPresentCallback(&TestPresents.record, &presents);
     // A late frame of a size the host no longer has: the main-thread present drops it, so it never reaches the layer.
-    try metal.present(testFrame(stale, .{}), false);
+    try metal.present(testFrame(stale), false);
     try testing.expectEqual(@as(?usize, 80), testShownWidth(&metal));
     try testing.expectEqual(@as(u32, 0), presents.calls);
 }
@@ -884,13 +773,14 @@ test "host present: a frame of a size the host no longer has goes through main, 
     defer testDeinit(&metal);
     const shown = try testSurface(80, 60);
     defer shown.release();
-    testSynced(&metal, shown);
+    testHostSized(&metal, shown);
     metal.setHostDrawableSize(true, 120, 60);
     const stale = try testSurface(100, 60);
     defer stale.release();
-    try metal.present(testFrame(stale, .{ .alternate = true }), false);
+    try metal.present(testFrame(stale), false);
     try testing.expectEqual(@as(?usize, 80), testShownWidth(&metal));
-    try testing.expectEqual(@as(u64, 0), metal.counters.held.load(.acquire));
+    try testing.expectEqual(@as(u64, 1), metal.counters.main_presents.load(.acquire));
+    try testing.expectEqual(@as(u64, 0), metal.counters.size_presents.load(.acquire));
 }
 
 /// Turns the main run loop once (Core Animation's commit, then `IOSurfaceLayer`'s observer after it).
@@ -898,32 +788,28 @@ fn testRunMainLoopOnce() void {
     _ = macos.c.CFRunLoopRunInMode(macos.c.kCFRunLoopDefaultMode, 0, 0);
 }
 
-/// A frame the renderer drew at `surface`'s size, on the primary or the alternate screen, with or without the
-/// program's redraw at its grid.
-fn testFrame(surface: *IOSurface, flags: struct { alternate: bool = false, program_fresh: bool = false }) Target {
+/// A frame the renderer drew at `surface`'s size.
+fn testFrame(surface: *IOSurface) Target {
     return .{
         .surface = surface,
         .texture = undefined,
         .width = surface.getWidth(),
         .height = surface.getHeight(),
-        .alternate = flags.alternate,
-        .program_fresh = flags.program_fresh,
     };
 }
 
-/// A synced host-sized surface that shows an 80x60 frame, committed (frames at that size go off main).
-fn testSynced(metal: *Metal, shown: *IOSurface) void {
-    metal.setHostPresent(.renderer_synced);
-    metal.setHostDrawableSize(true, 80, 60);
+/// A host-sized surface that shows `shown` at the host size, committed (frames at that size go off main).
+fn testHostSized(metal: *Metal, shown: *IOSurface) void {
+    metal.setHostDrawableSize(true, @intCast(shown.getWidth()), @intCast(shown.getHeight()));
     metal.layer.setSurfaceSync(shown);
     testRunMainLoopOnce();
 }
 
-test "resize sync: a scroll and an output frame during a resize hold are never routed through main" {
+test "resize sync: a frame of a new host size goes through main once, and frames at the shown size go off main" {
     // ghostty-integration step 4 (cmux GI RENDERER SYNC): with the hold in cmux (P1-P8), Ghostty sent every frame
     // through main until the embedder reported its commit (P3), so a resize policy touched scroll and output frames.
-    // In the synced mode the renderer holds only a TUI's frame of a new size, on its own thread: no frame of the hold
-    // goes to a main-queue block, and a frame at the shown size goes off main.
+    // The renderer times the frames itself: the frame of a new size changes the shown size once, on main, and after
+    // main's commit a frame at the shown size goes off main, with no report from the embedder.
     const testing = std.testing;
     try testing.expect(testIsMainThread());
     const pool = objc.AutoreleasePool.init();
@@ -933,50 +819,31 @@ test "resize sync: a scroll and an output frame during a resize hold are never r
     defer testDeinit(&metal);
     const shown = try testSurface(80, 60);
     defer shown.release();
-    testSynced(&metal, shown);
+    testHostSized(&metal, shown);
 
-    // A TUI's pane grows: its program has not redrawn at the new grid.
+    // The pane grows: the frame of the new size shows from the main thread's present (on main here, at once).
     metal.setHostDrawableSize(true, 120, 60);
+    const resized = try testSurface(120, 60);
+    defer resized.release();
+    try metal.present(testFrame(resized), false);
+    try testing.expectEqual(@as(u64, 1), metal.counters.main_presents.load(.acquire));
+    try testing.expectEqual(@as(u64, 1), metal.counters.size_presents.load(.acquire));
+    try testing.expectEqual(@as(?usize, 120), testShownWidth(&metal));
+
+    // After main's commit, output and scroll at that size go off main.
+    testRunMainLoopOnce();
     const output = try testSurface(120, 60);
     defer output.release();
     const scroll = try testSurface(120, 60);
     defer scroll.release();
-    try metal.present(testFrame(output, .{ .alternate = true }), false);
-    try metal.present(testFrame(scroll, .{ .alternate = true }), false);
-    try testing.expectEqual(@as(u64, 0), metal.counters.main_presents.load(.acquire));
-    try testing.expectEqual(@as(u64, 2), metal.counters.held.load(.acquire));
-    try testing.expectEqual(@as(?usize, 80), testShownWidth(&metal));
-
-    // The drag comes back to the shown size during the hold: its output goes off main at once.
-    metal.setHostDrawableSize(true, 80, 60);
-    const back = try testSurface(80, 60);
-    defer back.release();
-    try metal.present(testFrame(back, .{ .alternate = true }), false);
-    try testing.expectEqual(@as(u64, 1), metal.counters.off_main_presents.load(.acquire));
-    try testing.expectEqual(@as(u64, 0), metal.counters.main_presents.load(.acquire));
-
-    // It grows again and the program redraws at the new grid: that frame changes the shown size, once, on main.
-    metal.setHostDrawableSize(true, 120, 60);
-    const redrawn = try testSurface(120, 60);
-    defer redrawn.release();
-    try metal.present(testFrame(redrawn, .{ .alternate = true, .program_fresh = true }), false);
+    try metal.present(testFrame(output), false);
+    try metal.present(testFrame(scroll), false);
     try testing.expectEqual(@as(u64, 1), metal.counters.main_presents.load(.acquire));
-    try testing.expectEqual(@as(?usize, 120), testShownWidth(&metal));
-
-    // After main's commit, output and scroll at that size go off main, with no report from the embedder.
-    testRunMainLoopOnce();
-    const output2 = try testSurface(120, 60);
-    defer output2.release();
-    const scroll2 = try testSurface(120, 60);
-    defer scroll2.release();
-    try metal.present(testFrame(output2, .{ .alternate = true }), false);
-    try metal.present(testFrame(scroll2, .{ .alternate = true }), false);
-    try testing.expectEqual(@as(u64, 1), metal.counters.main_presents.load(.acquire));
-    try testing.expectEqual(@as(u64, 3), metal.counters.off_main_presents.load(.acquire));
-    try testing.expectEqual(@as(?*anyopaque, @ptrCast(scroll2)), metal.layer.layer.getProperty(?*anyopaque, "contents"));
+    try testing.expectEqual(@as(u64, 2), metal.counters.off_main_presents.load(.acquire));
+    try testing.expectEqual(@as(?*anyopaque, @ptrCast(scroll)), metal.layer.layer.getProperty(?*anyopaque, "contents"));
 }
 
-test "resize sync: the primary screen shows a frame of a new host size at once" {
+test "resize sync: a first frame presents itself" {
     const testing = std.testing;
     try testing.expect(testIsMainThread());
     const pool = objc.AutoreleasePool.init();
@@ -984,134 +851,11 @@ test "resize sync: the primary screen shows a frame of a new host size at once" 
     const device = testDevice();
     var metal = try testMetal(&device);
     defer testDeinit(&metal);
-    const shown = try testSurface(80, 60);
-    defer shown.release();
-    testSynced(&metal, shown);
-
     metal.setHostDrawableSize(true, 120, 60);
-    const reflowed = try testSurface(120, 60);
-    defer reflowed.release();
-    try metal.present(testFrame(reflowed, .{}), false);
+    const first = try testSurface(120, 60);
+    defer first.release();
+    try metal.present(testFrame(first), false);
     try testing.expectEqual(@as(?usize, 120), testShownWidth(&metal));
-    try testing.expectEqual(@as(u64, 0), metal.counters.held.load(.acquire));
-    // The size's frame is up: no redraw waits for the bound.
-    try testing.expectEqual(@as(?u64, null), metal.resizeHoldWakeMs());
-}
-
-test "resize sync: the alternate screen keeps the last frame until the program's redraw or the bound" {
-    const testing = std.testing;
-    try testing.expect(testIsMainThread());
-    const pool = objc.AutoreleasePool.init();
-    defer pool.deinit();
-    const device = testDevice();
-    var metal = try testMetal(&device);
-    defer testDeinit(&metal);
-    const shown = try testSurface(80, 60);
-    defer shown.release();
-    testSynced(&metal, shown);
-
-    metal.setHostDrawableSize(true, 120, 60);
-    const busy = try testSurface(120, 60);
-    defer busy.release();
-    try metal.present(testFrame(busy, .{ .alternate = true }), false);
-    try testing.expectEqual(@as(?usize, 80), testShownWidth(&metal));
-    // The renderer thread wakes at the bound to draw the size anyway.
-    try testing.expect(metal.resizeHoldWakeMs() != null);
-    try testing.expect(!metal.resizeHoldEnds());
-
-    // The bound passed (the program did not redraw): the hold ends once, and the next frame shows the size.
-    metal.resize_hold_until_ns.store(0, .release);
-    try testing.expectEqual(@as(?u64, 0), metal.resizeHoldWakeMs());
-    try testing.expect(metal.resizeHoldEnds());
-    try testing.expect(!metal.resizeHoldEnds());
-    try testing.expectEqual(@as(?u64, null), metal.resizeHoldWakeMs());
-    const late = try testSurface(120, 60);
-    defer late.release();
-    try metal.present(testFrame(late, .{ .alternate = true }), false);
-    try testing.expectEqual(@as(?usize, 120), testShownWidth(&metal));
-}
-
-test "resize sync: a grid the PTY owner announced restarts the bound" {
-    const testing = std.testing;
-    try testing.expect(testIsMainThread());
-    const pool = objc.AutoreleasePool.init();
-    defer pool.deinit();
-    const device = testDevice();
-    var metal = try testMetal(&device);
-    defer testDeinit(&metal);
-    const shown = try testSurface(80, 60);
-    defer shown.release();
-    testSynced(&metal, shown);
-
-    metal.setHostDrawableSize(true, 120, 60);
-    // The bound would end now, but the grid reached the program only now (ghostty_surface_set_grid).
-    metal.resize_hold_until_ns.store(0, .release);
-    metal.restartResizeHold();
-    const wake = metal.resizeHoldWakeMs() orelse return error.TestUnexpectedResult;
-    try testing.expect(wake > 0);
-    const busy = try testSurface(120, 60);
-    defer busy.release();
-    try metal.present(testFrame(busy, .{ .alternate = true }), false);
-    try testing.expectEqual(@as(?usize, 80), testShownWidth(&metal));
-}
-
-test "resize sync: no frame is held in the renderer mode, for a first frame, or after a reveal" {
-    const testing = std.testing;
-    try testing.expect(testIsMainThread());
-    const pool = objc.AutoreleasePool.init();
-    defer pool.deinit();
-    const device = testDevice();
-
-    // The renderer mode (default): a TUI's frame of a new size shows at once.
-    {
-        var metal = try testMetal(&device);
-        defer testDeinit(&metal);
-        const shown = try testSurface(80, 60);
-        defer shown.release();
-        metal.setHostDrawableSize(true, 80, 60);
-        metal.layer.setSurfaceSync(shown);
-        testRunMainLoopOnce();
-        metal.setHostDrawableSize(true, 120, 60);
-        const drawn = try testSurface(120, 60);
-        defer drawn.release();
-        try metal.present(testFrame(drawn, .{ .alternate = true }), false);
-        try testing.expectEqual(@as(?usize, 120), testShownWidth(&metal));
-    }
-    // A first frame (nothing shown) presents itself.
-    {
-        var metal = try testMetal(&device);
-        defer testDeinit(&metal);
-        metal.setHostPresent(.renderer_synced);
-        metal.setHostDrawableSize(true, 120, 60);
-        const first = try testSurface(120, 60);
-        defer first.release();
-        try metal.present(testFrame(first, .{ .alternate = true }), false);
-        try testing.expectEqual(@as(?usize, 120), testShownWidth(&metal));
-    }
-    // Resized while hidden, then shown: the frame for the reveal shows at once.
-    {
-        var metal = try testMetal(&device);
-        defer testDeinit(&metal);
-        const shown = try testSurface(80, 60);
-        defer shown.release();
-        testSynced(&metal, shown);
-        metal.setHostDrawableSize(true, 120, 60);
-        metal.setShownFromMain(true);
-        try testing.expectEqual(@as(?u64, null), metal.resizeHoldWakeMs());
-        const drawn = try testSurface(120, 60);
-        defer drawn.release();
-        try metal.present(testFrame(drawn, .{ .alternate = true }), false);
-        try testing.expectEqual(@as(?usize, 120), testShownWidth(&metal));
-    }
-}
-
-/// A host-sized surface in cmux's mode that shows `shown` at the host size, committed (frames at that size go off
-/// main).
-fn testHostSized(metal: *Metal, shown: *IOSurface) void {
-    metal.setHostPresent(.renderer_synced);
-    metal.setHostDrawableSize(true, @intCast(shown.getWidth()), @intCast(shown.getHeight()));
-    metal.layer.setSurfaceSync(shown);
-    testRunMainLoopOnce();
 }
 
 /// The frames of a resize burst that the layer showed at a size other than the host size, by refresh.
@@ -1131,15 +875,14 @@ const TestBurst = struct {
     }
 
     /// One display refresh of a pane resize, as cmux drives it: the pane's size goes to the host size on the main
-    /// thread, the renderer draws a frame at that size and presents it, and the main thread commits. The frame is of
-    /// a full-screen program that has not redrawn at the new grid (it redraws only after SIGWINCH, a refresh or more
-    /// late). Counts what the layer shows after the commit against the host size.
+    /// thread, the renderer draws a frame at that size and presents it, and the main thread commits. Counts what the
+    /// layer shows after the commit against the host size.
     fn refresh(self: *TestBurst, metal: *Metal, width: u32, height: u32) !void {
         metal.setHostDrawableSize(true, width, height);
         const frame = try testSurface(@intCast(width), @intCast(height));
         self.frames[self.count] = frame;
         self.count += 1;
-        try metal.present(testFrame(frame, .{ .alternate = true }), false);
+        try metal.present(testFrame(frame), false);
         testRunMainLoopOnce();
         const shown = metal.layer.shownSize() orelse return error.TestUnexpectedResult;
         if (shown.width > width or shown.height > height) {
@@ -1157,7 +900,8 @@ test "resize sync: in a key-resize burst no shown frame is wider or higher than 
     // resize hold kept the last frame of a full-screen program while the pane went on, and each new host size (and
     // each grid the PTY owner announced) started the hold's bound again, so the hold had no end in a spring: the pane
     // cut the kept frame (smaller pane) or padded it (larger pane). The pane's size is not Ghostty's to hold, so the
-    // frame of the host size must show in the commit that follows its draw.
+    // hold is deleted: the frame of the host size shows in the commit that follows its draw, whatever the program
+    // drew (a full-screen program's picture at the old grid shows, at the right size, until its redraw).
     const testing = std.testing;
     try testing.expect(testIsMainThread());
     const pool = objc.AutoreleasePool.init();

@@ -767,15 +767,12 @@ typedef struct {
   // surfaces (ghostty_surface_set_host_sized): frames handed to a main-thread
   // present (a main-queue block each), frames the main thread drew itself in
   // a display pass (the first frame, or a surface that is not host-sized),
-  // frames of the host size handed to the main thread's present (a size
-  // change, or a frame while main's commit of one is pending), and frames of
-  // a new host size not shown because the resize hold ran
-  // (GHOSTTY_HOST_PRESENT_RENDERER_SYNCED).
+  // and frames of the host size handed to the main thread's present (a size
+  // change, or a frame while main's commit of one is pending).
   uint64_t host_display_passes;
   uint64_t host_main_presents;
   uint64_t host_main_draws;
   uint64_t host_size_presents;
-  uint64_t host_held_frames;
   // Content-only frames of a host-sized surface (the drawable size
   // unchanged) that went to the screen from the renderer's GPU completion
   // thread, in their own Core Animation transaction, without the main thread.
@@ -1500,8 +1497,10 @@ GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t)
 // held size. Each new size draws at once on the renderer thread, with the
 // cells rebuilt for it (the reflow preview included), and that frame shows
 // through the main thread, in main's Core Animation transaction (with the
-// view's bounds of that pass); a frame of a size the host no longer has is
-// dropped. A frame at the shown size goes to the screen from the renderer's
+// view's bounds of that pass), for each screen and each program: the renderer
+// never keeps the frame of an older size while the host size goes on, because
+// the view has the new size and would cut or pad the kept frame. A frame of a
+// size the host no longer has is dropped. A frame at the shown size goes to the screen from the renderer's
 // GPU completion thread, in its own transaction, without the main thread,
 // except right after the main thread changed the shown size: until main's
 // commit (one run loop pass) such a frame goes through main, so it never
@@ -1517,28 +1516,6 @@ GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t)
 // Default false (the target follows the bounds). No effect on iOS, where the
 // target always follows ghostty_surface_set_size. Main thread.
 GHOSTTY_API void ghostty_surface_set_host_sized(ghostty_surface_t, bool);
-// macOS, host-sized surfaces: when a frame of a new host size shows.
-typedef enum {
-  // When drawn (default): see ghostty_surface_set_host_sized.
-  GHOSTTY_HOST_PRESENT_RENDERER = 0,
-  // Value 1 (the embedder presented new sizes) is removed: ignored.
-  // Resize sync in the renderer: on the primary screen a new size shows when
-  // drawn. On the alternate screen (a full-screen program) the layer keeps
-  // the last frame (top-left, clipped or padded, never stretched) until the
-  // renderer drew the new size after the program redrew a whole picture at
-  // the new grid, or until the bound (3 refreshes of 120 Hz) after the size
-  // change passed; a grid the PTY owner announced (ghostty_surface_set_grid)
-  // restarts the bound. Frames during the hold go to no main-thread present;
-  // a scroll or output frame at the shown size goes off main as always.
-  // Synchronized output (mode 2026) is unchanged: a resize ends it. A first
-  // frame and the frame after a reveal (ghostty_surface_set_occlusion true)
-  // are never held.
-  GHOSTTY_HOST_PRESENT_RENDERER_SYNCED = 2,
-} ghostty_host_present_e;
-// Default GHOSTTY_HOST_PRESENT_RENDERER. No effect on iOS or on a surface
-// that is not host-sized. Main thread.
-GHOSTTY_API void ghostty_surface_set_host_present(ghostty_surface_t,
-                                                  ghostty_host_present_e);
 // Why a frame reached the layer (ghostty_surface_present_s).
 typedef enum {
   // The frame has the pixel size of the frame the layer showed before it:

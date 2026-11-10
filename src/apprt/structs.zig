@@ -322,26 +322,6 @@ pub const SurfaceLocalHistoryResult = enum(c_int) {
     mismatch = 1,
 };
 
-/// When the frame of a new host size of a host-sized macOS surface shows
-/// (ghostty_surface_set_host_present).
-///
-/// If this is changed, you must also update ghostty.h
-/// (ghostty_host_present_e).
-pub const HostPresent = enum(c_int) {
-    /// When drawn (default).
-    renderer = 0,
-    /// Resize sync in the renderer: a full-screen program's frame of a new
-    /// size waits for its redraw at the new grid or the bound (Metal.present).
-    renderer_synced = 2,
-};
-
-test "ghostty.h HostPresent" {
-    try @import("../lib/enum.zig").checkGhosttyHEnum(
-        HostPresent,
-        "GHOSTTY_HOST_PRESENT_",
-    );
-}
-
 /// Why a frame reached a surface's layer (ghostty_surface_present_s).
 ///
 /// If this is changed, you must also update ghostty.h
