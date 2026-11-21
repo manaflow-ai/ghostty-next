@@ -230,6 +230,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// The screen size (packed width << 32 | height) the cells were
         /// last built for. Under `draw_mutex`.
         cells_screen: u64 = 0,
+        /// The cells were built from the live terminal at the grid that fits
+        /// `cells_screen`, after the program's output at that grid
+        /// (`Terminal.output_since_grid_change`): the program redrew for this
+        /// size. Never for a reflow preview. Under `draw_mutex`.
+        cells_program_fresh: bool = false,
         /// Set to true after the Kitty image placements are rebuilt. Like
         /// `cells_rebuilt`, this means the next frame must be drawn. This
         /// matters when the images change but no cell does, for example
@@ -1611,6 +1616,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 swapped: bool,
                 resized: bool,
                 color_transition: ColorBlend.Spec,
+                program_fresh: bool,
             };
 
             // Update all our data as tightly as possible within the mutex.
@@ -1811,6 +1817,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .resized = resized,
                     .color_config_at = state.color_config_at,
                     .color_transition = state.color_transition,
+                    // The program drew at the grid of this size: the live
+                    // terminal (not a reflow preview) has the grid that fits
+                    // and parsed output since its last grid change.
+                    .program_fresh = drawn == state.terminal and
+                        state.terminal.output_since_grid_change and
+                        state.terminal.cols == fit.columns and
+                        state.terminal.rows == fit.rows,
                 };
             };
 
@@ -1970,6 +1983,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // that fits it, the reflow preview's too): a frame drawn at
                 // another size shows them clipped or padded.
                 self.cells_screen = packScreen(self.size.screen);
+                self.cells_program_fresh = critical.program_fresh;
 
                 // The scrollbar is only emitted during draws so we also
                 // check the scrollbar cache here and update if needed.
@@ -2245,6 +2259,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
             if (@hasField(GraphicsAPI.Target, "size_generation")) {
                 frame.target.size_generation = self.api.sizeGeneration();
+            }
+            // Whether the program redrew at this size's grid before these
+            // cells were built (`Metal.hostFrame` reports `ready_program`).
+            if (@hasField(GraphicsAPI.Target, "program_fresh")) {
+                frame.target.program_fresh = self.cells_program_fresh and
+                    self.cells_screen == packScreen(self.size.screen);
             }
 
             // Get a frame context from the graphics API.

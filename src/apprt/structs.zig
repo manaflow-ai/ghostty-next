@@ -365,6 +365,10 @@ pub const HostFrame = enum(c_int) {
     /// Frame updates are held (synchronized output, a restore): no frame
     /// can come now, and the layer keeps the frame it shows.
     held = 6,
+    /// A query: the renderer drew the host size's frame after the program's
+    /// PTY output at that size's grid, not shown yet. `ready` is then a frame
+    /// of the size only (the program's last picture clipped or padded).
+    ready_program = 7,
 };
 
 test "ghostty.h HostFrame" {

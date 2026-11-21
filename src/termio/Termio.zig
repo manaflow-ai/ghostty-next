@@ -2223,6 +2223,10 @@ fn processOutputLocked(self: *Termio, buf: []const u8) void {
         self.terminal_stream.nextSlice(buf);
     }
 
+    // The screen now shows what the program drew at the current grid
+    // (`Terminal.output_since_grid_change`, read by the renderer).
+    if (buf.len > 0) self.terminal.output_since_grid_change = true;
+
     // If our stream handling caused messages to be sent to the mailbox
     // thread, then we need to wake it up so that it processes them.
     if (self.terminal_stream.handler.termio_messaged) {
@@ -2573,6 +2577,64 @@ test "manual: a mirror never reflows" {
             // waits for the owner's snapshot.
             try testing.expectEqual(!mirror, std.mem.indexOf(u8, str, "56789") != null);
             try testing.expect(std.mem.startsWith(u8, str, "01234"));
+        }
+    }.run;
+
+    try testManualTermio(false, body);
+    try testManualTermio(true, body);
+}
+
+test "manual: output after a grid change marks the program drawn at that grid" {
+    // cmux RESIZE P0 12: a host-size frame is program fresh only when the terminal parsed the program's output after
+    // its last grid change (Target.program_fresh).
+    const body = struct {
+        fn run(io: *Termio, _: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            try testing.expect(!io.terminal.output_since_grid_change);
+            io.processOutput("before\r\n");
+            try testing.expect(io.terminal.output_since_grid_change);
+
+            // A grid change clears it; a lock at the same grid does not.
+            try testing.expect(io.setGrid(20, 5, 1));
+            try testing.expect(!io.terminal.output_since_grid_change);
+            io.processOutput("");
+            try testing.expect(!io.terminal.output_since_grid_change);
+            io.processOutput("after");
+            try testing.expect(io.terminal.output_since_grid_change);
+            try testing.expect(io.setGrid(20, 5, 2));
+            try testing.expect(io.terminal.output_since_grid_change);
+
+            // A pixel-only resize of a locked grid keeps it.
+            io.queueMessage(.{ .resize = .{
+                .screen = .{ .width = 400, .height = 480 },
+                .cell = .{ .width = 10, .height = 20 },
+                .padding = .{},
+            } }, .unlocked);
+            try testing.expect(io.terminal.output_since_grid_change);
+            try testing.expect(io.setGrid(30, 6, 3));
+            try testing.expect(!io.terminal.output_since_grid_change);
+        }
+    }.run;
+
+    try testManualTermio(false, body);
+    try testManualTermio(true, body);
+}
+
+test "manual: a view resize that changes the grid clears the program's output mark" {
+    const body = struct {
+        fn run(io: *Termio, _: *TestSink, _: bool) !void {
+            const testing = std.testing;
+            io.processOutput("before\r\n");
+            try testing.expect(io.terminal.output_since_grid_change);
+            io.queueMessage(.{ .resize = .{
+                .screen = .{ .width = 400, .height = 480 },
+                .cell = .{ .width = 10, .height = 20 },
+                .padding = .{},
+            } }, .unlocked);
+            try testing.expectEqual(@as(usize, 40), io.terminal.cols);
+            try testing.expect(!io.terminal.output_since_grid_change);
+            io.processOutput("after");
+            try testing.expect(io.terminal.output_since_grid_change);
         }
     }.run;
 

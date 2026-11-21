@@ -1583,6 +1583,18 @@ typedef enum {
   // Frame updates are held (synchronized output, a snapshot restore): no
   // frame can come now, and the layer keeps the frame it shows.
   GHOSTTY_HOST_FRAME_HELD = 6,
+  // present false: the renderer drew the host size's frame after the
+  // program's PTY output at that size's grid (the program redrew for it); it
+  // is not shown yet. A call with present true shows it (PRESENTED). READY
+  // is then a frame of the size only (the program's last picture clipped or
+  // padded): an embedder may keep its old frame and bounds for a bounded
+  // time. A frame is drawn after the program's output when the terminal
+  // parsed PTY output after its last grid change and its grid is the grid
+  // that fits the host size; a reflow preview never is. While the embedder
+  // presents host sizes, such a frame also wakes the main run loop when it
+  // completes, so a pre-commit observer can present it in that display
+  // refresh.
+  GHOSTTY_HOST_FRAME_READY_PROGRAM = 7,
 } ghostty_host_frame_e;
 // macOS, a surface whose new host sizes the embedder presents
 // (ghostty_surface_set_host_present): what it can show for its host size.
