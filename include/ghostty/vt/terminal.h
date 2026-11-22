@@ -1164,7 +1164,8 @@ struct GhosttyClipboardRead {
   /**
    * Token for a deferred reply (ghostty-next). Unique per terminal and
    * nonzero for an OSC 52 read; zero when the read cannot be deferred.
-   * Check `size` before reading it.
+   * ghostty-next appends this field to upstream's frozen layout, so the
+   * struct is 80 bytes on 64-bit targets in ghostty-next builds.
    */
   uint64_t token;
 };
