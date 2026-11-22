@@ -1026,6 +1026,27 @@ palette: Palette = .{},
 /// Available since: 1.2.0
 @"background-opacity-cells": bool = false,
 
+/// cmux: the opacity of cells with an explicit background color (an SGR
+/// background from a program: Claude Code's sent-message band, a status
+/// line, a Neovim theme), from 0 to 1. Unset keeps the behavior above:
+/// opaque, or `background-opacity` with `background-opacity-cells`.
+/// Selected and reversed cells stay opaque. cmux NEXT sets it from its
+/// Terminal > Cell backgrounds setting: its surfaces draw a transparent
+/// default background over the window's own sheet, so
+/// `background-opacity-cells` (which takes the surface's opacity) would
+/// erase these cells.
+@"background-cells-opacity": ?f64 = null,
+
+/// cmux: explicit cell backgrounds that differ from `background` only in
+/// lightness (Oklab chroma difference under 0.03) fade toward transparent
+/// as they near it: a cell whose Oklab lightness differs by `d` from the
+/// background takes `min(1, d / this)` of its opacity (the opacity above,
+/// else 1). A gray band a program paints just off the theme background
+/// then shows the window's background through it, keeping a tint, while
+/// colored backgrounds (diffs, selections, highlights) stay as they are.
+/// 0, the default, turns it off.
+@"background-cells-neutral-fade": f64 = 0,
+
 /// Whether to blur the background when `background-opacity` is less than 1.
 ///
 /// Valid values are:
