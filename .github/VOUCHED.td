@@ -190,6 +190,7 @@ ibaios
 icodesign
 -ifmael
 illiakrauchanka
+inv1x
 j-c-m
 j0hnm4r5
 jacobsandlund
@@ -202,8 +203,11 @@ jcollie
 jesusvazquez
 jglanz
 jguthmiller
+jin-eden
+-jischeng
 jmcgover
 jmr
+johnrichardrinehart
 johnslavik
 jordandm
 josephmart
@@ -289,6 +293,7 @@ nagato-yuzuru
 natesmyth
 neo773
 neobrain
+neomantra
 neoto
 neurosnap
 nicholas-ochoa
@@ -300,6 +305,7 @@ nmggithub
 noib3
 nolinmcfarland
 nouritsu
+nurpax
 nwehg
 ocean6954
 ollieatkinson
@@ -372,6 +378,7 @@ silveirapf
 simonbcn
 slowdub
 slsrepo
+sm010422
 stepankandrushin
 steven-tk
 sunshine-syz
