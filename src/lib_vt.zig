@@ -329,101 +329,83 @@ comptime {
         @export(&c.terminal_continuation_write, .{ .name = "ghostty_terminal_continuation_write" });
         @export(&c.terminal_continuation_buf, .{ .name = "ghostty_terminal_continuation_buf" });
         @export(&c.terminal_continuation_alloc, .{ .name = "ghostty_terminal_continuation_alloc" });
-        if (features.selection) {
-            @export(&c.terminal_select_word, .{ .name = "ghostty_terminal_select_word" });
-            @export(&c.terminal_select_word_between, .{ .name = "ghostty_terminal_select_word_between" });
-            @export(&c.terminal_select_line, .{ .name = "ghostty_terminal_select_line" });
-            @export(&c.terminal_select_all, .{ .name = "ghostty_terminal_select_all" });
-            @export(&c.terminal_select_output, .{ .name = "ghostty_terminal_select_output" });
-            @export(&c.terminal_selection_adjust, .{ .name = "ghostty_terminal_selection_adjust" });
-            @export(&c.terminal_selection_order, .{ .name = "ghostty_terminal_selection_order" });
-            @export(&c.terminal_selection_ordered, .{ .name = "ghostty_terminal_selection_ordered" });
-            @export(&c.terminal_selection_contains, .{ .name = "ghostty_terminal_selection_contains" });
-            @export(&c.terminal_selection_equal, .{ .name = "ghostty_terminal_selection_equal" });
-            @export(&c.selection_gesture_new, .{ .name = "ghostty_selection_gesture_new" });
-            @export(&c.selection_gesture_free, .{ .name = "ghostty_selection_gesture_free" });
-            @export(&c.selection_gesture_reset, .{ .name = "ghostty_selection_gesture_reset" });
-            @export(&c.selection_gesture_event, .{ .name = "ghostty_selection_gesture_event" });
-            @export(&c.selection_gesture_get, .{ .name = "ghostty_selection_gesture_get" });
-            @export(&c.selection_gesture_get_multi, .{ .name = "ghostty_selection_gesture_get_multi" });
-            @export(&c.selection_gesture_event_new, .{ .name = "ghostty_selection_gesture_event_new" });
-            @export(&c.selection_gesture_event_free, .{ .name = "ghostty_selection_gesture_event_free" });
-            @export(&c.selection_gesture_event_set, .{ .name = "ghostty_selection_gesture_event_set" });
-        }
-        if (features.search) {
-            @export(&c.search_new, .{ .name = "ghostty_search_new" });
-            @export(&c.search_free, .{ .name = "ghostty_search_free" });
-            @export(&c.search_tick, .{ .name = "ghostty_search_tick" });
-            @export(&c.search_feed, .{ .name = "ghostty_search_feed" });
-            @export(&c.search_run, .{ .name = "ghostty_search_run" });
-            @export(&c.search_select_next, .{ .name = "ghostty_search_select_next" });
-            @export(&c.search_select_prev, .{ .name = "ghostty_search_select_prev" });
-            @export(&c.search_set, .{ .name = "ghostty_search_set" });
-            @export(&c.search_get, .{ .name = "ghostty_search_get" });
-            @export(&c.search_get_multi, .{ .name = "ghostty_search_get_multi" });
-        }
-        // Selections are expressed in grid references, so the untracked
-        // reference constructors are required by both features.
-        if (features.grid_introspection or features.selection) {
-            @export(&c.terminal_grid_ref, .{ .name = "ghostty_terminal_grid_ref" });
-            @export(&c.terminal_point_from_grid_ref, .{ .name = "ghostty_terminal_point_from_grid_ref" });
-        }
-        if (features.grid_introspection) {
-            @export(&c.terminal_grid_ref_track, .{ .name = "ghostty_terminal_grid_ref_track" });
-        }
-        if (features.snapshot) {
-            @export(&c.snapshot_encode, .{ .name = "ghostty_snapshot_encode" });
-            @export(&c.snapshot_encode_buf, .{ .name = "ghostty_snapshot_encode_buf" });
-            @export(&c.snapshot_encode_alloc, .{ .name = "ghostty_snapshot_encode_alloc" });
-            @export(&c.snapshot_decoder_new, .{ .name = "ghostty_snapshot_decoder_new" });
-            @export(&c.snapshot_decoder_new_buf, .{ .name = "ghostty_snapshot_decoder_new_buf" });
-            @export(&c.snapshot_decoder_free, .{ .name = "ghostty_snapshot_decoder_free" });
-            @export(&c.snapshot_decoder_set, .{ .name = "ghostty_snapshot_decoder_set" });
-            @export(&c.snapshot_decoder_get, .{ .name = "ghostty_snapshot_decoder_get" });
-            @export(&c.snapshot_decoder_get_multi, .{ .name = "ghostty_snapshot_decoder_get_multi" });
-            @export(&c.snapshot_decoder_ready, .{ .name = "ghostty_snapshot_decoder_ready" });
-            @export(&c.snapshot_decoder_next, .{ .name = "ghostty_snapshot_decoder_next" });
-            @export(&c.snapshot_decoder_decode, .{ .name = "ghostty_snapshot_decoder_decode" });
-        }
-        if (features.kitty_graphics) {
-            @export(&c.kitty_graphics_get, .{ .name = "ghostty_kitty_graphics_get" });
-            @export(&c.kitty_graphics_set, .{ .name = "ghostty_kitty_graphics_set" });
-            @export(&c.kitty_graphics_image_by_number, .{ .name = "ghostty_kitty_graphics_image_by_number" });
-            @export(&c.kitty_graphics_image_set_number, .{ .name = "ghostty_kitty_graphics_image_set_number" });
-            @export(&c.kitty_graphics_image_iterator_new, .{ .name = "ghostty_kitty_graphics_image_iterator_new" });
-            @export(&c.kitty_graphics_image_iterator_free, .{ .name = "ghostty_kitty_graphics_image_iterator_free" });
-            @export(&c.kitty_graphics_image_next, .{ .name = "ghostty_kitty_graphics_image_next" });
-            @export(&c.kitty_graphics_animation_tick, .{ .name = "ghostty_kitty_graphics_animation_tick" });
-            @export(&c.kitty_graphics_image, .{ .name = "ghostty_kitty_graphics_image" });
-            @export(&c.kitty_graphics_image_get, .{ .name = "ghostty_kitty_graphics_image_get" });
-            @export(&c.kitty_graphics_image_get_multi, .{ .name = "ghostty_kitty_graphics_image_get_multi" });
-            @export(&c.kitty_graphics_placement_iterator_new, .{ .name = "ghostty_kitty_graphics_placement_iterator_new" });
-            @export(&c.kitty_graphics_placement_iterator_free, .{ .name = "ghostty_kitty_graphics_placement_iterator_free" });
-            @export(&c.kitty_graphics_placement_iterator_set, .{ .name = "ghostty_kitty_graphics_placement_iterator_set" });
-            @export(&c.kitty_graphics_placement_next, .{ .name = "ghostty_kitty_graphics_placement_next" });
-            @export(&c.kitty_graphics_placement_get, .{ .name = "ghostty_kitty_graphics_placement_get" });
-            @export(&c.kitty_graphics_placement_get_multi, .{ .name = "ghostty_kitty_graphics_placement_get_multi" });
-            @export(&c.kitty_graphics_placement_rect, .{ .name = "ghostty_kitty_graphics_placement_rect" });
-            @export(&c.kitty_graphics_placement_pixel_size, .{ .name = "ghostty_kitty_graphics_placement_pixel_size" });
-            @export(&c.kitty_graphics_placement_grid_size, .{ .name = "ghostty_kitty_graphics_placement_grid_size" });
-            @export(&c.kitty_graphics_placement_viewport_pos, .{ .name = "ghostty_kitty_graphics_placement_viewport_pos" });
-            @export(&c.kitty_graphics_placement_source_rect, .{ .name = "ghostty_kitty_graphics_placement_source_rect" });
-            @export(&c.kitty_graphics_placement_render_info, .{ .name = "ghostty_kitty_graphics_placement_render_info" });
-        }
-        if (features.grid_introspection) {
-            @export(&c.grid_ref_cell, .{ .name = "ghostty_grid_ref_cell" });
-            @export(&c.grid_ref_row, .{ .name = "ghostty_grid_ref_row" });
-            @export(&c.grid_ref_graphemes, .{ .name = "ghostty_grid_ref_graphemes" });
-            @export(&c.grid_ref_hyperlink_uri, .{ .name = "ghostty_grid_ref_hyperlink_uri" });
-            @export(&c.grid_ref_style, .{ .name = "ghostty_grid_ref_style" });
-            @export(&c.tracked_grid_ref_free, .{ .name = "ghostty_tracked_grid_ref_free" });
-            @export(&c.tracked_grid_ref_has_value, .{ .name = "ghostty_tracked_grid_ref_has_value" });
-            @export(&c.tracked_grid_ref_point, .{ .name = "ghostty_tracked_grid_ref_point" });
-            @export(&c.tracked_grid_ref_set, .{ .name = "ghostty_tracked_grid_ref_set" });
-        }
-        if (features.grid_introspection and features.snapshot) {
-            @export(&c.tracked_grid_ref_snapshot, .{ .name = "ghostty_tracked_grid_ref_snapshot" });
-        }
+        @export(&c.terminal_select_word, .{ .name = "ghostty_terminal_select_word" });
+        @export(&c.terminal_select_word_between, .{ .name = "ghostty_terminal_select_word_between" });
+        @export(&c.terminal_select_line, .{ .name = "ghostty_terminal_select_line" });
+        @export(&c.terminal_select_all, .{ .name = "ghostty_terminal_select_all" });
+        @export(&c.terminal_select_output, .{ .name = "ghostty_terminal_select_output" });
+        @export(&c.terminal_selection_adjust, .{ .name = "ghostty_terminal_selection_adjust" });
+        @export(&c.terminal_selection_order, .{ .name = "ghostty_terminal_selection_order" });
+        @export(&c.terminal_selection_ordered, .{ .name = "ghostty_terminal_selection_ordered" });
+        @export(&c.terminal_selection_contains, .{ .name = "ghostty_terminal_selection_contains" });
+        @export(&c.terminal_selection_equal, .{ .name = "ghostty_terminal_selection_equal" });
+        @export(&c.selection_gesture_new, .{ .name = "ghostty_selection_gesture_new" });
+        @export(&c.selection_gesture_free, .{ .name = "ghostty_selection_gesture_free" });
+        @export(&c.selection_gesture_reset, .{ .name = "ghostty_selection_gesture_reset" });
+        @export(&c.selection_gesture_event, .{ .name = "ghostty_selection_gesture_event" });
+        @export(&c.selection_gesture_get, .{ .name = "ghostty_selection_gesture_get" });
+        @export(&c.selection_gesture_get_multi, .{ .name = "ghostty_selection_gesture_get_multi" });
+        @export(&c.selection_gesture_event_new, .{ .name = "ghostty_selection_gesture_event_new" });
+        @export(&c.selection_gesture_event_free, .{ .name = "ghostty_selection_gesture_event_free" });
+        @export(&c.selection_gesture_event_set, .{ .name = "ghostty_selection_gesture_event_set" });
+        @export(&c.search_new, .{ .name = "ghostty_search_new" });
+        @export(&c.search_free, .{ .name = "ghostty_search_free" });
+        @export(&c.search_tick, .{ .name = "ghostty_search_tick" });
+        @export(&c.search_feed, .{ .name = "ghostty_search_feed" });
+        @export(&c.search_run, .{ .name = "ghostty_search_run" });
+        @export(&c.search_select_next, .{ .name = "ghostty_search_select_next" });
+        @export(&c.search_select_prev, .{ .name = "ghostty_search_select_prev" });
+        @export(&c.search_set, .{ .name = "ghostty_search_set" });
+        @export(&c.search_get, .{ .name = "ghostty_search_get" });
+        @export(&c.search_get_multi, .{ .name = "ghostty_search_get_multi" });
+        @export(&c.terminal_grid_ref, .{ .name = "ghostty_terminal_grid_ref" });
+        @export(&c.terminal_point_from_grid_ref, .{ .name = "ghostty_terminal_point_from_grid_ref" });
+        @export(&c.terminal_grid_ref_track, .{ .name = "ghostty_terminal_grid_ref_track" });
+        @export(&c.snapshot_encode, .{ .name = "ghostty_snapshot_encode" });
+        @export(&c.snapshot_encode_buf, .{ .name = "ghostty_snapshot_encode_buf" });
+        @export(&c.snapshot_encode_alloc, .{ .name = "ghostty_snapshot_encode_alloc" });
+        @export(&c.snapshot_decoder_new, .{ .name = "ghostty_snapshot_decoder_new" });
+        @export(&c.snapshot_decoder_new_buf, .{ .name = "ghostty_snapshot_decoder_new_buf" });
+        @export(&c.snapshot_decoder_free, .{ .name = "ghostty_snapshot_decoder_free" });
+        @export(&c.snapshot_decoder_set, .{ .name = "ghostty_snapshot_decoder_set" });
+        @export(&c.snapshot_decoder_get, .{ .name = "ghostty_snapshot_decoder_get" });
+        @export(&c.snapshot_decoder_get_multi, .{ .name = "ghostty_snapshot_decoder_get_multi" });
+        @export(&c.snapshot_decoder_ready, .{ .name = "ghostty_snapshot_decoder_ready" });
+        @export(&c.snapshot_decoder_next, .{ .name = "ghostty_snapshot_decoder_next" });
+        @export(&c.snapshot_decoder_decode, .{ .name = "ghostty_snapshot_decoder_decode" });
+        @export(&c.kitty_graphics_get, .{ .name = "ghostty_kitty_graphics_get" });
+        @export(&c.kitty_graphics_set, .{ .name = "ghostty_kitty_graphics_set" });
+        @export(&c.kitty_graphics_image_by_number, .{ .name = "ghostty_kitty_graphics_image_by_number" });
+        @export(&c.kitty_graphics_image_set_number, .{ .name = "ghostty_kitty_graphics_image_set_number" });
+        @export(&c.kitty_graphics_image_iterator_new, .{ .name = "ghostty_kitty_graphics_image_iterator_new" });
+        @export(&c.kitty_graphics_image_iterator_free, .{ .name = "ghostty_kitty_graphics_image_iterator_free" });
+        @export(&c.kitty_graphics_image_next, .{ .name = "ghostty_kitty_graphics_image_next" });
+        @export(&c.kitty_graphics_animation_tick, .{ .name = "ghostty_kitty_graphics_animation_tick" });
+        @export(&c.kitty_graphics_image, .{ .name = "ghostty_kitty_graphics_image" });
+        @export(&c.kitty_graphics_image_get, .{ .name = "ghostty_kitty_graphics_image_get" });
+        @export(&c.kitty_graphics_image_get_multi, .{ .name = "ghostty_kitty_graphics_image_get_multi" });
+        @export(&c.kitty_graphics_placement_iterator_new, .{ .name = "ghostty_kitty_graphics_placement_iterator_new" });
+        @export(&c.kitty_graphics_placement_iterator_free, .{ .name = "ghostty_kitty_graphics_placement_iterator_free" });
+        @export(&c.kitty_graphics_placement_iterator_set, .{ .name = "ghostty_kitty_graphics_placement_iterator_set" });
+        @export(&c.kitty_graphics_placement_next, .{ .name = "ghostty_kitty_graphics_placement_next" });
+        @export(&c.kitty_graphics_placement_get, .{ .name = "ghostty_kitty_graphics_placement_get" });
+        @export(&c.kitty_graphics_placement_get_multi, .{ .name = "ghostty_kitty_graphics_placement_get_multi" });
+        @export(&c.kitty_graphics_placement_rect, .{ .name = "ghostty_kitty_graphics_placement_rect" });
+        @export(&c.kitty_graphics_placement_pixel_size, .{ .name = "ghostty_kitty_graphics_placement_pixel_size" });
+        @export(&c.kitty_graphics_placement_grid_size, .{ .name = "ghostty_kitty_graphics_placement_grid_size" });
+        @export(&c.kitty_graphics_placement_viewport_pos, .{ .name = "ghostty_kitty_graphics_placement_viewport_pos" });
+        @export(&c.kitty_graphics_placement_source_rect, .{ .name = "ghostty_kitty_graphics_placement_source_rect" });
+        @export(&c.kitty_graphics_placement_render_info, .{ .name = "ghostty_kitty_graphics_placement_render_info" });
+        @export(&c.grid_ref_cell, .{ .name = "ghostty_grid_ref_cell" });
+        @export(&c.grid_ref_row, .{ .name = "ghostty_grid_ref_row" });
+        @export(&c.grid_ref_graphemes, .{ .name = "ghostty_grid_ref_graphemes" });
+        @export(&c.grid_ref_hyperlink_uri, .{ .name = "ghostty_grid_ref_hyperlink_uri" });
+        @export(&c.grid_ref_style, .{ .name = "ghostty_grid_ref_style" });
+        @export(&c.tracked_grid_ref_free, .{ .name = "ghostty_tracked_grid_ref_free" });
+        @export(&c.tracked_grid_ref_has_value, .{ .name = "ghostty_tracked_grid_ref_has_value" });
+        @export(&c.tracked_grid_ref_point, .{ .name = "ghostty_tracked_grid_ref_point" });
+        @export(&c.tracked_grid_ref_set, .{ .name = "ghostty_tracked_grid_ref_set" });
+        @export(&c.tracked_grid_ref_snapshot, .{ .name = "ghostty_tracked_grid_ref_snapshot" });
         @export(&c.build_info, .{ .name = "ghostty_build_info" });
         @export(&c.version, .{ .name = "ghostty_version" });
         @export(&c.type_json, .{ .name = "ghostty_type_json" });

@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing = std.testing;
 const lib = @import("../lib.zig");
 const grid_ref = @import("grid_ref.zig");
 const point = @import("../point.zig");
