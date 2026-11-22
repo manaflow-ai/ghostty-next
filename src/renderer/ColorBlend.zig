@@ -298,6 +298,11 @@ fn gamma(c: f32) f32 {
     return if (c <= 0.0031308) c * 12.92 else 1.055 * std.math.pow(f32, c, 1.0 / 2.4) - 0.055;
 }
 
+/// Oklab `{L, a, b}` of an sRGB color.
+pub fn oklab(rgb: RGB) [3]f32 {
+    return components(rgb, .oklab);
+}
+
 fn components(rgb: RGB, space: Space) [3]f32 {
     const r: f32 = @as(f32, @floatFromInt(rgb.r)) / 255.0;
     const g: f32 = @as(f32, @floatFromInt(rgb.g)) / 255.0;
