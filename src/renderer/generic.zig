@@ -21,6 +21,7 @@ const rowNeverExtendBg = @import("row.zig").neverExtendBg;
 const Overlay = @import("Overlay.zig");
 const ReflowPreview = @import("ReflowPreview.zig");
 const ColorBlend = @import("ColorBlend.zig");
+const cell_bg_alpha = @import("cell_bg_alpha.zig");
 
 /// Why a frame update rebuilds every row (RenderCounters).
 const RebuildCause = enum { none, config, font };
@@ -733,6 +734,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             background: terminal.color.RGB,
             background_opacity: f64,
             background_opacity_cells: bool,
+            background_cells_opacity: ?f64,
+            background_cells_neutral_fade: f64,
             foreground: terminal.color.RGB,
             selection_background: ?configpkg.Config.TerminalColor,
             selection_foreground: ?configpkg.Config.TerminalColor,
@@ -800,6 +803,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 return .{
                     .background_opacity = @max(0, @min(1, config.@"background-opacity")),
                     .background_opacity_cells = config.@"background-opacity-cells",
+                    .background_cells_opacity = config.@"background-cells-opacity",
+                    .background_cells_neutral_fade = @max(0, config.@"background-cells-neutral-fade"),
                     .font_thicken = config.@"font-thicken",
                     .font_thicken_strength = config.@"font-thicken-strength",
                     .font_features = font_features.list,
@@ -3687,6 +3692,22 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         // Cells that are reversed should be fully opaque.
                         if (style.flags.inverse) break :bg_alpha default;
 
+                        // cmux: `background-cells-opacity` and
+                        // `background-cells-neutral-fade` (cell_bg_alpha).
+                        if (bg_style) |explicit_bg| {
+                            const opts: cell_bg_alpha.Options = .{
+                                .opacity = self.config.background_cells_opacity,
+                                .neutral_fade = self.config.background_cells_neutral_fade,
+                                .opacity_cells = self.config.background_opacity_cells,
+                                .background_opacity = self.config.background_opacity,
+                            };
+                            if (opts.active()) break :bg_alpha cell_bg_alpha.explicit(
+                                explicit_bg.rgb,
+                                table[ColorBlend.Slot.background],
+                                opts,
+                            );
+                        }
+
                         // If the user requested to have opacity on all cells, apply it.
                         if (self.config.background_opacity_cells and bg_style != null) {
                             var opacity: f64 = @floatFromInt(default);
@@ -4278,6 +4299,8 @@ fn cellsKey(
     std.hash.autoHash(&h, config.@"font-thicken-strength");
     std.hash.autoHash(&h, config.@"font-shaping-break");
     std.hash.autoHash(&h, config.@"background-opacity-cells");
+    std.hash.autoHash(&h, @as(u64, @bitCast(@as(f64, config.@"background-cells-opacity" orelse -1))));
+    std.hash.autoHash(&h, @as(u64, @bitCast(@as(f64, config.@"background-cells-neutral-fade"))));
     std.hash.autoHash(&h, @as(u64, @bitCast(@as(f64, config.@"background-opacity"))));
     std.hash.autoHash(&h, @as(u64, @bitCast(@as(f64, config.@"faint-opacity"))));
     std.hash.autoHash(&h, config.@"window-padding-color");
