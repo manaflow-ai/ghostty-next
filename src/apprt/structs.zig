@@ -414,7 +414,7 @@ pub const PresentCallback = *const fn (?*anyopaque, *const Present) callconv(.c)
 
 test "present callback: ghostty.h present struct" {
     const testing = std.testing;
-    const c = @import("ghostty.h");
+    const c = @import("ghostty-h");
     const T = c.ghostty_surface_present_s;
     try testing.expectEqual(@offsetOf(Present, "width_px"), @offsetOf(T, "width_px"));
     try testing.expectEqual(@offsetOf(Present, "height_px"), @offsetOf(T, "height_px"));
@@ -432,7 +432,7 @@ test "ghostty.h SurfaceLocalHistoryResult" {
 }
 
 test "ghostty.h history digest length and version" {
-    const c = @import("ghostty.h");
+    const c = @import("ghostty-h");
     try std.testing.expectEqual(
         @as(usize, terminal.history_digest.len),
         @as(usize, c.GHOSTTY_SURFACE_HISTORY_DIGEST_LEN),
@@ -445,7 +445,7 @@ test "ghostty.h history digest length and version" {
 
 test "ghostty.h surface grid" {
     const testing = std.testing;
-    const c = @import("ghostty.h");
+    const c = @import("ghostty-h");
     const T = c.ghostty_surface_grid_s;
     try testing.expectEqual(@offsetOf(SurfaceGrid, "locked"), @offsetOf(T, "locked"));
     try testing.expectEqual(@offsetOf(SurfaceGrid, "columns"), @offsetOf(T, "columns"));
@@ -468,7 +468,7 @@ test "ghostty.h surface config IO fields" {
     if (@sizeOf(usize) != 8) return error.SkipZigTest;
 
     const testing = std.testing;
-    const c = @import("ghostty.h");
+    const c = @import("ghostty-h");
     const T = c.ghostty_surface_config_s;
     try testing.expectEqual(@as(usize, 84), @offsetOf(T, "context"));
     try testing.expectEqual(@as(usize, 88), @offsetOf(T, "io_mode"));
