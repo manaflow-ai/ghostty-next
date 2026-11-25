@@ -31,11 +31,18 @@ link() { # sdk slice target out extra...
     "$lib" "${frameworks[@]}" "$@" -o "$out"
   echo "linked $slice"
 }
-link macosx macos-arm64_x86_64 arm64-apple-macos13 "$work/smoke-macos" -framework AppKit -framework Carbon
+# GHOSTTYKIT_MACOS_ARM64_ONLY=1 (PR CI): the macOS slice is macos-arm64 and
+# there is no x86_64 half to link. Unset: the release's universal slice.
+macos=macos-arm64_x86_64
+if [ "${GHOSTTYKIT_MACOS_ARM64_ONLY:-}" = 1 ]; then macos=macos-arm64; fi
+[ -d "$x/$macos" ] || { echo "missing slice $macos in $x" >&2; exit 1; }
+link macosx "$macos" arm64-apple-macos13 "$work/smoke-macos" -framework AppKit -framework Carbon
 "$work/smoke-macos"
-# Intel Macs: link the x86_64 half of the universal slice (run needs Rosetta).
-link macosx macos-arm64_x86_64 x86_64-apple-macos13 "$work/smoke-macos-x86_64" -framework AppKit -framework Carbon
-lipo -archs "$work/smoke-macos-x86_64" | grep -qx x86_64
+if [ "$macos" = macos-arm64_x86_64 ]; then
+  # Intel Macs: link the x86_64 half of the universal slice (run needs Rosetta).
+  link macosx "$macos" x86_64-apple-macos13 "$work/smoke-macos-x86_64" -framework AppKit -framework Carbon
+  lipo -archs "$work/smoke-macos-x86_64" | grep -qx x86_64
+fi
 # Swift: `import GhosttyNextKit` through the xcframework's module map.
 swift_link() { # sdk slice target out extra...
   local sdk="$1" slice="$2" target="$3" out="$4"; shift 4
@@ -44,7 +51,7 @@ swift_link() { # sdk slice target out extra...
     "$lib" "${frameworks[@]}" "$@" -o "$out"
   echo "swift linked $slice"
 }
-swift_link macosx macos-arm64_x86_64 arm64-apple-macos13 "$work/smoke-swift-macos" -framework AppKit -framework Carbon
+swift_link macosx "$macos" arm64-apple-macos13 "$work/smoke-swift-macos" -framework AppKit -framework Carbon
 "$work/smoke-swift-macos"
 swift_link iphonesimulator ios-arm64-simulator arm64-apple-ios17.0-simulator "$work/smoke-swift-sim" -framework UIKit
 link iphonesimulator ios-arm64-simulator arm64-apple-ios17.0-simulator "$work/smoke-sim" -framework UIKit

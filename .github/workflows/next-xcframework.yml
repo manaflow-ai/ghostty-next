@@ -67,6 +67,10 @@ jobs:
     outputs:
       archive_sha256: ${{ steps.pkg.outputs.archive_sha256 }}
       release_tag: ${{ steps.pkg.outputs.release_tag }}
+    env:
+      # Pull requests build and smoke the arm64 macOS slice only (no x86_64).
+      # Pushes and dispatches keep the universal slice the release ships.
+      GHOSTTYKIT_MACOS_ARM64_ONLY: ${{ github.event_name == 'pull_request' && '1' || '' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 

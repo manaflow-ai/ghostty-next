@@ -24,6 +24,17 @@ pub fn init(
         Config.genericMacOSTarget(b, null),
     ));
 
+    // ghostty-next: macOS slice of the ios target. Universal (arm64 +
+    // x86_64) by default; arm64 only with -Dxcframework-macos-arm64-only
+    // (PR CI: no x86_64 build off the release path).
+    const macos_ios_target = if (deps.config.xcframework_macos_arm64_only)
+        try GhosttyLib.initStatic(b, &try deps.retarget(
+            b,
+            Config.genericMacOSTarget(b, .aarch64),
+        ))
+    else
+        macos_universal;
+
     // iOS
     const ios = try GhosttyLib.initStatic(b, &try deps.retarget(
         b,
@@ -122,11 +133,12 @@ pub fn init(
                 },
                 // ghostty-next: macOS arm64 + x86_64, so one GhosttyNextKit
                 // serves the iOS app and the cmux-next Mac app on Apple
-                // silicon and Intel (flavor apple-v6).
+                // silicon and Intel (flavor apple-v6). PR CI builds the
+                // arm64-only slice (macos-arm64) instead.
                 .{
-                    .library = macos_universal.output,
+                    .library = macos_ios_target.output,
                     .headers = headers,
-                    .dsym = macos_universal.dsym,
+                    .dsym = macos_ios_target.dsym,
                 },
             },
         },
