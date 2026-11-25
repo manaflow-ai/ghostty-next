@@ -20,6 +20,9 @@ const GitVersion = @import("GitVersion.zig");
 optimize: std.lang.Optimize,
 target: std.Build.ResolvedTarget,
 xcframework_target: XCFrameworkTarget = .universal,
+/// ghostty-next: the ios target's macOS slice is arm64 only (no x86_64
+/// half). PR CI builds this; releases keep the universal slice.
+xcframework_macos_arm64_only: bool = false,
 wasm_target: WasmTarget,
 
 /// Comptime interfaces
@@ -179,6 +182,12 @@ pub fn init(b: *std.Build, appVersion: []const u8, libVersion: []const u8) !Conf
         "xcframework-target",
         "The target for the xcframework.",
     ) orelse .universal;
+
+    config.xcframework_macos_arm64_only = b.option(
+        bool,
+        "xcframework-macos-arm64-only",
+        "ghostty-next: build the ios xcframework's macOS slice for arm64 only (macos-arm64), not arm64+x86_64.",
+    ) orelse false;
 
     //---------------------------------------------------------------
     // Comptime Interfaces

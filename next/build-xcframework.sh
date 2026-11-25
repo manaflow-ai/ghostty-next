@@ -41,6 +41,13 @@ flags=(
   -Dsentry=false
   -Di18n=false
 )
+# GHOSTTYKIT_MACOS_ARM64_ONLY=1 (PR CI): the macOS slice is arm64 only, no
+# x86_64 build. Releases leave it unset and ship the universal slice.
+macos_slice=macos-arm64_x86_64
+if [ "${GHOSTTYKIT_MACOS_ARM64_ONLY:-}" = 1 ]; then
+  flags+=(-Dxcframework-macos-arm64-only=true)
+  macos_slice=macos-arm64
+fi
 # Archive members carry no timestamps, so equal inputs give equal archives.
 export ZERO_AR_DATE=1
 cd "$repo"
@@ -55,4 +62,5 @@ python3 "$here/package_xcframework.py" \
   --zig-version "$ZIG_VERSION" \
   --zig-sha256 "$ZIG_AARCH64_MACOS_SHA256" \
   --zig-std-patch-sha256 "${ZIG_STD_THREADED_PATCHED_SHA256:-}" \
-  --flags "${flags[*]}"
+  --flags "${flags[*]}" \
+  --macos-slice "$macos_slice"

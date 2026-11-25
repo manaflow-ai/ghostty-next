@@ -29,7 +29,10 @@ from pathlib import Path
 
 ROOT = "GhosttyNextKit.xcframework"
 FIXED_DATE = (1980, 1, 1, 0, 0, 0)
-# Slices the ios target must produce (Info.plist LibraryIdentifier).
+# Slices the ios target must produce (Info.plist LibraryIdentifier). The
+# release build's macOS slice is universal; PR CI builds arm64 only
+# (GHOSTTYKIT_MACOS_ARM64_ONLY=1, --macos-slice macos-arm64).
+MACOS_SLICES = ("macos-arm64_x86_64", "macos-arm64")
 REQUIRED_SLICES = {"ios-arm64", "ios-arm64-simulator", "macos-arm64_x86_64"}
 
 
@@ -122,7 +125,11 @@ def main() -> int:
     parser.add_argument("--zig-std-patch-sha256", default="",
                         help="sha256 of the patched lib/std/Io/Threaded.zig (toolchain.env), empty when none")
     parser.add_argument("--flags", required=True)
+    parser.add_argument("--macos-slice", choices=MACOS_SLICES, default=MACOS_SLICES[0],
+                        help="the macOS slice the build must produce (macos-arm64 for PR CI)")
     args = parser.parse_args()
+    global REQUIRED_SLICES
+    REQUIRED_SLICES = {"ios-arm64", "ios-arm64-simulator", args.macos_slice}
 
     xcframework = args.xcframework.resolve()
     if xcframework.name != ROOT:
