@@ -58,19 +58,15 @@ jobs:
           python3 next/release_plan.py --repo . --head "$GITHUB_SHA" \
             --flavor "$GHOSTTYKIT_FLAVOR" --github-output "$GITHUB_OUTPUT"
 
-  build:
+  # The patch unit tests run in their own job, beside the build, not before
+  # it: the two were serial in one job and the tests alone took 3 to 26 min
+  # of a PR's wait. publish still needs both.
+  patch-tests:
     needs: plan
     if: >-
       github.event_name != 'push' || needs.plan.outputs.publish == 'true'
     runs-on: ${{ vars.GHOSTTY_NEXT_MACOS_RUNNER || 'blacksmith-6vcpu-macos-26' }}
-    timeout-minutes: 90
-    outputs:
-      archive_sha256: ${{ steps.pkg.outputs.archive_sha256 }}
-      release_tag: ${{ steps.pkg.outputs.release_tag }}
-    env:
-      # Pull requests build and smoke the arm64 macOS slice only (no x86_64).
-      # Pushes and dispatches keep the universal slice the release ships.
-      GHOSTTYKIT_MACOS_ARM64_ONLY: ${{ github.event_name == 'pull_request' && '1' || '' }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -81,9 +77,16 @@ jobs:
           key: zig-pkg-${{ hashFiles('build.zig.zon', 'build.zig.zon.json', 'next/toolchain.env') }}
           restore-keys: zig-pkg-
 
-      # Unit tests for the ghostty-next patches. They run before the
-      # GhosttyNextKit build so a red patch fails fast. Add a filter when a
-      # patch adds tests.
+      # The pinned Zig (next/install-zig.sh installs it under runner.temp and
+      # checks its version and std patch hash, so a restored copy is safe).
+      - name: Cache Zig toolchain
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/zig-*
+          key: zig-toolchain-${{ hashFiles('next/toolchain.env', 'next/install-zig.sh') }}
+
+      # Unit tests for the ghostty-next patches. Add a filter when a patch
+      # adds tests.
       - name: Patch unit tests
         run: |
           set -euo pipefail
@@ -184,6 +187,37 @@ jobs:
             -Dtest-filter="set program_status callback" \
             --summary all
 
+  build:
+    needs: plan
+    if: >-
+      github.event_name != 'push' || needs.plan.outputs.publish == 'true'
+    runs-on: ${{ vars.GHOSTTY_NEXT_MACOS_RUNNER || 'blacksmith-6vcpu-macos-26' }}
+    timeout-minutes: 90
+    outputs:
+      archive_sha256: ${{ steps.pkg.outputs.archive_sha256 }}
+      release_tag: ${{ steps.pkg.outputs.release_tag }}
+    env:
+      # Pull requests build and smoke the arm64 macOS slice only (no x86_64).
+      # Pushes and dispatches keep the universal slice the release ships.
+      GHOSTTYKIT_MACOS_ARM64_ONLY: ${{ github.event_name == 'pull_request' && '1' || '' }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Cache Zig packages
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/.cache/zig
+          key: zig-pkg-${{ hashFiles('build.zig.zon', 'build.zig.zon.json', 'next/toolchain.env') }}
+          restore-keys: zig-pkg-
+
+      # The pinned Zig (next/install-zig.sh installs it under runner.temp and
+      # checks its version and std patch hash, so a restored copy is safe).
+      - name: Cache Zig toolchain
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ${{ runner.temp }}/zig-*
+          key: zig-toolchain-${{ hashFiles('next/toolchain.env', 'next/install-zig.sh') }}
+
       - name: Build and package
         id: pkg
         run: |
@@ -241,7 +275,7 @@ jobs:
     if: >-
       (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')) &&
       (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish))
-    needs: [plan, build]
+    needs: [plan, build, patch-tests]
     runs-on: ubuntu-latest # runner-policy-exception: actions/attest-build-provenance release attestation; kept GitHub-hosted for a GitHub-hosted provenance record
     timeout-minutes: 15
     permissions:
